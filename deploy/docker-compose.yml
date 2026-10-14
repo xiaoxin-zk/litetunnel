@@ -32,8 +32,12 @@ services:
       - NET_BIND_SERVICE
 
   panel:
-    # 镜像由 GitHub Actions 构建并推送到 GHCR（见 .github/workflows/release.yml）
-    image: ${LT_PANEL_IMAGE:-litetunnel/panel:latest}
+    # 镜像由 GitHub Actions 构建并推送到 GHCR（见 .github/workflows/ci.yml 的 publish job）。
+    # 这里给出可直接使用的默认值，避免 Compose 插值取不到 .env 时回退到不存在的镜像名。
+    # 若要改用国内仓库，在 .env 中设置 LT_PANEL_IMAGE 并以
+    #   docker compose --env-file .env -f deploy/docker-compose.yml up -d
+    # 方式启动（--env-file 用于让插值读到根目录的 .env）。
+    image: ${LT_PANEL_IMAGE:-ghcr.io/xiaoxin-zk/litetunnel-panel:latest}
     # 如需在本机从源码构建，取消下面三行注释后执行：docker compose up -d --build
     # build:
     #   context: ..

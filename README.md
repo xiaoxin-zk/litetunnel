@@ -128,25 +128,130 @@ cd web/admin && npm install && npm run dev   # http://localhost:5175
 ### 2. 生产部署（Docker）
 
 镜像由 GitHub Actions 构建并推送到 GHCR，服务器只负责拉取运行。
-
-```bash
-# 0) 首次需要登录私有镜像仓库（PAT 需勾选 read:packages）
-echo "<你的PAT>" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
-
-# 1) 准备配置
-cp .env.example .env
-# 编辑 .env：填写域名、网关地址、各项密钥（openssl rand -hex 32）
-
-# 2) 渲染 frps.toml 与 Caddyfile
-bash deploy/scripts/render.sh          # Windows: powershell -File deploy/scripts/render.ps1
-
-# 3) 拉取并启动
-docker compose -f deploy/docker-compose.yml pull
-docker compose -f deploy/docker-compose.yml up -d
-```
+完整流程见下方「部署手册」。
 
 > 若需要在本机从源码构建，取消 `deploy/docker-compose.yml` 中 `build:` 段落的注释，
 > 然后执行 `docker compose -f deploy/docker-compose.yml up -d --build`。
+
+---
+
+## 五、部署手册
+
+### 步骤 0：服务器准备
+
+```bash
+# 安装 Docker（官方脚本）
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+
+# 国内服务器必须配置 Docker Hub 镜像加速，否则拉不动 frps 与 caddy
+sudo tee /etc/docker/daemon.json >/dev/null <<'EOF'
+{
+  "registry-mirrors": [
+    "https://<你的ID>.mirror.aliyuncs.com",
+    "https://docker.m.daocloud.io"
+  ]
+}
+EOF
+sudo systemctl restart docker
+```
+
+阿里云的专属加速地址在「容器镜像服务 → 镜像工具 → 镜像加速器」中获取。
+
+### 步骤 1：拉取代码
+
+```bash
+git clone https://github.com/xiaoxin-zk/litetunnel.git
+cd litetunnel
+```
+
+### 步骤 2：生成配置
+
+```bash
+cp .env.example .env
+
+# 一键生成全部密钥，把输出粘贴进 .env
+for k in LT_USER_JWT_SECRET LT_ADMIN_JWT_SECRET LT_APIKEY_ENC_KEY LT_FRPS_TOKEN LT_FRPS_API_PASSWORD; do
+  echo "$k=$(openssl rand -hex 32)"
+done
+echo "LT_BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 15 | tr -d '/+=')"
+```
+
+必填项：
+
+| 变量 | 说明 |
+|---|---|
+| `LT_ENV` | **必须是 `production`**，否则启动时会放宽安全校验并告警 |
+| `LT_USER_PUBLIC_URL` | 控制台域名，如 `https://panel.example.com`（Caddy 靠它签证书） |
+| `LT_GATEWAY_HOST` | 客户端接入地址，填域名或公网 IP |
+| `LT_ACME_EMAIL` | Let's Encrypt 通知邮箱 |
+| 上面生成的 6 个密钥 | 直接粘贴 |
+| `LT_TUNNEL_DOMAIN` | 可选，启用 HTTP/HTTPS 隧道时填泛域名 |
+
+### 步骤 3：渲染 frps.toml 与 Caddyfile
+
+```bash
+bash deploy/scripts/render.sh
+# Windows: powershell -ExecutionPolicy Bypass -File deploy/scripts/render.ps1
+```
+
+脚本会校验 `.env` 完整性、拒绝 `CHANGE_ME` 占位符，并生成 `deploy/frps/frps.toml` 与 `deploy/caddy/Caddyfile`（两者均已被 gitignore）。
+
+### 步骤 4：启动
+
+```bash
+# 仓库公开后镜像通常也是公开的，可跳过 login；若拉取报 401 则执行：
+# echo "<PAT>" | docker login ghcr.io -u xiaoxin-zk --password-stdin
+
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml ps
+```
+
+### 步骤 5：验证
+
+```bash
+# 三个容器都应为 running
+docker compose -f deploy/docker-compose.yml ps
+
+# 控制面健康检查
+curl -fsS http://127.0.0.1:7848/healthz && echo
+
+# 查看启动日志（首次会打印初始管理员账号）
+docker compose -f deploy/docker-compose.yml logs panel | head -30
+```
+
+首次启动会打印一行 `【注意】初始管理员账号 ... 密码 ...`，把它记下来。
+
+### 步骤 6：放行端口与解析域名
+
+防火墙 / 安全组只放行：
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| 80 | TCP | ACME 证书校验与跳转 |
+| 443 | TCP | 控制台 + 网站隧道 |
+| 7001 | TCP | 客户端 frpc 接入 |
+| 7002 | UDP | KCP 加速（游戏联机建议开） |
+| 20000-30000 | TCP+UDP | 隧道端口池 |
+
+DNS：把控制台域名 A 记录指向服务器，泛域名（如 `*.tunnel.example.com`）按需解析。
+
+### 步骤 7：登录与创建隧道
+
+```bash
+# 管理后台默认只监听回环，用 SSH 隧道访问
+ssh -L 8443:127.0.0.1:8443 user@你的服务器
+# 浏览器打开 http://127.0.0.1:8443，用上面的初始账号登录，立即改密码
+```
+
+用户控制台走 `https://你的域名`，注册账号后即可创建隧道。
+游戏联机场景记得选 **UDP** 类型（如基岩版 19132、帕鲁 8211）。
+
+### 步骤 8：分发客户端
+
+到仓库 Actions 页面下载最近一次 CI 的 `LiteTunnel-windows-amd64` artifact（或用打 tag 后的 Release 包，已内置 `frpc.exe`），
+把安装包放进服务器的 `deploy/data/panel/clients` 目录，用户控制台的「客户端」页会自动列出。
 
 ### 3. 安全组 / 防火墙
 
@@ -181,7 +286,7 @@ ssh -L 8443:127.0.0.1:8443 user@your-server
 
 ---
 
-## 五、构建与发布（GitHub Actions）
+## 六、构建与发布（GitHub Actions）
 
 **不在本地构建**，全部交给 CI。
 
@@ -216,7 +321,7 @@ git push origin v1.0.0
 
 ---
 
-## 六、安全清单
+## 七、安全清单
 
 | 项 | 实现 |
 |---|---|
@@ -256,7 +361,7 @@ git push origin v1.0.0
 
 ---
 
-## 七、配置项
+## 八、配置项
 
 完整列表见 `.env.example`。几处关键约束：
 
@@ -267,7 +372,7 @@ git push origin v1.0.0
 
 ---
 
-## 八、常见问题
+## 九、常见问题
 
 **Q：客户端连不上，日志提示「客户端凭据无效」？**
 在管理后台对该用户执行「重置客户端凭据」，然后重新登录客户端。
@@ -286,7 +391,7 @@ git push origin v1.0.0
 
 ---
 
-## 九、许可
+## 十、许可
 
 数据面内核 [fatedier/frp](https://github.com/fatedier/frp) 采用 Apache-2.0。
 本项目自身代码可用于商业用途，请自行保留 frp 的版权与许可声明。

@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
   {
@@ -26,11 +26,13 @@ const routes = [
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
 ]
 
-// 与 vite.config.js 的 base 保持一致：管理后台挂在 /admin 下。
-const ADMIN_BASE = '/admin'
-
+// 使用哈希路由：前端路由不依赖挂载路径。
+//
+// 管理后台的 URL 前缀由服务端 LT_ADMIN_PATH 决定且可随时修改，
+// 若使用 history 模式，路由 base 就必须与之一致，改路径就得重新构建前端。
+// 哈希模式把路由状态放在 # 之后，无论挂在哪个前缀下都能正常工作。
 const router = createRouter({
-  history: createWebHistory(ADMIN_BASE),
+  history: createWebHashHistory(),
   routes
 })
 

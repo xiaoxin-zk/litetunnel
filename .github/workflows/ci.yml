@@ -55,10 +55,17 @@ jobs:
           LT_GATEWAY_PORT: "7001"
           LT_FRPS_API_ADDR: 127.0.0.1:7500
           LT_CLIENT_DIST_DIR: /tmp/smoke/clients
+          # 用非默认值验证管理后台路径可配置
+          LT_ADMIN_PATH: /smoke-console
+          LT_USER_WEB_DIR: /tmp/smoke/userweb
+          LT_ADMIN_WEB_DIR: /tmp/smoke/adminweb
         run: |
           set -euo pipefail
           BASE=http://127.0.0.1:7848
-          mkdir -p /tmp/smoke
+          # 最小前端产物，用于验证两套 SPA 的挂载与路径隔离
+          mkdir -p /tmp/smoke/userweb/assets /tmp/smoke/adminweb/assets
+          printf '<html>USER-CONSOLE</html>' > /tmp/smoke/userweb/index.html
+          printf '<html>ADMIN-CONSOLE</html>' > /tmp/smoke/adminweb/index.html
           /tmp/panel > /tmp/smoke/panel.log 2>&1 &
           PANEL_PID=$!
           trap 'kill $PANEL_PID 2>/dev/null || true' EXIT
@@ -111,6 +118,31 @@ jobs:
             exit 1
           fi
           echo "PASS admin API requires authentication"
+
+          # 管理后台路径可配置：不带斜杠时应 302 到带斜杠版本
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/smoke-console")
+          loc=$(curl -s -o /dev/null -w '%{redirect_url}' "$BASE/smoke-console")
+          if [ "$code" != "302" ] || [ "$loc" != "$BASE/smoke-console/" ]; then
+            echo "::error::admin path redirect failed (code=$code loc=$loc)"
+            exit 1
+          fi
+          echo "PASS admin path trailing-slash redirect"
+
+          # 自定义路径应返回管理端页面
+          body=$(curl -fsS "$BASE/smoke-console/")
+          if ! printf '%s' "$body" | grep -q 'ADMIN-CONSOLE'; then
+            echo "::error::admin console not served at the configured path"
+            exit 1
+          fi
+          echo "PASS admin console served at the configured path"
+
+          # 默认的 /admin 不再是管理端入口（应落到用户控制台）
+          body=$(curl -fsS "$BASE/admin")
+          if printf '%s' "$body" | grep -q 'ADMIN-CONSOLE'; then
+            echo "::error::/admin still exposes the admin console"
+            exit 1
+          fi
+          echo "PASS /admin no longer exposes the admin console"
 
           # 暴力破解防护：连续失败后必须被限流/锁定（返回 429）
           locked=0

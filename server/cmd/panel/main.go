@@ -68,7 +68,7 @@ func main() {
 	go func() {
 		log.Printf("控制面监听于 %s", cfg.UserAddr)
 		log.Printf("  用户控制台  http://%s/", cfg.UserAddr)
-		log.Printf("  管理后台    http://%s%s", cfg.UserAddr, router.AdminPath)
+		log.Printf("  管理后台    http://%s%s/", cfg.UserAddr, cfg.AdminPath)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("服务异常退出: %v", err)
 		}

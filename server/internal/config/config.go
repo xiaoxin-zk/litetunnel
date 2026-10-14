@@ -35,6 +35,15 @@ type Config struct {
 	UserAddr      string
 	UserPublicURL string
 
+	// AdminPath 是管理后台的挂载路径。
+	//
+	// 刻意不使用 /admin 这类扫描器字典里的高频路径：管理后台虽然是
+	// 公网可达的（安全由账号锁定 + 限流 + 双因素保证），但把入口藏在
+	// 一个自定义路径下能挡掉绝大部分自动化探测流量。
+	//
+	// 前端采用哈希路由 + 相对资源路径，因此本值可随时修改而无需重新构建镜像。
+	AdminPath string
+
 	// AdminAllowCIDRs 可选的管理后台来源白名单。
 	// 为空表示管理后台同样对公网开放（默认），此时安全性由
 	// 账号锁定 + 限流 + 双因素认证共同保证。
@@ -138,6 +147,7 @@ func Load() (*Config, error) {
 
 		UserAddr:        env("LT_USER_ADDR", "0.0.0.0:7848"),
 		UserPublicURL:   strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),
+		AdminPath:       env("LT_ADMIN_PATH", "/lt-console"),
 		AdminAllowCIDRs: splitCSV(env("LT_ADMIN_ALLOW_CIDR", "")),
 
 		UserJWTSecret:  env("LT_USER_JWT_SECRET", ""),
@@ -254,6 +264,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("LT_DB_DRIVER 仅支持 sqlite 或 postgres，当前为 %q", c.DBDriver)
 	}
 
+	adminPath, err := normalizeAdminPath(c.AdminPath)
+	if err != nil {
+		return err
+	}
+	c.AdminPath = adminPath
+
 	// 邮件配置校验：只校验「已配置」的情况，未配置时视为禁用该功能。
 	if c.SMTP.Host != "" {
 		switch c.SMTP.TLS {
@@ -341,6 +357,48 @@ func (c *Config) validate() error {
 				"请务必启用管理员双因素认证，否则仅有密码一道防线")
 	}
 	return nil
+}
+
+// reservedPathPrefixes 是管理后台路径不得占用的前缀。
+// 它们被接口、健康检查或静态资源使用，占用会导致路由冲突。
+var reservedPathPrefixes = []string{"/api", "/healthz", "/assets", "/favicon"}
+
+// normalizeAdminPath 规范化并校验管理后台挂载路径。
+//
+// 只接受单层路径（形如 /xxx），字符集限制为字母数字与 - _，
+// 避免出现 /a/b 这类多段路径或包含点号的路径引发路由歧义与目录穿越联想。
+func normalizeAdminPath(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", errors.New("LT_ADMIN_PATH 不能为空")
+	}
+	p = "/" + strings.Trim(p, "/")
+	if p == "/" {
+		return "", errors.New("LT_ADMIN_PATH 不能为根路径，否则会与用户控制台冲突")
+	}
+	if len(p) < 4 {
+		return "", errors.New("LT_ADMIN_PATH 至少需要 3 个字符，过短容易被猜中")
+	}
+	if len(p) > 64 {
+		return "", errors.New("LT_ADMIN_PATH 不得超过 64 个字符")
+	}
+	if strings.Contains(p[1:], "/") {
+		return "", errors.New("LT_ADMIN_PATH 只支持单层路径，例如 /lt-console")
+	}
+	for _, r := range p[1:] {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_'
+		if !ok {
+			return "", fmt.Errorf("LT_ADMIN_PATH 只允许字母、数字、- 与 _，当前为 %q", p)
+		}
+	}
+	lower := strings.ToLower(p)
+	for _, reserved := range reservedPathPrefixes {
+		if lower == reserved || strings.HasPrefix(lower, reserved+"/") {
+			return "", fmt.Errorf("LT_ADMIN_PATH 不能占用保留前缀 %s", reserved)
+		}
+	}
+	return p, nil
 }
 
 // isPublicBind 判断监听地址是否对外暴露。

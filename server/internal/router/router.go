@@ -34,12 +34,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// AdminPath 是管理后台的挂载路径。
-//
-// 该值必须与 web/admin 的 Vite 构建参数 base 保持一致，否则前端资源会 404。
-// 注意：路径本身不是安全边界，只用于区分两套控制台。
-const AdminPath = "/admin"
-
 // New 构建唯一的公网入口。
 func New(
 	cfg *config.Config,
@@ -207,25 +201,26 @@ func New(
 		adminSuper.POST("/admins/:id/totp-reset", adminH.ClearAdminTOTP)
 	}
 
-	serveSPA(r, cfg.UserWebDir, cfg.AdminWebDir, adminAllow)
+	serveSPA(r, cfg, adminAllow)
 	return r
 }
 
 // serveSPA 托管两套单页应用。
 //
 // 目录不存在时静默跳过，服务以纯 API 模式运行（便于前后端分离开发）。
-func serveSPA(r *gin.Engine, userDir, adminDir string, adminAllow *middleware.CIDRSet) {
-	userIndex, userOK := indexPath(userDir)
-	adminIndex, adminOK := indexPath(adminDir)
+func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet) {
+	userIndex, userOK := indexPath(cfg.UserWebDir)
+	adminIndex, adminOK := indexPath(cfg.AdminWebDir)
+	adminPath := cfg.AdminPath
 
 	if adminOK {
-		if assets := filepath.Join(adminDir, "assets"); isDir(assets) {
+		if assets := filepath.Join(cfg.AdminWebDir, "assets"); isDir(assets) {
 			// 管理后台静态资源同样受白名单约束，避免受限 IP 看到半截页面。
-			r.Group(AdminPath, adminAllow.Middleware()).Static("/assets", assets)
+			r.Group(adminPath, adminAllow.Middleware()).Static("/assets", assets)
 		}
 	}
 	if userOK {
-		if assets := filepath.Join(userDir, "assets"); isDir(assets) {
+		if assets := filepath.Join(cfg.UserWebDir, "assets"); isDir(assets) {
 			r.Static("/assets", assets)
 		}
 	}
@@ -244,9 +239,15 @@ func serveSPA(r *gin.Engine, userDir, adminDir string, adminAllow *middleware.CI
 		}
 
 		// 管理后台路径：先做白名单校验，未通过时按不存在处理。
-		if isUnder(path, AdminPath) {
+		if isUnder(path, adminPath) {
 			if !adminAllow.Contains(c.ClientIP()) || !adminOK {
 				httpx.NotFound(c, "资源不存在")
+				return
+			}
+			// 管理端前端使用相对资源路径，缺少结尾斜杠会让浏览器把
+			// ./assets/... 解析到站点根目录。这里补一次跳转。
+			if path == adminPath {
+				c.Redirect(http.StatusFound, adminPath+"/")
 				return
 			}
 			c.File(adminIndex)

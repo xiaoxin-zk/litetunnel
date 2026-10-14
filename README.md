@@ -337,16 +337,20 @@ ssh -L 8443:127.0.0.1:8443 user@your-server
 | 账号信息 | 接入后由服务端下发 |
 | frpc 接入凭据 | 服务端生成在配置文件里，客户端自动写入 |
 
-> ⚠️ **发版前必须设置仓库变量**，否则打出来的客户端会退回「手动填写服务器地址」：
+> ⚠️ **发版前必须设置仓库 Secret**，否则打出来的客户端会退回「手动填写服务器地址」：
 >
-> 仓库 → Settings → Secrets and variables → Actions → **Variables** → New variable
+> 仓库 → Settings → Secrets and variables → Actions → **Secrets** → New repository secret
 >
 > | 名称 | 值 |
 > |---|---|
 > | `LT_CLIENT_SERVER` | 你的控制台地址，如 `https://panel.example.com` |
 >
 > 地址通过 `-ldflags -X main.buildServerURL=...` 烧进二进制，
-> **源码与仓库文件中不出现任何真实地址**，符合「不在源码暴露公网信息」的要求。
+> **源码与仓库文件中不出现任何真实地址**。
+>
+> 用 **Secret 而不是 Variable**：公开仓库的 Actions Variables 是任何人可读的，
+> 那等于把地址写在公告板上。同理，`ci.yml` 刻意不注入地址——
+> 公开仓库的 artifact 谁都能下载，带地址的正式包只由 `release.yml` 产出。
 
 > 本地调试构建（`scripts/build.ps1`）不注入地址，客户端会显示地址输入框作为兜底。
 

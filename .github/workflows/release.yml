@@ -89,15 +89,17 @@ jobs:
       - name: Build client
         working-directory: client/windows
         shell: pwsh
+        env:
+          # 用 Secret 而非 Variable：公开仓库的 Variables 任何人可读，
+          # 那等于把地址写在公告板上。Secret 不会对外暴露。
+          LT_CLIENT_SERVER: ${{ secrets.LT_CLIENT_SERVER }}
         run: |
           $env:PATH = "$env:PATH;$env:USERPROFILE\go\bin"
           # 把平台地址烧进客户端，用户只需粘贴 API Key，不必填服务器地址。
-          # 地址来自仓库变量 LT_CLIENT_SERVER（Settings → Secrets and variables → Actions → Variables），
-          # 因此源码与仓库文件中不出现任何真实地址。
-          if (-not "${{ vars.LT_CLIENT_SERVER }}") {
+          if (-not $env:LT_CLIENT_SERVER) {
             Write-Host "::warning::LT_CLIENT_SERVER 未设置，客户端将回退为手动填写服务器地址"
           }
-          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=${{ vars.LT_CLIENT_SERVER }}"
+          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER"
 
       - name: Download frpc
         shell: pwsh

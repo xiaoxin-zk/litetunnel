@@ -243,9 +243,10 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "$env:PATH;$env:USERPROFILE\go\bin"
-          # 平台地址在构建时注入，源码中不出现任何真实地址。
-          # 仓库变量 LT_CLIENT_SERVER 未设置时为空，客户端会回退为手填地址。
-          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=${{ vars.LT_CLIENT_SERVER }}"
+          # 这里刻意不注入平台地址：CI 只验证能否构建。
+          # 公开仓库的 artifact 任何人可下载，把真实地址烧进去等于对外公开。
+          # 带地址的正式安装包由 release.yml 产出。
+          wails build -clean -platform windows/amd64
 
       - name: Upload client
         uses: actions/upload-artifact@v4

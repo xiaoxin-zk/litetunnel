@@ -48,6 +48,10 @@ var (
 	ErrCaptchaInvalid  = errors.New("验证码不正确或已过期，请重新获取")
 	ErrRegisterLimited = errors.New("当前网络注册过于频繁，请稍后再试")
 	ErrEmailNotAllowed = errors.New("该邮箱域名不允许注册")
+	// ErrDomainNotTrusted 表示站点开启了「仅白名单域名可注册」。
+	ErrDomainNotTrusted = errors.New("本站当前仅允许白名单内的邮箱域名注册")
+	// ErrDomainRegisterLimited 表示该邮箱域名当日注册量已达上限。
+	ErrDomainRegisterLimited = errors.New("该邮箱域名今日注册数量已达上限，请改用其他邮箱或明日再试")
 	ErrEmailCodeNeeded = errors.New("请输入邮箱验证码")
 	ErrEmailCodeWrong  = errors.New("邮箱验证码不正确或已过期")
 )

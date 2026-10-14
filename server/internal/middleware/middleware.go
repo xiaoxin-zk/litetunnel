@@ -80,12 +80,18 @@ type bucket struct {
 	lastSeen time.Time
 }
 
+// RateSource 返回当前的「每秒补充令牌数」与「桶容量」。
+// 由上层注入，使限流阈值可以在管理端热调整而无需重启。
+type RateSource func() (rate, capacity float64)
+
 // RateLimiter 基于令牌桶的内存限流器，按 IP + 分组键隔离。
 type RateLimiter struct {
 	mu       sync.Mutex
 	buckets  map[string]*bucket
 	rate     float64 // 每秒补充令牌数
 	capacity float64
+	// source 非空时改用实时读取的阈值，用于支持管理端热调整。
+	source RateSource
 }
 
 // NewRateLimiter 创建限流器：每秒补充 rate 个令牌，桶容量 capacity。
@@ -97,6 +103,35 @@ func NewRateLimiter(rate, capacity float64) *RateLimiter {
 	}
 	go rl.gc()
 	return rl
+}
+
+// NewDynamicRateLimiter 创建阈值可热调整的限流器。
+//
+// 刻意不在配置变更时重建限流器：重建会清空所有令牌桶，
+// 攻击者只要设法让管理员改一次配置，就能顺带重置自己的配额。
+// 这里保持桶本身不变，仅在补充令牌时采用最新速率。
+func NewDynamicRateLimiter(source RateSource) *RateLimiter {
+	rl := &RateLimiter{
+		buckets: make(map[string]*bucket),
+		source:  source,
+	}
+	go rl.gc()
+	return rl
+}
+
+// limits 返回本次使用的速率与容量，并做兜底，避免配置异常导致完全放开。
+func (rl *RateLimiter) limits() (rate, capacity float64) {
+	if rl.source == nil {
+		return rl.rate, rl.capacity
+	}
+	rate, capacity = rl.source()
+	if rate <= 0 {
+		rate = 0.05
+	}
+	if capacity < 1 {
+		capacity = 1
+	}
+	return rate, capacity
 }
 
 func (rl *RateLimiter) gc() {
@@ -116,17 +151,19 @@ func (rl *RateLimiter) gc() {
 
 // Allow 判断某键是否放行。
 func (rl *RateLimiter) Allow(key string) bool {
+	rate, capacity := rl.limits()
+
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	b, ok := rl.buckets[key]
 	if !ok {
-		rl.buckets[key] = &bucket{tokens: rl.capacity - 1, lastSeen: now}
+		rl.buckets[key] = &bucket{tokens: capacity - 1, lastSeen: now}
 		return true
 	}
 	elapsed := now.Sub(b.lastSeen).Seconds()
-	b.tokens = min(rl.capacity, b.tokens+elapsed*rl.rate)
+	b.tokens = min(capacity, b.tokens+elapsed*rate)
 	b.lastSeen = now
 	if b.tokens < 1 {
 		return false

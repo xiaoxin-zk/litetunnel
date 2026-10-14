@@ -81,6 +81,9 @@ type User struct {
 
 	// RegisterIP 记录注册来源，用于「单 IP 每日注册上限」的风控统计。
 	RegisterIP string `gorm:"size:64;index" json:"-"`
+	// EmailDomain 是邮箱域名的冗余列，用于「单域名每日注册上限」的统计。
+	// 单独存一列而不是每次用 LIKE 查询，是为了让统计能命中索引。
+	EmailDomain string `gorm:"size:128;index" json:"-"`
 	// EmailVerified 表示邮箱是否通过验证码校验（未开启邮件验证时恒为 false）。
 	EmailVerified bool `gorm:"default:false" json:"email_verified"`
 

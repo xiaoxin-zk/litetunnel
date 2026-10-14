@@ -55,7 +55,35 @@
               :rows="2"
               placeholder="逗号分隔，如 tempmail.com, mailinator.com"
             />
-            <span class="hint">命中域名及其子域将被拒绝注册</span>
+            <span class="hint">命中域名及其子域将被直接拒绝，优先级最高</span>
+          </el-form-item>
+
+          <el-divider content-position="left">邮箱域名白名单</el-divider>
+
+          <el-form-item label="白名单域名">
+            <el-input
+              v-model="form['register.allowed_email_domains']"
+              type="textarea"
+              :rows="2"
+              placeholder="逗号分隔，如 company.com, partner.cn"
+            />
+            <span class="hint">
+              典型用法：企业自有域名列入白名单供员工自由注册；其余公共邮箱仍可注册但受下方限制
+            </span>
+          </el-form-item>
+          <el-form-item label="仅白名单可注册">
+            <el-switch v-model="boolForm['register.whitelist_only']" />
+            <span class="hint">开启后非白名单邮箱一律无法注册（填写白名单后才可开启）</span>
+          </el-form-item>
+          <el-form-item label="单域名每日上限">
+            <el-input-number v-model="numForm['register.max_per_domain_per_day']" :min="0" :max="1000" />
+            <span class="hint">
+              同一邮箱域名（如 qq.com）每日可注册的数量，0 表示不限；默认 5
+            </span>
+          </el-form-item>
+          <el-form-item label="白名单跳过限制">
+            <el-switch v-model="boolForm['register.trusted_domain_skip_limits']" />
+            <span class="hint">开启后白名单域名不受「单 IP 上限」与「单域名上限」约束</span>
           </el-form-item>
           <el-form-item label="注册服务条款">
             <el-input v-model="form['register.terms']" type="textarea" :rows="12" />
@@ -170,6 +198,17 @@
           <el-form-item label="单 IP 每分钟登录上限">
             <el-input-number v-model="numForm['login.max_per_minute']" :min="1" :max="600" />
           </el-form-item>
+
+          <el-divider content-position="left">面板接口限流</el-divider>
+
+          <el-form-item label="接口每分钟上限">
+            <el-input-number v-model="numForm['api.rate_limit_per_minute']" :min="1" :max="100000" />
+            <span class="hint">单个 IP 每分钟可发起的业务接口请求数，默认 120</span>
+          </el-form-item>
+          <el-form-item label="接口突发容量">
+            <el-input-number v-model="numForm['api.rate_limit_burst']" :min="1" :max="10000" />
+            <span class="hint">允许的瞬时峰值，默认 60；调低可防刷，但页面并发加载多时易误伤</span>
+          </el-form-item>
         </el-form>
 
         <el-divider />
@@ -250,6 +289,8 @@ const SECRET_MASK = '__UNCHANGED__'
 const BOOL_KEYS = [
   'register.enabled',
   'register.captcha_enabled',
+  'register.whitelist_only',
+  'register.trusted_domain_skip_limits',
   'smtp.enabled',
   'payment.enabled',
   'firewall.enabled',
@@ -258,11 +299,14 @@ const BOOL_KEYS = [
 
 const NUM_KEYS = [
   'register.max_per_ip_per_day',
+  'register.max_per_domain_per_day',
   'smtp.port',
   'payment.min_amount',
   'payment.max_amount',
   'login.captcha_after_failures',
-  'login.max_per_minute'
+  'login.max_per_minute',
+  'api.rate_limit_per_minute',
+  'api.rate_limit_burst'
 ]
 
 const SECRET_KEYS = ['smtp.password', 'payment.secret']

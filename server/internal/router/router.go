@@ -64,9 +64,16 @@ func New(
 
 	// 登录/注册类接口用更严格的限流，抵御撞库。
 	userAuthLimiter := middleware.NewRateLimiter(0.5, 10)
-	userAPILimiter := middleware.NewRateLimiter(30, 90)
 	// 管理侧限流更严：它是公网可达的最高权限入口。
 	adminAPILimiter := middleware.NewRateLimiter(20, 60)
+
+	// 面板业务接口的限流阈值来自运行期配置，可在管理端「系统设置 → 接口限流」热调整。
+	// 用动态限流器而不是固定值：不同规模的站点差异很大，写死会误伤或形同虚设。
+	userAPILimiter := middleware.NewDynamicRateLimiter(func() (float64, float64) {
+		perMinute := svc.Settings.Int(service.KeyAPIRatePerMinute)
+		burst := svc.Settings.Int(service.KeyAPIRateBurst)
+		return float64(perMinute) / 60.0, float64(burst)
+	})
 
 	// ================= 用户侧 =================
 

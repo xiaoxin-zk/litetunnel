@@ -36,9 +36,26 @@ const (
 	KeyRegisterBlockDomains SettingKey = "register.blocked_email_domains"
 	KeyRegisterCaptcha      SettingKey = "register.captcha_enabled"
 
+	// 邮箱域名白名单与差异化准入。
+	//
+	// 典型用法：把企业自有域名（如 company.com）列入白名单，员工可自由注册；
+	// 其余公共邮箱域名仍可注册，但受「单域名每日上限」约束，
+	// 避免有人用临时邮箱批量刷账号。
+	KeyRegisterAllowDomains      SettingKey = "register.allowed_email_domains"
+	KeyRegisterWhitelistOnly     SettingKey = "register.whitelist_only"
+	KeyRegisterMaxPerDomain      SettingKey = "register.max_per_domain_per_day"
+	KeyRegisterTrustedSkipLimits SettingKey = "register.trusted_domain_skip_limits"
+
 	// ---- 登录防护 ----
 	KeyLoginCaptchaAfter SettingKey = "login.captcha_after_failures"
 	KeyLoginMaxPerMinute SettingKey = "login.max_per_minute"
+
+	// ---- 面板接口限流 ----
+	//
+	// 针对已认证接口的通用限流，按账号维度计数（未认证请求按 IP）。
+	// 与登录限流分开配置：登录需要严，正常业务接口太严会误伤。
+	KeyAPIRatePerMinute SettingKey = "api.rate_limit_per_minute"
+	KeyAPIRateBurst     SettingKey = "api.rate_limit_burst"
 
 	// ---- 邮件 ----
 	KeySMTPEnabled  SettingKey = "smtp.enabled"
@@ -101,9 +118,19 @@ var settingSpecs = []settingSpec{
 	{Key: KeyRegisterBlockDomains, Default: func(*config.Config) string { return "" }},
 	{Key: KeyRegisterCaptcha, Default: func(*config.Config) string { return "true" }},
 
+	// 邮箱域名白名单与差异化准入
+	{Key: KeyRegisterAllowDomains, Default: func(*config.Config) string { return "" }},
+	{Key: KeyRegisterWhitelistOnly, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyRegisterMaxPerDomain, Default: func(*config.Config) string { return "5" }},
+	{Key: KeyRegisterTrustedSkipLimits, Default: func(*config.Config) string { return "true" }},
+
 	// 登录防护
 	{Key: KeyLoginCaptchaAfter, Default: func(*config.Config) string { return "3" }},
 	{Key: KeyLoginMaxPerMinute, Default: func(*config.Config) string { return "10" }},
+
+	// 面板接口限流
+	{Key: KeyAPIRatePerMinute, Default: func(*config.Config) string { return "120" }},
+	{Key: KeyAPIRateBurst, Default: func(*config.Config) string { return "60" }},
 
 	// 邮件：默认值取自环境变量，便于用 .env 快速部署
 	{Key: KeySMTPEnabled, Default: func(c *config.Config) string { return boolStr(c.SMTP.Enabled()) }},
@@ -403,6 +430,28 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 	if n, err := strconv.Atoi(view(KeyRegisterMaxPerIP)); err != nil || n < 0 || n > 1000 {
 		return fmt.Errorf("%w: 单 IP 每日注册上限需为 0-1000 的整数", ErrInvalidParam)
 	}
+	if n, err := strconv.Atoi(view(KeyRegisterMaxPerDomain)); err != nil || n < 0 || n > 1000 {
+		return fmt.Errorf("%w: 单域名每日注册上限需为 0-1000 的整数", ErrInvalidParam)
+	}
+
+	allowDomains := ParseDomainList(view(KeyRegisterAllowDomains))
+	blockDomains := ParseDomainList(view(KeyRegisterBlockDomains))
+	for d := range allowDomains {
+		if blockDomains[d] {
+			return fmt.Errorf("%w: 域名 %s 同时出现在白名单与黑名单中，行为不可预期", ErrInvalidParam, d)
+		}
+	}
+	if truthy(KeyRegisterWhitelistOnly) && len(allowDomains) == 0 {
+		return fmt.Errorf("%w: 选择「仅允许白名单域名注册」时必须先填写白名单", ErrInvalidParam)
+	}
+
+	// ---- 接口限流 ----
+	if n, err := strconv.Atoi(view(KeyAPIRatePerMinute)); err != nil || n < 1 || n > 100000 {
+		return fmt.Errorf("%w: 接口每分钟请求上限需为 1-100000 的整数", ErrInvalidParam)
+	}
+	if n, err := strconv.Atoi(view(KeyAPIRateBurst)); err != nil || n < 1 || n > 10000 {
+		return fmt.Errorf("%w: 接口突发容量需为 1-10000 的整数", ErrInvalidParam)
+	}
 
 	return s.Settings.SetMany(in)
 }
@@ -438,6 +487,40 @@ func ParsePortList(s string) map[int]bool {
 		}
 	}
 	return out
+}
+
+// ParseDomainList 解析逗号分隔的域名列表，统一转小写并去掉 @ 前缀。
+//
+// 与 ParsePortList 一样采取宽容策略：忽略空项与格式明显错误的项，
+// 不让一个笔误导致整份配置无法保存。
+func ParseDomainList(s string) map[string]bool {
+	out := make(map[string]bool)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "@")))
+		if part == "" || strings.ContainsAny(part, " \t\r\n/\\") {
+			continue
+		}
+		// 只接受形如 a.b 的域名，避免把 IP 或路径写进来。
+		if !strings.Contains(part, ".") {
+			continue
+		}
+		out[part] = true
+	}
+	return out
+}
+
+// DomainInList 判断邮箱域名是否命中列表（含子域）。
+func DomainInList(domain string, list map[string]bool) bool {
+	if domain == "" || len(list) == 0 {
+		return false
+	}
+	domain = strings.ToLower(domain)
+	for d := range list {
+		if domain == d || strings.HasSuffix(domain, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 func boolStr(b bool) string {

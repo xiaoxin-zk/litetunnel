@@ -63,9 +63,25 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	if in.Email != "" && s.emailDomainBlocked(in.Email) {
 		return nil, ErrEmailNotAllowed
 	}
-	// 5. 单 IP 每日注册上限：拦住同一台机器批量注册
-	if err := s.checkRegisterRate(in.IP); err != nil {
-		return nil, err
+
+	domain := emailDomain(in.Email)
+	trusted := s.isTrustedEmailDomain(domain)
+	// 5. 白名单模式：开启后非白名单域名一律拒绝
+	if s.Settings.Bool(KeyRegisterWhitelistOnly) && !trusted {
+		return nil, ErrDomainNotTrusted
+	}
+
+	// 6. 频率限制。白名单域名可选择跳过：企业自有域名下员工批量注册属正常行为。
+	skipLimits := trusted && s.Settings.Bool(KeyRegisterTrustedSkipLimits)
+	if !skipLimits {
+		// 单 IP 每日上限：拦住同一台机器批量注册
+		if err := s.checkRegisterRate(in.IP); err != nil {
+			return nil, err
+		}
+		// 单邮箱域名每日上限：拦住用同一邮箱服务商批量注册
+		if err := s.checkDomainRate(domain); err != nil {
+			return nil, err
+		}
 	}
 
 	var exists int64
@@ -106,6 +122,7 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		APIKeyEnc:       apiEnc,
 		APIKeyCreatedAt: &now,
 		RegisterIP:      truncate(in.IP, 64),
+		EmailDomain:     truncate(domain, 128),
 	}
 	if group != nil {
 		user.GroupID = group.ID
@@ -141,6 +158,52 @@ func (s *Services) emailDomainBlocked(email string) bool {
 		}
 	}
 	return false
+}
+
+// emailDomain 从邮箱中取出小写域名，取不到时返回空串。
+func emailDomain(email string) string {
+	email = strings.TrimSpace(email)
+	at := strings.LastIndex(email, "@")
+	if at < 0 || at == len(email)-1 {
+		return ""
+	}
+	return strings.ToLower(email[at+1:])
+}
+
+// isTrustedEmailDomain 判断邮箱域名是否命中白名单。
+func (s *Services) isTrustedEmailDomain(domain string) bool {
+	if domain == "" {
+		return false
+	}
+	return DomainInList(domain, ParseDomainList(s.Settings.Get(KeyRegisterAllowDomains)))
+}
+
+// checkDomainRate 限制单个邮箱域名在自然日内的注册数量。
+//
+// 与「单 IP 上限」互补：IP 上限挡不住换 IP 的批量注册，
+// 但同一批注册往往共用同一个邮箱服务商，按域名计数能兜住。
+func (s *Services) checkDomainRate(domain string) error {
+	if domain == "" {
+		return nil
+	}
+	limit := s.Settings.Int(KeyRegisterMaxPerDomain)
+	if limit <= 0 {
+		return nil
+	}
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	var n int64
+	if err := s.DB.Model(&model.User{}).
+		Where("email_domain = ? AND created_at >= ?", domain, dayStart).
+		Count(&n).Error; err != nil {
+		// 统计失败时放行，理由同 checkRegisterRate。
+		return nil
+	}
+	if n >= int64(limit) {
+		return ErrDomainRegisterLimited
+	}
+	return nil
 }
 
 // checkRegisterRate 限制单个 IP 在自然日内的注册数量。

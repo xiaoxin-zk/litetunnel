@@ -224,15 +224,16 @@ func (h *Handler) Handle(c *gin.Context) {
 // 绝不能仅凭 frpUser 就查库放行：那等于绕过了 Login 的凭据校验，
 // 任何人只要知道目标用户名与全局 token 就能冒充该用户。
 func (h *Handler) resolveUser(frpUser, runID string) (*model.User, bool) {
-	username, ok := service.UsernameFromFrpUser(frpUser)
+	userID, ok := service.UserIDFromFrpUser(frpUser)
 	if !ok || runID == "" {
 		return nil, false
 	}
 
 	// 1) 内存会话
 	if s, ok := h.svc.Runtime.LookupSession(runID); ok {
-		if s.Username != username {
-			log.Printf("[plugin] run_id %s 的用户不匹配（声称 %s，实际 %s），已拒绝", runID, username, s.Username)
+		if s.UserID != userID {
+			log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
+				runID, userID, s.UserID)
 			return nil, false
 		}
 		u, err := h.svc.LoadUser(s.UserID)
@@ -247,8 +248,9 @@ func (h *Handler) resolveUser(frpUser, runID string) (*model.User, bool) {
 	if err != nil {
 		return nil, false
 	}
-	if sess.Username != username {
-		log.Printf("[plugin] run_id %s 的用户不匹配（声称 %s，实际 %s），已拒绝", runID, username, sess.Username)
+	if sess.UserID != userID {
+		log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
+			runID, userID, sess.UserID)
 		return nil, false
 	}
 	u, err := h.svc.LoadUser(sess.UserID)

@@ -293,11 +293,9 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		log.Printf("[traffic] 载入用户失败: %v", err)
 		return
 	}
-	userByName := make(map[string]*model.User, len(users))
-	userNameByID := make(map[uint]string, len(users))
+	userByID := make(map[uint]*model.User, len(users))
 	for i := range users {
-		userByName[users[i].Username] = &users[i]
-		userNameByID[users[i].ID] = users[i].Username
+		userByID[users[i].ID] = &users[i]
 	}
 
 	var tunnels []model.Tunnel
@@ -305,15 +303,15 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		log.Printf("[traffic] 载入隧道失败: %v", err)
 		return
 	}
-	type tunnelKey struct{ username, tunnel string }
+	// 用不可变的用户 ID 建索引：frp 的 user 字段是 lt_u<id>，与用户名无关。
+	type tunnelKey struct {
+		userID uint
+		tunnel string
+	}
 	tunnelByKey := make(map[tunnelKey]*model.Tunnel, len(tunnels))
 	tunnelOwner := make(map[uint]uint, len(tunnels))
 	for i := range tunnels {
-		uname := userNameByID[tunnels[i].UserID]
-		if uname == "" {
-			continue
-		}
-		tunnelByKey[tunnelKey{username: uname, tunnel: tunnels[i].Name}] = &tunnels[i]
+		tunnelByKey[tunnelKey{userID: tunnels[i].UserID, tunnel: tunnels[i].Name}] = &tunnels[i]
 		tunnelOwner[tunnels[i].ID] = tunnels[i].UserID
 	}
 
@@ -329,15 +327,15 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		username, ok := UsernameFromFrpUser(frpUser)
+		userID, ok := UserIDFromFrpUser(frpUser)
 		if !ok {
 			continue
 		}
-		u, ok := userByName[username]
+		u, ok := userByID[userID]
 		if !ok {
 			continue
 		}
-		t, ok := tunnelByKey[tunnelKey{username: username, tunnel: tunnelName}]
+		t, ok := tunnelByKey[tunnelKey{userID: userID, tunnel: tunnelName}]
 		if !ok {
 			continue
 		}

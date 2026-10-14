@@ -127,14 +127,5 @@ func ParseProxyName(name string) (frpUser, proxyName string, ok bool) {
 	return name[:idx], name[idx+1:], true
 }
 
-// UsernameFromFrpUser 从 frp 的 user 字段还原平台用户名。
-func UsernameFromFrpUser(frpUser string) (string, bool) {
-	if !strings.HasPrefix(frpUser, ProxyNamePrefix) {
-		return "", false
-	}
-	name := strings.TrimPrefix(frpUser, ProxyNamePrefix)
-	if name == "" {
-		return "", false
-	}
-	return name, true
-}
+// 说明：从 frp user 字段还原身份的解析逻辑已迁移到 frpc.go 的 UserIDFromFrpUser。
+// 早期版本用「用户名」作前缀，导致用户改名会破坏全部已下发配置，现已改为不可变用户 ID。

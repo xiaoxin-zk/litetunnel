@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -13,9 +14,30 @@ import (
 // MetaTokenKey 是客户端在 frpc 配置 metadatas 中携带接入凭据的键名。
 const MetaTokenKey = "token"
 
-// ProxyNamePrefix 由 frp 自动把 user 作为 proxy 名前缀，
-// 本平台统一以 lt_ 开头标识来源，便于在 frps 侧识别与过滤。
-const ProxyNamePrefix = "lt_"
+// FrpUserPrefix 是 frp 配置里 user 字段的前缀，后接**不可变的用户 ID**。
+//
+// 为什么用 ID 而不是用户名：frp 会把 user 作为代理名前缀，插件回调也靠它
+// 反解调用方身份。若用用户名，用户一旦改名，所有已下发的客户端配置立即失效，
+// 且需要重建全部会话。改用 ID 后用户名可自由变更。
+const FrpUserPrefix = "lt_u"
+
+// FrpUserOf 生成 frp 的 user 字段，形如 lt_u12。
+func FrpUserOf(userID uint) string {
+	return FrpUserPrefix + strconv.FormatUint(uint64(userID), 10)
+}
+
+// UserIDFromFrpUser 从 frp 的 user 字段还原用户 ID。
+func UserIDFromFrpUser(frpUser string) (uint, bool) {
+	rest, ok := strings.CutPrefix(frpUser, FrpUserPrefix)
+	if !ok {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(rest, 10, 64)
+	if err != nil || id == 0 {
+		return 0, false
+	}
+	return uint(id), true
+}
 
 // EnsureClientSecret 确保用户拥有客户端接入凭据。
 func (s *Services) EnsureClientSecret(u *model.User) (string, error) {
@@ -77,7 +99,7 @@ func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 	return &ClientInfo{
 		ServerAddr:    s.Cfg.GatewayHost,
 		ServerPort:    s.Cfg.GatewayPort,
-		User:          ProxyNamePrefix + u.Username,
+		User:          FrpUserOf(u.ID),
 		Token:         secret,
 		FrpsToken:     s.Cfg.FrpsToken,
 		TunnelDomain:  s.Cfg.TunnelDomain,

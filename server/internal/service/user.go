@@ -33,6 +33,9 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	if len(in.Password) < 8 {
 		return nil, fmt.Errorf("%w: 密码长度不得少于 8 位", ErrInvalidParam)
 	}
+	if in.Email != "" && !IsValidEmail(in.Email) {
+		return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
+	}
 
 	var exists int64
 	if err := s.DB.Model(&model.User{}).Where("username = ?", in.Username).Count(&exists).Error; err != nil {
@@ -190,6 +193,98 @@ func (s *Services) RevealAPIKey(u *model.User) (string, error) {
 		return "", ErrNotFound
 	}
 	return auth.DecryptAPIKey(s.Cfg.APIKeyEncKey, u.APIKeyEnc)
+}
+
+// ProfileUpdateInput 用户自助修改资料的入参。
+// 全部使用指针，用于区分「未提交该字段」与「提交了空值」。
+type ProfileUpdateInput struct {
+	Username *string `json:"username"`
+	Nickname *string `json:"nickname"`
+	Email    *string `json:"email"`
+}
+
+// UpdateProfile 用户修改自己的账号资料。
+//
+// 允许修改用户名：frp 配置里的 user 字段已改为不可变的用户 ID（lt_u<id>），
+// 插件与流量采集均以 ID 为准，因此改名不会导致已下发的客户端配置失效。
+func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.User, error) {
+	u, err := s.LoadUser(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	updates := map[string]any{}
+	renamed := false
+
+	if in.Username != nil {
+		name := strings.TrimSpace(*in.Username)
+		if name != u.Username {
+			if len(name) < 3 || len(name) > 32 || !isSafeName(name) {
+				return nil, fmt.Errorf("%w: 用户名需为 3-32 位字母、数字或下划线", ErrInvalidParam)
+			}
+			var n int64
+			if err := s.DB.Model(&model.User{}).Where("username = ?", name).Count(&n).Error; err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				return nil, ErrUsernameTaken
+			}
+			updates["username"] = name
+			renamed = true
+		}
+	}
+
+	if in.Nickname != nil {
+		nick := strings.TrimSpace(*in.Nickname)
+		if len([]rune(nick)) > 32 {
+			return nil, fmt.Errorf("%w: 昵称不得超过 32 个字符", ErrInvalidParam)
+		}
+		updates["nickname"] = nick
+	}
+
+	if in.Email != nil {
+		email := strings.TrimSpace(*in.Email)
+		if email != "" && !IsValidEmail(email) {
+			return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
+		}
+		updates["email"] = email
+	}
+
+	if len(updates) == 0 {
+		return u, nil
+	}
+	if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
+		// 唯一索引冲突（并发改名）同样按占用处理。
+		return nil, ErrUsernameTaken
+	}
+	if renamed {
+		// 会话表里的用户名仅用于后台展示，改名后同步，避免显示旧值。
+		_ = s.DB.Model(&model.ClientSession{}).Where("user_id = ?", userID).
+			Update("username", updates["username"]).Error
+	}
+	return s.LoadUser(userID)
+}
+
+// IsValidEmail 做基础格式校验：恰好一个 @，域名部分为合法主机名。
+//
+// 不做完整 RFC 5322 校验——邮箱的真实性只能靠验证邮件确认，
+// 而本项目暂未实现邮件发送，因此这里只拦截明显错误的输入。
+func IsValidEmail(s string) bool {
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	at := strings.LastIndex(s, "@")
+	if at <= 0 || at == len(s)-1 {
+		return false
+	}
+	local, domain := s[:at], s[at+1:]
+	if local == "" || strings.ContainsAny(local, " \t\r\n") {
+		return false
+	}
+	if !strings.Contains(domain, ".") {
+		return false
+	}
+	return isValidHostname(domain)
 }
 
 // UpdatePassword 修改密码。

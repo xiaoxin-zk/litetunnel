@@ -124,6 +124,23 @@ func (h *Handler) Profile(c *gin.Context) {
 	httpx.OK(c, h.profileVO(u))
 }
 
+// UpdateProfile 修改当前用户资料（用户名 / 昵称 / 邮箱）。
+//
+// 用户名可以修改：frp 侧以不可变用户 ID 识别身份，改名不会影响已连接的客户端。
+func (h *Handler) UpdateProfile(c *gin.Context) {
+	var in service.ProfileUpdateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		httpx.BadRequest(c, "参数格式不正确")
+		return
+	}
+	u, err := h.svc.UpdateProfile(middleware.CurrentUserID(c), in)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, h.profileVO(u))
+}
+
 type changePasswordReq struct {
 	OldPassword string `json:"old_password" binding:"required"`
 	NewPassword string `json:"new_password" binding:"required"`

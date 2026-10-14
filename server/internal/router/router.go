@@ -77,6 +77,7 @@ func NewUser(cfg *config.Config, svc *service.Services, h *userapi.Handler) *gin
 	api.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.IsActiveUser))
 	{
 		api.GET("/profile", h.Profile)
+		api.PUT("/profile", h.UpdateProfile)
 		api.POST("/logout", h.Logout)
 		api.PUT("/profile/password", h.ChangePassword)
 

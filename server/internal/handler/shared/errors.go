@@ -85,15 +85,37 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrAccountDisabled):
 		httpx.Unauthorized(c, err.Error())
 
-	case errors.Is(err, service.ErrUsernameTaken):
+	// 认证类失败：双因素与验证码都算「你没通过验证」，用 401 更贴切。
+	// 漏掉映射的话这些会掉进 default 分支变成 500「服务内部错误」，
+	// 用户看到的是系统故障而不是「验证码填错了」。
+	case errors.Is(err, service.ErrTOTPRequired),
+		errors.Is(err, service.ErrTOTPInvalid),
+		errors.Is(err, service.ErrTOTPReplay),
+		errors.Is(err, service.ErrEmailCodeWrong),
+		errors.Is(err, service.ErrResetTokenInvalid),
+		errors.Is(err, service.ErrResetTokenExpired):
+		httpx.Unauthorized(c, err.Error())
+
+	case errors.Is(err, service.ErrUsernameTaken),
+		errors.Is(err, service.ErrEmailTaken):
 		httpx.Conflict(c, err.Error())
+
+	// 限流类：这类提示必须明确告知「稍后再试」，
+	// 混进 400 会让用户以为是自己填错了。
+	case errors.Is(err, service.ErrEmailCodeTooSoon),
+		errors.Is(err, service.ErrEmailCodeTooMany),
+		errors.Is(err, service.ErrEmailCodeAttempts),
+		errors.Is(err, service.ErrRegisterLimited),
+		errors.Is(err, service.ErrDomainRegisterLimited):
+		httpx.Fail(c, http.StatusTooManyRequests, err.Error())
 
 	case errors.Is(err, service.ErrQuotaExceeded),
 		errors.Is(err, service.ErrTunnelLimit),
 		errors.Is(err, service.ErrPortLimit),
 		errors.Is(err, service.ErrProtocolDenied),
 		errors.Is(err, service.ErrDomainDenied),
-		errors.Is(err, service.ErrCodeDisabled):
+		errors.Is(err, service.ErrCodeDisabled),
+		errors.Is(err, service.ErrDomainNotTrusted):
 		httpx.Forbidden(c, err.Error())
 
 	case errors.Is(err, service.ErrInvalidParam),
@@ -101,7 +123,13 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrNoPortAvailable),
 		errors.Is(err, service.ErrCodeInvalid),
 		errors.Is(err, service.ErrCodeUsed),
-		errors.Is(err, service.ErrCodeExpired):
+		errors.Is(err, service.ErrCodeExpired),
+		errors.Is(err, service.ErrRegisterClosed),
+		errors.Is(err, service.ErrCaptchaInvalid),
+		errors.Is(err, service.ErrEmailRequired),
+		errors.Is(err, service.ErrEmailNotAllowed),
+		errors.Is(err, service.ErrEmailCodeNeeded),
+		errors.Is(err, service.ErrMailDisabled):
 		httpx.BadRequest(c, err.Error())
 
 	default:

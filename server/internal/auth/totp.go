@@ -19,7 +19,13 @@ import (
 const (
 	totpPeriod = 30
 	totpDigits = 6
+	// totpWindow 是允许的时间步进偏移量：前后各 1 步，用于容忍时钟漂移。
+	// 再宽会显著削弱安全性——每多容忍一步，攻击者可利用的窗口就多 30 秒。
+	totpWindow = 1
 )
+
+// TOTPPeriodSeconds 对外暴露步进长度，供上层计算口令有效期。
+const TOTPPeriodSeconds = totpPeriod
 
 // GenerateTOTPSecret 生成 20 字节随机密钥的 Base32 表示（RFC 4226 推荐长度）。
 func GenerateTOTPSecret() (string, error) {
@@ -32,14 +38,21 @@ func GenerateTOTPSecret() (string, error) {
 
 // GenerateTOTP 计算指定时刻的动态口令（RFC 6238）。
 func GenerateTOTP(secret string, at time.Time) (string, error) {
+	return GenerateTOTPAtStep(secret, at.Unix()/totpPeriod)
+}
+
+// GenerateTOTPAtStep 按步进码计算动态口令。
+//
+// 步进码 = Unix 时间戳 / 30。直接以步进码为参数，
+// 是为了让校验函数能把它回传给调用方做「这一步已用过」的登记。
+func GenerateTOTPAtStep(secret string, step int64) (string, error) {
 	key, err := decodeTOTPSecret(secret)
 	if err != nil {
 		return "", err
 	}
 
-	counter := uint64(at.Unix() / totpPeriod)
 	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], counter)
+	binary.BigEndian.PutUint64(buf[:], uint64(step))
 
 	mac := hmac.New(sha1.New, key)
 	if _, err := mac.Write(buf[:]); err != nil {
@@ -57,26 +70,35 @@ func GenerateTOTP(secret string, at time.Time) (string, error) {
 	return fmt.Sprintf("%0*d", totpDigits, code%1_000_000), nil
 }
 
-// VerifyTOTP 校验动态口令。
+// VerifyTOTPStep 校验动态口令，成功时返回匹配的**步进码**。
 //
-// 允许前后各一个时间窗（共 ±30 秒），以容忍客户端与服务器的时钟漂移；
-// 再宽就会显著削弱安全性。
-func VerifyTOTP(secret, code string, at time.Time) bool {
+// 为什么返回步进码而不是 bool：调用方需要用它登记「这一步的口令已经用过」。
+//
+// 只返回 true/false 的话，同一个 6 位口令在整个窗口内（±1 步，最长 90 秒）
+// 可以被无限次提交。攻击者通过钓鱼反代实时拿到一次口令后，就能在这 90 秒里
+// 完成登录——而受害者此时可能还没意识到自己被骗。
+//
+// 刻意不提供「只校验不返回步进码」的简化版本：那会让调用方在无意识中
+// 放弃防重放。所有调用点都必须显式处理步进码。
+func VerifyTOTPStep(secret, code string, at time.Time) (int64, bool) {
 	code = strings.TrimSpace(code)
 	if len(code) != totpDigits {
-		return false
+		return 0, false
 	}
-	for _, delta := range []int{-1, 0, 1} {
-		want, err := GenerateTOTP(secret, at.Add(time.Duration(delta)*totpPeriod*time.Second))
+
+	base := at.Unix() / totpPeriod
+	for _, delta := range []int{-totpWindow, 0, totpWindow} {
+		step := base + int64(delta)
+		want, err := GenerateTOTPAtStep(secret, step)
 		if err != nil {
-			return false
+			return 0, false
 		}
 		// 常量时间比较，避免通过响应时间侧信道逐位试探。
 		if subtle.ConstantTimeCompare([]byte(want), []byte(code)) == 1 {
-			return true
+			return step, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // OtpauthURL 生成供认证器 App 扫描的 otpauth:// 链接。

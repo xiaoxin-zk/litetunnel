@@ -41,8 +41,14 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 		if strings.TrimSpace(totpCode) == "" {
 			return nil, ErrTOTPRequired
 		}
-		if !auth.VerifyTOTP(a.TOTPSecret, totpCode, time.Now()) {
+		step, ok := auth.VerifyTOTPStep(a.TOTPSecret, totpCode, time.Now())
+		if !ok {
 			return nil, ErrTOTPInvalid
+		}
+		// 登记这一步已用过：同一口令在有效窗口内（±1 步，最长 90 秒）
+		// 只能成功一次。这是阻止「钓鱼反代拿到口令后立刻重放」的关键一环。
+		if !s.TOTPReplay.Claim(a.ID, step) {
+			return nil, ErrTOTPReplay
 		}
 		now := time.Now()
 		_ = s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
@@ -91,8 +97,14 @@ func (s *Services) AdminTOTPEnable(id uint, code string) error {
 	if a.TOTPSecret == "" {
 		return fmt.Errorf("%w: 请先生成密钥", ErrInvalidParam)
 	}
-	if !auth.VerifyTOTP(a.TOTPSecret, code, time.Now()) {
+	step, ok := auth.VerifyTOTPStep(a.TOTPSecret, code, time.Now())
+	if !ok {
 		return ErrTOTPInvalid
+	}
+	// 绑定用的口令同样登记。不登记的话，「刚绑定完立刻拿同一个口令去登录」
+	// 就成了一条绕过防重放的现成路径。
+	if !s.TOTPReplay.Claim(a.ID, step) {
+		return ErrTOTPReplay
 	}
 	now := time.Now()
 	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{

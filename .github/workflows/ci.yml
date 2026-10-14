@@ -37,6 +37,13 @@ jobs:
         working-directory: server
         run: go vet ./...
 
+      # 纯逻辑单元测试（不依赖数据库与网络）。
+      # 目前覆盖 TOTP 的窗口边界与防重放语义——这两处的错误都不会在
+      # 编译期或冒烟测试中暴露：窗口放宽了不会报错，防重放失效也不会。
+      - name: Unit tests
+        working-directory: server
+        run: go test ./... 2>&1
+
       - name: Build
         working-directory: server
         run: |
@@ -163,16 +170,41 @@ jobs:
           fi
           echo "PASS register with captcha"
 
-          # 3) 注册必须显式同意条款
+          # 3) 注册必须显式同意条款。
+          #    这里刻意断言具体的 400 而不是「非 200」：
+          #    新增的业务错误若忘了在 shared.Fail 里映射，会掉进 default
+          #    分支变成 500，而「非 200」这种宽松断言根本发现不了。
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' \
             -d '{"username":"norefuse","password":"SmokePass123"}' \
             "$BASE/api/user/auth/register")
-          if [ "$code" = "200" ]; then
-            echo "::error::register succeeded without accepting terms"
+          if [ "$code" != "400" ]; then
+            echo "::error::register without terms returned $code, want 400"
             exit 1
           fi
           echo "PASS register requires terms acceptance"
+
+          # 3b) 图形验证码错误同样必须是 400 而不是 500
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"badcaptcha","password":"SmokePass123","agreed":true,"captcha_ticket":"forged","captcha_answer":"1"}' \
+            "$BASE/api/user/auth/register")
+          if [ "$code" != "400" ]; then
+            echo "::error::bad captcha returned $code, want 400 (500 means the error is unmapped)"
+            exit 1
+          fi
+          echo "PASS bad captcha maps to 400"
+
+          # 3c) 伪造的重置令牌必须是 401，不能是 500
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"token":"deadbeef","password":"SmokePass123"}' \
+            "$BASE/api/user/auth/reset-password")
+          if [ "$code" != "401" ]; then
+            echo "::error::invalid reset token returned $code, want 401"
+            exit 1
+          fi
+          echo "PASS invalid reset token maps to 401"
 
           # 4) 统一登录拿 JWT
           login=$(curl -fsS -X POST -H 'Content-Type: application/json' \

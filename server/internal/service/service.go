@@ -42,6 +42,9 @@ var (
 	// 与 ErrTOTPInvalid 区分开：前者只是没填，不应计入暴力破解次数。
 	ErrTOTPRequired = errors.New("该账号已启用双因素认证，请输入动态口令")
 	ErrTOTPInvalid  = errors.New("动态口令不正确")
+	// ErrTOTPReplay 表示该动态口令在有效窗口内已被使用过。
+	// 正常用户不会碰到（认证器每 30 秒换一个码），出现即意味着有人在重放。
+	ErrTOTPReplay = errors.New("该动态口令已被使用过，请等待认证器刷新后重试")
 
 	// 注册准入相关
 	ErrRegisterClosed  = errors.New("本站已关闭注册，请联系管理员开通账号")
@@ -77,6 +80,9 @@ type Services struct {
 	// Captchas 是内存中的一次性验证码存储。
 	Captchas *CaptchaStore
 
+	// TOTPReplay 记录已用过的动态口令步进码，阻止窗口内重放。
+	TOTPReplay *TOTPReplayGuard
+
 	// loginLogCh 与 mailCh 都是异步队列：
 	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
 	loginLogCh chan model.LoginLog
@@ -92,6 +98,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Runtime:    NewRuntime(),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
+		TOTPReplay: NewTOTPReplayGuard(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
 	}

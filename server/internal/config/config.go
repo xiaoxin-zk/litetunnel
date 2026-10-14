@@ -30,10 +30,15 @@ type Config struct {
 	DBDriver string // sqlite | postgres
 	DBDSN    string
 
-	// 监听地址：用户侧对公网，管理侧仅本机
+	// 监听地址：单一入口，用户控制台与管理后台共用同一端口，
+	// 通过路径前缀区分（管理后台挂在 AdminPath 下）。
 	UserAddr      string
 	UserPublicURL string
-	AdminAddr     string
+
+	// AdminAllowCIDRs 可选的管理后台来源白名单。
+	// 为空表示管理后台同样对公网开放（默认），此时安全性由
+	// 账号锁定 + 限流 + 双因素认证共同保证。
+	AdminAllowCIDRs []string
 
 	// 双域密钥：用户令牌与管理令牌互不通用
 	UserJWTSecret  string
@@ -98,9 +103,9 @@ func Load() (*Config, error) {
 		DBDriver: env("LT_DB_DRIVER", "sqlite"),
 		DBDSN:    env("LT_DB_DSN", "./data/litetunnel.db"),
 
-		UserAddr:      env("LT_USER_ADDR", "0.0.0.0:7848"),
-		UserPublicURL: strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),
-		AdminAddr:     env("LT_ADMIN_ADDR", "127.0.0.1:8443"),
+		UserAddr:        env("LT_USER_ADDR", "0.0.0.0:7848"),
+		UserPublicURL:   strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),
+		AdminAllowCIDRs: splitCSV(env("LT_ADMIN_ALLOW_CIDR", "")),
 
 		UserJWTSecret:  env("LT_USER_JWT_SECRET", ""),
 		AdminJWTSecret: env("LT_ADMIN_JWT_SECRET", ""),
@@ -228,11 +233,7 @@ func (c *Config) validate() error {
 		// 非生产环境只做风险提示，不阻断启动，便于本地调试。
 		if isPublicBind(c.UserAddr) {
 			c.Warnings = append(c.Warnings,
-				fmt.Sprintf("当前为非生产环境且用户侧监听在 %s，任何人都可能访问；请勿用于公网", c.UserAddr))
-		}
-		if isPublicBind(c.AdminAddr) {
-			c.Warnings = append(c.Warnings,
-				fmt.Sprintf("当前为非生产环境且管理后台监听在 %s；请勿用于公网", c.AdminAddr))
+				fmt.Sprintf("当前为非生产环境且监听在 %s，任何人都可能访问；请勿用于公网", c.UserAddr))
 		}
 		return nil
 	}
@@ -267,10 +268,12 @@ func (c *Config) validate() error {
 	if len(c.APIKeyEncKey) != 32 && len(c.APIKeyEncKey) != 64 {
 		return errors.New("LT_APIKEY_ENC_KEY 需为 32 或 64 个字符（AES-128/256 密钥）")
 	}
-	// 管理后台必须只监听回环。用 SplitHostPort 解析而非前缀匹配，
-	// 否则 [::]:8443 这类 IPv6 通配写法会绕过检查。
-	if isPublicBind(c.AdminAddr) {
-		return fmt.Errorf("生产环境禁止将管理后台监听在 %s，请使用 127.0.0.1:port 并通过本机反代或 VPN 访问", c.AdminAddr)
+	// 管理后台与用户控制台共用公网端口，安全依赖以下三件事，
+	// 缺任何一件都会让公网暴露的后台变成可爆破目标，因此必须显式确认。
+	if len(c.AdminAllowCIDRs) == 0 {
+		c.Warnings = append(c.Warnings,
+			"管理后台当前对公网开放（未配置 LT_ADMIN_ALLOW_CIDR）。"+
+				"请务必启用管理员双因素认证，否则仅有密码一道防线")
 	}
 	return nil
 }

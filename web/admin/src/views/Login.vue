@@ -24,6 +24,17 @@
             @keyup.enter="submit"
           />
         </el-form-item>
+
+        <el-form-item label="动态口令（可选）" prop="totp_code">
+          <el-input
+            v-model="form.totp_code"
+            size="large"
+            maxlength="6"
+            :prefix-icon="Key"
+            placeholder="已启用双因素认证时必填"
+            @keyup.enter="submit"
+          />
+        </el-form-item>
         <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="submit">
           登录
         </el-button>
@@ -35,7 +46,7 @@
         show-icon
         style="margin-top: 18px"
         title="安全提示"
-        description="所有登录与操作都会写入审计日志。请通过本机反代或 VPN 访问本页面。"
+        description="本页面为公网可达的最高权限入口：连续登录失败会锁定账号，所有登录与操作都会写入审计日志。强烈建议在「账号设置」中启用双因素认证。"
       />
     </div>
   </div>
@@ -45,13 +56,13 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { User, Lock } from '@element-plus/icons-vue'
+import { User, Lock, Key } from '@element-plus/icons-vue'
 import { authApi, TOKEN_KEY } from '../api'
 
 const router = useRouter()
 const formRef = ref()
 const loading = ref(false)
-const form = reactive({ username: '', password: '' })
+const form = reactive({ username: '', password: '', totp_code: '' })
 
 const rules = {
   username: [{ required: true, message: '请输入管理员账号', trigger: 'blur' }],
@@ -62,7 +73,11 @@ async function submit() {
   await formRef.value.validate()
   loading.value = true
   try {
-    const data = await authApi.login({ ...form })
+    const data = await authApi.login({
+      username: form.username,
+      password: form.password,
+      totp_code: form.totp_code.trim()
+    })
     localStorage.setItem(TOKEN_KEY, data.token)
     ElMessage.success('登录成功')
     router.push('/dashboard')

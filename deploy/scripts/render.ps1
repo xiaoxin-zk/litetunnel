@@ -39,15 +39,14 @@ function Strip-Scheme([string]$v) {
     return ($v -replace '^https?://', '').TrimEnd('/')
 }
 
-$userDomain  = Strip-Scheme $vars['LT_USER_PUBLIC_URL']
-$adminDomain = Strip-Scheme $vars['LT_ADMIN_PUBLIC_URL']
+$userDomain = Strip-Scheme $vars['LT_USER_PUBLIC_URL']
 
 if ([string]::IsNullOrWhiteSpace($userDomain)) {
     throw 'LT_USER_PUBLIC_URL is empty: Caddy needs a domain to issue a certificate.'
 }
 
-$vars['LT_USER_DOMAIN']      = $userDomain
-$vars['LT_ADMIN_DOMAIN']     = if ($adminDomain) { $adminDomain } else { 'admin.invalid.local' }
+$vars['LT_USER_DOMAIN'] = $userDomain
+# Admin console shares the user domain; only the optional IP allowlist placeholder remains.
 $vars['LT_ADMIN_ALLOW_CIDR'] = if ($vars['LT_ADMIN_ALLOW_CIDR']) { $vars['LT_ADMIN_ALLOW_CIDR'] } else { '127.0.0.1/32' }
 $vars['LT_ACME_EMAIL']       = if ($vars['LT_ACME_EMAIL']) { $vars['LT_ACME_EMAIL'] } else { "admin@$userDomain" }
 $vars['LT_TUNNEL_DOMAIN']    = if ($vars['LT_TUNNEL_DOMAIN']) { $vars['LT_TUNNEL_DOMAIN'] } else { '' }
@@ -56,7 +55,7 @@ $required = @(
     'LT_GATEWAY_PORT', 'LT_KCP_PORT', 'LT_VHOST_HTTP_PORT', 'LT_VHOST_HTTPS_PORT',
     'LT_FRPS_TOKEN', 'LT_PORT_RANGE_START', 'LT_PORT_RANGE_END', 'LT_MAX_PORTS_PER_USER',
     'LT_FRPS_API_PORT', 'LT_FRPS_API_USER', 'LT_FRPS_API_PASSWORD',
-    'LT_USER_PORT', 'LT_ADMIN_PORT'
+    'LT_USER_PORT'
 )
 $missing = @()
 foreach ($k in $required) {

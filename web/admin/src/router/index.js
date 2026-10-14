@@ -24,8 +24,11 @@ const routes = [
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' }
 ]
 
+// 与 vite.config.js 的 base 保持一致：管理后台挂在 /admin 下。
+const ADMIN_BASE = '/admin'
+
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory(ADMIN_BASE),
   routes
 })
 

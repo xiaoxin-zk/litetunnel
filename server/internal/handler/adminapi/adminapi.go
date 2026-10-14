@@ -48,6 +48,8 @@ func (h *Handler) audit(c *gin.Context, action, target, targetID, detail string)
 type loginReq struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	// TOTPCode 为双因素动态口令，仅对已启用 TOTP 的账号必填。
+	TOTPCode string `json:"totp_code"`
 }
 
 // Login 管理员登录，签发管理域令牌。
@@ -64,11 +66,17 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	a, err := h.svc.AdminAuthenticate(req.Username, req.Password, httpx.ClientIP(c))
+	a, err := h.svc.AdminAuthenticate(req.Username, req.Password, req.TOTPCode, httpx.ClientIP(c))
 	if err != nil {
+		// 「未提交动态口令」只是交互未完成，不计入失败次数，
+		// 否则用户每点一次登录都会被自己锁定。
+		if errors.Is(err, service.ErrTOTPRequired) {
+			shared.Fail(c, err)
+			return
+		}
 		shared.LoginFailed(h.guard, shared.LoginLockScopeAdmin, account)
 		// 管理员登录失败同样写入审计，便于发现暴力破解。
-		h.svc.WriteAudit(0, req.Username, "admin.login_failed", "admin", "", "密码错误", httpx.ClientIP(c))
+		h.svc.WriteAudit(0, req.Username, "admin.login_failed", "admin", "", err.Error(), httpx.ClientIP(c))
 		shared.Fail(c, err)
 		return
 	}
@@ -103,13 +111,72 @@ func (h *Handler) Profile(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{
-		"id":            a.ID,
-		"username":      a.Username,
-		"nickname":      a.Nickname,
-		"role":          a.Role,
-		"last_login_at": a.LastLoginAt,
-		"last_login_ip": a.LastLoginIP,
+		"id":               a.ID,
+		"username":         a.Username,
+		"nickname":         a.Nickname,
+		"role":             a.Role,
+		"totp_enabled":     a.TOTPEnabled,
+		"totp_verified_at": a.TOTPVerifiedAt,
+		"last_login_at":    a.LastLoginAt,
+		"last_login_ip":    a.LastLoginIP,
 	})
+}
+
+// ---- 双因素认证 ----
+
+// TOTPSetup 生成新的 TOTP 密钥（此时尚未启用）。
+func (h *Handler) TOTPSetup(c *gin.Context) {
+	adminID, _, _ := middleware.CurrentAdminID(c)
+	secret, otpauth, err := h.svc.AdminTOTPSetup(adminID)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{
+		"secret":      secret,
+		"otpauth_url": otpauth,
+		"message":     "请用认证器 App 扫描二维码或手动输入密钥，然后输入一次动态口令完成绑定",
+	})
+}
+
+type totpCodeReq struct {
+	Code string `json:"code" binding:"required"`
+}
+
+// TOTPEnable 用一次正确的动态口令确认绑定。
+func (h *Handler) TOTPEnable(c *gin.Context) {
+	var req totpCodeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请输入动态口令")
+		return
+	}
+	adminID, _, _ := middleware.CurrentAdminID(c)
+	if err := h.svc.AdminTOTPEnable(adminID, req.Code); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "admin.totp_enable", "admin", strconv.Itoa(int(adminID)), "启用双因素认证")
+	httpx.OK(c, gin.H{"message": "双因素认证已启用，下次登录需要输入动态口令"})
+}
+
+type totpDisableReq struct {
+	Password string `json:"password" binding:"required"`
+}
+
+// TOTPDisable 关闭双因素认证，需重新验证登录口令。
+func (h *Handler) TOTPDisable(c *gin.Context) {
+	var req totpDisableReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请输入登录密码")
+		return
+	}
+	adminID, _, _ := middleware.CurrentAdminID(c)
+	if err := h.svc.AdminTOTPDisable(adminID, req.Password); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "admin.totp_disable", "admin", strconv.Itoa(int(adminID)), "关闭双因素认证")
+	httpx.OK(c, gin.H{"message": "双因素认证已关闭"})
 }
 
 type adminPasswordReq struct {

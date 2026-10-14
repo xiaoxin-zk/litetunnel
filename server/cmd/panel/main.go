@@ -1,9 +1,9 @@
 // Command panel 是 LiteTunnel 的控制面服务端。
 //
-// 它同时监听两个地址：
-//   - 用户侧（默认 0.0.0.0:7848）：用户控制台与其 API，可对公网暴露；
-//   - 管理侧（默认 127.0.0.1:8443）：管理员后台与其 API、frps 插件回调，
-//     默认不监听公网，需通过本机反代或 VPN 访问。
+// 单一公网入口：用户控制台与管理后台共用同一监听地址，通过路径区分
+// （用户控制台在 /，管理后台在 /admin）。安全由四层机制共同保证：
+// 令牌域隔离、IP 限流、账号级锁定、管理员双因素认证；
+// 可选地通过 LT_ADMIN_ALLOW_CIDR 进一步限制管理后台来源。
 package main
 
 import (
@@ -58,37 +58,26 @@ func main() {
 
 	svc.StartTrafficCollector(ctx)
 
-	userRouter := router.NewUser(cfg, svc, userapi.New(svc))
-	adminRouter := router.NewAdmin(cfg, svc, adminapi.New(svc), frpsplugin.New(svc, cfg.FrpsPluginAllowCIDRs))
+	engine := router.New(cfg, svc, userapi.New(svc), adminapi.New(svc),
+		frpsplugin.New(svc, cfg.FrpsPluginAllowCIDRs))
 
-	userSrv := newServer(cfg.UserAddr, userRouter)
-	adminSrv := newServer(cfg.AdminAddr, adminRouter)
+	srv := newServer(cfg.UserAddr, engine)
 
-	errCh := make(chan error, 2)
 	go func() {
-		log.Printf("用户控制台监听于 %s", cfg.UserAddr)
-		if err := userSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-	go func() {
-		log.Printf("管理后台监听于 %s（请勿直接对公网暴露）", cfg.AdminAddr)
-		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+		log.Printf("控制面监听于 %s", cfg.UserAddr)
+		log.Printf("  用户控制台  http://%s/", cfg.UserAddr)
+		log.Printf("  管理后台    http://%s%s", cfg.UserAddr, router.AdminPath)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("服务异常退出: %v", err)
 		}
 	}()
 
-	select {
-	case err := <-errCh:
-		log.Fatalf("服务异常退出: %v", err)
-	case <-ctx.Done():
-		log.Println("收到退出信号，正在优雅关闭…")
-	}
+	<-ctx.Done()
+	log.Println("收到退出信号，正在优雅关闭…")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = userSrv.Shutdown(shutdownCtx)
-	_ = adminSrv.Shutdown(shutdownCtx)
+	_ = srv.Shutdown(shutdownCtx)
 	log.Println("已退出")
 }
 
@@ -104,7 +93,7 @@ func printStartupWarnings(cfg *config.Config, createdAdmin bool) {
 	if cfg.EphemeralAdminPassword && createdAdmin {
 		log.Printf("【注意】初始管理员账号 %s，密码 %s（本次随机生成，重启后不再打印）",
 			cfg.BootstrapAdminUser, cfg.BootstrapAdminPassword)
-		log.Printf("【注意】请登录后立即修改密码")
+		log.Printf("【注意】请登录后立即修改密码，并启用双因素认证")
 	}
 	for _, w := range cfg.Warnings {
 		log.Printf("【警告】%s", w)

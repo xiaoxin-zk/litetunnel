@@ -265,17 +265,28 @@ type Setting struct {
 func (Setting) TableName() string { return "lt_settings" }
 
 // Admin 管理员账号，与用户体系完全隔离（不同表、不同登录入口、不同密钥）。
+//
+// 管理后台与用户控制台共用公网端口，因此管理员口令之外还必须提供
+// 第二道防线：TOTP 双因素认证。
 type Admin struct {
-	ID        uint       `gorm:"primarykey" json:"id"`
-	Username  string     `gorm:"size:64;uniqueIndex;not null" json:"username"`
-	Password  string     `gorm:"size:128;not null" json:"-"`
-	Nickname  string     `gorm:"size:64" json:"nickname"`
-	Role      string     `gorm:"size:32;default:'super'" json:"role"` // super | operator | auditor
-	Status    string     `gorm:"size:16;default:active" json:"status"`
+	ID          uint       `gorm:"primarykey" json:"id"`
+	Username    string     `gorm:"size:64;uniqueIndex;not null" json:"username"`
+	Password    string     `gorm:"size:128;not null" json:"-"`
+	Nickname    string     `gorm:"size:64" json:"nickname"`
+	Role        string     `gorm:"size:32;default:'super'" json:"role"` // super | operator | auditor
+	Status      string     `gorm:"size:16;default:active" json:"status"`
 	LastLoginAt *time.Time `json:"last_login_at"`
 	LastLoginIP string     `gorm:"size:64" json:"last_login_ip"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+
+	// TOTPSecret 为双因素认证共享密钥（Base32）。json:"-" 保证永不外泄。
+	TOTPSecret string `gorm:"size:64" json:"-"`
+	// TOTPEnabled 为 true 时登录必须携带动态口令。
+	TOTPEnabled bool `gorm:"default:false" json:"totp_enabled"`
+	// TOTPVerifiedAt 记录最近一次成功校验时间，仅用于展示。
+	TOTPVerifiedAt *time.Time `json:"totp_verified_at"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // TableName 固定表名。

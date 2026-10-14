@@ -38,7 +38,8 @@ COPY --from=web-admin /src/web/admin/dist /app/web/admin
 RUN mkdir -p /data/clients && chown -R lt:lt /app /data
 
 USER lt
-EXPOSE 7848 8443
+# 单一公网入口：用户控制台与管理后台共用该端口（管理后台在 /admin 下）
+EXPOSE 7848
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:7848/healthz || exit 1

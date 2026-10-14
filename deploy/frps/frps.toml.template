@@ -57,6 +57,7 @@ enablePrometheus = true
 # ============================================================
 [[httpPlugins]]
 name = "litetunnel-panel"
-addr = "127.0.0.1:${LT_ADMIN_PORT}"
+# 控制面已合并为单一入口，插件回调走用户侧端口（仅回环可达）
+addr = "127.0.0.1:${LT_USER_PORT}"
 path = "/api/frps/plugin"
 ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]

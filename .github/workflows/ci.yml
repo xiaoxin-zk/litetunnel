@@ -51,13 +51,13 @@ jobs:
           LT_DB_DRIVER: sqlite
           LT_DB_DSN: /tmp/smoke/litetunnel.db
           LT_USER_ADDR: 127.0.0.1:7848
-          LT_ADMIN_ADDR: 127.0.0.1:8443
           LT_GATEWAY_HOST: 127.0.0.1
           LT_GATEWAY_PORT: "7001"
           LT_FRPS_API_ADDR: 127.0.0.1:7500
           LT_CLIENT_DIST_DIR: /tmp/smoke/clients
         run: |
           set -euo pipefail
+          BASE=http://127.0.0.1:7848
           mkdir -p /tmp/smoke
           /tmp/panel > /tmp/smoke/panel.log 2>&1 &
           PANEL_PID=$!
@@ -65,45 +65,67 @@ jobs:
 
           ok=0
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:7848/healthz > /dev/null 2>&1; then
-              ok=1; break
-            fi
+            if curl -fsS "$BASE/healthz" > /dev/null 2>&1; then ok=1; break; fi
             if ! kill -0 $PANEL_PID 2>/dev/null; then
-              echo "::error::panel exited during startup"
-              cat /tmp/smoke/panel.log
-              exit 1
+              echo "::error::panel exited during startup"; cat /tmp/smoke/panel.log; exit 1
             fi
             sleep 1
           done
-          if [ "$ok" != "1" ]; then
-            echo "::error::panel did not become healthy in time"
-            cat /tmp/smoke/panel.log
-            exit 1
-          fi
-          echo "user console healthz OK"
+          [ "$ok" = "1" ] || { echo "::error::panel did not become healthy"; cat /tmp/smoke/panel.log; exit 1; }
+          echo "PASS healthz"
 
-          curl -fsS http://127.0.0.1:8443/healthz > /dev/null
-          echo "admin console healthz OK"
-
-          # 管理路由绝不能出现在公网监听端口上
+          # 单一入口：管理接口必须挂在同一端口上（返回 401 而非 404）
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            -H 'Content-Type: application/json' -d '{}' \
-            http://127.0.0.1:7848/api/admin/auth/login)
-          if [ "$code" != "404" ]; then
-            echo "::error::admin API is reachable on the public listener (got $code)"
+            -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}' \
+            "$BASE/api/admin/auth/login")
+          if [ "$code" != "401" ]; then
+            echo "::error::admin login on shared port returned $code, want 401"
             exit 1
           fi
-          echo "admin API correctly absent from public listener"
+          echo "PASS admin API mounted on the shared port"
 
-          # frps 插件回调必须能从回环访问
+          # 用户接口同样可用
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}' \
+            "$BASE/api/user/auth/login")
+          if [ "$code" != "401" ]; then
+            echo "::error::user login returned $code, want 401"
+            exit 1
+          fi
+          echo "PASS user API on the same port"
+
+          # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \
-            http://127.0.0.1:8443/api/frps/plugin)
+            "$BASE/api/frps/plugin")
           if [ "$code" != "200" ]; then
             echo "::error::frps plugin endpoint returned $code"
             exit 1
           fi
-          echo "frps plugin endpoint OK"
+          echo "PASS frps plugin endpoint"
+
+          # 管理路由不能在没有令牌的情况下返回业务数据
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/admin/users")
+          if [ "$code" != "401" ]; then
+            echo "::error::admin API without token returned $code, want 401"
+            exit 1
+          fi
+          echo "PASS admin API requires authentication"
+
+          # 暴力破解防护：连续失败后必须被限流/锁定（返回 429）
+          locked=0
+          for i in $(seq 1 6); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"username":"bruteforce","password":"wrong-password"}' \
+              "$BASE/api/admin/auth/login")
+            if [ "$code" = "429" ]; then locked=1; break; fi
+          done
+          if [ "$locked" != "1" ]; then
+            echo "::error::brute force protection did not trigger within 6 attempts"
+            exit 1
+          fi
+          echo "PASS brute force protection (429 after repeated failures)"
 
           echo "--- startup log ---"
           cat /tmp/smoke/panel.log

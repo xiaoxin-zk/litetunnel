@@ -36,6 +36,11 @@ var (
 	ErrCodeExpired     = errors.New("兑换码已过期")
 	ErrCodeDisabled    = errors.New("兑换码已被禁用")
 	ErrInvalidParam    = errors.New("参数不合法")
+
+	// ErrTOTPRequired 表示账号已启用双因素认证但本次未提交动态口令。
+	// 与 ErrTOTPInvalid 区分开：前者只是没填，不应计入暴力破解次数。
+	ErrTOTPRequired = errors.New("该账号已启用双因素认证，请输入动态口令")
+	ErrTOTPInvalid  = errors.New("动态口令不正确")
 )
 
 // Services 业务服务集合。

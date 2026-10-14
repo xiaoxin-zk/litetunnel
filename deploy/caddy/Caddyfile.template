@@ -31,26 +31,24 @@ ${LT_USER_DOMAIN} {
 	}
 }
 
-# ---------- 管理后台（务必限制来源）----------
-# 建议：不配置此段，改走 SSH 隧道或 VPN 访问 127.0.0.1:8443。
-# 若确需域名访问，请配合下面的 IP 白名单一起使用。
-${LT_ADMIN_DOMAIN} {
-	@allowed remote_ip ${LT_ADMIN_ALLOW_CIDR}
-	handle @allowed {
-		reverse_proxy 127.0.0.1:${LT_ADMIN_PORT}
-	}
-	handle {
-		respond "Forbidden" 403
-	}
-
-	log {
-		output file /data/access-admin.log {
-			roll_size 50MiB
-			roll_keep 5
-		}
-		format json
-	}
-}
+# ---------- 管理后台 ----------
+# 管理后台与用户控制台共用同一域名与端口，挂载在 /admin 路径下，
+# 因此不需要单独的反代配置。
+#
+# 若希望在反代层再收一道口子，可取消下面注释，按来源 IP 限制 /admin 与 /api/admin。
+# 应用层同样支持 LT_ADMIN_ALLOW_CIDR，两者可叠加使用。
+#
+#	@adminPath path /admin* /api/admin*
+#	@adminAllowed {
+#		remote_ip ${LT_ADMIN_ALLOW_CIDR}
+#		path /admin* /api/admin*
+#	}
+#	handle @adminPath {
+#		handle @adminAllowed {
+#			reverse_proxy 127.0.0.1:${LT_USER_PORT}
+#		}
+#		respond "Not Found" 404
+#	}
 
 # ---------- HTTP 隧道泛域名 ----------
 # 需要把 *.隧道域名 解析到本机，并在此处使用 DNS Challenge 申请泛域名证书。

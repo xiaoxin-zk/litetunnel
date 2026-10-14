@@ -49,8 +49,8 @@ services:
       - ../.env
     environment:
       # 覆盖为回环监听：公网流量统一由 Caddy 进入
+      # 用户控制台与管理后台共用该端口，通过 /admin 路径区分
       LT_USER_ADDR: "127.0.0.1:7848"
-      LT_ADMIN_ADDR: "127.0.0.1:8443"
       LT_DB_DRIVER: "sqlite"
       LT_DB_DSN: "/data/litetunnel.db"
       LT_USER_WEB_DIR: "/app/web/user"

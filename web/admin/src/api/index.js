@@ -46,7 +46,10 @@ export default http
 export const authApi = {
   login: (data) => http.post('/auth/login', data),
   profile: () => http.get('/profile'),
-  changePassword: (data) => http.put('/profile/password', data)
+  changePassword: (data) => http.put('/profile/password', data),
+  totpSetup: () => http.post('/profile/totp/setup'),
+  totpEnable: (code) => http.post('/profile/totp/enable', { code }),
+  totpDisable: (password) => http.post('/profile/totp/disable', { password })
 }
 
 export const statsApi = {

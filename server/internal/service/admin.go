@@ -12,14 +12,18 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// AdminAuthenticate 校验管理员凭据。
+// AdminAuthenticate 校验管理员凭据（含可选的动态口令）。
 //
 // 与用户登录完全分离：不同的表、不同的入口、不同的令牌域。
-func (s *Services) AdminAuthenticate(username, password, ip string) (*model.Admin, error) {
+//
+// 管理后台与用户控制台共用公网端口，因此口令之外还要求第二因素：
+// 已启用 TOTP 的账号必须提交正确的动态口令才能换取令牌。
+func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*model.Admin, error) {
 	username = strings.TrimSpace(username)
 	var a model.Admin
 	err := s.DB.Where("username = ?", username).First(&a).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// 即使用户不存在也执行一次哈希校验，抹平响应时间差异，避免账号枚举。
 		auth.VerifyPassword("$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin", password)
 		return nil, ErrBadCredentials
 	}
@@ -32,12 +36,87 @@ func (s *Services) AdminAuthenticate(username, password, ip string) (*model.Admi
 	if a.Status != "active" {
 		return nil, ErrAccountDisabled
 	}
+
+	if a.TOTPEnabled {
+		if strings.TrimSpace(totpCode) == "" {
+			return nil, ErrTOTPRequired
+		}
+		if !auth.VerifyTOTP(a.TOTPSecret, totpCode, time.Now()) {
+			return nil, ErrTOTPInvalid
+		}
+		now := time.Now()
+		_ = s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
+			Update("totp_verified_at", now).Error
+		a.TOTPVerifiedAt = &now
+	}
+
 	now := time.Now()
 	_ = s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
 		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error
 	a.LastLoginAt = &now
 	a.LastLoginIP = ip
 	return &a, nil
+}
+
+// ---- 双因素认证 ----
+
+// AdminTOTPSetup 生成新的 TOTP 密钥，此时尚未启用。
+//
+// 两步式设计（先生成、再用一次正确口令确认）是为了避免用户扫码失败后
+// 就把自己锁在门外。
+func (s *Services) AdminTOTPSetup(id uint) (secret, otpauthURL string, err error) {
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return "", "", err
+	}
+	secret, err = auth.GenerateTOTPSecret()
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"totp_secret":  secret,
+		"totp_enabled": false,
+	}).Error; err != nil {
+		return "", "", err
+	}
+	return secret, auth.OtpauthURL("LiteTunnel", a.Username, secret), nil
+}
+
+// AdminTOTPEnable 用一次正确的动态口令确认绑定并启用双因素认证。
+func (s *Services) AdminTOTPEnable(id uint, code string) error {
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+	if a.TOTPSecret == "" {
+		return fmt.Errorf("%w: 请先生成密钥", ErrInvalidParam)
+	}
+	if !auth.VerifyTOTP(a.TOTPSecret, code, time.Now()) {
+		return ErrTOTPInvalid
+	}
+	now := time.Now()
+	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"totp_enabled":     true,
+		"totp_verified_at": now,
+	}).Error
+}
+
+// AdminTOTPDisable 关闭双因素认证。
+//
+// 关闭是降级安全等级的操作，必须重新验证登录口令，
+// 避免令牌被盗后攻击者直接关掉第二因素。
+func (s *Services) AdminTOTPDisable(id uint, password string) error {
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+	if !auth.VerifyPassword(a.Password, password) {
+		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
+	}
+	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"totp_enabled": false,
+		"totp_secret":  "",
+	}).Error
 }
 
 // LoadAdmin 载入管理员。

@@ -17,7 +17,8 @@ const routes = [
       { path: 'groups', name: 'groups', meta: { title: '分组权限' }, component: () => import('../views/Groups.vue') },
       { path: 'tunnels', name: 'tunnels', meta: { title: '隧道管理' }, component: () => import('../views/Tunnels.vue') },
       { path: 'redeem', name: 'redeem', meta: { title: '兑换码' }, component: () => import('../views/RedeemCodes.vue') },
-      { path: 'logs', name: 'logs', meta: { title: '审计与客户端' }, component: () => import('../views/Logs.vue') }
+      { path: 'logs', name: 'logs', meta: { title: '审计与客户端' }, component: () => import('../views/Logs.vue') },
+      { path: 'settings', name: 'settings', meta: { title: '账号设置' }, component: () => import('../views/Settings.vue') }
     ]
   },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' }

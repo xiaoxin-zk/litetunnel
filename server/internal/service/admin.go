@@ -52,6 +52,45 @@ func (s *Services) LoadAdmin(id uint) (*model.Admin, error) {
 	return &a, nil
 }
 
+// AdminChangePassword 管理员修改自己的登录密码。
+//
+// 管理员口令是平台的最高权限入口，因此策略比普通用户更严格：
+// 长度不少于 12 位，且不允许与原密码相同。
+func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string) error {
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+	if !auth.VerifyPassword(a.Password, oldPassword) {
+		return fmt.Errorf("%w: 原密码不正确", ErrInvalidParam)
+	}
+	if len(newPassword) < 12 {
+		return fmt.Errorf("%w: 管理员密码长度不得少于 12 位", ErrInvalidParam)
+	}
+	if newPassword == oldPassword {
+		return fmt.Errorf("%w: 新密码不能与原密码相同", ErrInvalidParam)
+	}
+	hashed, err := auth.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Update("password", hashed)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListAdmins 列出全部管理员账号，供后台自查是否残留无用账号。
+func (s *Services) ListAdmins() ([]model.Admin, error) {
+	var list []model.Admin
+	err := s.DB.Order("id asc").Find(&list).Error
+	return list, err
+}
+
 // ---- 用户管理 ----
 
 // ListUsers 分页查询用户。

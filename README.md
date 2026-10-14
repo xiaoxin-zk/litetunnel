@@ -239,11 +239,20 @@ DNS：把控制台域名 A 记录指向服务器，泛域名（如 `*.tunnel.exa
 
 ### 步骤 7：登录与创建隧道
 
-```bash
-# 管理后台默认只监听回环，用 SSH 隧道访问
-ssh -L 8443:127.0.0.1:8443 user@你的服务器
-# 浏览器打开 http://127.0.0.1:8443，用上面的初始账号登录，立即改密码
-```
+管理后台需要**同时满足两个条件**才能进入：
+
+1. **网络可达** —— 默认只监听 `127.0.0.1:8443`，公网打不开，必须先建隧道：
+
+   ```bash
+   ssh -L 8443:127.0.0.1:8443 user@你的服务器
+   # 浏览器打开 http://127.0.0.1:8443
+   ```
+
+2. **使用管理员账号** —— 管理员与普通用户是**两套完全独立的账号体系**（不同的表、不同的令牌域、不同的签名密钥）。用户控制台注册的账号**无法**登录管理后台，反过来也一样。
+
+   初始管理员账号来自 `.env` 的 `LT_BOOTSTRAP_ADMIN_USER` / `LT_BOOTSTRAP_ADMIN_PASSWORD`，只在数据库首次初始化时创建。
+
+登录后到 **账号设置** 页修改密码（管理员密码要求不少于 12 位）。
 
 用户控制台走 `https://你的域名`，注册账号后即可创建隧道。
 游戏联机场景记得选 **UDP** 类型（如基岩版 19132、帕鲁 8211）。
@@ -387,7 +396,23 @@ git push origin v1.0.0
 需要在 DNS 把泛域名 `*.你的隧道域名` 解析到本机，并在 `Caddyfile` 中配置 DNS Challenge 申请泛域名证书。
 
 **Q：忘记管理员密码？**
-停掉 panel 容器，用 SQLite 客户端清空 `lt_admins` 表中对应记录后重启，会重新按 `.env` 播种初始管理员。
+`Seed` 只在 `lt_admins` 表为空时才创建管理员，所以把该表清空后重启即可按 `.env` 重新播种：
+
+```bash
+docker compose -f deploy/docker-compose.yml stop panel
+# 用任意 SQLite 客户端打开 deploy/data/panel/litetunnel.db 执行：
+#   DELETE FROM lt_admins;
+docker compose -f deploy/docker-compose.yml start panel
+docker compose -f deploy/docker-compose.yml logs panel | grep 初始管理员
+```
+
+若 `.env` 中已写死 `LT_BOOTSTRAP_ADMIN_PASSWORD`，则重启后密码就是该值（不会再打印）。
+
+**Q：能用用户控制台的账号登录管理后台吗？**
+不能。两者是独立的账号体系：`lt_users` 与 `lt_admins` 分表存储，JWT 使用不同密钥与不同 `aud`，用户令牌在管理接口上会直接被拒绝。这是刻意的设计，避免用户侧任何漏洞波及管理面。
+
+**Q：管理后台打不开 / 返回连接超时？**
+这是预期行为。管理后台只监听回环地址，必须先建立 SSH 隧道（`ssh -L 8443:127.0.0.1:8443`）或用 VPN 访问。生产环境下若把 `LT_ADMIN_ADDR` 配成 `0.0.0.0`，服务会直接拒绝启动。
 
 ---
 

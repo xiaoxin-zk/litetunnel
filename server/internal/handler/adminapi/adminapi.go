@@ -112,6 +112,29 @@ func (h *Handler) Profile(c *gin.Context) {
 	})
 }
 
+type adminPasswordReq struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+// ChangePassword 管理员修改自己的登录密码。
+//
+// 放在只读组里：审计角色同样需要能改自己的密码，且本接口只能改自己。
+func (h *Handler) ChangePassword(c *gin.Context) {
+	var req adminPasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写原密码与新密码")
+		return
+	}
+	adminID, _, _ := middleware.CurrentAdminID(c)
+	if err := h.svc.AdminChangePassword(adminID, req.OldPassword, req.NewPassword); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "admin.change_password", "admin", strconv.Itoa(int(adminID)), "修改自身登录密码")
+	httpx.OK(c, gin.H{"message": "密码已更新，请重新登录"})
+}
+
 // ---- 概览 ----
 
 // StatsOverview 后台首页概览。

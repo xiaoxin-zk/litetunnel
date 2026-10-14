@@ -45,7 +45,8 @@ export default http
 
 export const authApi = {
   login: (data) => http.post('/auth/login', data),
-  profile: () => http.get('/profile')
+  profile: () => http.get('/profile'),
+  changePassword: (data) => http.put('/profile/password', data)
 }
 
 export const statsApi = {

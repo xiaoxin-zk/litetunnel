@@ -125,6 +125,8 @@ func NewAdmin(cfg *config.Config, svc *service.Services, h *adminapi.Handler, pl
 	api.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.IsActiveAdmin))
 	{
 		api.GET("/profile", h.Profile)
+		// 改自己的密码不涉及他人，放在只读组，审计角色也能操作。
+		api.PUT("/profile/password", h.ChangePassword)
 		api.GET("/stats/overview", h.StatsOverview)
 
 		api.GET("/users", h.ListUsers)

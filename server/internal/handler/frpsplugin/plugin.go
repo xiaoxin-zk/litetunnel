@@ -267,11 +267,11 @@ func (h *Handler) onLogin(req *request) response {
 		return deny("登录参数解析失败")
 	}
 
-	username, ok := service.UsernameFromFrpUser(content.User)
+	userID, ok := service.UserIDFromFrpUser(content.User)
 	if !ok {
 		return deny("客户端标识非法，请使用 LiteTunnel 官方客户端")
 	}
-	u, err := h.svc.LoadUserByUsername(username)
+	u, err := h.svc.LoadUser(userID)
 	if err != nil {
 		return deny("账号不存在")
 	}
@@ -285,7 +285,7 @@ func (h *Handler) onLogin(req *request) response {
 		got = content.Metas[service.MetaTokenKey]
 	}
 	if !service.VerifyClientSecret(u.ClientSecret, got) {
-		log.Printf("[plugin] 用户 %s 登录凭据校验失败，来源 %s", username, content.ClientAddress)
+		log.Printf("[plugin] 用户 %s 登录凭据校验失败，来源 %s", u.Username, content.ClientAddress)
 		return deny("客户端凭据无效，请在控制台重新下载客户端配置")
 	}
 

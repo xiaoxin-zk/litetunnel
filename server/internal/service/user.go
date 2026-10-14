@@ -109,19 +109,6 @@ func (s *Services) LoadUser(id uint) (*model.User, error) {
 	return &u, nil
 }
 
-// LoadUserByUsername 按用户名载入。
-func (s *Services) LoadUserByUsername(username string) (*model.User, error) {
-	var u model.User
-	if err := s.DB.Preload("Group").Where("username = ?", username).First(&u).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	s.EnsureTrafficPeriod(&u)
-	return &u, nil
-}
-
 // LoadUserByAPIKey 通过 API Key 明文定位用户。
 func (s *Services) LoadUserByAPIKey(plain string) (*model.User, error) {
 	if plain == "" {

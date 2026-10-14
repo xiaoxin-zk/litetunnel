@@ -66,6 +66,7 @@ func main() {
 	srv := newServer(cfg.UserAddr, engine)
 
 	go func() {
+		log.Printf("LiteTunnel %s 启动中（环境 %s）", config.Version, cfg.Env)
 		log.Printf("控制面监听于 %s", cfg.UserAddr)
 		log.Printf("  用户控制台  http://%s/", cfg.UserAddr)
 		log.Printf("  管理后台    http://%s%s/", cfg.UserAddr, cfg.AdminPath)

@@ -21,6 +21,15 @@ import (
 
 const placeholderPrefix = "CHANGE_ME"
 
+// Version 是构建时注入的版本号，用于确认线上跑的是哪个版本。
+//
+// 通过 -ldflags 注入，例如：
+//
+//	go build -ldflags "-X github.com/xiaoxin-zk/litetunnel/server/internal/config.Version=v1.0.0"
+//
+// 未注入时保持 dev，便于区分本地构建产物。
+var Version = "dev"
+
 // Config 为控制面全部可配置项。
 type Config struct {
 	Env      string

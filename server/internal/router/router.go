@@ -51,7 +51,7 @@ func New(
 	_ = r.SetTrustedProxies(cfg.TrustedProxies)
 
 	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": config.Version})
 	})
 
 	// frps 服务端插件回调：仍严格限制为受信网段（默认仅回环），

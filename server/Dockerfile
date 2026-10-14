@@ -17,12 +17,17 @@ RUN cd web/admin && npm run build
 
 # ---------- 后端 ----------
 FROM golang:1.26-alpine AS builder
+
+# 构建时注入版本号，便于确认线上运行的具体版本
+ARG VERSION=dev
 WORKDIR /src
 ENV CGO_ENABLED=0 GOOS=linux
 COPY server/go.mod server/go.sum* ./
 RUN go mod download
 COPY server .
-RUN go build -trimpath -ldflags="-s -w" -o /out/panel ./cmd/panel
+RUN go build -trimpath \
+      -ldflags="-s -w -X github.com/xiaoxin-zk/litetunnel/server/internal/config.Version=${VERSION}" \
+      -o /out/panel ./cmd/panel
 
 # ---------- 运行镜像 ----------
 FROM alpine:3.21

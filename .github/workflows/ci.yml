@@ -39,7 +39,10 @@ jobs:
 
       - name: Build
         working-directory: server
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /tmp/panel ./cmd/panel
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X github.com/xiaoxin-zk/litetunnel/server/internal/config.Version=ci-${GITHUB_SHA::7}" \
+            -o /tmp/panel ./cmd/panel
 
       # 编译通过不代表能启动：数据库 DSN、迁移语句、路由注册等问题
       # 只有真正跑起来才会暴露，这一步把部署风险前移到 CI。
@@ -80,6 +83,14 @@ jobs:
           done
           [ "$ok" = "1" ] || { echo "::error::panel did not become healthy"; cat /tmp/smoke/panel.log; exit 1; }
           echo "PASS healthz"
+
+          # 版本号必须能从 /healthz 读到，部署后才好确认线上跑的是哪个版本
+          ver=$(curl -fsS "$BASE/healthz" | grep -o '"version":"[^"]*"' || true)
+          if ! printf '%s' "$ver" | grep -q 'ci-'; then
+            echo "::error::version not injected into the binary (got '$ver')"
+            exit 1
+          fi
+          echo "PASS build version injected ($ver)"
 
           # 单一入口：管理接口必须挂在同一端口上（返回 401 而非 404）
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
@@ -267,12 +278,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve version
+        id: ver
+        run: echo "value=main-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: server/Dockerfile
           push: true
+          build-args: |
+            VERSION=${{ steps.ver.outputs.value }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/litetunnel-panel:latest
             ghcr.io/${{ github.repository_owner }}/litetunnel-panel:sha-${{ github.sha }}

@@ -80,6 +80,10 @@ func New(
 	{
 		userAuth.POST("/register", userH.Register)
 		userAuth.POST("/login", userH.Login)
+		// 找回密码：发信走异步队列，账号是否存在不会体现在响应上。
+		userAuth.POST("/forgot-password", userH.ForgotPassword)
+		userAuth.POST("/reset-password", userH.ResetPassword)
+		userAuth.GET("/mail-status", userH.ResetMailStatus)
 	}
 
 	// 桌面客户端接入：同样是密码校验入口，必须同样限流 + 账号锁定。
@@ -92,7 +96,7 @@ func New(
 	// 桌面客户端接口：支持 JWT 或长期凭据（API Key / 客户端接入凭据）。
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(userAPILimiter, "user-client"))
-	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.IsActiveUser))
+	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
 	{
 		cli.GET("/info", userH.ClientInfo)
 		cli.GET("/config", userH.ClientConfig)
@@ -102,10 +106,12 @@ func New(
 
 	userAPI := r.Group("/api/user")
 	userAPI.Use(middleware.Limit(userAPILimiter, "user-api"))
-	userAPI.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.IsActiveUser))
+	userAPI.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.ResolveUserIdentity))
 	{
 		userAPI.GET("/profile", userH.Profile)
 		userAPI.PUT("/profile", userH.UpdateProfile)
+		// 注销账号：需要密码二次确认，且不可恢复。
+		userAPI.DELETE("/profile", userH.DeleteAccount)
 		userAPI.POST("/logout", userH.Logout)
 		userAPI.PUT("/profile/password", userH.ChangePassword)
 
@@ -138,7 +144,7 @@ func New(
 	adminRead := r.Group("/api/admin")
 	adminRead.Use(middleware.Limit(adminAPILimiter, "admin-api"))
 	adminRead.Use(adminAllow.Middleware())
-	adminRead.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.IsActiveAdmin))
+	adminRead.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity))
 	{
 		adminRead.GET("/profile", adminH.Profile)
 		// 改自己的密码与双因素设置不涉及他人，放在只读组，审计角色也能操作。
@@ -155,13 +161,15 @@ func New(
 		adminRead.GET("/redeem-records", adminH.ListRedeemRecords)
 		adminRead.GET("/clients", adminH.ListClients)
 		adminRead.GET("/audit-logs", adminH.ListAuditLogs)
+		adminRead.GET("/login-logs", adminH.ListLoginLogs)
+		adminRead.GET("/admins", adminH.ListAdmins)
 	}
 
 	// 写操作额外要求 super / operator 角色，auditor 只读。
 	adminWrite := r.Group("/api/admin")
 	adminWrite.Use(middleware.Limit(adminAPILimiter, "admin-write"))
 	adminWrite.Use(adminAllow.Middleware())
-	adminWrite.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.IsActiveAdmin, "super", "operator"))
+	adminWrite.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity, "super", "operator"))
 	{
 		adminWrite.POST("/users", adminH.CreateUser)
 		adminWrite.PUT("/users/:id", adminH.UpdateUser)
@@ -183,6 +191,20 @@ func New(
 		adminWrite.POST("/redeem-codes/generate", adminH.GenerateRedeemCodes)
 		adminWrite.POST("/redeem-codes/:id/status", adminH.SetRedeemCodeStatus)
 		adminWrite.DELETE("/redeem-codes/:id", adminH.DeleteRedeemCode)
+	}
+
+	// 管理员账号管理仅限超级管理员：这是权限提升的关键路径，
+	// 绝不能让 operator 通过创建管理员来给自己提权。
+	adminSuper := r.Group("/api/admin")
+	adminSuper.Use(middleware.Limit(adminAPILimiter, "admin-super"))
+	adminSuper.Use(adminAllow.Middleware())
+	adminSuper.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity, "super"))
+	{
+		adminSuper.POST("/admins", adminH.CreateAdmin)
+		adminSuper.PUT("/admins/:id", adminH.UpdateAdmin)
+		adminSuper.DELETE("/admins/:id", adminH.DeleteAdmin)
+		adminSuper.POST("/admins/:id/password", adminH.SetAdminPassword)
+		adminSuper.POST("/admins/:id/totp-reset", adminH.ClearAdminTOTP)
 	}
 
 	serveSPA(r, cfg.UserWebDir, cfg.AdminWebDir, adminAllow)

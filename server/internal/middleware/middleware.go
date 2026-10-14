@@ -149,10 +149,12 @@ func Limit(rl *RateLimiter, scope string) gin.HandlerFunc {
 
 // ---- 双域鉴权 ----
 
-// StatusResolver 由上层注入，用于在每次请求时确认主体是否仍然有效
-// （未被禁用 / 未被删除）。仅校验 JWT 签名是不够的：账号被禁用后，
-// 已签发的令牌在有效期内仍然能通过签名校验。
-type StatusResolver func(id uint) bool
+// IdentityResolver 由上层注入，用于在每次请求时确认主体的实时状态。
+//
+// 仅校验 JWT 签名是不够的：JWT 无状态，账号被禁用或密码被重置后，
+// 已签发的令牌在有效期内依然能通过签名校验。
+// 返回的 tokenVersion 会与令牌中的声明比对，从而实现「改密即全端下线」。
+type IdentityResolver func(id uint) (active bool, tokenVersion int)
 
 // extractToken 只从 Authorization 头读取令牌。
 //
@@ -170,20 +172,25 @@ func extractToken(c *gin.Context) string {
 	return strings.TrimSpace(after)
 }
 
-// checkActive 统一处理「令牌有效但账号已失效」的情况。
-func checkActive(c *gin.Context, resolve StatusResolver, id uint) bool {
+// checkIdentity 统一处理「签名有效但主体状态已变化」的情况。
+func checkIdentity(c *gin.Context, resolve IdentityResolver, id uint, claimVersion int) bool {
 	if resolve == nil {
 		return true
 	}
-	if !resolve(id) {
+	active, current := resolve(id)
+	if !active {
 		httpx.Unauthorized(c, "账号已被禁用或不存在，请重新登录")
+		return false
+	}
+	if current != claimVersion {
+		httpx.Unauthorized(c, "登录状态已失效（密码已变更），请重新登录")
 		return false
 	}
 	return true
 }
 
 // UserAuth 用户域鉴权：只接受用户域 JWT，管理域令牌在此处一定失败。
-func UserAuth(secret string, resolve StatusResolver) gin.HandlerFunc {
+func UserAuth(secret string, resolve IdentityResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := extractToken(c)
 		if tokenStr == "" {
@@ -195,7 +202,7 @@ func UserAuth(secret string, resolve StatusResolver) gin.HandlerFunc {
 			httpx.Unauthorized(c, "登录状态已失效，请重新登录")
 			return
 		}
-		if !checkActive(c, resolve, claims.UserID) {
+		if !checkIdentity(c, resolve, claims.UserID, claims.Version) {
 			return
 		}
 		c.Set(CtxUserID, claims.UserID)
@@ -205,7 +212,7 @@ func UserAuth(secret string, resolve StatusResolver) gin.HandlerFunc {
 }
 
 // AdminAuth 管理域鉴权：只接受管理域 JWT，且校验角色。
-func AdminAuth(secret string, resolve StatusResolver, allowRoles ...string) gin.HandlerFunc {
+func AdminAuth(secret string, resolve IdentityResolver, allowRoles ...string) gin.HandlerFunc {
 	allowed := make(map[string]struct{}, len(allowRoles))
 	for _, r := range allowRoles {
 		allowed[r] = struct{}{}
@@ -221,8 +228,8 @@ func AdminAuth(secret string, resolve StatusResolver, allowRoles ...string) gin.
 			httpx.Unauthorized(c, "登录状态已失效，请重新登录")
 			return
 		}
-		// 角色以令牌为准，但账号是否仍然启用必须实时查证。
-		if !checkActive(c, resolve, claims.UserID) {
+		// 角色以令牌为准，但账号是否仍然启用、令牌版本是否一致必须实时查证。
+		if !checkIdentity(c, resolve, claims.UserID, claims.Version) {
 			return
 		}
 		if len(allowed) > 0 {
@@ -244,7 +251,7 @@ type CredentialResolver func(plain string) (userID uint, username string, err er
 
 // UserAuthFlexible 允许用户域 JWT 或长期凭据（API Key / 客户端接入凭据）通过。
 // 供桌面客户端使用：客户端只持有凭据，不需要登录会话。
-func UserAuthFlexible(secret string, resolve CredentialResolver, status StatusResolver) gin.HandlerFunc {
+func UserAuthFlexible(secret string, resolve CredentialResolver, status IdentityResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := extractToken(c)
 		if tokenStr == "" {
@@ -254,7 +261,7 @@ func UserAuthFlexible(secret string, resolve CredentialResolver, status StatusRe
 
 		// 优先按 JWT 解析；失败再交给上层解析长期凭据。
 		if claims, err := auth.Parse(secret, auth.DomainUser, tokenStr); err == nil {
-			if !checkActive(c, status, claims.UserID) {
+			if !checkIdentity(c, status, claims.UserID, claims.Version) {
 				return
 			}
 			c.Set(CtxUserID, claims.UserID)
@@ -263,9 +270,11 @@ func UserAuthFlexible(secret string, resolve CredentialResolver, status StatusRe
 			return
 		}
 
+		// 长期凭据（API Key / 客户端接入凭据）不携带令牌版本，
+		// 只校验账号是否仍然有效。
 		if resolve != nil {
 			if uid, uname, err := resolve(tokenStr); err == nil {
-				if !checkActive(c, status, uid) {
+				if !checkIdentity(c, status, uid, 0) {
 					return
 				}
 				c.Set(CtxUserID, uid)

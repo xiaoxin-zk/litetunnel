@@ -73,6 +73,13 @@ type loginReq struct {
 	Password string `json:"password" binding:"required"`
 }
 
+// recordLogin 写入登录日志，自动补齐 IP 与 UA。
+func (h *Handler) recordLogin(c *gin.Context, a service.LoginAttempt) {
+	a.IP = httpx.ClientIP(c)
+	a.UserAgent = c.GetHeader("User-Agent")
+	h.svc.RecordLogin(a)
+}
+
 // Login 用户登录，签发用户域令牌。
 func (h *Handler) Login(c *gin.Context) {
 	var req loginReq
@@ -82,21 +89,37 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	account := strings.ToLower(strings.TrimSpace(req.Username))
+	attempt := service.LoginAttempt{
+		Kind:     model.LoginKindUser,
+		Username: req.Username,
+		Source:   model.LoginSourceWeb,
+	}
+
 	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
+		attempt.Result = model.LoginResultLocked
+		attempt.Detail = "账号处于登录锁定期"
+		h.recordLogin(c, attempt)
 		return
 	}
 
 	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
 	if err != nil {
 		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
+		attempt.Result = shared.LoginResultOf(err)
+		attempt.Detail = err.Error()
+		h.recordLogin(c, attempt)
 		shared.Fail(c, err)
 		return
 	}
 	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
+	attempt.AccountID = u.ID
+	attempt.Username = u.Username
+	attempt.Result = model.LoginResultSuccess
+	h.recordLogin(c, attempt)
 
 	token, expireAt, err := auth.Issue(
 		h.svc.Cfg.UserJWTSecret, auth.DomainUser,
-		u.ID, u.Username, "", h.svc.Cfg.UserJWTExpire,
+		u.ID, u.Username, "", u.TokenVersion, h.svc.Cfg.UserJWTExpire,
 	)
 	if err != nil {
 		shared.Fail(c, err)
@@ -139,6 +162,36 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, h.profileVO(u))
+}
+
+type deleteAccountReq struct {
+	Password string `json:"password" binding:"required"`
+}
+
+// DeleteAccount 用户注销自己的账号。
+//
+// 需要密码二次确认：注销不可恢复，必须防止令牌被盗后被恶意注销。
+func (h *Handler) DeleteAccount(c *gin.Context) {
+	var req deleteAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请输入登录密码以确认注销")
+		return
+	}
+	uid := middleware.CurrentUserID(c)
+	if err := h.svc.DeleteAccount(uid, req.Password); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.svc.RecordLogin(service.LoginAttempt{
+		Kind:      model.LoginKindUser,
+		AccountID: uid,
+		IP:        httpx.ClientIP(c),
+		UserAgent: c.GetHeader("User-Agent"),
+		Source:    model.LoginSourceWeb,
+		Result:    "account_deleted",
+		Detail:    "用户自助注销账号",
+	})
+	httpx.OK(c, gin.H{"message": "账号已注销，感谢使用"})
 }
 
 type changePasswordReq struct {
@@ -197,6 +250,70 @@ func (h *Handler) profileVO(u *model.User) gin.H {
 	return vo
 }
 
+// ---- 找回密码 ----
+
+type forgotPasswordReq struct {
+	// Account 可以是用户名或邮箱
+	Account string `json:"account" binding:"required"`
+}
+
+// ForgotPassword 发起找回密码。
+//
+// 无论账号是否存在，一律返回同样的提示：该接口若区分「不存在」与「已发送」，
+// 就会变成账号枚举工具。找回密码页面的响应时间也做了对齐（发信走异步队列）。
+func (h *Handler) ForgotPassword(c *gin.Context) {
+	var req forgotPasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请输入用户名或邮箱")
+		return
+	}
+
+	baseURL := h.svc.Cfg.UserPublicURL
+	if baseURL == "" {
+		// 未配置对外地址时用请求来源推断，保证链接在部署后仍然可用。
+		scheme := "https"
+		if c.Request.TLS == nil && c.GetHeader("X-Forwarded-Proto") == "" {
+			scheme = "http"
+		}
+		if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		}
+		baseURL = scheme + "://" + c.Request.Host
+	}
+
+	if err := h.svc.RequestPasswordReset(req.Account, httpx.ClientIP(c), baseURL); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{
+		"message": "如果该账号存在且已绑定邮箱，我们已发送重置链接，请查收（30 分钟内有效）",
+	})
+}
+
+type resetPasswordReq struct {
+	Token    string `json:"token" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// ResetPassword 使用邮件中的令牌重置密码。
+func (h *Handler) ResetPassword(c *gin.Context) {
+	var req resetPasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "参数不完整")
+		return
+	}
+	if err := h.svc.ResetPassword(req.Token, req.Password, httpx.ClientIP(c)); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"message": "密码已重置，所有设备已下线，请用新密码登录"})
+}
+
+// ResetMailStatus 返回站点是否已启用邮件找回功能，供前端决定是否显示入口。
+func (h *Handler) ResetMailStatus(c *gin.Context) {
+	httpx.OK(c, gin.H{"mail_enabled": h.svc.MailEnabled()})
+}
+
 // ---- 桌面客户端接入 ----
 
 type clientAuthReq struct {
@@ -216,17 +333,33 @@ func (h *Handler) ClientAuth(c *gin.Context) {
 	}
 
 	account := strings.ToLower(strings.TrimSpace(req.Username))
+	attempt := service.LoginAttempt{
+		Kind:     model.LoginKindUser,
+		Username: req.Username,
+		Source:   model.LoginSourceClient,
+	}
+
 	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
+		attempt.Result = model.LoginResultLocked
+		attempt.Detail = "账号处于登录锁定期"
+		h.recordLogin(c, attempt)
 		return
 	}
 
 	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
 	if err != nil {
 		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
+		attempt.Result = shared.LoginResultOf(err)
+		attempt.Detail = err.Error()
+		h.recordLogin(c, attempt)
 		shared.Fail(c, err)
 		return
 	}
 	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
+	attempt.AccountID = u.ID
+	attempt.Username = u.Username
+	attempt.Result = model.LoginResultSuccess
+	h.recordLogin(c, attempt)
 	tunnels, err := h.svc.ListTunnels(u.ID)
 	if err != nil {
 		shared.Fail(c, err)

@@ -79,6 +79,9 @@ type Config struct {
 	// 默认为回环地址（反代与本服务同机），避免客户端伪造 X-Forwarded-For 绕过限流。
 	TrustedProxies []string
 
+	// SMTP 邮件发送配置。未配置时找回密码功能自动禁用，接口会明确返回提示。
+	SMTP SMTPConfig
+
 	TrafficPollInterval time.Duration
 
 	UserJWTExpire  time.Duration
@@ -92,6 +95,36 @@ type Config struct {
 	EphemeralAdminPassword bool
 	// Warnings 收集非致命的配置风险提示。
 	Warnings []string
+}
+
+// SMTPConfig 是邮件发送配置。
+//
+// 以 QQ 邮箱为例（国内服务器最常用的方案）：
+//
+//	LT_SMTP_HOST=smtp.qq.com
+//	LT_SMTP_PORT=465
+//	LT_SMTP_TLS=ssl
+//	LT_SMTP_USER=你的QQ号@qq.com
+//	LT_SMTP_PASS=在QQ邮箱设置里生成的「授权码」（不是登录密码）
+//	LT_SMTP_FROM=LiteTunnel <你的QQ号@qq.com>
+//
+// 注意：国内服务器 25 端口普遍被封，请使用 465(SSL) 或 587(STARTTLS)。
+type SMTPConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+	// From 是收件人看到的发件人。多数服务商要求它必须与 User 一致。
+	From string
+	// TLS 取值：ssl（隐式 TLS，465）、starttls（587）、none（明文，仅内网调试）。
+	TLS string
+	// SiteName 用于邮件标题与正文中的品牌名。
+	SiteName string
+}
+
+// Enabled 表示邮件功能是否可用。
+func (s SMTPConfig) Enabled() bool {
+	return s.Host != "" && s.User != "" && s.Password != ""
 }
 
 // Load 从环境变量装载配置并做必要校验。
@@ -135,6 +168,16 @@ func Load() (*Config, error) {
 		TrustedProxies: splitCSV(
 			env("LT_TRUSTED_PROXIES", "127.0.0.1,::1"),
 		),
+
+		SMTP: SMTPConfig{
+			Host:     env("LT_SMTP_HOST", ""),
+			Port:     envInt("LT_SMTP_PORT", 465),
+			User:     env("LT_SMTP_USER", ""),
+			Password: env("LT_SMTP_PASS", ""),
+			From:     env("LT_SMTP_FROM", ""),
+			TLS:      strings.ToLower(env("LT_SMTP_TLS", "ssl")),
+			SiteName: env("LT_SITE_NAME", "LiteTunnel"),
+		},
 
 		TrafficPollInterval: time.Duration(envInt("LT_TRAFFIC_POLL_INTERVAL", 30)) * time.Second,
 		UserJWTExpire:       12 * time.Hour,
@@ -209,6 +252,28 @@ func (c *Config) fillDefaults() error {
 func (c *Config) validate() error {
 	if c.DBDriver != "sqlite" && c.DBDriver != "postgres" {
 		return fmt.Errorf("LT_DB_DRIVER 仅支持 sqlite 或 postgres，当前为 %q", c.DBDriver)
+	}
+
+	// 邮件配置校验：只校验「已配置」的情况，未配置时视为禁用该功能。
+	if c.SMTP.Host != "" {
+		switch c.SMTP.TLS {
+		case "ssl", "starttls", "none":
+		default:
+			return fmt.Errorf("LT_SMTP_TLS 仅支持 ssl / starttls / none，当前为 %q", c.SMTP.TLS)
+		}
+		if c.SMTP.Port <= 0 || c.SMTP.Port > 65535 {
+			return errors.New("LT_SMTP_PORT 配置非法")
+		}
+		if c.SMTP.User == "" || c.SMTP.Password == "" {
+			return errors.New("已配置 LT_SMTP_HOST 但缺少 LT_SMTP_USER 或 LT_SMTP_PASS")
+		}
+		if c.SMTP.From == "" {
+			// 未显式指定发件人时回落到认证账号，这是大多数服务商的要求。
+			c.SMTP.From = c.SMTP.User
+		}
+		if c.IsProd() && c.SMTP.TLS == "none" {
+			return errors.New("生产环境禁止使用明文 SMTP（LT_SMTP_TLS=none）")
+		}
 	}
 	if c.PortRangeStart <= 0 || c.PortRangeEnd <= c.PortRangeStart {
 		return errors.New("LT_PORT_RANGE_START/END 配置非法")

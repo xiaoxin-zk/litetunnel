@@ -15,6 +15,8 @@
         <el-menu-item index="/tunnels"><el-icon><Connection /></el-icon><span>隧道管理</span></el-menu-item>
         <el-menu-item index="/redeem"><el-icon><Ticket /></el-icon><span>兑换码</span></el-menu-item>
         <el-menu-item index="/logs"><el-icon><Document /></el-icon><span>审计与客户端</span></el-menu-item>
+        <el-menu-item index="/login-logs"><el-icon><Key /></el-icon><span>登录日志</span></el-menu-item>
+        <el-menu-item index="/admins"><el-icon><Avatar /></el-icon><span>管理员管理</span></el-menu-item>
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon><span>账号设置</span></el-menu-item>
       </el-menu>
     </el-aside>

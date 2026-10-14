@@ -8,6 +8,18 @@ const routes = [
     meta: { public: true }
   },
   {
+    path: '/forgot-password',
+    name: 'forgot-password',
+    component: () => import('../views/ForgotPassword.vue'),
+    meta: { public: true }
+  },
+  {
+    path: '/reset-password',
+    name: 'reset-password',
+    component: () => import('../views/ResetPassword.vue'),
+    meta: { public: true }
+  },
+  {
     path: '/',
     component: () => import('../views/Layout.vue'),
     children: [

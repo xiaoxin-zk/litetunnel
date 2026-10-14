@@ -62,6 +62,36 @@
         </div>
       </el-col>
     </el-row>
+
+    <div class="lt-card danger-zone">
+      <div class="lt-card-title" style="color: #b91c1c">危险操作</div>
+      <div class="danger-row">
+        <div>
+          <div class="danger-title">注销账号</div>
+          <div class="lt-muted">
+            将永久删除你的账号、全部隧道与流量记录，且不可恢复。
+            兑换记录与登录日志会作为审计数据保留。
+          </div>
+        </div>
+        <el-button type="danger" plain @click="deleteVisible = true">注销账号</el-button>
+      </div>
+    </div>
+
+    <el-dialog v-model="deleteVisible" title="确认注销账号" width="440px" :close-on-click-modal="false">
+      <el-alert
+        type="error"
+        :closable="false"
+        show-icon
+        title="此操作不可恢复"
+        description="账号、隧道与流量记录将被永久删除。请输入登录密码以确认。"
+        style="margin-bottom: 16px"
+      />
+      <el-input v-model="deletePassword" type="password" show-password placeholder="输入登录密码" />
+      <template #footer>
+        <el-button @click="deleteVisible = false">取消</el-button>
+        <el-button type="danger" :loading="deleting" @click="confirmDelete">确认注销</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -80,6 +110,10 @@ const formRef = ref()
 const pwdRef = ref()
 const saving = ref(false)
 const changingPwd = ref(false)
+
+const deleteVisible = ref(false)
+const deletePassword = ref('')
+const deleting = ref(false)
 
 const form = reactive({ username: '', nickname: '', email: '' })
 const pwd = reactive({ old_password: '', new_password: '', confirm: '' })
@@ -161,11 +195,44 @@ async function submitPassword() {
     changingPwd.value = false
   }
 }
+
+async function confirmDelete() {
+  if (!deletePassword.value) {
+    ElMessage.warning('请输入登录密码')
+    return
+  }
+  deleting.value = true
+  try {
+    await profileApi.deleteAccount(deletePassword.value)
+    ElMessage.success('账号已注销')
+    localStorage.removeItem(TOKEN_KEY)
+    router.push('/login')
+  } finally {
+    deleting.value = false
+  }
+}
 </script>
 
 <style scoped>
 .hint {
   margin-top: 4px;
   line-height: 1.6;
+}
+
+.danger-zone {
+  margin-top: 16px;
+  border: 1px solid #fee2e2;
+}
+
+.danger-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.danger-title {
+  font-weight: 600;
+  margin-bottom: 4px;
 }
 </style>

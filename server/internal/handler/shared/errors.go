@@ -11,6 +11,7 @@ import (
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
@@ -43,6 +44,23 @@ func LoginFailed(g *middleware.LoginGuard, scope, account string) {
 // LoginSucceeded 清除该账号的失败记录。
 func LoginSucceeded(g *middleware.LoginGuard, scope, account string) {
 	g.Reset(scope, account)
+}
+
+// LoginResultOf 把登录错误归类为日志用的结果码。
+//
+// 归类而非直接记录错误文本，是为了让后台可以按结果聚合统计，
+// 例如「近 24 小时 totp_failed 次数」这类风控视图。
+func LoginResultOf(err error) string {
+	switch {
+	case err == nil:
+		return model.LoginResultSuccess
+	case errors.Is(err, service.ErrAccountDisabled):
+		return model.LoginResultDisabled
+	case errors.Is(err, service.ErrTOTPInvalid):
+		return model.LoginResultTOTPFail
+	default:
+		return model.LoginResultBadCred
+	}
 }
 
 // Fail 把业务错误统一映射为 HTTP 响应。

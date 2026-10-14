@@ -23,10 +23,14 @@ type Claims struct {
 	Username string `json:"uname"`
 	Role     string `json:"role,omitempty"`
 	Domain   string `json:"dom"`
+	// Version 是签发时的令牌版本。JWT 无状态、无法单独吊销，
+	// 因此在账号上维护一个版本号：改密 / 重置密码时自增，
+	// 旧令牌即便未过期也会在下次请求时被拒绝。
+	Version int `json:"ver"`
 }
 
 // Issue 签发指定域的令牌。
-func Issue(secret, domain string, userID uint, username, role string, ttl time.Duration) (string, time.Time, error) {
+func Issue(secret, domain string, userID uint, username, role string, version int, ttl time.Duration) (string, time.Time, error) {
 	now := time.Now()
 	expireAt := now.Add(ttl)
 	claims := Claims{
@@ -42,6 +46,7 @@ func Issue(secret, domain string, userID uint, username, role string, ttl time.D
 		Username: username,
 		Role:     role,
 		Domain:   domain,
+		Version:  version,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(secret))

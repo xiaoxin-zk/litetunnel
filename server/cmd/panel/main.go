@@ -57,6 +57,8 @@ func main() {
 	defer stop()
 
 	svc.StartTrafficCollector(ctx)
+	svc.StartLoginLogWriter(ctx)
+	svc.StartMailWorker(ctx)
 
 	engine := router.New(cfg, svc, userapi.New(svc), adminapi.New(svc),
 		frpsplugin.New(svc, cfg.FrpsPluginAllowCIDRs))

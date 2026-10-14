@@ -18,6 +18,8 @@ const routes = [
       { path: 'tunnels', name: 'tunnels', meta: { title: '隧道管理' }, component: () => import('../views/Tunnels.vue') },
       { path: 'redeem', name: 'redeem', meta: { title: '兑换码' }, component: () => import('../views/RedeemCodes.vue') },
       { path: 'logs', name: 'logs', meta: { title: '审计与客户端' }, component: () => import('../views/Logs.vue') },
+      { path: 'login-logs', name: 'login-logs', meta: { title: '登录日志' }, component: () => import('../views/LoginLogs.vue') },
+      { path: 'admins', name: 'admins', meta: { title: '管理员管理' }, component: () => import('../views/Admins.vue') },
       { path: 'settings', name: 'settings', meta: { title: '账号设置' }, component: () => import('../views/Settings.vue') }
     ]
   },

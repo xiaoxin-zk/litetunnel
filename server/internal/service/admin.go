@@ -153,7 +153,201 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 	if err != nil {
 		return err
 	}
-	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Update("password", hashed)
+	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"password":      hashed,
+		"token_version": gorm.Expr("token_version + 1"),
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	return nil
+}
+
+// ListAdmins 列出全部管理员账号，供后台自查是否残留无用账号。
+func (s *Services) ListAdmins() ([]model.Admin, error) {
+	var list []model.Admin
+	err := s.DB.Order("id asc").Find(&list).Error
+	return list, err
+}
+
+// ---- 管理员账号管理 ----
+
+// 合法角色集合。
+var validAdminRoles = map[string]bool{
+	"super":    true, // 全部权限
+	"operator": true, // 可写，不可管理管理员
+	"auditor":  true, // 只读
+}
+
+// AdminCreateInput 新建管理员入参。
+type AdminCreateInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Nickname string `json:"nickname"`
+	Role     string `json:"role"`
+}
+
+// CreateAdmin 新建管理员账号。
+func (s *Services) CreateAdmin(in AdminCreateInput) (*model.Admin, error) {
+	in.Username = strings.TrimSpace(in.Username)
+	if len(in.Username) < 3 || len(in.Username) > 32 || !isSafeName(in.Username) {
+		return nil, fmt.Errorf("%w: 账号需为 3-32 位字母、数字或下划线", ErrInvalidParam)
+	}
+	if len(in.Password) < 12 {
+		return nil, fmt.Errorf("%w: 管理员密码长度不得少于 12 位", ErrInvalidParam)
+	}
+	if in.Role == "" {
+		in.Role = "operator"
+	}
+	if !validAdminRoles[in.Role] {
+		return nil, fmt.Errorf("%w: 不支持的角色 %q", ErrInvalidParam, in.Role)
+	}
+
+	var n int64
+	if err := s.DB.Model(&model.Admin{}).Where("username = ?", in.Username).Count(&n).Error; err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		return nil, ErrUsernameTaken
+	}
+
+	hashed, err := auth.HashPassword(in.Password)
+	if err != nil {
+		return nil, err
+	}
+	nickname := strings.TrimSpace(in.Nickname)
+	if nickname == "" {
+		nickname = in.Username
+	}
+	a := &model.Admin{
+		Username:     in.Username,
+		Password:     hashed,
+		Nickname:     truncate(nickname, 64),
+		Role:         in.Role,
+		Status:       "active",
+		TokenVersion: 1,
+	}
+	if err := s.DB.Create(a).Error; err != nil {
+		return nil, ErrUsernameTaken
+	}
+	return a, nil
+}
+
+// AdminUpdateInput 修改管理员入参。指针用于区分「未传」与「传空」。
+type AdminUpdateInput struct {
+	Nickname *string `json:"nickname"`
+	Role     *string `json:"role"`
+	Status   *string `json:"status"`
+}
+
+// UpdateAdmin 修改管理员资料。为避免把自己锁在门外，
+// 不允许修改自己的角色与状态。
+func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
+	target, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+
+	updates := map[string]any{}
+	if in.Nickname != nil {
+		updates["nickname"] = truncate(strings.TrimSpace(*in.Nickname), 64)
+	}
+
+	if in.Role != nil || in.Status != nil {
+		if id == operatorID {
+			return fmt.Errorf("%w: 不能修改自己的角色或状态", ErrInvalidParam)
+		}
+		if in.Role != nil {
+			if !validAdminRoles[*in.Role] {
+				return fmt.Errorf("%w: 不支持的角色 %q", ErrInvalidParam, *in.Role)
+			}
+			// 不允许把最后一个超级管理员降级。
+			if target.Role == "super" && *in.Role != "super" {
+				if err := s.assertNotLastSuperAdmin(id, "降级"); err != nil {
+					return err
+				}
+			}
+			updates["role"] = *in.Role
+		}
+		if in.Status != nil {
+			if *in.Status != "active" && *in.Status != "disabled" {
+				return fmt.Errorf("%w: 不支持的账号状态", ErrInvalidParam)
+			}
+			if *in.Status != "active" && target.Role == "super" {
+				if err := s.assertNotLastSuperAdmin(id, "禁用"); err != nil {
+					return err
+				}
+			}
+			updates["status"] = *in.Status
+		}
+	}
+
+	if len(updates) == 0 {
+		return nil
+	}
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		return err
+	}
+	// 角色或状态变更后，让该账号的旧令牌立即失效。
+	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	return nil
+}
+
+// DeleteAdmin 删除管理员。不允许删除自己，也不允许删除最后一个超级管理员。
+func (s *Services) DeleteAdmin(id, operatorID uint) error {
+	if id == operatorID {
+		return fmt.Errorf("%w: 不能删除当前登录的账号", ErrInvalidParam)
+	}
+	target, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+	if target.Role == "super" {
+		if err := s.assertNotLastSuperAdmin(id, "删除"); err != nil {
+			return err
+		}
+	}
+	if err := s.DB.Delete(&model.Admin{}, id).Error; err != nil {
+		return err
+	}
+	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	return nil
+}
+
+// AdminSetPassword 管理员重置他人的登录密码。
+func (s *Services) AdminSetPassword(id uint, newPassword string) error {
+	if len(newPassword) < 12 {
+		return fmt.Errorf("%w: 管理员密码长度不得少于 12 位", ErrInvalidParam)
+	}
+	hashed, err := auth.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"password":      hashed,
+		"token_version": gorm.Expr("token_version + 1"),
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	return nil
+}
+
+// AdminClearTOTP 清除指定管理员的双因素绑定，用于认证器丢失的救援场景。
+func (s *Services) AdminClearTOTP(id uint) error {
+	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+		"totp_enabled":     false,
+		"totp_secret":      "",
+		"totp_verified_at": nil,
+	})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -163,11 +357,20 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 	return nil
 }
 
-// ListAdmins 列出全部管理员账号，供后台自查是否残留无用账号。
-func (s *Services) ListAdmins() ([]model.Admin, error) {
-	var list []model.Admin
-	err := s.DB.Order("id asc").Find(&list).Error
-	return list, err
+// assertNotLastSuperAdmin 确保系统里始终至少保留一个可用的超级管理员，
+// 否则会出现「谁都进不去后台」的死锁。
+func (s *Services) assertNotLastSuperAdmin(excludeID uint, action string) error {
+	var n int64
+	err := s.DB.Model(&model.Admin{}).
+		Where("role = ? AND status = ? AND id <> ?", "super", "active", excludeID).
+		Count(&n).Error
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: 系统必须保留至少一个启用的超级管理员，无法%s该账号", ErrInvalidParam, action)
+	}
+	return nil
 }
 
 // ---- 用户管理 ----
@@ -368,6 +571,8 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) erro
 }
 
 // AdminResetUserPassword 重置用户密码。
+//
+// 同时自增令牌版本，把该用户所有已登录会话踢下线。
 func (s *Services) AdminResetUserPassword(id uint, newPassword string) error {
 	if len(newPassword) < 8 {
 		return fmt.Errorf("%w: 密码长度不得少于 8 位", ErrInvalidParam)
@@ -376,13 +581,17 @@ func (s *Services) AdminResetUserPassword(id uint, newPassword string) error {
 	if err != nil {
 		return err
 	}
-	res := s.DB.Model(&model.User{}).Where("id = ?", id).Update("password", hashed)
+	res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(map[string]any{
+		"password":      hashed,
+		"token_version": gorm.Expr("token_version + 1"),
+	})
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
+	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	return nil
 }
 

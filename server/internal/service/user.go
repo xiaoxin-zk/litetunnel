@@ -275,6 +275,9 @@ func IsValidEmail(s string) bool {
 }
 
 // UpdatePassword 修改密码。
+//
+// 改密后自增 TokenVersion，使此前签发的所有令牌立即失效——
+// JWT 无状态，这是让「改密即全端下线」成立的唯一办法。
 func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 	var u model.User
 	if err := s.DB.First(&u, userID).Error; err != nil {
@@ -286,11 +289,59 @@ func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 	if len(newPwd) < 8 {
 		return fmt.Errorf("%w: 新密码长度不得少于 8 位", ErrInvalidParam)
 	}
+	if newPwd == oldPwd {
+		return fmt.Errorf("%w: 新密码不能与原密码相同", ErrInvalidParam)
+	}
 	hashed, err := auth.HashPassword(newPwd)
 	if err != nil {
 		return err
 	}
-	return s.DB.Model(&model.User{}).Where("id = ?", userID).Update("password", hashed).Error
+	if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"password":      hashed,
+		"token_version": gorm.Expr("token_version + 1"),
+	}).Error; err != nil {
+		return err
+	}
+	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
+	return nil
+}
+
+// DeleteAccount 用户注销自己的账号。
+//
+// 需要提供登录密码二次确认：注销不可恢复，必须防止令牌被盗后被恶意注销。
+// 关联数据一并清理，避免留下悬空记录。
+func (s *Services) DeleteAccount(userID uint, password string) error {
+	var u model.User
+	if err := s.DB.First(&u, userID).Error; err != nil {
+		return ErrNotFound
+	}
+	if !auth.VerifyPassword(u.Password, password) {
+		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
+	}
+
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ?", userID).Delete(&model.Tunnel{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&model.TrafficDaily{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&model.ClientSession{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
+			return err
+		}
+		// 兑换流水与登录日志保留：它们属于审计数据，删除会让风控出现盲区。
+		return tx.Delete(&model.User{}, userID).Error
+	})
+	if err != nil {
+		return err
+	}
+
+	s.Runtime.SetQuotaExceeded(userID, false)
+	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
+	return nil
 }
 
 // isSafeName 限制用户名可用字符，避免其进入 frp 的 proxy 名前缀时引入注入风险。

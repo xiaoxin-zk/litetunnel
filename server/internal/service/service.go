@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/mailer"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -49,15 +50,24 @@ type Services struct {
 	Cfg     *config.Config
 	Frps    *FrpsClient
 	Runtime *Runtime
+	Mail    *mailer.Mailer
+
+	// loginLogCh 与 mailCh 都是异步队列：
+	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
+	loginLogCh chan model.LoginLog
+	mailCh     chan outboundMail
 }
 
 // New 构造服务集合。
 func New(db *gorm.DB, cfg *config.Config) *Services {
 	return &Services{
-		DB:      db,
-		Cfg:     cfg,
-		Frps:    NewFrpsClient(cfg),
-		Runtime: NewRuntime(),
+		DB:         db,
+		Cfg:        cfg,
+		Frps:       NewFrpsClient(cfg),
+		Runtime:    NewRuntime(),
+		Mail:       mailer.New(cfg.SMTP),
+		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
+		mailCh:     make(chan outboundMail, mailQueueSize),
 	}
 }
 
@@ -148,28 +158,37 @@ func (s *Services) ResolveCredential(plain string) (uint, string, error) {
 	return 0, "", ErrNotFound
 }
 
-// IsActiveUser 判断用户当前是否仍然有效（存在且未被禁用）。
+// ResolveUserIdentity 返回用户的实时状态：是否有效 + 当前令牌版本。
 //
-// 用于每次请求时校验令牌持有者的实时状态：仅验签无法发现账号已被禁用。
-func (s *Services) IsActiveUser(id uint) bool {
-	if active, ok := s.Runtime.CachedIdentity(IdentityKindUser, id); ok {
-		return active
+// 用于每次请求时校验令牌持有者：仅验签无法发现账号已被禁用，
+// 也无法发现密码已被重置（此时令牌版本自增，旧令牌必须失效）。
+func (s *Services) ResolveUserIdentity(id uint) (active bool, tokenVersion int) {
+	if a, v, ok := s.Runtime.CachedIdentity(IdentityKindUser, id); ok {
+		return a, v
 	}
 	u, err := s.LoadUser(id)
-	active := err == nil && u.Status == model.UserStatusActive
-	s.Runtime.SetCachedIdentity(IdentityKindUser, id, active)
-	return active
+	if err != nil {
+		s.Runtime.SetCachedIdentity(IdentityKindUser, id, false, 0)
+		return false, 0
+	}
+	active = u.Status == model.UserStatusActive
+	s.Runtime.SetCachedIdentity(IdentityKindUser, id, active, u.TokenVersion)
+	return active, u.TokenVersion
 }
 
-// IsActiveAdmin 判断管理员当前是否仍然有效。
-func (s *Services) IsActiveAdmin(id uint) bool {
-	if active, ok := s.Runtime.CachedIdentity(IdentityKindAdmin, id); ok {
-		return active
+// ResolveAdminIdentity 返回管理员的实时状态。
+func (s *Services) ResolveAdminIdentity(id uint) (active bool, tokenVersion int) {
+	if a, v, ok := s.Runtime.CachedIdentity(IdentityKindAdmin, id); ok {
+		return a, v
 	}
-	a, err := s.LoadAdmin(id)
-	active := err == nil && a.Status == "active"
-	s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, active)
-	return active
+	adm, err := s.LoadAdmin(id)
+	if err != nil {
+		s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, false, 0)
+		return false, 0
+	}
+	active = adm.Status == "active"
+	s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, active, adm.TokenVersion)
+	return active, adm.TokenVersion
 }
 
 // AllowedProtocols 解析分组允许的协议集合。

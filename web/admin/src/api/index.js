@@ -90,7 +90,17 @@ export const redeemApi = {
   records: (params) => http.get('/redeem-records', { params })
 }
 
+export const adminApi = {
+  list: () => http.get('/admins'),
+  create: (data) => http.post('/admins', data),
+  update: (id, data) => http.put(`/admins/${id}`, data),
+  remove: (id) => http.delete(`/admins/${id}`),
+  setPassword: (id, password) => http.post(`/admins/${id}/password`, { password }),
+  clearTOTP: (id) => http.post(`/admins/${id}/totp-reset`)
+}
+
 export const logApi = {
   audit: (params) => http.get('/audit-logs', { params }),
-  clients: (params) => http.get('/clients', { params })
+  clients: (params) => http.get('/clients', { params }),
+  logins: (params) => http.get('/login-logs', { params })
 }

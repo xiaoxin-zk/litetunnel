@@ -46,13 +46,18 @@ export default http
 export const authApi = {
   register: (data) => http.post('/auth/register', data),
   login: (data) => http.post('/auth/login', data),
-  logout: () => http.post('/logout')
+  logout: () => http.post('/logout'),
+  forgotPassword: (account) => http.post('/auth/forgot-password', { account }),
+  resetPassword: (data) => http.post('/auth/reset-password', data),
+  mailStatus: () => http.get('/auth/mail-status')
 }
 
 export const profileApi = {
   get: () => http.get('/profile'),
   update: (data) => http.put('/profile', data),
-  changePassword: (data) => http.put('/profile/password', data)
+  changePassword: (data) => http.put('/profile/password', data),
+  // 注销需要密码二次确认，放在 body 里传递
+  deleteAccount: (password) => http.delete('/profile', { data: { password } })
 }
 
 export const tunnelApi = {

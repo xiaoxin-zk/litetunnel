@@ -75,6 +75,10 @@ type User struct {
 	// 与 API Key 分离：重置客户端凭据不影响 API 调用，反之亦然。
 	ClientSecret string `gorm:"size:64;index" json:"-"`
 
+	// TokenVersion 是已签发令牌的版本号。改密 / 重置密码时自增，
+	// 使所有旧令牌立即失效（JWT 本身无状态，无法单独吊销）。
+	TokenVersion int `gorm:"default:1" json:"-"`
+
 	Remark      string     `gorm:"size:255" json:"remark"`
 	LastLoginAt *time.Time `json:"last_login_at"`
 	LastLoginIP string     `gorm:"size:64" json:"last_login_ip"`
@@ -254,6 +258,64 @@ type TrafficDaily struct {
 // TableName 固定表名。
 func (TrafficDaily) TableName() string { return "lt_traffic_daily" }
 
+// 登录主体类型
+const (
+	LoginKindUser  = "user"
+	LoginKindAdmin = "admin"
+)
+
+// 登录来源
+const (
+	LoginSourceWeb    = "web"
+	LoginSourceClient = "client"
+)
+
+// 登录结果
+const (
+	LoginResultSuccess   = "success"
+	LoginResultBadCred   = "bad_credentials"
+	LoginResultDisabled  = "disabled"
+	LoginResultLocked    = "locked"
+	LoginResultTOTPFail  = "totp_failed"
+)
+
+// LoginLog 记录每一次登录尝试，用户与管理员共用一张表。
+//
+// 无论成功失败都记录：失败记录才是发现暴力破解的依据。
+type LoginLog struct {
+	ID        uint   `gorm:"primarykey" json:"id"`
+	Kind      string `gorm:"size:16;index" json:"kind"`
+	AccountID uint   `gorm:"index" json:"account_id"`
+	Username  string `gorm:"size:64;index" json:"username"`
+	IP        string `gorm:"size:64" json:"ip"`
+	UserAgent string `gorm:"size:255" json:"user_agent"`
+	Source    string `gorm:"size:16" json:"source"`
+	Result    string `gorm:"size:24;index" json:"result"`
+	Detail    string `gorm:"size:255" json:"detail"`
+
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
+}
+
+// TableName 固定表名。
+func (LoginLog) TableName() string { return "lt_login_logs" }
+
+// PasswordResetToken 是找回密码的一次性令牌。
+//
+// 只存 SHA-256 摘要：数据库泄露也无法据此重置他人密码。
+type PasswordResetToken struct {
+	ID        uint       `gorm:"primarykey" json:"id"`
+	UserID    uint       `gorm:"index" json:"user_id"`
+	TokenHash string     `gorm:"size:64;uniqueIndex" json:"-"`
+	ExpireAt  time.Time  `gorm:"index" json:"expire_at"`
+	UsedAt    *time.Time `json:"used_at"`
+	IP        string     `gorm:"size:64" json:"ip"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TableName 固定表名。
+func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens" }
+
 // Setting 运行期可调的键值配置。
 type Setting struct {
 	Key       string    `gorm:"primarykey;size:64" json:"key"`
@@ -277,6 +339,9 @@ type Admin struct {
 	Status      string     `gorm:"size:16;default:active" json:"status"`
 	LastLoginAt *time.Time `json:"last_login_at"`
 	LastLoginIP string     `gorm:"size:64" json:"last_login_ip"`
+
+	// TokenVersion 同用户侧：改密后旧令牌立即失效。
+	TokenVersion int `gorm:"default:1" json:"-"`
 
 	// TOTPSecret 为双因素认证共享密钥（Base32）。json:"-" 保证永不外泄。
 	TOTPSecret string `gorm:"size:64" json:"-"`

@@ -66,9 +66,11 @@ type identityKey struct {
 	id   uint
 }
 
+// identityState 缓存账号的有效性与令牌版本，供每次请求快速校验。
 type identityState struct {
-	active bool
-	at     time.Time
+	active  bool
+	version int
+	at      time.Time
 }
 
 // NewRuntime 构造内存态。
@@ -83,24 +85,24 @@ func NewRuntime() *Runtime {
 	}
 }
 
-// CachedIdentity 读取账号有效性缓存。
-func (r *Runtime) CachedIdentity(kind uint8, id uint) (bool, bool) {
+// CachedIdentity 读取账号状态缓存，返回 (是否有效, 令牌版本, 是否命中)。
+func (r *Runtime) CachedIdentity(kind uint8, id uint) (bool, int, bool) {
 	key := identityKey{kind: kind, id: id}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	st, ok := r.identities[key]
 	if !ok || time.Since(st.at) > identityTTL {
-		return false, false
+		return false, 0, false
 	}
-	return st.active, true
+	return st.active, st.version, true
 }
 
-// SetCachedIdentity 写入账号有效性缓存。
-func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool) {
+// SetCachedIdentity 写入账号状态缓存。
+func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool, version int) {
 	key := identityKey{kind: kind, id: id}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.identities[key] = identityState{active: active, at: time.Now()}
+	r.identities[key] = identityState{active: active, version: version, at: time.Now()}
 }
 
 // InvalidateIdentity 立即失效某个账号的缓存。

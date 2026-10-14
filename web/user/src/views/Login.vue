@@ -26,6 +26,9 @@
                 @keyup.enter="doLogin"
               />
             </el-form-item>
+            <div class="forgot">
+              <el-button link type="primary" @click="$router.push('/forgot-password')">忘记密码？</el-button>
+            </div>
             <el-button type="primary" size="large" class="submit" :loading="loading" @click="doLogin">
               登录
             </el-button>
@@ -190,6 +193,11 @@ async function doRegister() {
 .submit {
   width: 100%;
   margin-top: 6px;
+}
+
+.forgot {
+  text-align: right;
+  margin: -6px 0 4px;
 }
 
 .tip {

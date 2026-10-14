@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   # ============================================================
-  #  控制面：静态检查 + 编译
+  #  控制面：静态检查 + 编译 + 启动冒烟测试
   # ============================================================
   server:
     name: Server (Go)
@@ -40,6 +40,73 @@ jobs:
       - name: Build
         working-directory: server
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /tmp/panel ./cmd/panel
+
+      # 编译通过不代表能启动：数据库 DSN、迁移语句、路由注册等问题
+      # 只有真正跑起来才会暴露，这一步把部署风险前移到 CI。
+      - name: Smoke test
+        working-directory: server
+        env:
+          LT_ENV: development
+          LT_LOG_LEVEL: info
+          LT_DB_DRIVER: sqlite
+          LT_DB_DSN: /tmp/smoke/litetunnel.db
+          LT_USER_ADDR: 127.0.0.1:7848
+          LT_ADMIN_ADDR: 127.0.0.1:8443
+          LT_GATEWAY_HOST: 127.0.0.1
+          LT_GATEWAY_PORT: "7001"
+          LT_FRPS_API_ADDR: 127.0.0.1:7500
+          LT_CLIENT_DIST_DIR: /tmp/smoke/clients
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/smoke
+          /tmp/panel > /tmp/smoke/panel.log 2>&1 &
+          PANEL_PID=$!
+          trap 'kill $PANEL_PID 2>/dev/null || true' EXIT
+
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7848/healthz > /dev/null 2>&1; then
+              ok=1; break
+            fi
+            if ! kill -0 $PANEL_PID 2>/dev/null; then
+              echo "::error::panel exited during startup"
+              cat /tmp/smoke/panel.log
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::panel did not become healthy in time"
+            cat /tmp/smoke/panel.log
+            exit 1
+          fi
+          echo "user console healthz OK"
+
+          curl -fsS http://127.0.0.1:8443/healthz > /dev/null
+          echo "admin console healthz OK"
+
+          # 管理路由绝不能出现在公网监听端口上
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -d '{}' \
+            http://127.0.0.1:7848/api/admin/auth/login)
+          if [ "$code" != "404" ]; then
+            echo "::error::admin API is reachable on the public listener (got $code)"
+            exit 1
+          fi
+          echo "admin API correctly absent from public listener"
+
+          # frps 插件回调必须能从回环访问
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \
+            http://127.0.0.1:8443/api/frps/plugin)
+          if [ "$code" != "200" ]; then
+            echo "::error::frps plugin endpoint returned $code"
+            exit 1
+          fi
+          echo "frps plugin endpoint OK"
+
+          echo "--- startup log ---"
+          cat /tmp/smoke/panel.log
 
       - name: Upload panel binary
         uses: actions/upload-artifact@v4
@@ -121,22 +188,39 @@ jobs:
           retention-days: 7
 
   # ============================================================
-  #  容器镜像构建验证（不推送）
+  #  构建并推送镜像到 GHCR
+  #
+  #  main 分支每次通过即推送 latest，服务器可直接 pull 部署；
+  #  带版本号的镜像由 release.yml 在打 tag 时推送。
   # ============================================================
-  docker:
-    name: Docker image
+  publish:
+    name: Publish image
+    needs: [server, web, client]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build image
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: server/Dockerfile
-          push: false
-          tags: litetunnel-panel:ci
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/litetunnel-panel:latest
+            ghcr.io/${{ github.repository_owner }}/litetunnel-panel:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

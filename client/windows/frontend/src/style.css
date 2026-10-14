@@ -1,0 +1,138 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  background: #f5f7fb;
+  color: #1f2937;
+  font-size: 14px;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: 9px;
+  padding: 9px 18px;
+  font-size: 14px;
+  transition: all 0.15s ease;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn-danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #fecaca;
+}
+
+.btn-ghost {
+  background: #eef2f7;
+  color: #334155;
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: #e2e8f0;
+}
+
+input {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 11px 13px;
+  border: 1px solid #d8dee9;
+  border-radius: 9px;
+  outline: none;
+  background: #fff;
+  width: 100%;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.card {
+  background: #fff;
+  border-radius: 14px;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.muted {
+  color: #6b7280;
+  font-size: 12.5px;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.tag-success {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.tag-warn {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.tag-info {
+  background: #e0e7ff;
+  color: #4338ca;
+}
+
+.tag-danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

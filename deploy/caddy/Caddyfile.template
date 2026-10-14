@@ -1,0 +1,74 @@
+# ============================================================
+#  Caddy 配置模板（自动 HTTPS）
+#  由 deploy/scripts/render 脚本从 .env 渲染生成 Caddyfile。
+# ============================================================
+
+{
+	email ${LT_ACME_EMAIL}
+	# 关闭管理接口对外暴露（Caddy 自身的管理 API）
+	admin off
+}
+
+# ---------- 用户控制台 ----------
+${LT_USER_DOMAIN} {
+	encode zstd gzip
+
+	# 基础安全响应头（应用层已设置，这里做兜底）
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:${LT_USER_PORT}
+
+	log {
+		output file /data/access-user.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# ---------- 管理后台（务必限制来源）----------
+# 建议：不配置此段，改走 SSH 隧道或 VPN 访问 127.0.0.1:8443。
+# 若确需域名访问，请配合下面的 IP 白名单一起使用。
+${LT_ADMIN_DOMAIN} {
+	@allowed remote_ip ${LT_ADMIN_ALLOW_CIDR}
+	handle @allowed {
+		reverse_proxy 127.0.0.1:${LT_ADMIN_PORT}
+	}
+	handle {
+		respond "Forbidden" 403
+	}
+
+	log {
+		output file /data/access-admin.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# ---------- HTTP 隧道泛域名 ----------
+# 需要把 *.隧道域名 解析到本机，并在此处使用 DNS Challenge 申请泛域名证书。
+# 未配置泛域名时，本段可整体删除。
+${LT_TUNNEL_DOMAIN} {
+	tls {
+		# 泛域名证书必须使用 DNS Challenge，请按你的 DNS 服务商补充插件：
+		# dns <provider> <credentials>
+		# 若无法使用 DNS Challenge，请改为逐个域名签发（不使用通配符）。
+	}
+
+	reverse_proxy 127.0.0.1:${LT_VHOST_HTTP_PORT}
+
+	log {
+		output file /data/access-tunnel.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

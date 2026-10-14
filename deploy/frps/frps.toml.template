@@ -1,0 +1,62 @@
+# ============================================================
+#  frps 服务端配置模板
+#  由 deploy/scripts/render 脚本从 .env 渲染生成 frps.toml。
+#  请勿直接编辑 frps.toml（已被 .gitignore 忽略）。
+# ============================================================
+
+bindAddr = "0.0.0.0"
+bindPort = ${LT_GATEWAY_PORT}
+
+# KCP/QUIC 使用同一 UDP 端口，游戏联机走 KCP 可显著降低延迟
+kcpBindPort = ${LT_KCP_PORT}
+
+# HTTP/HTTPS 隧道入口：仅监听本机，由 Caddy 按域名转发进来
+vhostHTTPPort = ${LT_VHOST_HTTP_PORT}
+vhostHTTPSPort = ${LT_VHOST_HTTPS_PORT}
+
+# 强制 TLS：拒绝任何明文连接
+transport.tls.force = true
+transport.maxPoolCount = 5
+
+# UDP 包大小需与客户端一致，影响 udp/sudp 代理
+udpPacketSize = 1500
+
+# 客户端接入认证（全局 token，与每用户凭据共同构成两层校验）
+auth.method = "token"
+auth.token = "${LT_FRPS_TOKEN}"
+
+# 端口池：用户只能使用该范围内的端口，防止占用特权端口或任意端口
+allowPorts = [ { start = ${LT_PORT_RANGE_START}, end = ${LT_PORT_RANGE_END} } ]
+maxPortsPerClient = ${LT_MAX_PORTS_PER_USER}
+
+# HTTP 隧道泛域名（留空表示不启用 HTTP 隧道）
+subDomainHost = "${LT_TUNNEL_DOMAIN}"
+
+log.to = "./frps.log"
+log.level = "info"
+log.maxDays = 7
+log.disablePrintColor = true
+
+# 管理接口：只监听回环，控制面通过它采集流量与代理状态
+webServer.addr = "127.0.0.1"
+webServer.port = ${LT_FRPS_API_PORT}
+webServer.user = "${LT_FRPS_API_USER}"
+webServer.password = "${LT_FRPS_API_PASSWORD}"
+
+enablePrometheus = true
+
+# ============================================================
+#  服务端插件：把鉴权、隧道审批、配额断流的决策权交给控制面
+#  ops 全部启用，缺一不可：
+#    Login        校验每用户独立凭据
+#    NewProxy     校验隧道归属/协议/端口，并强制下发限速
+#    CloseProxy   记录关闭事件
+#    Ping         刷新会话心跳
+#    NewWorkConn  工作连接建立
+#    NewUserConn  超额时实时拒绝新建用户连接
+# ============================================================
+[[httpPlugins]]
+name = "litetunnel-panel"
+addr = "127.0.0.1:${LT_ADMIN_PORT}"
+path = "/api/frps/plugin"
+ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]

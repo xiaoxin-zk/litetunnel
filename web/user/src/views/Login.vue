@@ -57,8 +57,8 @@
               />
             </el-form-item>
 
-            <!-- 验证码：连续失败若干次后才要求 -->
-            <el-form-item v-if="captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
+            <!-- 验证码：账号连续失败较多后才要求（代替硬锁，避免被恶意锁死） -->
+            <el-form-item v-if="loginCaptcha && captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
               <el-input
                 v-model="form.captcha_answer"
                 size="large"
@@ -165,6 +165,8 @@ const site = ref({})
 const captcha = ref(null)
 const totpVisible = ref(false)
 const termsVisible = ref(false)
+// 账号连续失败较多时后端会要求验证码，而不是把账号锁死
+const loginCaptcha = ref(false)
 
 const formRef = ref()
 const regRef = ref()
@@ -227,7 +229,7 @@ async function submit() {
   error.value = ''
   await formRef.value.validate()
 
-  if (captcha.value && !form.captcha_answer.trim()) {
+  if (loginCaptcha.value && captcha.value && !form.captcha_answer.trim()) {
     error.value = '请填写验证码'
     return
   }
@@ -237,7 +239,9 @@ async function submit() {
     const data = await sessionApi.login({
       username: form.username.trim(),
       password: form.password,
-      totp_code: form.totp_code.trim()
+      totp_code: form.totp_code.trim(),
+      captcha_ticket: loginCaptcha.value ? captcha.value?.ticket || '' : '',
+      captcha_answer: loginCaptcha.value ? form.captcha_answer.trim() : ''
     })
 
     if (data.role === 'admin') {
@@ -253,14 +257,17 @@ async function submit() {
     router.push('/')
   } catch (e) {
     const body = e?.response?.data
-    // 后端要求动态口令时展开输入框，并聚焦过去
     if (body?.data?.totp_required || /动态口令/.test(body?.message || '')) {
       totpVisible.value = true
       error.value = '该账号已启用双因素认证，请输入动态口令'
+    } else if (body?.data?.captcha_required) {
+      // 连续失败较多：后端不再硬锁账号，而是要求人机验证。
+      // 这样账号真正的所有者随时能登录进来，而脚本无法继续爆破。
+      loginCaptcha.value = true
+      error.value = body?.message || '请输入验证码后重试'
+      await loadCaptcha()
     } else {
       error.value = body?.message || '登录失败，请检查账号与密码'
-      // 失败后按策略要求验证码
-      if (site.value.register_captcha) await loadCaptcha()
     }
   } finally {
     loading.value = false

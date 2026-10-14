@@ -24,29 +24,33 @@ const (
 	LoginLockScopeUnified = "unified"
 )
 
-// CheckLoginLock 检查账号是否处于登录锁定期。
+// CheckLoginLock 检查「账号 + 来源 IP」是否处于登录锁定期。
 //
-// 与按 IP 的令牌桶互补：令牌桶挡不住代理池对单一账号的慢速爆破，
-// 账号级指数退避锁定可以。返回 false 时已写出响应，调用方直接 return。
-func CheckLoginLock(c *gin.Context, g *middleware.LoginGuard, scope, account string) bool {
-	ok, wait := g.Check(scope, account)
+// 维度选择说明：锁定按账号与 IP 的组合计数，而不是单纯按账号。
+// 纯账号维度会变成一个廉价的拒绝服务——攻击者知道管理员用户名后，
+// 每隔一段时间发几次错误密码就能让管理员永远登不进来。
+// 组合维度下攻击者只能锁住自己那个 IP，而分布式爆破由验证码兜底。
+//
+// 返回 false 时已写出响应，调用方直接 return。
+func CheckLoginLock(c *gin.Context, g *middleware.LoginGuard, scope, account, ip string) bool {
+	ok, wait := g.Check(scope, account, ip)
 	if ok {
 		return true
 	}
 	minutes := int(wait.Minutes()) + 1
 	httpx.Fail(c, http.StatusTooManyRequests,
-		fmt.Sprintf("该账号因连续登录失败已被临时锁定，请约 %d 分钟后重试", minutes))
+		fmt.Sprintf("该账号在当前网络下因连续登录失败已被临时锁定，请约 %d 分钟后重试", minutes))
 	return false
 }
 
 // LoginFailed 记录一次登录失败。
-func LoginFailed(g *middleware.LoginGuard, scope, account string) {
-	g.Fail(scope, account)
+func LoginFailed(g *middleware.LoginGuard, scope, account, ip string) {
+	g.Fail(scope, account, ip)
 }
 
-// LoginSucceeded 清除该账号的失败记录。
-func LoginSucceeded(g *middleware.LoginGuard, scope, account string) {
-	g.Reset(scope, account)
+// LoginSucceeded 清除该账号在当前 IP 下的失败记录。
+func LoginSucceeded(g *middleware.LoginGuard, scope, account, ip string) {
+	g.Reset(scope, account, ip)
 }
 
 // LoginResultOf 把登录错误归类为日志用的结果码。

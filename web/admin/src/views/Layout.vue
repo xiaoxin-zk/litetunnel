@@ -17,6 +17,7 @@
         <el-menu-item index="/logs"><el-icon><Document /></el-icon><span>审计与客户端</span></el-menu-item>
         <el-menu-item index="/login-logs"><el-icon><Key /></el-icon><span>登录日志</span></el-menu-item>
         <el-menu-item index="/admins"><el-icon><Avatar /></el-icon><span>管理员管理</span></el-menu-item>
+        <el-menu-item index="/firewall"><el-icon><Lock /></el-icon><span>端口与防火墙</span></el-menu-item>
         <el-menu-item index="/system"><el-icon><Tools /></el-icon><span>系统设置</span></el-menu-item>
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon><span>账号设置</span></el-menu-item>
       </el-menu>

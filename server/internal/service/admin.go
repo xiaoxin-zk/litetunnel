@@ -167,6 +167,64 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 	return nil
 }
 
+// AdminProfileInput 管理员自助修改资料的入参。
+// 使用指针以区分「未提交该字段」与「提交了空值」。
+type AdminProfileInput struct {
+	Username *string `json:"username"`
+	Nickname *string `json:"nickname"`
+}
+
+// AdminUpdateProfile 管理员修改自己的登录账号与昵称。
+//
+// 允许改登录账号是刻意的：初始账号名来自 .env（默认 admin），
+// 是公开可猜的。攻击者据此可以对管理员账号做定向爆破或定向锁定。
+// 允许改成不可预测的名字，能显著降低这类定向攻击的性价比。
+//
+// 改名不使当前令牌失效（版本号未变）：否则管理员每次改名都要重新登录，
+// 而账号名本身不是密钥，改名也不意味着凭据泄露。
+func (s *Services) AdminUpdateProfile(id uint, in AdminProfileInput) (*model.Admin, error) {
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return nil, err
+	}
+
+	updates := map[string]any{}
+
+	if in.Username != nil {
+		name := strings.TrimSpace(*in.Username)
+		if name != a.Username {
+			if len(name) < 3 || len(name) > 32 || !isSafeName(name) {
+				return nil, fmt.Errorf("%w: 登录账号需为 3-32 位字母、数字或下划线", ErrInvalidParam)
+			}
+			var n int64
+			if err := s.DB.Model(&model.Admin{}).Where("username = ?", name).Count(&n).Error; err != nil {
+				return nil, err
+			}
+			if n > 0 {
+				return nil, ErrUsernameTaken
+			}
+			updates["username"] = name
+		}
+	}
+
+	if in.Nickname != nil {
+		nick := strings.TrimSpace(*in.Nickname)
+		if len([]rune(nick)) > 32 {
+			return nil, fmt.Errorf("%w: 昵称不得超过 32 个字符", ErrInvalidParam)
+		}
+		updates["nickname"] = nick
+	}
+
+	if len(updates) == 0 {
+		return a, nil
+	}
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		// 并发改名撞唯一索引，同样按占用处理。
+		return nil, ErrUsernameTaken
+	}
+	return s.LoadAdmin(id)
+}
+
 // ListAdmins 列出全部管理员账号，供后台自查是否残留无用账号。
 func (s *Services) ListAdmins() ([]model.Admin, error) {
 	var list []model.Admin

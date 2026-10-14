@@ -1,22 +1,38 @@
 package middleware
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
 
-// LoginGuard 按「账号」维度限制连续登录失败。
+// LoginGuard 按「账号 + 来源 IP」维度限制连续登录失败。
 //
-// 为什么 IP 限流不够：攻击者可以用代理池 / 肉鸡，从成千上万个 IP 对**同一个账号**
-// 做慢速爆破，此时按 IP 计数的令牌桶完全失效。这里以账号为键做指数退避锁定，
-// 与 IP 限流形成互补：IP 限流挡高频单点，账号锁定挡分布式慢速撞库。
+// 为什么不是纯 IP 限流：攻击者可以用代理池 / 肉鸡，从成千上万个 IP 对**同一个账号**
+// 做慢速爆破，此时按 IP 计数的令牌桶完全失效。
+//
+// 为什么也不是纯账号锁定：那会变成一个廉价的拒绝服务——
+// 攻击者只要知道管理员用户名，每隔一段时间发几次错误密码，
+// 就能让管理员**永远无法登录**。账号锁定维度越粗，被武器化的代价越低。
+//
+// 折中方案：硬锁按「账号 + IP」计数。攻击者只能锁住自己那个 IP；
+// 而针对单一账号的分布式爆破，由「账号累计失败达阈值后要求验证码」来兜底
+// （见 service.CaptchaRequired），验证码不需要硬锁也能挡住脚本。
+//
+// 记录只存内存：重启即清空，这是可接受的——重启本身就是一次人工介入。
 type LoginGuard struct {
-	mu       sync.Mutex
-	records  map[string]*failureRecord
+	mu        sync.Mutex
+	records   map[string]*failureRecord
 	threshold int
 	baseLock  time.Duration
 	maxLock   time.Duration
 }
+
+// maxLoginRecords 是失败记录表的容量上限。
+//
+// 没有上限时，攻击者用**随机用户名**持续制造失败记录，可以让这张表无限增长：
+// GC 只清理 2 小时无活动的记录，而攻击者只要周期性再失败一次就能让它一直存活。
+const maxLoginRecords = 100000
 
 type failureRecord struct {
 	count      int
@@ -49,9 +65,17 @@ func NewLoginGuard(threshold int, baseLock, maxLock time.Duration) *LoginGuard {
 	return g
 }
 
-// Check 判断该账号当前是否允许尝试登录。返回剩余锁定时长。
-func (g *LoginGuard) Check(scope, account string) (bool, time.Duration) {
-	key := scope + "|" + account
+// guardKey 组合锁定维度：作用域 + 账号 + 来源 IP。
+//
+// 账号做小写归一化：登录本身不区分大小写，若不归一化，
+// 攻击者用 Admin / ADMIN / aDmin 就能绕过同一个账号的失败计数。
+func guardKey(scope, account, ip string) string {
+	return scope + "|" + strings.ToLower(strings.TrimSpace(account)) + "|" + ip
+}
+
+// Check 判断该账号 + IP 当前是否允许尝试登录。返回剩余锁定时长。
+func (g *LoginGuard) Check(scope, account, ip string) (bool, time.Duration) {
+	key := guardKey(scope, account, ip)
 	now := time.Now()
 
 	g.mu.Lock()
@@ -68,12 +92,18 @@ func (g *LoginGuard) Check(scope, account string) (bool, time.Duration) {
 }
 
 // Fail 记录一次失败，必要时升级为锁定。
-func (g *LoginGuard) Fail(scope, account string) {
-	key := scope + "|" + account
+func (g *LoginGuard) Fail(scope, account, ip string) {
+	key := guardKey(scope, account, ip)
 	now := time.Now()
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// 容量保护：达到上限时整表清空。
+	// 宁可让少数攻击者重新开始计数，也不让内存被随机用户名撑爆。
+	if len(g.records) >= maxLoginRecords {
+		g.records = make(map[string]*failureRecord)
+	}
 
 	rec, ok := g.records[key]
 	if !ok {
@@ -98,11 +128,10 @@ func (g *LoginGuard) Fail(scope, account string) {
 }
 
 // Reset 登录成功后清除失败记录。
-func (g *LoginGuard) Reset(scope, account string) {
-	key := scope + "|" + account
+func (g *LoginGuard) Reset(scope, account, ip string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.records, key)
+	delete(g.records, guardKey(scope, account, ip))
 }
 
 // gc 定期清理已解锁且长时间无活动的记录，避免内存无限增长。

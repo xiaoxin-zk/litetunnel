@@ -114,6 +114,13 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 	if err != nil {
 		return nil, err
 	}
+
+	// 隧道建好后按需在主机防火墙上放行端口。
+	// 失败不影响隧道本身——管理员仍可去云安全组手工放行，
+	// 而把建隧道整体失败掉会让用户完全无从下手。
+	if created.RemotePort > 0 {
+		_ = s.FirewallOpenPort(created.RemotePort, ProtoOfTunnel(created.Type))
+	}
 	return &created, nil
 }
 
@@ -162,6 +169,16 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 
 // DeleteTunnel 删除隧道并释放端口。
 func (s *Services) DeleteTunnel(userID, id uint) error {
+	// 先取出端口信息：记录删掉之后就查不到了，
+	// 而防火墙需要它才能收回对应的放行规则。
+	var t model.Tunnel
+	if err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+
 	res := s.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Tunnel{})
 	if res.Error != nil {
 		return res.Error
@@ -169,22 +186,44 @@ func (s *Services) DeleteTunnel(userID, id uint) error {
 	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
+
+	// 隧道已删除，收回防火墙上的放行规则。
+	// 若该端口在保护列表中，FirewallClosePort 会拒绝并记日志，属预期行为。
+	if t.RemotePort > 0 {
+		_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+	}
 	return nil
 }
 
 // SetTunnelStatus 启用/停用隧道。
+//
+// 状态切换同时联动防火墙：停用即收回端口，启用即重新放行。
+// 否则「停用的隧道端口仍然对外开放」会成为一个隐蔽的安全缺口。
 func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
 		return ErrInvalidParam
 	}
-	res := s.DB.Model(&model.Tunnel{}).
-		Where("id = ? AND user_id = ?", id, userID).
-		Update("status", status)
-	if res.Error != nil {
-		return res.Error
+
+	var t model.Tunnel
+	if err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
 	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
+
+	if err := s.DB.Model(&model.Tunnel{}).
+		Where("id = ? AND user_id = ?", id, userID).
+		Update("status", status).Error; err != nil {
+		return err
+	}
+
+	if t.RemotePort > 0 {
+		if status == model.TunnelStatusActive {
+			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
+		} else {
+			_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+		}
 	}
 	return nil
 }

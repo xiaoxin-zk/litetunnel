@@ -58,6 +58,29 @@
         </div>
 
         <div class="lt-card" style="margin-top: 16px">
+          <div class="lt-card-title">修改登录账号</div>
+
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 14px"
+            title="建议把初始账号名改掉"
+            description="初始账号名来自部署配置（默认 admin），是公开可猜的。攻击者据此可对管理员账号做定向爆破或定向锁定。改成不可预测的名字能显著降低这类攻击的性价比。"
+          />
+
+          <el-form :model="profile" :rules="profileRules" ref="profileRef" label-width="90px">
+            <el-form-item label="登录账号" prop="username">
+              <el-input v-model="profile.username" placeholder="3-32 位字母、数字或下划线" />
+            </el-form-item>
+            <el-form-item label="昵称">
+              <el-input v-model="profile.nickname" placeholder="用于界面展示，可留空" />
+            </el-form-item>
+            <el-button type="primary" :loading="profileSaving" @click="submitProfile">保存</el-button>
+          </el-form>
+        </div>
+
+        <div class="lt-card" style="margin-top: 16px">
           <div class="lt-card-title">
             <span>双因素认证（TOTP）</span>
             <el-tag size="small" :type="admin?.totp_enabled ? 'success' : 'info'">
@@ -153,6 +176,17 @@ const totpLoading = ref(false)
 
 const form = reactive({ old_password: '', new_password: '', confirm: '' })
 
+const profileRef = ref()
+const profileSaving = ref(false)
+const profile = reactive({ username: '', nickname: '' })
+
+const profileRules = {
+  username: [
+    { required: true, message: '请输入登录账号', trigger: 'blur' },
+    { pattern: /^[A-Za-z0-9_]{3,32}$/, message: '仅允许 3-32 位字母、数字或下划线', trigger: 'blur' }
+  ]
+}
+
 const setupVisible = ref(false)
 const setupSecret = ref('')
 const setupCode = ref('')
@@ -183,6 +217,23 @@ const rules = {
 
 async function load() {
   admin.value = await authApi.profile()
+  profile.username = admin.value?.username || ''
+  profile.nickname = admin.value?.nickname || ''
+}
+
+async function submitProfile() {
+  await profileRef.value.validate()
+  profileSaving.value = true
+  try {
+    await authApi.updateProfile({
+      username: profile.username.trim(),
+      nickname: profile.nickname.trim()
+    })
+    ElMessage.success('已保存')
+    await load()
+  } finally {
+    profileSaving.value = false
+  }
 }
 
 async function submit() {

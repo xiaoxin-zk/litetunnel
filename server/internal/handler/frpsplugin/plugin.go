@@ -179,15 +179,28 @@ func (h *Handler) Guard() gin.HandlerFunc {
 }
 
 // Handle 处理一次插件回调。
+//
+// 失败策略：**无法判断 op 时一律拒绝**（fail-closed）。
+//
+// 这是刻意的选择。Login 是整个平台的信任边界，如果请求体解析失败就放行，
+// 那么任何能构造出解析失败的输入，都会让每用户凭据校验被静默跳过，
+// 只剩全局 frps token 一道门（而那个 token 每个注册用户都能拿到）。
+//
+// 代价是 frp 协议若有变动会导致登录失败——但那属于**显式故障**，
+// 比静默放行安全得多：前者立刻暴露，后者无声无息。
+//
+// 注意：只有「无法判断 op」时才需要这样保守。已识别的 op 由各自处理函数
+// 决定失败策略（例如 Ping / CloseProxy 解析失败可以放行，它们不参与鉴权）。
 func (h *Handler) Handle(c *gin.Context) {
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20))
 	if err != nil {
-		c.JSON(http.StatusOK, allow())
+		c.JSON(http.StatusOK, deny("插件请求读取失败"))
 		return
 	}
 	var req request
 	if err := json.Unmarshal(body, &req); err != nil {
-		c.JSON(http.StatusOK, allow())
+		log.Printf("[plugin] 插件请求解析失败，已拒绝: %v", err)
+		c.JSON(http.StatusOK, deny("插件请求格式非法"))
 		return
 	}
 

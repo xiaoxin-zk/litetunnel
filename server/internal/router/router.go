@@ -18,6 +18,7 @@
 package router
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,8 +50,17 @@ func New(
 	r.Use(middleware.SecurityHeaders())
 	r.Use(middleware.LimitBodySize(middleware.MaxRequestBodyBytes))
 	r.Use(middleware.CORSDevOnly(cfg.IsProd()))
+
 	// 只信任反代地址的转发头，防止客户端伪造来源 IP 绕过限流与白名单。
-	_ = r.SetTrustedProxies(cfg.TrustedProxies)
+	//
+	// 这里必须检查错误并 fail-fast，不能忽略：gin 在 New() 时默认把
+	// trustedProxies 设为 ["0.0.0.0/0", "::/0"]（信任所有），而 SetTrustedProxies
+	// 解析失败时会提前返回、**不更新内部的 trustedCIDRs**，于是保留「信任所有」。
+	// 那样任何客户端都能伪造 X-Forwarded-For，限流与 LT_ADMIN_ALLOW_CIDR 全部失效。
+	// 启动失败远好于静默地信任所有人。
+	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		panic(fmt.Sprintf("设置可信代理失败（会导致任意客户端伪造来源 IP）: %v", err))
+	}
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": config.Version})
@@ -161,7 +171,8 @@ func New(
 	adminRead.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity))
 	{
 		adminRead.GET("/profile", adminH.Profile)
-		// 改自己的密码与双因素设置不涉及他人，放在只读组，审计角色也能操作。
+		// 改自己的资料 / 密码 / 双因素设置都不涉及他人，放在只读组，审计角色也能操作。
+		adminRead.PUT("/profile", adminH.UpdateProfile)
 		adminRead.PUT("/profile/password", adminH.ChangePassword)
 		adminRead.POST("/profile/totp/setup", adminH.TOTPSetup)
 		adminRead.POST("/profile/totp/enable", adminH.TOTPEnable)
@@ -224,6 +235,12 @@ func New(
 		// 系统设置含 SMTP 授权码与支付密钥，只有超级管理员可读写。
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
+
+		// 防火墙操作会改变主机网络可达性，属于高危操作，仅限超级管理员。
+		adminSuper.GET("/firewall/status", adminH.FirewallStatus)
+		adminSuper.POST("/firewall/rescan", adminH.FirewallRescan)
+		adminSuper.POST("/firewall/ports", adminH.FirewallOpenPort)
+		adminSuper.DELETE("/firewall/ports", adminH.FirewallClosePort)
 	}
 
 	serveSPA(r, cfg, adminAllow)

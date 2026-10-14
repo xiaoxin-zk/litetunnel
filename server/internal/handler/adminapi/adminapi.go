@@ -60,6 +60,30 @@ func (h *Handler) Profile(c *gin.Context) {
 	})
 }
 
+// UpdateProfile 管理员修改自己的登录账号与昵称。
+//
+// 放在只读权限组：本接口只能改自己，审计角色同样需要能改。
+func (h *Handler) UpdateProfile(c *gin.Context) {
+	var in service.AdminProfileInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		httpx.BadRequest(c, "参数格式不正确")
+		return
+	}
+	adminID, _, _ := middleware.CurrentAdminID(c)
+	a, err := h.svc.AdminUpdateProfile(adminID, in)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "admin.update_profile", "admin", strconv.Itoa(int(adminID)), "修改自身账号资料")
+	httpx.OK(c, gin.H{
+		"id":       a.ID,
+		"username": a.Username,
+		"nickname": a.Nickname,
+		"message":  "已保存。登录账号已变更，下次登录请使用新账号。",
+	})
+}
+
 // ---- 双因素认证 ----
 
 // TOTPSetup 生成新的 TOTP 密钥（此时尚未启用）。
@@ -687,6 +711,72 @@ func (h *Handler) TestMail(c *gin.Context) {
 	}
 	h.audit(c, "settings.test_mail", "settings", "", "测试收件人 "+req.To)
 	httpx.OK(c, gin.H{"message": "测试邮件已发送，请查收"})
+}
+
+// ---- 防火墙与端口池 ----
+
+// FirewallStatus 返回防火墙运行态与端口池使用情况。
+func (h *Handler) FirewallStatus(c *gin.Context) {
+	httpx.OK(c, gin.H{
+		"firewall": h.svc.FirewallStatusOf(),
+		"pool":     h.svc.PortPoolUsageOf(),
+	})
+}
+
+type firewallPortReq struct {
+	Port  int    `json:"port" binding:"required"`
+	Proto string `json:"proto"`
+}
+
+// FirewallOpenPort 手工放行一个端口。
+func (h *Handler) FirewallOpenPort(c *gin.Context) {
+	var req firewallPortReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写端口号")
+		return
+	}
+	if req.Proto == "" {
+		req.Proto = "tcp"
+	}
+	if err := h.svc.FirewallOpenPort(req.Port, req.Proto); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "firewall.open", "firewall", strconv.Itoa(req.Port),
+		fmt.Sprintf("放行 %d/%s", req.Port, req.Proto))
+	httpx.OK(c, gin.H{"message": "端口已放行"})
+}
+
+// FirewallClosePort 手工关闭一个端口。
+func (h *Handler) FirewallClosePort(c *gin.Context) {
+	var req firewallPortReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写端口号")
+		return
+	}
+	if req.Proto == "" {
+		req.Proto = "tcp"
+	}
+	// 关闭端口必须过护栏：保护端口与池外端口都会被拒绝。
+	if err := h.svc.FirewallGuard().CheckRemove(req.Port); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	if err := h.svc.FirewallClosePort(req.Port, req.Proto); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "firewall.close", "firewall", strconv.Itoa(req.Port),
+		fmt.Sprintf("关闭 %d/%s", req.Port, req.Proto))
+	httpx.OK(c, gin.H{"message": "端口已关闭"})
+}
+
+// FirewallRescan 重新扫描端口占用并输出可用区间，供管理页刷新用。
+func (h *Handler) FirewallRescan(c *gin.Context) {
+	httpx.OK(c, gin.H{
+		"firewall": h.svc.FirewallStatusOf(),
+		"pool":     h.svc.PortPoolUsageOf(),
+	})
 }
 
 // ---- 管理员账号管理 ----

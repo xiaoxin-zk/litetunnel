@@ -312,6 +312,15 @@ func (c *Config) validate() error {
 		if isTrustAll(p) {
 			return fmt.Errorf("LT_TRUSTED_PROXIES 不允许配置 %q：那会让任意客户端伪造来源 IP", p)
 		}
+		// 还必须是合法的 IP 或 CIDR。
+		//
+		// 这一步不能省：gin 的 SetTrustedProxies 遇到非法值会解析失败并提前返回，
+		// 而它内部的 trustedCIDRs 会保留构造函数写入的「信任所有」默认值。
+		// 也就是说一个拼错的 CIDR（如 127.0.0.1/33）会让整条信任链失效，
+		// 且失败是静默的。这里提前拦截，让问题在启动时暴露。
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return fmt.Errorf("LT_TRUSTED_PROXIES 中的 %q 不是合法的 IP 或 CIDR", p)
+		}
 	}
 	for _, p := range c.FrpsPluginAllowCIDRs {
 		if isTrustAll(p) {

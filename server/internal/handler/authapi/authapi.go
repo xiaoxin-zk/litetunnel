@@ -57,6 +57,25 @@ type loginReq struct {
 	Password string `json:"password" binding:"required"`
 	// TOTPCode 仅对已启用双因素的管理员必填。
 	TOTPCode string `json:"totp_code"`
+	// 账号累计失败较多时要求人机验证。
+	CaptchaTicket string `json:"captcha_ticket"`
+	CaptchaAnswer string `json:"captcha_answer"`
+}
+
+// respondCaptchaRequired 要求客户端先通过人机验证。
+//
+// 用 401 + 机器可读标记，而不是 429：
+// 429 的语义是「你被限流了，等着」，而这里是「请先证明你是人」。
+// 两者前端处理方式完全不同——前者只能等，后者可以立刻重试。
+func (h *Handler) respondCaptchaRequired(c *gin.Context, message string) {
+	if message == "" {
+		message = "该账号连续登录失败次数较多，请输入验证码后重试"
+	}
+	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+		"code":    http.StatusUnauthorized,
+		"message": message,
+		"data":    gin.H{"captcha_required": true},
+	})
 }
 
 // Login 统一登录入口。
@@ -77,9 +96,29 @@ func (h *Handler) Login(c *gin.Context) {
 	account := strings.ToLower(strings.TrimSpace(req.Username))
 	ip := httpx.ClientIP(c)
 
-	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUnified, account) {
-		h.record(c, model.LoginKindUser, req.Username, model.LoginResultLocked, "账号处于登录锁定期")
+	// 1. 硬锁：按「账号 + 来源 IP」计数，攻击者只能锁住自己。
+	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUnified, account, ip) {
+		h.record(c, model.LoginKindUser, req.Username, model.LoginResultLocked,
+			"账号在当前网络下处于登录锁定期")
 		return
+	}
+
+	// 2. 账号累计失败达阈值 → 要求验证码，而不是硬锁。
+	//
+	//    这是「管理员不会被锁死」的关键：验证码由人解答，脚本无法继续爆破，
+	//    而账号真正的所有者随时能登录进来。若改成硬锁，攻击者仅凭知道用户名
+	//    就能把管理员永久挡在门外——这比爆破本身更廉价。
+	if h.svc.CaptchaRequired("login", account) {
+		if strings.TrimSpace(req.CaptchaTicket) == "" {
+			h.respondCaptchaRequired(c, "")
+			return
+		}
+		if !h.svc.CheckCaptcha(req.CaptchaTicket, req.CaptchaAnswer) {
+			shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
+			h.record(c, model.LoginKindUser, req.Username, model.LoginResultBadCred, "验证码不正确")
+			h.respondCaptchaRequired(c, "验证码不正确或已过期，请重新获取")
+			return
+		}
 	}
 
 	// ---- 1. 普通用户 ----
@@ -92,7 +131,7 @@ func (h *Handler) Login(c *gin.Context) {
 			shared.Fail(c, err)
 			return
 		}
-		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account)
+		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindUser, u.Username, model.LoginResultSuccess, "")
 		httpx.OK(c, gin.H{
 			"role":      "user",
@@ -105,7 +144,7 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	} else if errors.Is(err, service.ErrAccountDisabled) {
 		// 账号被禁用是明确的状态，直接告知比笼统报错更有用。
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account)
+		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindUser, req.Username, model.LoginResultDisabled, err.Error())
 		httpx.Forbidden(c, "账号已被禁用，请联系管理员")
 		return
@@ -122,7 +161,7 @@ func (h *Handler) Login(c *gin.Context) {
 			shared.Fail(c, err)
 			return
 		}
-		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account)
+		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindAdmin, a.Username, model.LoginResultSuccess, "")
 		httpx.OK(c, gin.H{
 			"role":          "admin",
@@ -151,13 +190,13 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 	if errors.Is(err, service.ErrAccountDisabled) {
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account)
+		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindAdmin, req.Username, model.LoginResultDisabled, err.Error())
 		httpx.Forbidden(c, "账号已被禁用，请联系管理员")
 		return
 	}
 
-	shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account)
+	shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
 	h.record(c, model.LoginKindUser, req.Username, model.LoginResultBadCred, "账号或密码不正确")
 	httpx.Unauthorized(c, "账号或密码不正确")
 }

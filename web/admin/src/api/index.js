@@ -47,6 +47,7 @@ export default http
 // 管理端不再提供独立登录接口。
 export const authApi = {
   profile: () => http.get('/profile'),
+  updateProfile: (data) => http.put('/profile', data),
   changePassword: (data) => http.put('/profile/password', data),
   totpSetup: () => http.post('/profile/totp/setup'),
   totpEnable: (code) => http.post('/profile/totp/enable', { code }),
@@ -98,6 +99,13 @@ export const adminApi = {
   remove: (id) => http.delete(`/admins/${id}`),
   setPassword: (id, password) => http.post(`/admins/${id}/password`, { password }),
   clearTOTP: (id) => http.post(`/admins/${id}/totp-reset`)
+}
+
+export const firewallApi = {
+  status: () => http.get('/firewall/status'),
+  rescan: () => http.post('/firewall/rescan'),
+  open: (port, proto) => http.post('/firewall/ports', { port, proto }),
+  close: (port, proto) => http.delete('/firewall/ports', { data: { port, proto } })
 }
 
 export const settingsApi = {

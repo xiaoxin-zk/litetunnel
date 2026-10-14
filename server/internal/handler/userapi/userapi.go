@@ -295,23 +295,24 @@ func (h *Handler) ClientAuth(c *gin.Context) {
 		Source:   model.LoginSourceClient,
 	}
 
-	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
+	ip := httpx.ClientIP(c)
+	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account, ip) {
 		attempt.Result = model.LoginResultLocked
-		attempt.Detail = "账号处于登录锁定期"
+		attempt.Detail = "账号在当前网络下处于登录锁定期"
 		h.recordLogin(c, attempt)
 		return
 	}
 
-	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
+	u, err := h.svc.Authenticate(req.Username, req.Password, ip)
 	if err != nil {
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
+		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account, ip)
 		attempt.Result = shared.LoginResultOf(err)
 		attempt.Detail = err.Error()
 		h.recordLogin(c, attempt)
 		shared.Fail(c, err)
 		return
 	}
-	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
+	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account, ip)
 	attempt.AccountID = u.ID
 	attempt.Username = u.Username
 	attempt.Result = model.LoginResultSuccess

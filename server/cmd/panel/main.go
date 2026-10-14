@@ -60,6 +60,7 @@ func main() {
 	svc.StartTrafficCollector(ctx)
 	svc.StartLoginLogWriter(ctx)
 	svc.StartMailWorker(ctx)
+	svc.StartFirewallReconciler()
 
 	engine := router.New(cfg, svc,
 		authapi.New(svc, cfg.AdminPath),

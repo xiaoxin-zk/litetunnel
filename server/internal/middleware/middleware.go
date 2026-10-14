@@ -210,6 +210,8 @@ func extractToken(c *gin.Context) string {
 }
 
 // checkIdentity 统一处理「签名有效但主体状态已变化」的情况。
+//
+// 用于 JWT 路径：既校验账号有效，也校验令牌版本（实现「改密即全端下线」）。
 func checkIdentity(c *gin.Context, resolve IdentityResolver, id uint, claimVersion int) bool {
 	if resolve == nil {
 		return true
@@ -221,6 +223,31 @@ func checkIdentity(c *gin.Context, resolve IdentityResolver, id uint, claimVersi
 	}
 	if current != claimVersion {
 		httpx.Unauthorized(c, "登录状态已失效（密码已变更），请重新登录")
+		return false
+	}
+	return true
+}
+
+// checkActiveOnly 只校验账号是否仍然有效，不做令牌版本比对。
+//
+// 用于长期凭据路径（API Key / 客户端接入凭据）：这类凭据本身不带版本号，
+// 若强行与账号版本比对，会因为「凭据没有版本」而恒不相等，导致全部被拒。
+//
+// 关于「改密后旧凭据是否还有效」——这是刻意的设计取舍，不是遗漏：
+//   - 用户自助改密（知道原密码）：保留长期凭据，避免每次改密都要重新配置客户端；
+//   - 邮件找回密码 / 管理员重置：属于账号可能已被他人控制的场景，
+//     会一并轮换 client_secret（见 ResetPassword），旧客户端配置立即失效；
+//   - API Key 需要单独吊销：控制台「API Key → 重置」。
+//
+// 也就是说长期凭据与登录会话是两套独立的吊销通道，这与其他主流平台
+// （GitHub PAT、AWS Access Key）的语义一致。
+func checkActiveOnly(c *gin.Context, resolve IdentityResolver, id uint) bool {
+	if resolve == nil {
+		return true
+	}
+	active, _ := resolve(id)
+	if !active {
+		httpx.Unauthorized(c, "账号已被禁用或不存在，请重新登录")
 		return false
 	}
 	return true
@@ -308,10 +335,10 @@ func UserAuthFlexible(secret string, resolve CredentialResolver, status Identity
 		}
 
 		// 长期凭据（API Key / 客户端接入凭据）不携带令牌版本，
-		// 只校验账号是否仍然有效。
+		// 因此只校验账号是否仍然有效，不做版本比对。
 		if resolve != nil {
 			if uid, uname, err := resolve(tokenStr); err == nil {
-				if !checkIdentity(c, status, uid, 0) {
+				if !checkActiveOnly(c, status, uid) {
 					return
 				}
 				c.Set(CtxUserID, uid)

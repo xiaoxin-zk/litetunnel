@@ -31,7 +31,10 @@ RUN go build -trimpath \
 
 # ---------- 运行镜像 ----------
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tzdata wget \
+# iptables 与 ip6tables 供「防火墙控制」功能使用。
+# 镜像里带上它们不代表会用到：该功能默认关闭，只有管理端显式开启
+# 并且容器被授予 NET_ADMIN 时才会真正操作主机防火墙。
+RUN apk add --no-cache ca-certificates tzdata wget iptables ip6tables \
     && adduser -D -u 10001 -h /app lt
 
 WORKDIR /app
@@ -43,7 +46,8 @@ COPY --from=web-admin /src/web/admin/dist /app/web/admin
 RUN mkdir -p /data/clients && chown -R lt:lt /app /data
 
 USER lt
-# 单一公网入口：用户控制台与管理后台共用该端口（管理后台在 /admin 下）
+# 单一公网入口：用户控制台与管理后台共用该端口
+# （管理后台挂载路径由 LT_ADMIN_PATH 决定，默认 /lt-console）
 EXPOSE 7848
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

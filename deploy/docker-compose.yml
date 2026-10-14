@@ -6,7 +6,7 @@
 #    - panel 的插件回调只允许回环来源，必须与 frps 处于同一网络命名空间；
 #    - caddy 需要绑定 80/443。
 #
-#  对外暴露的端口只有：80、443、网关端口(默认 7000)、KCP 端口(默认 7001/udp)、
+#  对外暴露的端口只有：80、443、网关端口(默认 7001)、KCP 端口(默认 7002/udp)、
 #  以及隧道端口池(默认 20000-30000)。管理端口始终只监听回环。
 #
 #  使用前先执行：deploy/scripts/render.ps1（或 render.sh）生成 frps.toml 与 Caddyfile。
@@ -45,7 +45,7 @@ services:
       - ../.env
     environment:
       # 覆盖为回环监听：公网流量统一由 Caddy 进入
-      LT_USER_ADDR: "127.0.0.1:8080"
+      LT_USER_ADDR: "127.0.0.1:7848"
       LT_ADMIN_ADDR: "127.0.0.1:8443"
       LT_DB_DRIVER: "sqlite"
       LT_DB_DSN: "/data/litetunnel.db"

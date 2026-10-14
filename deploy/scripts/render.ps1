@@ -93,7 +93,7 @@ Render $caddyTpl $caddyOut $vars
 Write-Host ''
 Write-Host 'Done. Next steps:'
 Write-Host '  1) Open ports 80, 443, the tunnel port pool (default 20000-30000),'
-Write-Host '     7000/TCP and 7001/UDP in your firewall / security group only.'
+Write-Host '     7001/TCP and 7002/UDP in your firewall / security group only.'
 Write-Host '  2) From the repository root run:'
 Write-Host '     docker compose -f deploy/docker-compose.yml pull'
 Write-Host '     docker compose -f deploy/docker-compose.yml up -d'

@@ -104,6 +104,6 @@ render "${CADDY_TPL}" "${CADDY_OUT}"
 cat <<'EOF'
 
 渲染完成。接下来：
-  1) 确保防火墙/安全组只放行 80、443 与隧道端口池（默认 20000-30000），以及网关端口 7000/TCP 与 7001/UDP
+  1) 确保防火墙/安全组只放行 80、443 与隧道端口池（默认 20000-30000），以及网关端口 7001/TCP 与 7002/UDP
   2) 在仓库根目录执行： docker compose -f deploy/docker-compose.yml up -d --build
 EOF

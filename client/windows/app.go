@@ -198,7 +198,7 @@ func (a *App) Login(serverURL, username, password string) (State, error) {
 	}
 
 	// 拉一次隧道清单，登录后立即展示。
-	_ = a.Refresh()
+	_, _ = a.Refresh()
 	return a.GetState(), nil
 }
 

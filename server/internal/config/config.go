@@ -83,7 +83,7 @@ func Load() (*Config, error) {
 		DBDriver: env("LT_DB_DRIVER", "sqlite"),
 		DBDSN:    env("LT_DB_DSN", "./data/litetunnel.db"),
 
-		UserAddr:      env("LT_USER_ADDR", "0.0.0.0:8080"),
+		UserAddr:      env("LT_USER_ADDR", "0.0.0.0:7848"),
 		UserPublicURL: strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),
 		AdminAddr:     env("LT_ADMIN_ADDR", "127.0.0.1:8443"),
 
@@ -95,7 +95,7 @@ func Load() (*Config, error) {
 		BootstrapAdminPassword: env("LT_BOOTSTRAP_ADMIN_PASSWORD", ""),
 
 		GatewayHost: env("LT_GATEWAY_HOST", ""),
-		GatewayPort: envInt("LT_GATEWAY_PORT", 7000),
+		GatewayPort: envInt("LT_GATEWAY_PORT", 7001),
 
 		FrpsToken:            env("LT_FRPS_TOKEN", ""),
 		FrpsAPIAddr:          env("LT_FRPS_API_ADDR", "127.0.0.1:7500"),

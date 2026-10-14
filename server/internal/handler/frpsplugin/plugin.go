@@ -274,7 +274,7 @@ func (h *Handler) onLogin(req *request) response {
 	}
 
 	h.svc.Runtime.RecordLogin(content.RunID, u.ID, u.Username)
-	h.svc.UpsertClientSession(u.ID, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
+	h.UpsertClientSession(u.ID, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
 	return allow()
 }
 

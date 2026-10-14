@@ -16,7 +16,7 @@ COPY web/admin web/admin
 RUN cd web/admin && npm run build
 
 # ---------- 后端 ----------
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /src
 ENV CGO_ENABLED=0 GOOS=linux
 COPY server/go.mod server/go.sum* ./
@@ -38,9 +38,9 @@ COPY --from=web-admin /src/web/admin/dist /app/web/admin
 RUN mkdir -p /data/clients && chown -R lt:lt /app /data
 
 USER lt
-EXPOSE 8080 8443
+EXPOSE 7848 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+  CMD wget -qO- http://127.0.0.1:7848/healthz || exit 1
 
 ENTRYPOINT ["/app/panel"]

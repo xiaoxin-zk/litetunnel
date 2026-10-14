@@ -11,13 +11,18 @@ const appDirName = "LiteTunnel"
 
 // Config 是客户端本地配置。
 //
-// 这里只保存服务端地址与「客户端接入凭据」，不保存账号密码：
-// 凭据可在服务端单独吊销，泄露风险远低于留存口令。
+// 只保存 API Key：它是用户在控制台获取的唯一凭据，可在服务端单独吊销，
+// 泄露风险远低于在本地留存账号密码。
 type Config struct {
-	ServerURL string `json:"server_url"`
-	Token     string `json:"token"`
-	Username  string `json:"username"`
-	AutoStart bool   `json:"auto_start"`
+	// APIKey 是接入平台的唯一凭据。客户端不保存口令。
+	APIKey string `json:"api_key"`
+
+	// ServerURL 只在「构建时未注入平台地址」的情况下使用（本地调试）。
+	// 正式发布的客户端该字段始终为空，地址由 build.go 注入。
+	ServerURL string `json:"server_url,omitempty"`
+
+	// AutoStart 表示下次启动客户端时自动连接并拉起隧道。
+	AutoStart bool `json:"auto_start"`
 }
 
 // dataDir 返回应用数据目录（Windows 下为 %AppData%\LiteTunnel）。
@@ -79,7 +84,7 @@ func saveConfig(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	// 0600：仅当前用户可读写。
+	// 0600：仅当前用户可读写。API Key 等同于账号凭据。
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return fmt.Errorf("保存配置失败: %w", err)
 	}

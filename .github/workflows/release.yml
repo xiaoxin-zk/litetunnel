@@ -91,7 +91,13 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "$env:PATH;$env:USERPROFILE\go\bin"
-          wails build -clean -platform windows/amd64
+          # 把平台地址烧进客户端，用户只需粘贴 API Key，不必填服务器地址。
+          # 地址来自仓库变量 LT_CLIENT_SERVER（Settings → Secrets and variables → Actions → Variables），
+          # 因此源码与仓库文件中不出现任何真实地址。
+          if (-not "${{ vars.LT_CLIENT_SERVER }}") {
+            Write-Host "::warning::LT_CLIENT_SERVER 未设置，客户端将回退为手动填写服务器地址"
+          }
+          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=${{ vars.LT_CLIENT_SERVER }}"
 
       - name: Download frpc
         shell: pwsh

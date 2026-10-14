@@ -1,7 +1,7 @@
 <template>
   <div class="app">
     <transition name="fade" mode="out-in">
-      <LoginView v-if="!state.logged_in" :initial-server="state.server_url" @logged-in="onLoggedIn" />
+      <LoginView v-if="!state.logged_in" :state="state" @connected="onConnected" />
       <MainView v-else :state="state" :logs="logs" @update="onUpdate" />
     </transition>
   </div>
@@ -17,6 +17,8 @@ const state = ref({
   logged_in: false,
   tunnels: [],
   server_url: '',
+  server_fixed: false,
+  needs_server_url: false,
   running: false
 })
 const logs = ref([])
@@ -29,7 +31,7 @@ async function loadLogs() {
   logs.value = await api.logs()
 }
 
-function onLoggedIn(next) {
+function onConnected(next) {
   state.value = next
   loadLogs()
 }

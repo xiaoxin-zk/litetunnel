@@ -58,6 +58,38 @@
             使用官方 frpc 时，把该文件放到 frpc 同目录后执行即可。
           </div>
         </div>
+
+        <div class="lt-card" style="margin-top: 16px">
+          <div class="lt-card-title">三步接入</div>
+          <div class="steps">
+            <div class="step">
+              <span class="idx">1</span>
+              <div>
+                <b>下载客户端</b>
+                <div class="lt-muted">解压后双击 LiteTunnel.exe，无需安装。</div>
+              </div>
+            </div>
+            <div class="step">
+              <span class="idx">2</span>
+              <div>
+                <b>复制 API Key</b>
+                <div class="lt-muted">注册时已自动生成，无需申请。</div>
+                <el-button link type="primary" style="padding: 0" @click="$router.push('/apikey')">
+                  去获取 API Key →
+                </el-button>
+              </div>
+            </div>
+            <div class="step">
+              <span class="idx">3</span>
+              <div>
+                <b>粘贴并连接</b>
+                <div class="lt-muted">
+                  客户端已内置服务器地址，粘贴 Key 后点「连接」即可，隧道自动同步。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </el-col>
     </el-row>
 
@@ -119,3 +151,41 @@ function downloadConfig() {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.step {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.idx {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  color: #fff;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+
+.step b {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.step .lt-muted {
+  line-height: 1.7;
+  margin-top: 2px;
+}
+</style>

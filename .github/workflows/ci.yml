@@ -243,7 +243,9 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "$env:PATH;$env:USERPROFILE\go\bin"
-          wails build -clean -platform windows/amd64
+          # 平台地址在构建时注入，源码中不出现任何真实地址。
+          # 仓库变量 LT_CLIENT_SERVER 未设置时为空，客户端会回退为手填地址。
+          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=${{ vars.LT_CLIENT_SERVER }}"
 
       - name: Upload client
         uses: actions/upload-artifact@v4

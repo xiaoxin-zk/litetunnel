@@ -50,14 +50,30 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, err
 	}
 
+	// 注册即生成 API Key：桌面客户端只用这一把凭据登录，
+	// 用户不必再去控制台点一次「生成」，省掉一个容易卡住的步骤。
+	apiKey, apiPrefix, apiHash, err := auth.GenerateAPIKey()
+	if err != nil {
+		return nil, err
+	}
+	apiEnc, err := auth.EncryptAPIKey(s.Cfg.APIKeyEncKey, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+
 	group := s.defaultGroup()
 	user := &model.User{
-		Username:       in.Username,
-		Email:          in.Email,
-		Password:       hashed,
-		Nickname:       in.Username,
-		Status:         model.UserStatusActive,
-		TrafficResetAt: time.Now().AddDate(0, 1, 0),
+		Username:        in.Username,
+		Email:           in.Email,
+		Password:        hashed,
+		Nickname:        in.Username,
+		Status:          model.UserStatusActive,
+		TrafficResetAt:  time.Now().AddDate(0, 1, 0),
+		APIKeyHash:      apiHash,
+		APIKeyPrefix:    apiPrefix,
+		APIKeyEnc:       apiEnc,
+		APIKeyCreatedAt: &now,
 	}
 	if group != nil {
 		user.GroupID = group.ID

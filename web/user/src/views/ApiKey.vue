@@ -10,7 +10,7 @@
             :closable="false"
             show-icon
             title="API Key 等同于账号凭据"
-            description="请勿分享给他人，也不要提交到公开仓库。重置后旧 Key 立即失效，需要重新配置客户端。"
+            description="注册时已自动生成，桌面客户端只用这一把钥匙。请勿分享给他人，也不要提交到公开仓库。重置后旧 Key 立即失效，客户端需要重新粘贴。"
             style="margin-bottom: 16px"
           />
 
@@ -33,7 +33,7 @@
           </div>
 
           <div class="actions">
-            <el-button :icon="View" @click="reveal">显示完整 Key</el-button>
+            <el-button type="primary" :icon="View" @click="reveal">显示完整 Key</el-button>
             <el-button type="danger" plain :icon="RefreshRight" @click="rotate">重置 API Key</el-button>
           </div>
         </div>

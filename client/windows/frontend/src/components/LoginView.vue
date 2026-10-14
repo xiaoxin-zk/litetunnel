@@ -5,82 +5,99 @@
         <div class="logo">LT</div>
         <div>
           <h1>LiteTunnel</h1>
-          <p>登录后即可一键连接你的游戏服务器、网站或 NAS</p>
+          <p>粘贴 API Key 即可连接你的游戏服务器、网站或 NAS</p>
         </div>
       </div>
 
+      <!-- 服务地址：构建注入时只读展示，未注入时允许手填（仅调试构建） -->
       <label class="field">
-        <span>服务器地址</span>
+        <span>服务地址</span>
+        <div v-if="state.server_fixed" class="fixed-server">
+          {{ state.server_url || '未配置' }}
+        </div>
         <input
+          v-else
           v-model="form.server"
-          placeholder="例如 https://tunnel.example.com"
+          placeholder="例如 https://panel.example.com"
           spellcheck="false"
           autocomplete="off"
           @keyup.enter="submit"
         />
-        <em class="muted">填写控制台地址，无需带 /api 路径</em>
+        <em class="muted">
+          {{ state.server_fixed ? '由客户端内置，无需填写' : '当前为调试构建，请填写控制台地址' }}
+        </em>
       </label>
 
       <label class="field">
-        <span>用户名</span>
-        <input v-model="form.username" placeholder="控制台注册的用户名" autocomplete="off" @keyup.enter="submit" />
-      </label>
-
-      <label class="field">
-        <span>密码</span>
-        <input v-model="form.password" type="password" placeholder="登录密码" @keyup.enter="submit" />
+        <span>API Key</span>
+        <input
+          v-model="form.apiKey"
+          placeholder="lt_xxxxxxxxxxxxxxxxxxxx"
+          spellcheck="false"
+          autocomplete="off"
+          @keyup.enter="submit"
+        />
+        <em class="muted">在控制台「API Key」页复制，注册后即自动生成</em>
       </label>
 
       <div v-if="error" class="error">{{ error }}</div>
 
       <button class="btn-primary submit" :disabled="loading" @click="submit">
-        {{ loading ? '正在登录…' : '登录并连接' }}
+        {{ loading ? '正在连接…' : '连接' }}
       </button>
 
       <p class="hint muted">
-        客户端仅保存可吊销的接入凭据，不会在本地留存账号密码。
+        客户端只在本地保存这一把 Key，不保存账号密码；Key 可在控制台随时重置。
       </p>
     </div>
   </div>
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { api } from '../bridge'
 
-const props = defineProps({ initialServer: String })
-const emit = defineEmits(['logged-in'])
+const props = defineProps({
+  state: { type: Object, default: () => ({}) }
+})
+const emit = defineEmits(['connected'])
 
 const loading = ref(false)
 const error = ref('')
-const form = reactive({ server: props.initialServer || '', username: '', password: '' })
+const form = reactive({ server: '', apiKey: '' })
 
 async function submit() {
   error.value = ''
-  if (!form.server.trim()) {
-    error.value = '请填写服务器地址'
+  if (!form.apiKey.trim()) {
+    error.value = '请粘贴 API Key'
     return
   }
-  if (!form.username.trim() || !form.password) {
-    error.value = '请填写用户名与密码'
+  if (!props.state.server_fixed && !form.server.trim()) {
+    error.value = '请填写服务地址'
     return
   }
 
   loading.value = true
   try {
-    const state = await api.login(form.server.trim(), form.username.trim(), form.password)
-    form.password = ''
-    emit('logged-in', state)
+    const next = await api.connect(form.apiKey.trim(), form.server.trim())
+    emit('connected', next)
   } catch (e) {
-    error.value = typeof e === 'string' ? e : e?.message || '登录失败，请检查地址与账号'
+    error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
   } finally {
     loading.value = false
   }
 }
 
-onMounted(() => {
-  form.server = props.initialServer || ''
-})
+// 未注入地址的调试构建下，把上次填过的地址回填出来。
+watch(
+  () => props.state?.server_url,
+  (v) => {
+    if (!props.state?.server_fixed && !form.server) {
+      form.server = v || ''
+    }
+  },
+  { immediate: true }
+)
 </script>
 
 <style scoped>
@@ -147,6 +164,17 @@ h1 {
   display: block;
   margin-top: 5px;
   font-style: normal;
+}
+
+.fixed-server {
+  padding: 11px 13px;
+  border-radius: 10px;
+  background: #f3f4f6;
+  color: #4b5563;
+  font-size: 13.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .error {

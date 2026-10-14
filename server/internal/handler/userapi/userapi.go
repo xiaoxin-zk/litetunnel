@@ -383,10 +383,14 @@ func (h *Handler) ClientAuth(c *gin.Context) {
 // 字段直接内嵌 ClientInfo，保证既有前端读取 server_addr 等字段不受影响。
 type clientInfoResp struct {
 	*service.ClientInfo
-	Tunnels      []gin.H `json:"tunnels"`
-	TrafficUsed  int64   `json:"traffic_used"`
-	TrafficQuota int64   `json:"traffic_quota"`
-	Exceeded     bool    `json:"exceeded"`
+	// 客户端只持有 API Key，因此账号信息必须由服务端下发，
+	// 不能像以前那样依赖用户在登录框里填的用户名。
+	Username     string    `json:"username"`
+	Nickname     string    `json:"nickname"`
+	Tunnels      []gin.H  `json:"tunnels"`
+	TrafficUsed  int64    `json:"traffic_used"`
+	TrafficQuota int64    `json:"traffic_quota"`
+	Exceeded     bool     `json:"exceeded"`
 }
 
 // ClientInfo 返回接入信息与当前隧道清单（需已认证）。
@@ -412,6 +416,8 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 	}
 	httpx.OK(c, clientInfoResp{
 		ClientInfo:   info,
+		Username:     u.Username,
+		Nickname:     u.Nickname,
 		Tunnels:      out,
 		TrafficUsed:  u.TrafficUsed,
 		TrafficQuota: h.svc.EffectiveQuota(u),

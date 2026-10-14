@@ -16,7 +16,7 @@
 | 用户控制台 | 隧道管理、流量曲线、API Key、兑换码、客户端下载、账号资料自助修改（用户名/昵称/邮箱/密码）、**邮箱找回密码**、**账号注销** |
 | 管理后台 | 用户禁用/删除、流量限制、分组权限、兑换码生成、审计日志、**管理员管理（新增/角色分配/改密/重置 2FA）**、**登录日志** |
 | 隧道类型 | TCP / UDP（游戏、NAS）、HTTP / HTTPS（内网网站） |
-| Windows 客户端 | Wails + Vue 单文件 exe，一键登录、自动同步配置、内置 frpc 托管 |
+| Windows 客户端 | Wails + Vue 单文件 exe，**只需粘贴 API Key 即可接入**（地址由构建注入），自动同步配置、内置 frpc 托管 |
 | 多用户 | 每用户独立接入凭据，可单独吊销 |
 | 流量治理 | 按分组配额、按隧道限速、超额实时断流 |
 | 审计 | 全部管理操作落库，含来源 IP |
@@ -326,8 +326,29 @@ ssh -L 8443:127.0.0.1:8443 user@your-server
 
 把安装包放进服务器的 `LT_CLIENT_DIST_DIR` 目录，用户控制台会自动列出供下载。
 
-> 本地调试可执行 `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`，
-> 产物在 `client/windows/build/bin/LiteTunnel.exe`（需自行放置 `frpc.exe`）。
+#### 客户端接入只需一个 API Key
+
+用户拿到客户端后**只需要粘贴 API Key**，不用填服务器地址、不用填账号密码：
+
+| 项 | 来源 |
+|---|---|
+| 服务地址 | **构建时注入**，用户看不到也不用填 |
+| API Key | 用户在控制台「API Key」页复制（注册时已自动生成） |
+| 账号信息 | 接入后由服务端下发 |
+| frpc 接入凭据 | 服务端生成在配置文件里，客户端自动写入 |
+
+> ⚠️ **发版前必须设置仓库变量**，否则打出来的客户端会退回「手动填写服务器地址」：
+>
+> 仓库 → Settings → Secrets and variables → Actions → **Variables** → New variable
+>
+> | 名称 | 值 |
+> |---|---|
+> | `LT_CLIENT_SERVER` | 你的控制台地址，如 `https://panel.example.com` |
+>
+> 地址通过 `-ldflags -X main.buildServerURL=...` 烧进二进制，
+> **源码与仓库文件中不出现任何真实地址**，符合「不在源码暴露公网信息」的要求。
+
+> 本地调试构建（`scripts/build.ps1`）不注入地址，客户端会显示地址输入框作为兜底。
 
 ---
 

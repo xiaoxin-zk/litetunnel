@@ -37,9 +37,19 @@ type TunnelVO struct {
 
 // State 是前端渲染所需的完整状态。
 type State struct {
-	ServerURL    string     `json:"server_url"`
-	LoggedIn     bool       `json:"logged_in"`
-	Username     string     `json:"username"`
+	// ServerURL 是本次实际使用的服务端地址（构建注入的优先）。
+	ServerURL string `json:"server_url"`
+	// ServerFixed 为 true 表示地址由构建注入，界面不提供修改入口。
+	ServerFixed bool `json:"server_fixed"`
+	// NeedsServerURL 为 true 表示构建未注入地址，需要手填（仅本地调试构建）。
+	NeedsServerURL bool `json:"needs_server_url"`
+
+	LoggedIn bool `json:"logged_in"`
+	// Username 由服务端下发：客户端只持有 API Key，不填账号。
+	Username string `json:"username"`
+	// APIKeyMask 是脱敏后的 Key，仅用于界面展示。
+	APIKeyMask string `json:"api_key_mask"`
+
 	GatewayHost  string     `json:"gateway_host"`
 	GatewayPort  int        `json:"gateway_port"`
 	TunnelDomain string     `json:"tunnel_domain"`
@@ -66,6 +76,8 @@ type App struct {
 
 	// 服务端返回的运行态缓存
 	tunnels      []TunnelVO
+	username     string
+	apiKeyMask   string
 	gatewayHost  string
 	gatewayPort  int
 	tunnelDomain string
@@ -73,6 +85,14 @@ type App struct {
 	trafficQuota int64
 	exceeded     bool
 	lastError    string
+}
+
+// maskKey 生成用于界面展示的脱敏形式，避免完整 Key 长时间暴露在屏幕上。
+func maskKey(k string) string {
+	if len(k) <= 12 {
+		return "****"
+	}
+	return k[:12] + "********"
 }
 
 // NewApp 构造应用对象。
@@ -98,7 +118,7 @@ func (a *App) startup(ctx context.Context) {
 		_ = err
 	})
 
-	if a.cfg.AutoStart && a.cfg.Token != "" {
+	if a.cfg.AutoStart && a.cfg.APIKey != "" {
 		go func() {
 			time.Sleep(800 * time.Millisecond)
 			_ = a.StartClient()
@@ -114,20 +134,27 @@ func (a *App) GetState() State {
 	defer a.mu.RUnlock()
 
 	state := State{
-		ServerURL:    a.cfg.ServerURL,
-		LoggedIn:     a.cfg.Token != "",
-		Username:     a.cfg.Username,
-		GatewayHost:  a.gatewayHost,
-		GatewayPort:  a.gatewayPort,
-		TunnelDomain: a.tunnelDomain,
-		Tunnels:      a.tunnels,
-		TrafficUsed:  a.trafficUsed,
-		TrafficQuota: a.trafficQuota,
-		Exceeded:     a.exceeded,
-		Running:      a.mgr.Running(),
-		FrpcFound:    a.mgr.Available(),
-		FrpcPath:     a.mgr.ExePath(),
-		AutoStart:    a.cfg.AutoStart,
+		ServerURL:      a.cfg.ServerURL,
+		ServerFixed:    serverFixed(),
+		NeedsServerURL: !serverFixed() && a.cfg.ServerURL == "",
+		LoggedIn:       a.cfg.APIKey != "",
+		Username:       a.username,
+		APIKeyMask:     a.apiKeyMask,
+		GatewayHost:    a.gatewayHost,
+		GatewayPort:    a.gatewayPort,
+		TunnelDomain:   a.tunnelDomain,
+		Tunnels:        a.tunnels,
+		TrafficUsed:    a.trafficUsed,
+		TrafficQuota:   a.trafficQuota,
+		Exceeded:       a.exceeded,
+		Running:        a.mgr.Running(),
+		FrpcFound:      a.mgr.Available(),
+		FrpcPath:       a.mgr.ExePath(),
+		AutoStart:      a.cfg.AutoStart,
+	}
+	// 构建注入了地址时，界面上始终展示它，而不是本地残留的旧值。
+	if fixed := defaultServerURL(); fixed != "" {
+		state.ServerURL = fixed
 	}
 	if p, err := frpcConfigPath(); err == nil {
 		state.ConfigPath = p
@@ -138,67 +165,102 @@ func (a *App) GetState() State {
 	return state
 }
 
-// ---- 登录与配置同步 ----
-
-type loginPayload struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
+// ---- 接入与配置同步 ----
 
 type clientInfo struct {
 	ServerAddr   string `json:"server_addr"`
 	ServerPort   int    `json:"server_port"`
 	User         string `json:"user"`
-	Token        string `json:"token"`
 	TunnelDomain string `json:"tunnel_domain"`
-}
-
-type clientAuthData struct {
-	Client clientInfo `json:"client"`
-	Config string     `json:"config"`
 }
 
 type clientInfoData struct {
 	clientInfo
+	Username     string     `json:"username"`
+	Nickname     string     `json:"nickname"`
 	Tunnels      []TunnelVO `json:"tunnels"`
 	TrafficUsed  int64      `json:"traffic_used"`
 	TrafficQuota int64      `json:"traffic_quota"`
 	Exceeded     bool       `json:"exceeded"`
 }
 
-// Login 使用账号密码换取客户端接入凭据，并保存下发的 frpc 配置。
-func (a *App) Login(serverURL, username, password string) (State, error) {
-	base, err := normalizeServerURL(serverURL)
-	if err != nil {
+// serverBase 返回本次运行使用的服务端地址：构建注入的优先。
+func (a *App) serverBase() string {
+	if base := defaultServerURL(); base != "" {
+		return base
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimRight(a.cfg.ServerURL, "/")
+}
+
+// Connect 使用 API Key 接入平台。
+//
+// 用户只需要粘贴一个 Key，其余全部自动完成：
+//   - 服务端地址：构建时注入，不需要填；
+//   - 账号信息：由服务端下发，不需要填；
+//   - frpc 接入凭据：服务端生成在配置文件里，不需要填。
+//
+// serverURL 仅在构建未注入地址时使用（本地调试构建）。
+func (a *App) Connect(apiKey, serverURL string) (State, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return a.GetState(), errors.New("请填写 API Key")
+	}
+
+	base := defaultServerURL()
+	if base == "" {
+		var err error
+		base, err = normalizeServerURL(serverURL)
+		if err != nil {
+			return a.GetState(), err
+		}
+	}
+
+	// 先用 info 接口验证 Key 是否有效，同时拿到账号信息。
+	var info clientInfoData
+	if err := a.getJSON(base+"/api/user/client/info", apiKey, &info); err != nil {
 		return a.GetState(), err
 	}
 
-	var data clientAuthData
-	err = a.postJSON(base+"/api/user/client/auth", "", loginPayload{Username: username, Password: password}, &data)
-	if err != nil {
+	// 再拉取服务端生成的 frpc.toml（内含每用户独立的接入凭据）。
+	var cfgText string
+	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err != nil {
+		return a.GetState(), err
+	}
+	if strings.TrimSpace(cfgText) == "" {
+		return a.GetState(), errors.New("服务端未返回客户端配置，请先在控制台创建隧道")
+	}
+	if err := writeFrpcConfig(cfgText); err != nil {
 		return a.GetState(), err
 	}
 
-	if err := writeFrpcConfig(data.Config); err != nil {
-		return a.GetState(), err
+	username := info.Username
+	if username == "" {
+		username = info.Nickname
 	}
 
 	a.mu.Lock()
+	a.cfg.APIKey = apiKey
 	a.cfg.ServerURL = base
-	a.cfg.Token = data.Client.Token
-	a.cfg.Username = username
-	a.gatewayHost = data.Client.ServerAddr
-	a.gatewayPort = data.Client.ServerPort
-	a.tunnelDomain = data.Client.TunnelDomain
+	a.username = username
+	a.apiKeyMask = maskKey(apiKey)
+	a.gatewayHost = info.ServerAddr
+	a.gatewayPort = info.ServerPort
+	a.tunnelDomain = info.TunnelDomain
+	a.tunnels = info.Tunnels
+	a.trafficUsed = info.TrafficUsed
+	a.trafficQuota = info.TrafficQuota
+	a.exceeded = info.Exceeded
 	a.lastError = ""
+	if a.tunnels == nil {
+		a.tunnels = []TunnelVO{}
+	}
 	a.mu.Unlock()
 
 	if err := saveConfig(a.cfg); err != nil {
 		return a.GetState(), err
 	}
-
-	// 拉一次隧道清单，登录后立即展示。
-	_, _ = a.Refresh()
 	return a.GetState(), nil
 }
 
@@ -207,8 +269,10 @@ func (a *App) Logout() State {
 	_ = a.mgr.Stop()
 
 	a.mu.Lock()
-	a.cfg.Token = ""
-	a.cfg.Username = ""
+	a.cfg.APIKey = ""
+	a.cfg.ServerURL = ""
+	a.username = ""
+	a.apiKeyMask = ""
 	a.tunnels = nil
 	a.gatewayHost = ""
 	a.gatewayPort = 0
@@ -224,22 +288,24 @@ func (a *App) Logout() State {
 
 // Refresh 从服务端同步隧道清单与最新配置。
 func (a *App) Refresh() (State, error) {
+	base := a.serverBase()
+
 	a.mu.RLock()
-	base, token := a.cfg.ServerURL, a.cfg.Token
+	apiKey := a.cfg.APIKey
 	a.mu.RUnlock()
 
-	if base == "" || token == "" {
-		return a.GetState(), errors.New("尚未登录")
+	if base == "" || apiKey == "" {
+		return a.GetState(), errors.New("尚未接入")
 	}
 
 	var data clientInfoData
-	if err := a.getJSON(base+"/api/user/client/info", token, &data); err != nil {
+	if err := a.getJSON(base+"/api/user/client/info", apiKey, &data); err != nil {
 		return a.GetState(), err
 	}
 
 	// 同时刷新 frpc.toml，保证新增/删除隧道后本地配置同步。
 	var cfgText string
-	if err := a.getRaw(base+"/api/user/client/config", token, &cfgText); err == nil && cfgText != "" {
+	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err == nil && cfgText != "" {
 		_ = writeFrpcConfig(cfgText)
 	}
 
@@ -251,6 +317,9 @@ func (a *App) Refresh() (State, error) {
 	a.trafficUsed = data.TrafficUsed
 	a.trafficQuota = data.TrafficQuota
 	a.exceeded = data.Exceeded
+	if data.Username != "" {
+		a.username = data.Username
+	}
 	if a.tunnels == nil {
 		a.tunnels = []TunnelVO{}
 	}
@@ -267,17 +336,19 @@ func (a *App) Refresh() (State, error) {
 
 // StartClient 写入最新配置并启动 frpc。
 func (a *App) StartClient() error {
+	base := a.serverBase()
+
 	a.mu.RLock()
-	base, token := a.cfg.ServerURL, a.cfg.Token
+	apiKey := a.cfg.APIKey
 	a.mu.RUnlock()
 
-	if token == "" {
-		return errors.New("请先登录")
+	if apiKey == "" {
+		return errors.New("请先使用 API Key 接入")
 	}
 
 	// 启动前先同步一次配置，避免使用过期隧道列表。
 	var cfgText string
-	if err := a.getRaw(base+"/api/user/client/config", token, &cfgText); err == nil && cfgText != "" {
+	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err == nil && cfgText != "" {
 		if err := writeFrpcConfig(cfgText); err != nil {
 			return err
 		}
@@ -377,18 +448,6 @@ func normalizeServerURL(raw string) (string, error) {
 
 func (a *App) getJSON(endpoint, token string, out any) error {
 	body, err := a.do(http.MethodGet, endpoint, token, nil)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, out)
-}
-
-func (a *App) postJSON(endpoint, token string, payload any, out any) error {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	body, err := a.do(http.MethodPost, endpoint, token, raw)
 	if err != nil {
 		return err
 	}

@@ -9,8 +9,13 @@ const isWails = typeof window !== 'undefined' && !!window.go?.main?.App
 
 const emptyState = {
   server_url: '',
+  // server_fixed：地址由构建注入，界面不提供修改入口
+  server_fixed: false,
+  // needs_server_url：构建未注入地址，需要手填（仅本地调试构建）
+  needs_server_url: false,
   logged_in: false,
   username: '',
+  api_key_mask: '',
   gateway_host: '',
   gateway_port: 0,
   tunnel_domain: '',
@@ -26,16 +31,52 @@ const emptyState = {
 }
 
 /** 浏览器内预览时使用的假实现，方便纯前端调试样式。 */
+const mockConnectedState = {
+  ...emptyState,
+  server_url: 'https://demo.invalid',
+  server_fixed: true,
+  logged_in: true,
+  username: 'demo',
+  api_key_mask: 'lt_demo123456********',
+  gateway_host: 'demo.invalid',
+  gateway_port: 7001,
+  frpc_found: true,
+  tunnels: [
+    {
+      id: 1,
+      name: 'mc-server',
+      type: 'tcp',
+      local_ip: '127.0.0.1',
+      local_port: 25565,
+      public_addr: 'demo.invalid:20001',
+      status: 'enabled',
+      online: true,
+      traffic_used: 1073741824,
+      bandwidth_limit_str: '不限速'
+    },
+    {
+      id: 2,
+      name: 'nas',
+      type: 'tcp',
+      local_ip: '192.168.1.10',
+      local_port: 5000,
+      public_addr: 'demo.invalid:20002',
+      status: 'enabled',
+      online: false,
+      traffic_used: 52428800,
+      bandwidth_limit_str: '5 MB/s'
+    }
+  ]
+}
+
 const mock = {
   GetState: async () => emptyState,
-  Login: async () => {
-    throw new Error('当前为浏览器预览模式，请在桌面客户端中登录')
-  },
+  Connect: async () => mockConnectedState,
   Logout: async () => emptyState,
-  Refresh: async () => emptyState,
+  Refresh: async () => mockConnectedState,
   StartClient: async () => {},
   StopClient: async () => {},
-  GetLogs: async () => [],
+  GetLogs: async () => ['[mock] 当前为浏览器预览模式，未连接真实服务端'],
   ClearLogs: async () => {},
   SetAutoStart: async () => {},
   OpenDataDir: async () => ''
@@ -45,7 +86,8 @@ const go = isWails ? window.go.main.App : mock
 
 export const api = {
   getState: () => go.GetState(),
-  login: (server, username, password) => go.Login(server, username, password),
+  // 只用 API Key 接入；地址由构建注入，未注入时才用第二个参数
+  connect: (apiKey, serverUrl) => go.Connect(apiKey, serverUrl),
   logout: () => go.Logout(),
   refresh: () => go.Refresh(),
   start: () => go.StartClient(),

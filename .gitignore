@@ -50,3 +50,8 @@ deploy/caddy/data/
 deploy/caddy/config/
 deploy/data/
 deploy/letsencrypt/
+
+# ===== 本地取用的发布产物 =====
+# 从 GitHub Release 下载下来验证/试用的安装包，体积大且每次可重新获取
+LiteTunnel-*.zip
+litetunnel-deploy.zip

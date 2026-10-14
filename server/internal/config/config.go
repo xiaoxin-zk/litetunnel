@@ -1,12 +1,18 @@
 // Package config 负责集中加载运行期配置。
 //
-// 安全约定：本项目所有与部署环境相关的值（公网 IP、域名、密钥）一律通过
-// 环境变量注入，源码与默认值中不得出现任何真实地址。
+// 安全约定：
+//  1. 所有与部署环境相关的值（公网 IP、域名、密钥）一律通过环境变量注入，
+//     源码与默认值中不得出现任何真实地址或可用密钥。
+//  2. 非生产环境缺失密钥时**随机生成**，绝不使用硬编码默认值：
+//     否则源码公开后，任何以默认环境变量启动的实例都能被伪造令牌接管。
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -72,6 +78,15 @@ type Config struct {
 
 	UserJWTExpire  time.Duration
 	AdminJWTExpire time.Duration
+
+	// ---- 以下字段在 Load 时填充，供 main 输出启动提示 ----
+
+	// GeneratedSecrets 记录本次启动随机生成的密钥名，值为空说明来自环境变量。
+	GeneratedSecrets []string
+	// EphemeralAdminPassword 仅在未提供初始管理员密码时生成，重启即失效。
+	EphemeralAdminPassword bool
+	// Warnings 收集非致命的配置风险提示。
+	Warnings []string
 }
 
 // Load 从环境变量装载配置并做必要校验。
@@ -107,17 +122,23 @@ func Load() (*Config, error) {
 		PortRangeEnd:    envInt("LT_PORT_RANGE_END", 30000),
 		MaxPortsPerUser: envInt("LT_MAX_PORTS_PER_USER", 10),
 
-		TunnelDomain:  strings.ToLower(strings.TrimSpace(env("LT_TUNNEL_DOMAIN", ""))),
+		TunnelDomain: strings.ToLower(strings.TrimSpace(env("LT_TUNNEL_DOMAIN", ""))),
+
 		ClientDistDir: env("LT_CLIENT_DIST_DIR", "./data/clients"),
-		UserWebDir:     env("LT_USER_WEB_DIR", "./web/user/dist"),
-		AdminWebDir:    env("LT_ADMIN_WEB_DIR", "./web/admin/dist"),
-		TrustedProxies: splitCSV(env("LT_TRUSTED_PROXIES", "127.0.0.1,::1")),
+		UserWebDir:    env("LT_USER_WEB_DIR", "./web/user/dist"),
+		AdminWebDir:   env("LT_ADMIN_WEB_DIR", "./web/admin/dist"),
+		TrustedProxies: splitCSV(
+			env("LT_TRUSTED_PROXIES", "127.0.0.1,::1"),
+		),
 
 		TrafficPollInterval: time.Duration(envInt("LT_TRAFFIC_POLL_INTERVAL", 30)) * time.Second,
 		UserJWTExpire:       12 * time.Hour,
 		AdminJWTExpire:      4 * time.Hour,
 	}
 
+	if err := c.fillDefaults(); err != nil {
+		return nil, err
+	}
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -126,6 +147,59 @@ func Load() (*Config, error) {
 
 // IsProd 返回是否生产环境。
 func (c *Config) IsProd() bool { return c.Env == "production" }
+
+// fillDefaults 为非生产环境补齐缺失项。
+//
+// 关键点：这里**不使用硬编码密钥**，而是每次启动随机生成。
+// 否则源码公开后，任何用默认环境变量启动的实例都能被伪造令牌接管。
+func (c *Config) fillDefaults() error {
+	if c.IsProd() {
+		return nil
+	}
+
+	gen := func(target *string, name string) error {
+		if *target != "" {
+			return nil
+		}
+		v, err := randomHex(32)
+		if err != nil {
+			return err
+		}
+		*target = v
+		c.GeneratedSecrets = append(c.GeneratedSecrets, name)
+		return nil
+	}
+
+	if err := gen(&c.UserJWTSecret, "LT_USER_JWT_SECRET"); err != nil {
+		return err
+	}
+	if err := gen(&c.AdminJWTSecret, "LT_ADMIN_JWT_SECRET"); err != nil {
+		return err
+	}
+	if err := gen(&c.APIKeyEncKey, "LT_APIKEY_ENC_KEY"); err != nil {
+		return err
+	}
+	if c.BootstrapAdminPassword == "" {
+		v, err := randomHex(12)
+		if err != nil {
+			return err
+		}
+		c.BootstrapAdminPassword = v
+		c.EphemeralAdminPassword = true
+	}
+	if c.GatewayHost == "" {
+		c.GatewayHost = "127.0.0.1"
+	}
+	if c.FrpsToken == "" {
+		v, err := randomHex(32)
+		if err != nil {
+			return err
+		}
+		c.FrpsToken = v
+		c.GeneratedSecrets = append(c.GeneratedSecrets, "LT_FRPS_TOKEN")
+	}
+	return nil
+}
 
 func (c *Config) validate() error {
 	if c.DBDriver != "sqlite" && c.DBDriver != "postgres" {
@@ -138,27 +212,32 @@ func (c *Config) validate() error {
 		return errors.New("端口池起始端口不得低于 1024（禁止占用特权端口）")
 	}
 
+	// 转发头信任范围必须显式收窄，否则客户端可伪造来源 IP 绕过限流与白名单。
+	for _, p := range c.TrustedProxies {
+		if isTrustAll(p) {
+			return fmt.Errorf("LT_TRUSTED_PROXIES 不允许配置 %q：那会让任意客户端伪造来源 IP", p)
+		}
+	}
+	for _, p := range c.FrpsPluginAllowCIDRs {
+		if isTrustAll(p) {
+			return fmt.Errorf("LT_FRPS_PLUGIN_ALLOW_CIDR 不允许配置 %q：插件回调等同于最高权限接口", p)
+		}
+	}
+
 	if !c.IsProd() {
-		// 开发环境放宽，使用可复现的默认值，便于本地调试。
-		if c.UserJWTSecret == "" {
-			c.UserJWTSecret = "dev-user-secret-do-not-use-in-prod"
+		// 非生产环境只做风险提示，不阻断启动，便于本地调试。
+		if isPublicBind(c.UserAddr) {
+			c.Warnings = append(c.Warnings,
+				fmt.Sprintf("当前为非生产环境且用户侧监听在 %s，任何人都可能访问；请勿用于公网", c.UserAddr))
 		}
-		if c.AdminJWTSecret == "" {
-			c.AdminJWTSecret = "dev-admin-secret-do-not-use-in-prod"
-		}
-		if c.APIKeyEncKey == "" {
-			c.APIKeyEncKey = "dev-apikey-key-00000000000000000000"
-		}
-		if c.BootstrapAdminPassword == "" {
-			c.BootstrapAdminPassword = "admin12345"
-		}
-		if c.GatewayHost == "" {
-			c.GatewayHost = "127.0.0.1"
+		if isPublicBind(c.AdminAddr) {
+			c.Warnings = append(c.Warnings,
+				fmt.Sprintf("当前为非生产环境且管理后台监听在 %s；请勿用于公网", c.AdminAddr))
 		}
 		return nil
 	}
 
-	// 生产环境强制校验，避免带着占位符上线。
+	// ---- 生产环境强制校验，避免带着占位符上线 ----
 	var missing []string
 	require := func(name, v string) {
 		if v == "" || strings.HasPrefix(v, placeholderPrefix) {
@@ -172,12 +251,12 @@ func (c *Config) validate() error {
 	require("LT_GATEWAY_HOST", c.GatewayHost)
 	require("LT_FRPS_TOKEN", c.FrpsToken)
 	require("LT_FRPS_API_PASSWORD", c.FrpsAPIPassword)
-	if len(c.FrpsPluginAllowCIDRs) == 0 {
-		missing = append(missing, "LT_FRPS_PLUGIN_ALLOW_CIDR")
-	}
 
 	if len(missing) > 0 {
 		return fmt.Errorf("生产环境缺少或仍为占位符的配置项: %s", strings.Join(missing, ", "))
+	}
+	if len(c.FrpsPluginAllowCIDRs) == 0 {
+		return errors.New("生产环境必须显式配置 LT_FRPS_PLUGIN_ALLOW_CIDR")
 	}
 	if c.UserJWTSecret == c.AdminJWTSecret {
 		return errors.New("用户域与管理域必须使用不同的 JWT 密钥")
@@ -188,10 +267,48 @@ func (c *Config) validate() error {
 	if len(c.APIKeyEncKey) != 32 && len(c.APIKeyEncKey) != 64 {
 		return errors.New("LT_APIKEY_ENC_KEY 需为 32 或 64 个字符（AES-128/256 密钥）")
 	}
-	if strings.HasPrefix(c.AdminAddr, "0.0.0.0") || strings.HasPrefix(c.AdminAddr, ":") {
-		return errors.New("生产环境禁止将管理后台监听在 0.0.0.0，请使用 127.0.0.1:port 并通过本机反代访问")
+	// 管理后台必须只监听回环。用 SplitHostPort 解析而非前缀匹配，
+	// 否则 [::]:8443 这类 IPv6 通配写法会绕过检查。
+	if isPublicBind(c.AdminAddr) {
+		return fmt.Errorf("生产环境禁止将管理后台监听在 %s，请使用 127.0.0.1:port 并通过本机反代或 VPN 访问", c.AdminAddr)
 	}
 	return nil
+}
+
+// isPublicBind 判断监听地址是否对外暴露。
+// 解析失败一律按「危险」处理，避免畸形地址绕过校验。
+func isPublicBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return true
+	}
+	if host == "" {
+		return true
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// 非 IP 的主机名一律视为对外暴露
+		return true
+	}
+	return !ip.IsLoopback()
+}
+
+// isTrustAll 判断网段是否等价于「信任所有来源」。
+func isTrustAll(cidr string) bool {
+	cidr = strings.TrimSpace(cidr)
+	switch cidr {
+	case "0.0.0.0/0", "::/0", "0.0.0.0", "::", "*", "any":
+		return true
+	}
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	ones, bits := n.Mask.Size()
+	return ones == 0 && bits > 0
 }
 
 func env(key, def string) string {
@@ -219,4 +336,12 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func randomHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }

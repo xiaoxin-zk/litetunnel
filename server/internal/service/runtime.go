@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -43,17 +44,72 @@ type Runtime struct {
 	online   map[uint]bool          // tunnelID -> 是否在线
 	lastStat map[string]trafficPair // frp 代理全名 -> 上次采样的当日累计值
 	touchAt  map[string]time.Time   // runID -> 上次会话落库时间（节流用）
+
+	identities map[identityKey]identityState // 账号有效性短缓存
+}
+
+// 账号有效性缓存的命名空间。
+const (
+	IdentityKindUser  uint8 = 1
+	IdentityKindAdmin uint8 = 2
+)
+
+// identityTTL 是账号有效性缓存的存活时间。
+//
+// 每次请求都查库能保证「禁用立即生效」，但 SQLite 单写者模型下会成为瓶颈。
+// 10 秒的窗口在安全性与吞吐之间取得平衡：账号被禁用后最多 10 秒令牌失效，
+// 同时把每请求一次查询降为每个账号每 10 秒一次。
+const identityTTL = 10 * time.Second
+
+type identityKey struct {
+	kind uint8
+	id   uint
+}
+
+type identityState struct {
+	active bool
+	at     time.Time
 }
 
 // NewRuntime 构造内存态。
 func NewRuntime() *Runtime {
 	return &Runtime{
-		sessions: make(map[string]sessionInfo),
-		exceeded: make(map[uint]bool),
-		online:   make(map[uint]bool),
-		lastStat: make(map[string]trafficPair),
-		touchAt:  make(map[string]time.Time),
+		sessions:   make(map[string]sessionInfo),
+		exceeded:   make(map[uint]bool),
+		online:     make(map[uint]bool),
+		lastStat:   make(map[string]trafficPair),
+		touchAt:    make(map[string]time.Time),
+		identities: make(map[identityKey]identityState),
 	}
+}
+
+// CachedIdentity 读取账号有效性缓存。
+func (r *Runtime) CachedIdentity(kind uint8, id uint) (bool, bool) {
+	key := identityKey{kind: kind, id: id}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	st, ok := r.identities[key]
+	if !ok || time.Since(st.at) > identityTTL {
+		return false, false
+	}
+	return st.active, true
+}
+
+// SetCachedIdentity 写入账号有效性缓存。
+func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool) {
+	key := identityKey{kind: kind, id: id}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.identities[key] = identityState{active: active, at: time.Now()}
+}
+
+// InvalidateIdentity 立即失效某个账号的缓存。
+// 禁用 / 删除账号时必须调用，否则最长会有 identityTTL 的生效延迟。
+func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
+	key := identityKey{kind: kind, id: id}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.identities, key)
 }
 
 // ShouldTouch 判断某会话是否已达到落库节流间隔。
@@ -79,6 +135,32 @@ func (s *Services) TouchClientSession(runID string) {
 	}
 	_ = s.DB.Model(&model.ClientSession{}).Where("run_id = ?", runID).
 		Updates(map[string]any{"online": true, "last_seen_at": time.Now()}).Error
+}
+
+// sessionTrustWindow 是数据库会话被视为可信的最长时间。
+// 超过该窗口说明客户端已长时间无心跳，必须重新完成凭据校验。
+const sessionTrustWindow = 10 * time.Minute
+
+// FindTrustedClientSession 按 runID 查找一个「确实完成过认证」的会话。
+//
+// 这是服务端插件在内存缓存未命中时的唯一回落依据：
+// 会话表只在 Login 通过每用户凭据校验后写入，因此这里的结果可以信任。
+func (s *Services) FindTrustedClientSession(runID string) (*model.ClientSession, error) {
+	if runID == "" {
+		return nil, ErrNotFound
+	}
+	var sess model.ClientSession
+	err := s.DB.Where("run_id = ? AND online = ?", runID, true).First(&sess).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if time.Since(sess.LastSeenAt) > sessionTrustWindow {
+		return nil, ErrNotFound
+	}
+	return &sess, nil
 }
 
 // MarkStaleSessionsOffline 把长时间未上报心跳的会话标记为离线。

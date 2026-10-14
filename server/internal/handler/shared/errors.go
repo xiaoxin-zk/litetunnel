@@ -3,13 +3,47 @@ package shared
 
 import (
 	"errors"
+	"fmt"
 	"log"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
+
+// LoginLockScope 用于区分用户域与管理域的锁定计数，两者互不影响。
+const (
+	LoginLockScopeUser  = "user"
+	LoginLockScopeAdmin = "admin"
+)
+
+// CheckLoginLock 检查账号是否处于登录锁定期。
+//
+// 与按 IP 的令牌桶互补：令牌桶挡不住代理池对单一账号的慢速爆破，
+// 账号级指数退避锁定可以。返回 false 时已写出响应，调用方直接 return。
+func CheckLoginLock(c *gin.Context, g *middleware.LoginGuard, scope, account string) bool {
+	ok, wait := g.Check(scope, account)
+	if ok {
+		return true
+	}
+	minutes := int(wait.Minutes()) + 1
+	httpx.Fail(c, http.StatusTooManyRequests,
+		fmt.Sprintf("该账号因连续登录失败已被临时锁定，请约 %d 分钟后重试", minutes))
+	return false
+}
+
+// LoginFailed 记录一次登录失败。
+func LoginFailed(g *middleware.LoginGuard, scope, account string) {
+	g.Fail(scope, account)
+}
+
+// LoginSucceeded 清除该账号的失败记录。
+func LoginSucceeded(g *middleware.LoginGuard, scope, account string) {
+	g.Reset(scope, account)
+}
 
 // Fail 把业务错误统一映射为 HTTP 响应。
 //

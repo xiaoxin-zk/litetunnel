@@ -163,8 +163,9 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Delete(&model.User{}, id).Error; err != nil {
 			return err
 		}
-		// 内存态同步清理，避免已删除用户仍占用超额标记。
+		// 内存态同步清理，避免已删除用户仍占用超额标记或身份缓存。
 		s.Runtime.SetQuotaExceeded(id, false)
+		s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 		return nil
 	})
 }
@@ -183,6 +184,8 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
+	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
+	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	// 被封禁的用户需要立刻停止放行流量。
 	if status != model.UserStatusActive {
 		s.Runtime.SetQuotaExceeded(id, true)

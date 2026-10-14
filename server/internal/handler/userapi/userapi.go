@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,10 +27,18 @@ import (
 // Handler 用户控制台处理器。
 type Handler struct {
 	svc *service.Services
+	// guard 按账号维度锁定连续登录失败，抵御代理池对单一账号的慢速爆破。
+	guard *middleware.LoginGuard
 }
 
 // New 构造处理器。
-func New(svc *service.Services) *Handler { return &Handler{svc: svc} }
+func New(svc *service.Services) *Handler {
+	return &Handler{
+		svc: svc,
+		// 连续失败 5 次开始锁定，首次 15 分钟，之后逐次翻倍，上限 24 小时。
+		guard: middleware.NewLoginGuard(5, 15*time.Minute, 24*time.Hour),
+	}
+}
 
 // ---- 认证 ----
 
@@ -71,11 +80,20 @@ func (h *Handler) Login(c *gin.Context) {
 		httpx.BadRequest(c, "请填写用户名与密码")
 		return
 	}
+
+	account := strings.ToLower(strings.TrimSpace(req.Username))
+	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
+		return
+	}
+
 	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
 	if err != nil {
+		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
 		shared.Fail(c, err)
 		return
 	}
+	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
+
 	token, expireAt, err := auth.Issue(
 		h.svc.Cfg.UserJWTSecret, auth.DomainUser,
 		u.ID, u.Username, "", h.svc.Cfg.UserJWTExpire,
@@ -170,17 +188,28 @@ type clientAuthReq struct {
 }
 
 // ClientAuth 供桌面客户端首次登录使用，直接返回可用的接入信息与完整配置。
+//
+// 这是与网页登录等价的密码校验入口，必须套用同样的账号锁定策略，
+// 否则攻击者可以绕过网页端的锁定直接从客户端接口爆破。
 func (h *Handler) ClientAuth(c *gin.Context) {
 	var req clientAuthReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		httpx.BadRequest(c, "请填写用户名与密码")
 		return
 	}
+
+	account := strings.ToLower(strings.TrimSpace(req.Username))
+	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
+		return
+	}
+
 	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
 	if err != nil {
+		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
 		shared.Fail(c, err)
 		return
 	}
+	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
 	tunnels, err := h.svc.ListTunnels(u.ID)
 	if err != nil {
 		shared.Fail(c, err)

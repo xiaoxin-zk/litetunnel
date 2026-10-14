@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,10 +24,18 @@ import (
 // Handler 管理后台处理器。
 type Handler struct {
 	svc *service.Services
+	// guard 按账号维度锁定连续登录失败。管理后台权限最高，锁定策略更严格。
+	guard *middleware.LoginGuard
 }
 
 // New 构造处理器。
-func New(svc *service.Services) *Handler { return &Handler{svc: svc} }
+func New(svc *service.Services) *Handler {
+	return &Handler{
+		svc: svc,
+		// 连续失败 3 次开始锁定，首次 30 分钟，上限 24 小时。
+		guard: middleware.NewLoginGuard(3, 30*time.Minute, 24*time.Hour),
+	}
+}
 
 // audit 记录一次管理操作。所有写操作都必须调用。
 func (h *Handler) audit(c *gin.Context, action, target, targetID, detail string) {
@@ -48,13 +57,22 @@ func (h *Handler) Login(c *gin.Context) {
 		httpx.BadRequest(c, "请填写用户名与密码")
 		return
 	}
+	account := strings.ToLower(strings.TrimSpace(req.Username))
+	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeAdmin, account) {
+		// 锁定期间同样留痕，便于发现持续爆破。
+		h.svc.WriteAudit(0, req.Username, "admin.login_locked", "admin", "", "账号处于登录锁定期", httpx.ClientIP(c))
+		return
+	}
+
 	a, err := h.svc.AdminAuthenticate(req.Username, req.Password, httpx.ClientIP(c))
 	if err != nil {
+		shared.LoginFailed(h.guard, shared.LoginLockScopeAdmin, account)
 		// 管理员登录失败同样写入审计，便于发现暴力破解。
 		h.svc.WriteAudit(0, req.Username, "admin.login_failed", "admin", "", "密码错误", httpx.ClientIP(c))
 		shared.Fail(c, err)
 		return
 	}
+	shared.LoginSucceeded(h.guard, shared.LoginLockScopeAdmin, account)
 	token, expireAt, err := auth.Issue(
 		h.svc.Cfg.AdminJWTSecret, auth.DomainAdmin,
 		a.ID, a.Username, a.Role, h.svc.Cfg.AdminJWTExpire,

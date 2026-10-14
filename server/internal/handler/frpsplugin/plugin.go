@@ -212,36 +212,50 @@ func (h *Handler) Handle(c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
-// resolveUser 依据 frp 的 user 字段定位平台账号，并优先使用会话缓存。
+// resolveUser 依据 frp 的 user / run_id 定位平台账号。
 //
-// 会话缺失时回落到数据库查询：这样即使控制面重启导致内存会话清空，
-// 已连接的客户端也不会被误拒。
+// 安全要求：run_id 是**唯一**的身份依据，客户端自报的 user 字段只用于交叉核对。
+// 会话必须来自「已通过每用户凭据校验」的来源，否则拒绝。
+//
+// 回落顺序：
+//  1. 内存会话缓存（由 onLogin 在凭据校验通过后写入）；
+//  2. 数据库会话表（同样只在凭据校验通过后写入，用于控制面重启后的平滑过渡）。
+//
+// 绝不能仅凭 frpUser 就查库放行：那等于绕过了 Login 的凭据校验，
+// 任何人只要知道目标用户名与全局 token 就能冒充该用户。
 func (h *Handler) resolveUser(frpUser, runID string) (*model.User, bool) {
 	username, ok := service.UsernameFromFrpUser(frpUser)
-	if !ok {
+	if !ok || runID == "" {
 		return nil, false
 	}
 
-	if runID != "" {
-		if s, ok := h.svc.Runtime.LookupSession(runID); ok {
-			if s.Username != username {
-				return nil, false
-			}
-			u, err := h.svc.LoadUser(s.UserID)
-			if err != nil {
-				return nil, false
-			}
-			return u, true
+	// 1) 内存会话
+	if s, ok := h.svc.Runtime.LookupSession(runID); ok {
+		if s.Username != username {
+			log.Printf("[plugin] run_id %s 的用户不匹配（声称 %s，实际 %s），已拒绝", runID, username, s.Username)
+			return nil, false
 		}
+		u, err := h.svc.LoadUser(s.UserID)
+		if err != nil {
+			return nil, false
+		}
+		return u, true
 	}
 
-	u, err := h.svc.LoadUserByUsername(username)
+	// 2) 数据库会话
+	sess, err := h.svc.FindTrustedClientSession(runID)
 	if err != nil {
 		return nil, false
 	}
-	if runID != "" {
-		h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if sess.Username != username {
+		log.Printf("[plugin] run_id %s 的用户不匹配（声称 %s，实际 %s），已拒绝", runID, username, sess.Username)
+		return nil, false
 	}
+	u, err := h.svc.LoadUser(sess.UserID)
+	if err != nil {
+		return nil, false
+	}
+	h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
 	return u, true
 }
 
@@ -274,7 +288,7 @@ func (h *Handler) onLogin(req *request) response {
 	}
 
 	h.svc.Runtime.RecordLogin(content.RunID, u.ID, u.Username)
-	h.UpsertClientSession(u.ID, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
+	h.UpsertClientSession(u.ID, u.Username, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
 	return allow()
 }
 
@@ -411,27 +425,33 @@ func (h *Handler) onNewUserConn(req *request) response {
 // ---- 会话落库 ----
 
 // UpsertClientSession 记录/更新一次客户端登录会话。
-func (h *Handler) UpsertClientSession(userID uint, runID, addr, version, osName, arch string) {
+//
+// 只有 onLogin 在凭据校验通过后才会调用本方法，
+// 因此该表是后续插件回调判断身份可信度的唯一依据。
+func (h *Handler) UpsertClientSession(userID uint, username, runID, addr, version, osName, arch string) {
 	if runID == "" {
 		return
 	}
+	now := time.Now()
 	s := model.ClientSession{
 		UserID:     userID,
+		Username:   username,
 		RunID:      runID,
 		Addr:       addr,
 		Version:    version,
 		OS:         osName,
 		Arch:       arch,
 		Online:     true,
-		LastSeenAt: time.Now(),
+		LastSeenAt: now,
 	}
 	h.svc.DB.Where("run_id = ?", runID).Assign(map[string]any{
 		"user_id":      userID,
+		"username":     username,
 		"addr":         addr,
 		"version":      version,
 		"os":           osName,
 		"arch":         arch,
 		"online":       true,
-		"last_seen_at": time.Now(),
+		"last_seen_at": now,
 	}).FirstOrCreate(&s)
 }

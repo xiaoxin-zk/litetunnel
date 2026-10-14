@@ -126,6 +126,47 @@ func (s *Services) EnsureTrafficPeriod(u *model.User) {
 	}).Error
 }
 
+// ResolveCredential 把长期凭据解析为身份，供桌面客户端使用。
+//
+// 依次尝试 API Key（SHA-256 摘要比对）与客户端接入凭据（常量时间比对）。
+// 两者都可独立吊销，因此客户端无需在本地保存账号密码。
+func (s *Services) ResolveCredential(plain string) (uint, string, error) {
+	if plain == "" {
+		return 0, "", ErrNotFound
+	}
+	if u, err := s.LoadUserByAPIKey(plain); err == nil {
+		return u.ID, u.Username, nil
+	}
+	if u, err := s.LoadUserByClientSecret(plain); err == nil {
+		return u.ID, u.Username, nil
+	}
+	return 0, "", ErrNotFound
+}
+
+// IsActiveUser 判断用户当前是否仍然有效（存在且未被禁用）。
+//
+// 用于每次请求时校验令牌持有者的实时状态：仅验签无法发现账号已被禁用。
+func (s *Services) IsActiveUser(id uint) bool {
+	if active, ok := s.Runtime.CachedIdentity(IdentityKindUser, id); ok {
+		return active
+	}
+	u, err := s.LoadUser(id)
+	active := err == nil && u.Status == model.UserStatusActive
+	s.Runtime.SetCachedIdentity(IdentityKindUser, id, active)
+	return active
+}
+
+// IsActiveAdmin 判断管理员当前是否仍然有效。
+func (s *Services) IsActiveAdmin(id uint) bool {
+	if active, ok := s.Runtime.CachedIdentity(IdentityKindAdmin, id); ok {
+		return active
+	}
+	a, err := s.LoadAdmin(id)
+	active := err == nil && a.Status == "active"
+	s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, active)
+	return active
+}
+
 // AllowedProtocols 解析分组允许的协议集合。
 func AllowedProtocols(g *model.Group) map[string]bool {
 	out := map[string]bool{}

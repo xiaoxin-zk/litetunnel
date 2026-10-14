@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -44,9 +45,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
-	if err := store.Seed(db, cfg, auth.HashPassword); err != nil {
+	createdAdmin, err := store.Seed(db, cfg, auth.HashPassword)
+	if err != nil {
 		log.Fatalf("初始数据播种失败: %v", err)
 	}
+	printStartupWarnings(cfg, createdAdmin)
 
 	svc := service.New(db, cfg)
 
@@ -87,6 +90,28 @@ func main() {
 	_ = userSrv.Shutdown(shutdownCtx)
 	_ = adminSrv.Shutdown(shutdownCtx)
 	log.Println("已退出")
+}
+
+// printStartupWarnings 输出启动期的安全提示。
+//
+// 非生产环境会自动生成随机密钥与初始密码，必须明确告知使用者：
+// 这些值重启即变，且该环境的安全校验是放宽的，绝不能用于公网。
+func printStartupWarnings(cfg *config.Config, createdAdmin bool) {
+	if len(cfg.GeneratedSecrets) > 0 {
+		log.Printf("【注意】以下密钥未通过环境变量提供，已随机生成（重启后失效）：%s",
+			strings.Join(cfg.GeneratedSecrets, ", "))
+	}
+	if cfg.EphemeralAdminPassword && createdAdmin {
+		log.Printf("【注意】初始管理员账号 %s，密码 %s（本次随机生成，重启后不再打印）",
+			cfg.BootstrapAdminUser, cfg.BootstrapAdminPassword)
+		log.Printf("【注意】请登录后立即修改密码")
+	}
+	for _, w := range cfg.Warnings {
+		log.Printf("【警告】%s", w)
+	}
+	if !cfg.IsProd() {
+		log.Printf("【警告】当前为 %s 环境，安全校验已放宽，请勿用于公网部署", cfg.Env)
+	}
 }
 
 // newServer 构造带安全超时的 HTTP 服务，避免慢连接耗尽资源。

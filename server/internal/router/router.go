@@ -7,7 +7,6 @@
 package router
 
 import (
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,8 +28,9 @@ func newEngine(cfg *config.Config) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.SecurityHeaders())
+	r.Use(middleware.LimitBodySize(middleware.MaxRequestBodyBytes))
 	r.Use(middleware.CORSDevOnly(cfg.IsProd()))
-	// 只信任反代地址的转发头，防止客户端伪造来源 IP。
+	// 只信任反代地址的转发头，防止客户端伪造来源 IP 绕过限流与白名单。
 	_ = r.SetTrustedProxies(cfg.TrustedProxies)
 	return r
 }
@@ -53,26 +53,17 @@ func NewUser(cfg *config.Config, svc *service.Services, h *userapi.Handler) *gin
 		auth.POST("/login", h.Login)
 	}
 
-	// 桌面客户端接入：同样限流，避免被当作密码爆破入口。
+	// 桌面客户端接入：同样是密码校验入口，必须同样限流 + 账号锁定。
 	clientPub := r.Group("/api/user/client")
 	clientPub.Use(middleware.Limit(authLimiter, "user-client-auth"))
 	{
 		clientPub.POST("/auth", h.ClientAuth)
 	}
 
-	// 桌面客户端接口：支持 JWT 或 API Key。
+	// 桌面客户端接口：支持 JWT 或长期凭据（API Key / 客户端接入凭据）。
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(apiLimiter, "user-client"))
-	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, func(plain string) (uint, string, error) {
-		// 依次尝试 API Key（哈希比对）与客户端接入凭据（桌面客户端持有）。
-		if u, err := svc.LoadUserByAPIKey(plain); err == nil {
-			return u.ID, u.Username, nil
-		}
-		if u, err := svc.LoadUserByClientSecret(plain); err == nil {
-			return u.ID, u.Username, nil
-		}
-		return 0, "", errors.New("凭据无效")
-	}))
+	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.IsActiveUser))
 	{
 		cli.GET("/info", h.ClientInfo)
 		cli.GET("/config", h.ClientConfig)
@@ -83,7 +74,7 @@ func NewUser(cfg *config.Config, svc *service.Services, h *userapi.Handler) *gin
 	// 用户控制台接口：只接受用户域 JWT。
 	api := r.Group("/api/user")
 	api.Use(middleware.Limit(apiLimiter, "user-api"))
-	api.Use(middleware.UserAuth(cfg.UserJWTSecret))
+	api.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.IsActiveUser))
 	{
 		api.GET("/profile", h.Profile)
 		api.POST("/logout", h.Logout)
@@ -131,7 +122,7 @@ func NewAdmin(cfg *config.Config, svc *service.Services, h *adminapi.Handler, pl
 
 	api := r.Group("/api/admin")
 	api.Use(middleware.Limit(apiLimiter, "admin-api"))
-	api.Use(middleware.AdminAuth(cfg.AdminJWTSecret))
+	api.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.IsActiveAdmin))
 	{
 		api.GET("/profile", h.Profile)
 		api.GET("/stats/overview", h.StatsOverview)
@@ -148,7 +139,7 @@ func NewAdmin(cfg *config.Config, svc *service.Services, h *adminapi.Handler, pl
 	// 写操作额外要求 super / operator 角色，auditor 只读。
 	write := r.Group("/api/admin")
 	write.Use(middleware.Limit(apiLimiter, "admin-write"))
-	write.Use(middleware.AdminAuth(cfg.AdminJWTSecret, "super", "operator"))
+	write.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.IsActiveAdmin, "super", "operator"))
 	{
 		write.POST("/users", h.CreateUser)
 		write.PUT("/users/:id", h.UpdateUser)

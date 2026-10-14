@@ -1,7 +1,8 @@
-// Package middleware 提供安全头、限流与双域鉴权中间件。
+// Package middleware 提供安全头、限流、请求体限制与双域鉴权中间件。
 package middleware
 
 import (
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -14,12 +15,16 @@ import (
 
 // 上下文键
 const (
-	CtxUserID   = "lt_user_id"
-	CtxUsername = "lt_username"
-	CtxAdminID  = "lt_admin_id"
+	CtxUserID    = "lt_user_id"
+	CtxUsername  = "lt_username"
+	CtxAdminID   = "lt_admin_id"
 	CtxAdminRole = "lt_admin_role"
 	CtxAdminName = "lt_admin_name"
 )
+
+// MaxRequestBodyBytes 是单个请求体的上限。
+// 不做限制时，攻击者可以用超大 JSON 耗尽内存。
+const MaxRequestBodyBytes = 1 << 20 // 1 MiB
 
 // SecurityHeaders 注入基础安全响应头。
 func SecurityHeaders() gin.HandlerFunc {
@@ -33,6 +38,16 @@ func SecurityHeaders() gin.HandlerFunc {
 		h.Set("Content-Security-Policy",
 			"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "+
 				"script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+		c.Next()
+	}
+}
+
+// LimitBodySize 限制请求体大小，防止内存耗尽型攻击。
+func LimitBodySize(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		}
 		c.Next()
 	}
 }
@@ -125,7 +140,7 @@ func Limit(rl *RateLimiter, scope string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := scope + "|" + c.ClientIP()
 		if !rl.Allow(key) {
-			httpx.Fail(c, 429, "请求过于频繁，请稍后再试")
+			httpx.Fail(c, http.StatusTooManyRequests, "请求过于频繁，请稍后再试")
 			return
 		}
 		c.Next()
@@ -134,18 +149,41 @@ func Limit(rl *RateLimiter, scope string) gin.HandlerFunc {
 
 // ---- 双域鉴权 ----
 
+// StatusResolver 由上层注入，用于在每次请求时确认主体是否仍然有效
+// （未被禁用 / 未被删除）。仅校验 JWT 签名是不够的：账号被禁用后，
+// 已签发的令牌在有效期内仍然能通过签名校验。
+type StatusResolver func(id uint) bool
+
+// extractToken 只从 Authorization 头读取令牌。
+//
+// 刻意不支持 ?token= 查询参数：URL 会进入访问日志、Referer 与浏览器历史，
+// 等同于把凭据明文写入日志。
 func extractToken(c *gin.Context) string {
-	if h := c.GetHeader("Authorization"); h != "" {
-		if after, ok := strings.CutPrefix(h, "Bearer "); ok {
-			return strings.TrimSpace(after)
-		}
+	h := c.GetHeader("Authorization")
+	if h == "" {
+		return ""
 	}
-	// 兜底：部分场景通过查询串传递（仅用于客户端下载等只读接口）
-	return strings.TrimSpace(c.Query("token"))
+	after, ok := strings.CutPrefix(h, "Bearer ")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(after)
+}
+
+// checkActive 统一处理「令牌有效但账号已失效」的情况。
+func checkActive(c *gin.Context, resolve StatusResolver, id uint) bool {
+	if resolve == nil {
+		return true
+	}
+	if !resolve(id) {
+		httpx.Unauthorized(c, "账号已被禁用或不存在，请重新登录")
+		return false
+	}
+	return true
 }
 
 // UserAuth 用户域鉴权：只接受用户域 JWT，管理域令牌在此处一定失败。
-func UserAuth(secret string) gin.HandlerFunc {
+func UserAuth(secret string, resolve StatusResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := extractToken(c)
 		if tokenStr == "" {
@@ -157,6 +195,9 @@ func UserAuth(secret string) gin.HandlerFunc {
 			httpx.Unauthorized(c, "登录状态已失效，请重新登录")
 			return
 		}
+		if !checkActive(c, resolve, claims.UserID) {
+			return
+		}
 		c.Set(CtxUserID, claims.UserID)
 		c.Set(CtxUsername, claims.Username)
 		c.Next()
@@ -164,7 +205,7 @@ func UserAuth(secret string) gin.HandlerFunc {
 }
 
 // AdminAuth 管理域鉴权：只接受管理域 JWT，且校验角色。
-func AdminAuth(secret string, allowRoles ...string) gin.HandlerFunc {
+func AdminAuth(secret string, resolve StatusResolver, allowRoles ...string) gin.HandlerFunc {
 	allowed := make(map[string]struct{}, len(allowRoles))
 	for _, r := range allowRoles {
 		allowed[r] = struct{}{}
@@ -180,6 +221,10 @@ func AdminAuth(secret string, allowRoles ...string) gin.HandlerFunc {
 			httpx.Unauthorized(c, "登录状态已失效，请重新登录")
 			return
 		}
+		// 角色以令牌为准，但账号是否仍然启用必须实时查证。
+		if !checkActive(c, resolve, claims.UserID) {
+			return
+		}
 		if len(allowed) > 0 {
 			if _, ok := allowed[claims.Role]; !ok {
 				httpx.Forbidden(c, "当前角色无此操作权限")
@@ -193,13 +238,13 @@ func AdminAuth(secret string, allowRoles ...string) gin.HandlerFunc {
 	}
 }
 
-// APIKeyResolver 由上层注入，用于把 API Key 明文解析为身份。
+// CredentialResolver 由上层注入，把 API Key 或客户端接入凭据解析为身份。
 // 通过函数注入而非直接依赖 service 包，避免中间件与业务层循环依赖。
-type APIKeyResolver func(plain string) (userID uint, username string, err error)
+type CredentialResolver func(plain string) (userID uint, username string, err error)
 
-// UserAuthFlexible 允许用户域 JWT 或 API Key 二选一通过。
-// 供桌面客户端使用：客户端只持有 API Key，不需要登录会话。
-func UserAuthFlexible(secret string, resolve APIKeyResolver) gin.HandlerFunc {
+// UserAuthFlexible 允许用户域 JWT 或长期凭据（API Key / 客户端接入凭据）通过。
+// 供桌面客户端使用：客户端只持有凭据，不需要登录会话。
+func UserAuthFlexible(secret string, resolve CredentialResolver, status StatusResolver) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := extractToken(c)
 		if tokenStr == "" {
@@ -207,8 +252,11 @@ func UserAuthFlexible(secret string, resolve APIKeyResolver) gin.HandlerFunc {
 			return
 		}
 
-		// 优先按 JWT 解析；失败再交给上层解析 API Key 或客户端凭据。
+		// 优先按 JWT 解析；失败再交给上层解析长期凭据。
 		if claims, err := auth.Parse(secret, auth.DomainUser, tokenStr); err == nil {
+			if !checkActive(c, status, claims.UserID) {
+				return
+			}
 			c.Set(CtxUserID, claims.UserID)
 			c.Set(CtxUsername, claims.Username)
 			c.Next()
@@ -217,6 +265,9 @@ func UserAuthFlexible(secret string, resolve APIKeyResolver) gin.HandlerFunc {
 
 		if resolve != nil {
 			if uid, uname, err := resolve(tokenStr); err == nil {
+				if !checkActive(c, status, uid) {
+					return
+				}
 				c.Set(CtxUserID, uid)
 				c.Set(CtxUsername, uname)
 				c.Next()
@@ -235,7 +286,7 @@ func CurrentUserID(c *gin.Context) uint {
 	return id
 }
 
-// CurrentAdminID 从上下文取管理员 ID 与名称。
+// CurrentAdminID 从上下文取管理员 ID、名称与角色。
 func CurrentAdminID(c *gin.Context) (uint, string, string) {
 	idV, _ := c.Get(CtxAdminID)
 	nameV, _ := c.Get(CtxAdminName)

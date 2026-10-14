@@ -218,14 +218,19 @@ type AuditLog struct {
 func (AuditLog) TableName() string { return "lt_audit_logs" }
 
 // ClientSession 记录一次 frpc 登录会话，用于在线状态与设备管理。
+//
+// 安全语义：本表**只在 Login 回调通过每用户凭据校验后才写入**，
+// 因此它是「该 run_id 确实完成过认证」的唯一凭据来源。
+// 服务端插件在内存缓存未命中时，必须依赖本表而不是客户端自报的用户名。
 type ClientSession struct {
-	ID      uint   `gorm:"primarykey" json:"id"`
-	UserID  uint   `gorm:"index" json:"user_id"`
-	RunID   string `gorm:"size:64;uniqueIndex" json:"run_id"`
-	Addr    string `gorm:"size:64" json:"addr"`
-	Version string `gorm:"size:32" json:"version"`
-	OS      string `gorm:"size:32" json:"os"`
-	Arch    string `gorm:"size:32" json:"arch"`
+	ID       uint   `gorm:"primarykey" json:"id"`
+	UserID   uint   `gorm:"index" json:"user_id"`
+	Username string `gorm:"size:64;index" json:"username"`
+	RunID    string `gorm:"size:64;uniqueIndex" json:"run_id"`
+	Addr     string `gorm:"size:64" json:"addr"`
+	Version  string `gorm:"size:32" json:"version"`
+	OS       string `gorm:"size:32" json:"os"`
+	Arch     string `gorm:"size:32" json:"arch"`
 
 	Online     bool      `gorm:"index" json:"online"`
 	LastSeenAt time.Time `json:"last_seen_at"`

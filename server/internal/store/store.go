@@ -97,10 +97,13 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 }
 
 // Seed 播种默认分组与初始管理员（幂等）。
-func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, error)) error {
+//
+// 返回 createdAdmin 表示本次是否真的创建了初始管理员：
+// 只有在首次创建时，调用方才应把初始密码打印出来，否则重启后会打印出无效密码。
+func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, error)) (createdAdmin bool, err error) {
 	var groupCount int64
 	if err := db.Model(&model.Group{}).Count(&groupCount).Error; err != nil {
-		return err
+		return false, err
 	}
 	if groupCount == 0 {
 		groups := []model.Group{
@@ -141,19 +144,19 @@ func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, er
 			},
 		}
 		if err := db.Create(&groups).Error; err != nil {
-			return fmt.Errorf("初始化分组失败: %w", err)
+			return false, fmt.Errorf("初始化分组失败: %w", err)
 		}
 		log.Printf("[seed] 已创建 %d 个默认分组", len(groups))
 	}
 
 	var adminCount int64
 	if err := db.Model(&model.Admin{}).Count(&adminCount).Error; err != nil {
-		return err
+		return false, err
 	}
 	if adminCount == 0 {
 		hashed, err := hashPassword(cfg.BootstrapAdminPassword)
 		if err != nil {
-			return err
+			return false, err
 		}
 		admin := model.Admin{
 			Username: cfg.BootstrapAdminUser,
@@ -163,10 +166,10 @@ func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, er
 			Status:   "active",
 		}
 		if err := db.Create(&admin).Error; err != nil {
-			return fmt.Errorf("初始化管理员失败: %w", err)
+			return false, fmt.Errorf("初始化管理员失败: %w", err)
 		}
-		log.Printf("[seed] 已创建初始管理员 %q，请登录后立即修改密码", cfg.BootstrapAdminUser)
+		return true, nil
 	}
 
-	return nil
+	return false, nil
 }

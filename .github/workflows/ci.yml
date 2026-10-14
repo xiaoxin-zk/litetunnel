@@ -27,8 +27,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: server/go.mod
-          # go.sum 尚未入库，先关闭缓存；提交 go.sum 后可改为 true 加速
-          cache: false
+          cache: true
 
       - name: Resolve dependencies
         working-directory: server
@@ -93,6 +92,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client/windows/go.mod
+          # client 模块的 go.sum 尚未入库，先关闭缓存
           cache: false
 
       - uses: actions/setup-node@v4

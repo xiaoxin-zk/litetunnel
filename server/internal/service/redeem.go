@@ -134,6 +134,37 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			return ErrCodeUsed
 		}
 
+		// ---- 抢占核销权 ----
+		//
+		// 用条件更新（CAS）而不是「先读后写」。并发下多个事务会同时读到
+		// UsedCount 的同一个旧值，若各自在 Go 里算 newUsed 再写回，就会丢失更新
+		// —— 表现为一次兑换码被核销多次。
+		//
+		// 把「校验上限 + 自增」合并成一条带条件的 UPDATE 后，由数据库保证
+		// 只有一个事务能让 RowsAffected=1，其余全部为 0。
+		// 这比 SELECT ... FOR UPDATE 更轻：没有显式锁，也不依赖隔离级别。
+		//
+		// 这一步必须在发放权益**之前**：抢不到就直接返回错误、事务回滚，
+		// 不会出现「没抢到却已经加了流量」这种脏状态。
+		claim := tx.Model(&model.RedeemCode{}).
+			Where("id = ? AND status = ? AND (max_uses <= 0 OR used_count < max_uses)",
+				c.ID, model.RedeemStatusUnused).
+			Update("used_count", gorm.Expr("used_count + 1"))
+		if claim.Error != nil {
+			return claim.Error
+		}
+		if claim.RowsAffected == 0 {
+			// 已被别人抢走、或用尽、或已停用。
+			return ErrCodeUsed
+		}
+
+		// 抢到后若已达上限，标记为用尽。条件更新，重复执行无副作用。
+		if err := tx.Model(&model.RedeemCode{}).
+			Where("id = ? AND max_uses > 0 AND used_count >= max_uses", c.ID).
+			Update("status", model.RedeemStatusUsedUp).Error; err != nil {
+			return err
+		}
+
 		var u model.User
 		if err := tx.First(&u, userID).Error; err != nil {
 			return ErrNotFound
@@ -190,15 +221,8 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			return err
 		}
 
-		newUsed := c.UsedCount + 1
-		codeUpdates := map[string]any{"used_count": newUsed}
-		if c.MaxUses > 0 && newUsed >= c.MaxUses {
-			codeUpdates["status"] = model.RedeemStatusUsedUp
-		}
-		if err := tx.Model(&model.RedeemCode{}).Where("id = ?", c.ID).Updates(codeUpdates).Error; err != nil {
-			return err
-		}
-
+		// 核销计数已在前面用 CAS 完成，这里不再写 used_count，
+		// 否则又会退回「读-改-写」的老问题。
 		s.recordRedeem(tx, userID, c.ID, code, c.Type, c.Value, "success", ip)
 		return nil
 	})

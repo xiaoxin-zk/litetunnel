@@ -62,7 +62,16 @@ func New(
 		panic(fmt.Sprintf("设置可信代理失败（会导致任意客户端伪造来源 IP）: %v", err))
 	}
 
+	// 健康检查。
+	//
+	// 生产环境刻意不返回版本号：那等于给攻击者一个现成的「按版本匹配已知漏洞」
+	// 入口，而健康检查本身并不需要这个信息。非生产环境保留，
+	// 便于本地与 CI 确认 ldflags 注入是否真的生效。
 	r.GET("/healthz", func(c *gin.Context) {
+		if cfg.IsProd() {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": config.Version})
 	})
 
@@ -111,6 +120,8 @@ func New(
 	userAuth.Use(middleware.Limit(userAuthLimiter, "user-auth"))
 	{
 		userAuth.POST("/register", userH.Register)
+		// 邮箱一次性验证码：注册验证与找回密码共用，scene 区分用途。
+		userAuth.POST("/send-email-code", userH.SendEmailCode)
 		// 找回密码：发信走异步队列，账号是否存在不会体现在响应上。
 		userAuth.POST("/forgot-password", userH.ForgotPassword)
 		userAuth.POST("/reset-password", userH.ResetPassword)
@@ -125,9 +136,14 @@ func New(
 	}
 
 	// 桌面客户端接口：支持 JWT 或长期凭据（API Key / 客户端接入凭据）。
+	//
+	// ReadOnly 是结构性保证：API Key 会明文落在客户端本地配置里，
+	// 它的定位是「让客户端连上来」，而不是「让持有者接管账号」。
+	// 即使以后有人往这个组里加了写接口，也会被这一层直接挡住。
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(userAPILimiter, "user-client"))
 	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
+	cli.Use(middleware.ReadOnly())
 	{
 		cli.GET("/info", userH.ClientInfo)
 		cli.GET("/config", userH.ClientConfig)
@@ -138,6 +154,10 @@ func New(
 	userAPI := r.Group("/api/user")
 	userAPI.Use(middleware.Limit(userAPILimiter, "user-api"))
 	userAPI.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.ResolveUserIdentity))
+	// 本组是账号操作（改密、改邮箱、重置凭据、注销），一律要求会话令牌。
+	// 当前 UserAuth 只接受 JWT，这层今天不拦任何东西；它的作用是防止
+	// 以后有人把本组改成 UserAuthFlexible 时，把写权限顺带开放给 API Key。
+	userAPI.Use(middleware.RequireSession())
 	{
 		userAPI.GET("/profile", userH.Profile)
 		userAPI.PUT("/profile", userH.UpdateProfile)

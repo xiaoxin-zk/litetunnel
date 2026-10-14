@@ -28,27 +28,90 @@
         </em>
       </label>
 
-      <label class="field">
-        <span>API Key</span>
-        <input
-          v-model="form.apiKey"
-          placeholder="lt_xxxxxxxxxxxxxxxxxxxx"
-          spellcheck="false"
-          autocomplete="off"
-          @keyup.enter="submit"
-        />
-        <em class="muted">在控制台「API Key」页复制，注册后即自动生成</em>
-      </label>
+      <div v-if="notice" class="notice">{{ notice }}</div>
 
-      <div v-if="error" class="error">{{ error }}</div>
+      <!-- ============ 连接 ============ -->
+      <template v-if="mode === 'login'">
+        <label class="field">
+          <span>API Key</span>
+          <input
+            v-model="form.apiKey"
+            placeholder="lt_xxxxxxxxxxxxxxxxxxxx"
+            spellcheck="false"
+            autocomplete="off"
+            @keyup.enter="submit"
+          />
+          <em class="muted">在控制台「API Key」页复制，注册后即自动生成</em>
+        </label>
 
-      <button class="btn-primary submit" :disabled="loading" @click="submit">
-        {{ loading ? '正在连接…' : '连接' }}
-      </button>
+        <div v-if="error" class="error">{{ error }}</div>
 
-      <p class="hint muted">
-        客户端只在本地保存这一把 Key，不保存账号密码；Key 可在控制台随时重置。
-      </p>
+        <button class="btn-primary submit" :disabled="loading" @click="submit">
+          {{ loading ? '正在连接…' : '连接' }}
+        </button>
+
+        <p class="hint muted">
+          客户端只在本地保存这一把 Key，不保存账号密码；Key 可在控制台随时重置。
+        </p>
+        <p class="hint muted">
+          <a class="link" @click="openReset">忘记密码？</a>
+        </p>
+      </template>
+
+      <!-- ============ 重置密码 ============ -->
+      <template v-else>
+        <label class="field">
+          <span>用户名或邮箱</span>
+          <input v-model="reset.account" placeholder="注册时使用的账号" spellcheck="false" autocomplete="off" />
+        </label>
+
+        <!-- 服务端启用了邮件：用一次性验证码证明身份 -->
+        <label v-if="mailEnabled" class="field">
+          <span>邮箱验证码</span>
+          <div class="row">
+            <input
+              v-model="reset.emailCode"
+              maxlength="6"
+              placeholder="6 位验证码"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            <button class="btn-ghost" :disabled="countdown > 0 || sending" @click="sendCode">
+              {{ countdown > 0 ? `${countdown}s` : '获取验证码' }}
+            </button>
+          </div>
+          <em class="muted">发送到账号绑定的邮箱</em>
+        </label>
+
+        <!-- 服务端未启用邮件：用当前密码证明身份 -->
+        <label v-else class="field">
+          <span>当前密码</span>
+          <input v-model="reset.oldPassword" type="password" placeholder="用于验证身份" autocomplete="off" />
+          <em class="muted">本站未启用邮件服务，因此用当前密码验证身份</em>
+        </label>
+
+        <label class="field">
+          <span>新密码</span>
+          <input v-model="reset.password" type="password" placeholder="至少 8 位" autocomplete="off" />
+        </label>
+
+        <label class="field">
+          <span>确认新密码</span>
+          <input v-model="reset.confirm" type="password" autocomplete="off" />
+        </label>
+
+        <div v-if="error" class="error">{{ error }}</div>
+
+        <button class="btn-primary submit" :disabled="loading" @click="submitReset">
+          {{ loading ? '正在提交…' : '重置密码' }}
+        </button>
+        <p class="hint muted">
+          重置成功后所有已登录设备都会下线，客户端需要重新填写 API Key。
+        </p>
+        <p class="hint muted">
+          <a class="link" @click="mode = 'login'">返回连接</a>
+        </p>
+      </template>
     </div>
   </div>
 </template>
@@ -83,6 +146,100 @@ async function submit() {
     emit('connected', next)
   } catch (e) {
     error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
+  } finally {
+    loading.value = false
+  }
+}
+
+// ---- 重置密码 ----
+
+const mode = ref('login')
+const sending = ref(false)
+const countdown = ref(0)
+// 由服务端决定走哪种验证方式，不在客户端写死
+const mailEnabled = ref(false)
+const notice = ref('')
+const reset = reactive({ account: '', emailCode: '', oldPassword: '', password: '', confirm: '' })
+
+/** 打开重置面板，并向服务端确认该走验证码还是旧密码。 */
+async function openReset() {
+  error.value = ''
+  notice.value = ''
+  mode.value = 'reset'
+  try {
+    mailEnabled.value = await api.serverMailEnabled(form.server.trim())
+  } catch {
+    // 探测失败按「未启用邮件」处理：旧密码模式在任何配置下都能用，
+    // 而验证码模式在未启用邮件时根本无法发送。
+    mailEnabled.value = false
+  }
+}
+
+async function sendCode() {
+  const account = reset.account.trim()
+  if (!account) {
+    error.value = '请先填写用户名或邮箱'
+    return
+  }
+  error.value = ''
+  sending.value = true
+  try {
+    await api.sendEmailCode(form.server.trim(), account, 'reset')
+    countdown.value = 60
+    const timer = setInterval(() => {
+      countdown.value -= 1
+      if (countdown.value <= 0) clearInterval(timer)
+    }, 1000)
+  } catch (e) {
+    error.value = typeof e === 'string' ? e : e?.message || '验证码发送失败'
+  } finally {
+    sending.value = false
+  }
+}
+
+async function submitReset() {
+  error.value = ''
+  notice.value = ''
+
+  if (!reset.account.trim()) {
+    error.value = '请填写用户名或邮箱'
+    return
+  }
+  if (mailEnabled.value && !reset.emailCode.trim()) {
+    error.value = '请填写邮箱验证码'
+    return
+  }
+  if (!mailEnabled.value && !reset.oldPassword) {
+    error.value = '请填写当前密码'
+    return
+  }
+  if (reset.password.length < 8) {
+    error.value = '新密码至少 8 位'
+    return
+  }
+  if (reset.password !== reset.confirm) {
+    error.value = '两次输入的密码不一致'
+    return
+  }
+
+  loading.value = true
+  try {
+    await api.resetPassword(
+      form.server.trim(),
+      reset.account.trim(),
+      reset.oldPassword,
+      reset.emailCode.trim(),
+      reset.password
+    )
+    // 清掉敏感字段，避免残留在界面上
+    reset.oldPassword = ''
+    reset.emailCode = ''
+    reset.password = ''
+    reset.confirm = ''
+    mode.value = 'login'
+    notice.value = '密码已重置。请用新密码登录控制台，并重新获取 API Key 后连接。'
+  } catch (e) {
+    error.value = typeof e === 'string' ? e : e?.message || '重置失败，请检查填写的信息'
   } finally {
     loading.value = false
   }
@@ -186,6 +343,55 @@ h1 {
   margin-bottom: 14px;
   -webkit-user-select: text;
   user-select: text;
+}
+
+.notice {
+  background: #dcfce7;
+  color: #166534;
+  border-radius: 9px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.7;
+  margin-bottom: 16px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+.row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-ghost {
+  flex: 0 0 auto;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-ghost:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.link {
+  color: #2563eb;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.link:hover {
+  text-decoration: underline;
 }
 
 .submit {

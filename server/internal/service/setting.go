@@ -112,7 +112,9 @@ var settingSpecs = []settingSpec{
 	// 注册与准入
 	{Key: KeyRegisterEnabled, Default: func(*config.Config) string { return "true" }},
 	{Key: KeyRegisterNeedInvite, Default: func(*config.Config) string { return "false" }},
-	{Key: KeyRegisterRequireEmail, Default: func(*config.Config) string { return "false" }},
+	// 默认 true：只要站点启用了邮件，注册就必须验证邮箱。
+	// 邮件未启用时该项不生效（没有发信通道，强制验证只会把用户挡在门外）。
+	{Key: KeyRegisterRequireEmail, Default: func(*config.Config) string { return "true" }},
 	{Key: KeyRegisterTerms, Default: defaultTerms},
 	{Key: KeyRegisterMaxPerIP, Default: func(*config.Config) string { return "3" }},
 	{Key: KeyRegisterBlockDomains, Default: func(*config.Config) string { return "" }},

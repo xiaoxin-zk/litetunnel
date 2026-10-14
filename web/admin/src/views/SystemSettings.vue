@@ -44,6 +44,13 @@
             <el-switch v-model="boolForm['register.captcha_enabled']" />
             <span class="hint">强烈建议保持开启，否则脚本可批量注册</span>
           </el-form-item>
+          <el-form-item label="注册邮箱验证">
+            <el-switch v-model="boolForm['register.require_email_verify']" />
+            <span class="hint">
+              仅在「邮件」页启用了 SMTP 后生效。开启后注册必须填写邮箱并通过一次性验证码，
+              邮箱从「可选联系方式」升级为「身份凭证」——这是最有效的反批量注册手段
+            </span>
+          </el-form-item>
           <el-form-item label="单 IP 每日上限">
             <el-input-number v-model="numForm['register.max_per_ip_per_day']" :min="0" :max="1000" />
             <span class="hint">0 表示不限制；默认 3</span>
@@ -289,6 +296,7 @@ const SECRET_MASK = '__UNCHANGED__'
 const BOOL_KEYS = [
   'register.enabled',
   'register.captcha_enabled',
+  'register.require_email_verify',
   'register.whitelist_only',
   'register.trusted_domain_skip_limits',
   'smtp.enabled',

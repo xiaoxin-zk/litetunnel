@@ -20,7 +20,39 @@ const (
 	CtxAdminID   = "lt_admin_id"
 	CtxAdminRole = "lt_admin_role"
 	CtxAdminName = "lt_admin_name"
+	// CtxAuthMethod 标记本次请求用的是会话令牌还是长期凭据。
+	CtxAuthMethod = "lt_auth_method"
 )
+
+// 认证方式。
+const (
+	// AuthMethodSession 是浏览器会话令牌（JWT），可执行全部操作。
+	AuthMethodSession = "session"
+	// AuthMethodCredential 是长期凭据（API Key / 客户端接入凭据）。
+	//
+	// 这类凭据会以明文落在客户端本地的配置文件里，一旦泄露不应等价于
+	// 账号被完全接管，因此只允许访问只读接口。
+	AuthMethodCredential = "credential"
+)
+
+// RequireSession 要求本次请求使用会话令牌，拒绝长期凭据。
+//
+// 为什么必须加这一层：API Key 与客户端接入凭据的设计目标是
+// 「让客户端连上来」，而不是「让持有者完全接管账号」。若不加限制，
+// 一份泄露的客户端配置就等于账号被接管——可以改密码、改邮箱、
+// 重置 API Key、甚至注销账号，而用户往往意识不到这些凭据的权限有多大。
+//
+// 规则很直白：**长期凭据只能读，不能写**。
+// 客户端本来也只需要读（拉取隧道列表与接入配置）。
+func RequireSession() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString(CtxAuthMethod) == AuthMethodCredential {
+			httpx.Forbidden(c, "该操作需要使用登录会话，API Key 仅可用于读取")
+			return
+		}
+		c.Next()
+	}
+}
 
 // MaxRequestBodyBytes 是单个请求体的上限。
 // 不做限制时，攻击者可以用超大 JSON 耗尽内存。
@@ -271,7 +303,24 @@ func UserAuth(secret string, resolve IdentityResolver) gin.HandlerFunc {
 		}
 		c.Set(CtxUserID, claims.UserID)
 		c.Set(CtxUsername, claims.Username)
+		c.Set(CtxAuthMethod, AuthMethodSession)
 		c.Next()
+	}
+}
+
+// ReadOnly 只允许读取类方法，拒绝其他 HTTP 方法。
+//
+// 用于「长期凭据可访问」的路由组。这一层不是为了当下的安全，
+// 而是为了防止以后有人往这个组里加了一个写接口——那样 API Key
+// 就会在无人察觉的情况下获得写权限。有了它，加错了也写不进去。
+func ReadOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			c.Next()
+		default:
+			httpx.Forbidden(c, "该接口组仅支持读取")
+		}
 	}
 }
 
@@ -330,6 +379,7 @@ func UserAuthFlexible(secret string, resolve CredentialResolver, status Identity
 			}
 			c.Set(CtxUserID, claims.UserID)
 			c.Set(CtxUsername, claims.Username)
+			c.Set(CtxAuthMethod, AuthMethodSession)
 			c.Next()
 			return
 		}
@@ -343,6 +393,8 @@ func UserAuthFlexible(secret string, resolve CredentialResolver, status Identity
 				}
 				c.Set(CtxUserID, uid)
 				c.Set(CtxUsername, uname)
+				// 标记为长期凭据：写操作会被 RequireSession 拒绝。
+				c.Set(CtxAuthMethod, AuthMethodCredential)
 				c.Next()
 				return
 			}

@@ -100,12 +100,23 @@
             <el-form-item label="确认密码" prop="confirm">
               <el-input v-model="reg.confirm" type="password" size="large" show-password />
             </el-form-item>
-            <el-form-item label="邮箱">
+            <el-form-item label="邮箱" :prop="requireEmail ? 'email' : ''">
               <el-input
                 v-model="reg.email"
                 size="large"
-                placeholder="选填，用于找回密码"
+                :placeholder="requireEmail ? '必填，用于接收验证码' : '选填，用于找回密码'"
               />
+            </el-form-item>
+
+            <!-- 站点启用邮件后，注册必须通过邮箱一次性验证码 -->
+            <el-form-item v-if="requireEmail" label="邮箱验证码" prop="email_code">
+              <el-input v-model="reg.email_code" size="large" maxlength="6" placeholder="6 位验证码">
+                <template #append>
+                  <el-button :disabled="countdown > 0" @click="sendEmailCode">
+                    {{ countdown > 0 ? `${countdown}s` : '获取验证码' }}
+                  </el-button>
+                </template>
+              </el-input>
             </el-form-item>
 
             <el-form-item v-if="captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
@@ -149,7 +160,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { User, Lock, Key, Refresh } from '@element-plus/icons-vue'
@@ -181,9 +192,36 @@ const reg = reactive({
   password: '',
   confirm: '',
   email: '',
+  email_code: '',
   captcha_answer: '',
   agreed: false
 })
+
+// 站点启用邮件后，注册强制验证邮箱（可在管理端关闭该要求）
+const requireEmail = computed(
+  () => !!site.value.mail_enabled && !!site.value.register_require_email
+)
+// 验证码重发倒计时
+const countdown = ref(0)
+
+async function sendEmailCode() {
+  const email = reg.email.trim()
+  if (!email) {
+    ElMessage.warning('请先填写邮箱')
+    return
+  }
+  try {
+    await authApi.sendEmailCode({ email, scene: 'register' })
+    ElMessage.success('验证码已发送，请查收')
+    countdown.value = 60
+    const timer = setInterval(() => {
+      countdown.value -= 1
+      if (countdown.value <= 0) clearInterval(timer)
+    }, 1000)
+  } catch {
+    // 失败提示由响应拦截器统一处理
+  }
+}
 
 const rules = {
   username: [{ required: true, message: '请输入账号', trigger: 'blur' }],
@@ -282,6 +320,16 @@ async function submitRegister() {
     regError.value = '请先阅读并同意服务条款与禁止滥用规定'
     return
   }
+  if (requireEmail.value) {
+    if (!reg.email.trim()) {
+      regError.value = '请填写邮箱，注册需要邮箱验证'
+      return
+    }
+    if (!reg.email_code.trim()) {
+      regError.value = '请填写邮箱验证码'
+      return
+    }
+  }
   if (captcha.value && !reg.captcha_answer.trim()) {
     regError.value = '请填写验证码'
     return
@@ -293,6 +341,7 @@ async function submitRegister() {
       username: reg.username.trim(),
       password: reg.password,
       email: reg.email.trim(),
+      email_code: reg.email_code.trim(),
       agreed: reg.agreed,
       captcha_ticket: captcha.value?.ticket || '',
       captcha_answer: reg.captcha_answer.trim()

@@ -171,6 +171,114 @@ func (s *Services) ResetPassword(token, newPassword, ip string) error {
 	return nil
 }
 
+// ResetPasswordByOldPassword 用旧密码证明身份后重置密码。
+//
+// 用于「站点未启用邮件」的部署：没有发信通道就走不了验证码，
+// 但用户依然应当能自助重置，而不是只能找管理员。
+//
+// 安全性等价于一次登录（都要校验密码），因此必须套用与登录**完全相同**的
+// IP 限流与账号锁定策略——否则它会立刻变成一条绕过锁定的旁路：
+// 攻击者被登录接口锁住后，改打这个接口继续撞库。
+func (s *Services) ResetPasswordByOldPassword(account, oldPassword, newPassword, ip string) error {
+	if err := validateNewPassword(newPassword); err != nil {
+		return err
+	}
+
+	u, err := s.findUserByAccount(account)
+	if err != nil {
+		// 不区分「账号不存在」与「密码错误」，避免把接口变成账号枚举工具。
+		return ErrBadCredentials
+	}
+	if u.Status != model.UserStatusActive {
+		return ErrAccountDisabled
+	}
+	if !auth.VerifyPassword(u.Password, oldPassword) {
+		return ErrBadCredentials
+	}
+	// 新旧密码相同没有意义，且会让用户误以为改成功了。
+	if auth.VerifyPassword(u.Password, newPassword) {
+		return fmt.Errorf("%w: 新密码不能与当前密码相同", ErrInvalidParam)
+	}
+	return s.applyPasswordReset(u.ID, newPassword, ip)
+}
+
+// ResetPasswordByEmailCode 用邮箱一次性验证码重置密码。
+//
+// 用于「站点已启用邮件」的部署。验证码在 applyPasswordReset 之前消费，
+// 校验通过即失效，无法重放。
+func (s *Services) ResetPasswordByEmailCode(account, emailCode, newPassword, ip string) error {
+	if err := validateNewPassword(newPassword); err != nil {
+		return err
+	}
+
+	u, err := s.findUserByAccount(account)
+	if err != nil {
+		// 统一返回「验证码不正确」，不透露账号是否存在。
+		return ErrEmailCodeWrong
+	}
+	if u.Status != model.UserStatusActive {
+		return ErrAccountDisabled
+	}
+	if u.Email == "" {
+		return fmt.Errorf("%w: 该账号未绑定邮箱，无法通过邮箱重置，请联系管理员", ErrInvalidParam)
+	}
+	if err := s.VerifyEmailCode(u.Email, EmailSceneReset, emailCode); err != nil {
+		return err
+	}
+	return s.applyPasswordReset(u.ID, newPassword, ip)
+}
+
+// validateNewPassword 统一新密码的强度校验。
+func validateNewPassword(p string) error {
+	if len(p) < 8 {
+		return fmt.Errorf("%w: 密码长度不得少于 8 位", ErrInvalidParam)
+	}
+	if len(p) > 128 {
+		return fmt.Errorf("%w: 密码长度不得超过 128 位", ErrInvalidParam)
+	}
+	return nil
+}
+
+// applyPasswordReset 执行重置的公共部分。
+//
+// 三件事必须一起做，缺任何一件都会留下「旧凭据仍然可用」的窗口：
+//  1. 自增令牌版本 → 所有已签发的 JWT 立即失效（改密即全端下线）
+//  2. 轮换 client_secret → 已下发的 frpc 配置立即失效
+//  3. 客户端会话标记离线 → 迫使客户端重新认证
+//
+// 注意这里**不动** API Key：它与登录会话是两套独立的吊销通道，
+// 需要用户在控制台显式重置。这与 GitHub PAT / AWS Access Key 的语义一致。
+func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error {
+	hashed, err := auth.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	newSecret, err := randomHex(32)
+	if err != nil {
+		return err
+	}
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+			"password":      hashed,
+			"token_version": gorm.Expr("token_version + 1"),
+			"client_secret": newSecret,
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.ClientSession{}).
+			Where("user_id = ?", userID).
+			Update("online", false).Error
+	})
+	if err != nil {
+		return err
+	}
+
+	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
+	log.Printf("[reset] 用户 %d 已重置密码（来源 %s）", userID, ip)
+	return nil
+}
+
 // findUserByAccount 支持用用户名或邮箱定位账号。
 func (s *Services) findUserByAccount(account string) (*model.User, error) {
 	var u model.User

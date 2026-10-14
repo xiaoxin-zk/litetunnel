@@ -208,13 +208,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		return a.GetState(), errors.New("请填写 API Key")
 	}
 
-	base := defaultServerURL()
-	if base == "" {
-		var err error
-		base, err = normalizeServerURL(serverURL)
-		if err != nil {
-			return a.GetState(), err
-		}
+	base, err := a.resolveBase(serverURL)
+	if err != nil {
+		return a.GetState(), err
 	}
 
 	// 先用 info 接口验证 Key 是否有效，同时拿到账号信息。
@@ -444,6 +440,76 @@ func normalizeServerURL(raw string) (string, error) {
 		return "", errors.New("服务器地址缺少主机名")
 	}
 	return strings.TrimRight(u.Scheme+"://"+u.Host+u.Path, "/"), nil
+}
+
+// resolveBase 统一解析服务端地址。
+//
+// 构建注入的地址优先：正式客户端只认内置地址，用户无从篡改，
+// 也就不会被诱导连到钓鱼服务器。未注入时才用界面上填写的（仅调试构建）。
+func (a *App) resolveBase(serverURL string) (string, error) {
+	if base := defaultServerURL(); base != "" {
+		return base, nil
+	}
+	return normalizeServerURL(serverURL)
+}
+
+// ServerMailEnabled 查询服务端是否启用了邮件功能。
+//
+// 客户端据此决定重置密码走哪条路：启用邮件就用邮箱验证码，
+// 未启用就用「当前密码 + 新密码」。这一步必须先问服务端，
+// 而不是在客户端写死——否则服务端配置一变，客户端就失效了。
+func (a *App) ServerMailEnabled(serverURL string) (bool, error) {
+	base, err := a.resolveBase(serverURL)
+	if err != nil {
+		return false, err
+	}
+	var out struct {
+		MailEnabled bool `json:"mail_enabled"`
+	}
+	if err := a.getJSON(base+"/api/public/settings", "", &out); err != nil {
+		return false, err
+	}
+	return out.MailEnabled, nil
+}
+
+// SendEmailCode 请求服务端发送邮箱一次性验证码。scene 为 register 或 reset。
+func (a *App) SendEmailCode(serverURL, email, scene string) error {
+	base, err := a.resolveBase(serverURL)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]string{"email": email, "scene": scene})
+	if err != nil {
+		return err
+	}
+	_, err = a.do(http.MethodPost, base+"/api/user/auth/send-email-code", "", payload)
+	return err
+}
+
+// ResetPassword 重置账号密码。
+//
+// 两种材料一起提交，由服务端按自身配置选择校验方式：
+//   - 启用邮件 → 校验 email_code
+//   - 未启用邮件 → 校验 old_password
+//
+// 客户端不自己判断走哪条路，是为了避免两边规则不一致导致
+// 「客户端以为该用验证码、服务端却在等旧密码」这类错配。
+func (a *App) ResetPassword(serverURL, account, oldPassword, emailCode, newPassword string) error {
+	base, err := a.resolveBase(serverURL)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]string{
+		"account":      account,
+		"old_password": oldPassword,
+		"email_code":   emailCode,
+		"password":     newPassword,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = a.do(http.MethodPost, base+"/api/user/auth/reset-password", "", payload)
+	return err
 }
 
 func (a *App) getJSON(endpoint, token string, out any) error {

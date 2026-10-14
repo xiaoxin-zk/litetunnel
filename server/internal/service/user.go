@@ -23,6 +23,8 @@ type RegisterInput struct {
 	AgreedTerms   bool
 	CaptchaTicket string
 	CaptchaAnswer string
+	// EmailCode 是邮箱一次性验证码。站点启用邮件后为必填。
+	EmailCode string
 }
 
 // Register 创建用户并绑定默认分组。
@@ -59,6 +61,17 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	if in.Email != "" && !IsValidEmail(in.Email) {
 		return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
 	}
+
+	// 邮箱验证：站点启用邮件后，注册必须提供邮箱并通过一次性验证码。
+	//
+	// 为什么和邮件开关绑定而不是独立开关：没有邮件通道就无法验证邮箱真实性，
+	// 此时强制要求验证码只会把用户挡在门外。启用邮件意味着运营方愿意承担
+	// 验证成本，邮箱也就从「可选联系方式」升级为「身份凭证」。
+	requireEmail := s.MailEnabled() && s.Settings.Bool(KeyRegisterRequireEmail)
+	if requireEmail && in.Email == "" {
+		return nil, ErrEmailRequired
+	}
+
 	// 4. 邮箱域名黑名单：拦住一次性邮箱批量注册
 	if in.Email != "" && s.emailDomainBlocked(in.Email) {
 		return nil, ErrEmailNotAllowed
@@ -92,6 +105,26 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, ErrUsernameTaken
 	}
 
+	// 邮箱唯一性：找回密码要靠邮箱定位账号，重复邮箱会让整个流程产生歧义。
+	if in.Email != "" {
+		var emailExists int64
+		if err := s.DB.Model(&model.User{}).Where("email = ?", in.Email).Count(&emailExists).Error; err != nil {
+			return nil, err
+		}
+		if emailExists > 0 {
+			return nil, ErrEmailTaken
+		}
+	}
+
+	// 邮箱验证码放在最后校验：它会**消费掉**验证码。
+	// 必须等所有无副作用的校验都通过后再执行，否则一次「用户名已占用」
+	// 就会白白浪费用户一个验证码，用户得重新收信。
+	if requireEmail {
+		if err := s.VerifyEmailCode(in.Email, EmailSceneRegister, in.EmailCode); err != nil {
+			return nil, err
+		}
+	}
+
 	hashed, err := auth.HashPassword(in.Password)
 	if err != nil {
 		return nil, err
@@ -123,6 +156,7 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		APIKeyCreatedAt: &now,
 		RegisterIP:      truncate(in.IP, 64),
 		EmailDomain:     truncate(domain, 128),
+		EmailVerified:   requireEmail,
 	}
 	if group != nil {
 		user.GroupID = group.ID

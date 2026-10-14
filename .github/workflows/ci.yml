@@ -62,6 +62,9 @@ jobs:
           LT_ADMIN_PATH: /smoke-console
           LT_USER_WEB_DIR: /tmp/smoke/userweb
           LT_ADMIN_WEB_DIR: /tmp/smoke/adminweb
+          # 固定管理员口令：冒烟测试要用管理员身份验证管理接口（生成兑换码等）
+          LT_BOOTSTRAP_ADMIN_USER: smokeadmin
+          LT_BOOTSTRAP_ADMIN_PASSWORD: SmokeAdminPass123
         run: |
           set -euo pipefail
           BASE=http://127.0.0.1:7848
@@ -204,6 +207,89 @@ jobs:
             exit 1
           fi
           echo "PASS forged API key rejected"
+
+          # ===== API Key 的权限边界 =====
+          # 回归测试：API Key 会以明文落在客户端本地配置文件里，
+          # 它的定位是「让客户端连上来」，不是「让持有者接管账号」。
+          # 因此只能读，不能写——否则一份泄露的配置就等于账号被接管。
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"nickname":"hacked"}' "$BASE/api/user/profile")
+          if [ "$code" != "401" ]; then
+            echo "::error::API key could modify profile (got $code, want 401)"
+            exit 1
+          fi
+          echo "PASS api key cannot modify profile"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"name":"evil","type":"tcp","local_ip":"127.0.0.1","local_port":22}' \
+            "$BASE/api/user/tunnels")
+          if [ "$code" != "401" ]; then
+            echo "::error::API key could create a tunnel (got $code, want 401)"
+            exit 1
+          fi
+          echo "PASS api key cannot create tunnel"
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $apikey" "$BASE/api/user/apikey/reveal")
+          if [ "$code" != "401" ]; then
+            echo "::error::API key could reveal credentials (got $code, want 401)"
+            exit 1
+          fi
+          echo "PASS api key cannot reveal credentials"
+
+          # 但只读接口必须可用，否则客户端就废了
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $apikey" "$BASE/api/user/client/downloads")
+          if [ "$code" != "200" ]; then
+            echo "::error::API key cannot read client endpoints (got $code, want 200)"
+            exit 1
+          fi
+          echo "PASS api key can read client endpoints"
+
+          # ===== 兑换码并发核销 =====
+          # 回归测试：曾经用「读-改-写」更新 used_count，并发下多个事务会读到
+          # 同一个旧值并各自写回，丢失更新导致一张一次性码被核销多次。
+          # 现已改为条件更新（CAS），由数据库保证只有一个事务能抢到。
+          admintoken=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"username":"smokeadmin","password":"SmokeAdminPass123"}' "$BASE/api/auth/login" \
+            | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          if [ -z "$admintoken" ]; then
+            echo "::error::admin login failed"
+            exit 1
+          fi
+          echo "PASS admin login"
+
+          gen=$(curl -fsS -X POST -H "Authorization: Bearer $admintoken" \
+            -H 'Content-Type: application/json' \
+            -d '{"count":1,"type":"balance","value":100,"max_uses":1}' \
+            "$BASE/api/admin/redeem-codes/generate")
+          redeemcode=$(printf '%s' "$gen" | sed -n 's/.*"code":"\([^"]*\)".*/\1/p')
+          if [ -z "$redeemcode" ]; then
+            echo "::error::failed to generate redeem code"
+            exit 1
+          fi
+
+          # 8 个并发请求同时兑换同一张一次性码，只允许 1 个成功
+          rm -f /tmp/smoke/redeem_results
+          for i in $(seq 1 8); do
+            (
+              curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+                -H "Authorization: Bearer $jwt" -H 'Content-Type: application/json' \
+                -d "{\"code\":\"$redeemcode\"}" "$BASE/api/user/redeem" \
+                >> /tmp/smoke/redeem_results
+            ) &
+          done
+          wait
+          okcount=$(grep -c '^200$' /tmp/smoke/redeem_results || true)
+          if [ "$okcount" != "1" ]; then
+            echo "::error::single-use redeem code was consumed $okcount times (want 1)"
+            cat /tmp/smoke/redeem_results
+            exit 1
+          fi
+          echo "PASS redeem code is single-use under concurrency"
 
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \

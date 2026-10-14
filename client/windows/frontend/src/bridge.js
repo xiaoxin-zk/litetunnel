@@ -79,7 +79,10 @@ const mock = {
   GetLogs: async () => ['[mock] 当前为浏览器预览模式，未连接真实服务端'],
   ClearLogs: async () => {},
   SetAutoStart: async () => {},
-  OpenDataDir: async () => ''
+  OpenDataDir: async () => '',
+  ServerMailEnabled: async () => false,
+  SendEmailCode: async () => {},
+  ResetPassword: async () => {}
 }
 
 const go = isWails ? window.go.main.App : mock
@@ -95,7 +98,12 @@ export const api = {
   logs: () => go.GetLogs(),
   clearLogs: () => go.ClearLogs(),
   setAutoStart: (v) => go.SetAutoStart(v),
-  openDataDir: () => go.OpenDataDir()
+  openDataDir: () => go.OpenDataDir(),
+  // 重置密码：先问服务端有没有开邮件，再决定走验证码还是旧密码
+  serverMailEnabled: (serverUrl) => go.ServerMailEnabled(serverUrl),
+  sendEmailCode: (serverUrl, email, scene) => go.SendEmailCode(serverUrl, email, scene),
+  resetPassword: (serverUrl, account, oldPassword, emailCode, newPassword) =>
+    go.ResetPassword(serverUrl, account, oldPassword, emailCode, newPassword)
 }
 
 /** 订阅 Wails 事件；非桌面环境下静默忽略。 */

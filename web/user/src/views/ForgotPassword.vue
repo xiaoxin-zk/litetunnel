@@ -4,43 +4,74 @@
       <div class="brand">
         <div class="logo">LT</div>
         <div>
-          <h1>找回密码</h1>
-          <p>通过注册邮箱重置登录密码</p>
+          <h1>重置密码</h1>
+          <p>{{ mailEnabled ? '通过邮箱验证码重置' : '通过当前密码验证身份' }}</p>
         </div>
       </div>
 
-      <template v-if="!sent">
-        <el-form :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
-          <el-form-item label="用户名或邮箱" prop="account">
-            <el-input
-              v-model="form.account"
-              size="large"
-              placeholder="请输入用户名或注册邮箱"
-              :prefix-icon="Message"
-              @keyup.enter="submit"
-            />
-          </el-form-item>
-          <el-button type="primary" size="large" class="submit" :loading="loading" @click="submit">
-            发送重置链接
-          </el-button>
-        </el-form>
+      <el-alert
+        v-if="mailEnabled === false"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        title="站点未启用邮件服务"
+        description="因此改用「当前密码 + 新密码」的方式验证身份。如果你已忘记当前密码，请联系管理员重置。"
+      />
 
-        <el-alert
-          v-if="mailEnabled === false"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-top: 16px"
-          title="站点未启用邮件服务"
-          description="当前无法自助找回密码，请联系管理员重置。"
-        />
-      </template>
+      <el-form :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
+        <el-form-item label="用户名或邮箱" prop="account">
+          <el-input
+            v-model="form.account"
+            size="large"
+            placeholder="请输入用户名或注册邮箱"
+            :prefix-icon="User"
+          />
+        </el-form-item>
 
-      <el-result v-else icon="success" title="请求已提交" :sub-title="sentMessage">
-        <template #extra>
-          <el-button @click="$router.push('/login')">返回登录</el-button>
-        </template>
-      </el-result>
+        <!-- 站点启用邮件：用一次性验证码证明身份 -->
+        <el-form-item v-if="mailEnabled" label="邮箱验证码" prop="email_code">
+          <el-input v-model="form.email_code" size="large" maxlength="6" placeholder="6 位验证码">
+            <template #append>
+              <el-button :disabled="countdown > 0" @click="sendCode">
+                {{ countdown > 0 ? `${countdown}s` : '获取验证码' }}
+              </el-button>
+            </template>
+          </el-input>
+        </el-form-item>
+
+        <!-- 站点未启用邮件：用当前密码证明身份 -->
+        <el-form-item v-else label="当前密码" prop="old_password">
+          <el-input
+            v-model="form.old_password"
+            type="password"
+            size="large"
+            show-password
+            :prefix-icon="Lock"
+            placeholder="用于验证身份"
+          />
+        </el-form-item>
+
+        <el-form-item label="新密码" prop="password">
+          <el-input
+            v-model="form.password"
+            type="password"
+            size="large"
+            show-password
+            placeholder="至少 8 位"
+          />
+        </el-form-item>
+
+        <el-form-item label="确认新密码" prop="confirm">
+          <el-input v-model="form.confirm" type="password" size="large" show-password />
+        </el-form-item>
+
+        <div v-if="error" class="error">{{ error }}</div>
+
+        <el-button type="primary" size="large" class="submit" :loading="loading" @click="submit">
+          重置密码
+        </el-button>
+      </el-form>
 
       <div class="footer">
         <el-button link @click="$router.push('/login')">返回登录</el-button>
@@ -51,31 +82,86 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Message } from '@element-plus/icons-vue'
+import { User, Lock } from '@element-plus/icons-vue'
 import { authApi } from '../api'
 
+const router = useRouter()
 const formRef = ref()
 const loading = ref(false)
-const sent = ref(false)
-const sentMessage = ref('')
+const error = ref('')
+const countdown = ref(0)
+// null 表示尚未探测出来，避免首屏闪烁
 const mailEnabled = ref(null)
-const form = reactive({ account: '' })
+
+const form = reactive({
+  account: '',
+  email_code: '',
+  old_password: '',
+  password: '',
+  confirm: ''
+})
 
 const rules = {
-  account: [{ required: true, message: '请输入用户名或邮箱', trigger: 'blur' }]
+  account: [{ required: true, message: '请输入用户名或邮箱', trigger: 'blur' }],
+  password: [
+    { required: true, message: '请输入新密码', trigger: 'blur' },
+    { min: 8, message: '密码至少 8 位', trigger: 'blur' }
+  ],
+  confirm: [
+    {
+      validator: (_r, v, cb) => (v !== form.password ? cb(new Error('两次输入的密码不一致')) : cb()),
+      trigger: 'blur'
+    }
+  ]
+}
+
+async function sendCode() {
+  const account = form.account.trim()
+  if (!account) {
+    ElMessage.warning('请先填写用户名或邮箱')
+    return
+  }
+  try {
+    // scene=reset：无论邮箱是否注册过都返回成功，避免这个接口变成账号枚举工具
+    await authApi.sendEmailCode({ email: account, scene: 'reset' })
+    ElMessage.success('验证码已发送，请查收')
+    countdown.value = 60
+    const timer = setInterval(() => {
+      countdown.value -= 1
+      if (countdown.value <= 0) clearInterval(timer)
+    }, 1000)
+  } catch {
+    // 失败提示由响应拦截器统一处理
+  }
 }
 
 async function submit() {
+  error.value = ''
   await formRef.value.validate()
+
+  if (mailEnabled.value && !form.email_code.trim()) {
+    error.value = '请填写邮箱验证码'
+    return
+  }
+  if (!mailEnabled.value && !form.old_password) {
+    error.value = '请填写当前密码'
+    return
+  }
+
   loading.value = true
   try {
-    const data = await authApi.forgotPassword(form.account.trim())
-    sentMessage.value = data?.message || '请查收邮件并按提示重置密码'
-    sent.value = true
+    await authApi.resetPassword({
+      account: form.account.trim(),
+      email_code: mailEnabled.value ? form.email_code.trim() : '',
+      old_password: mailEnabled.value ? '' : form.old_password,
+      password: form.password
+    })
+    ElMessage.success('密码已重置，所有设备已下线，请用新密码登录')
+    router.push('/login')
   } catch (e) {
-    // 站点未配置邮件时会明确报错，这是配置问题而非账号问题，可以如实提示
-    ElMessage.error(e?.response?.data?.message || '提交失败，请稍后重试')
+    error.value = e?.response?.data?.message || '重置失败，请检查填写的信息'
   } finally {
     loading.value = false
   }
@@ -86,7 +172,8 @@ onMounted(async () => {
     const data = await authApi.mailStatus()
     mailEnabled.value = !!data?.mail_enabled
   } catch {
-    mailEnabled.value = null
+    // 探测失败时按「未启用邮件」处理：旧密码模式在任何配置下都可用
+    mailEnabled.value = false
   }
 })
 </script>
@@ -104,7 +191,7 @@ onMounted(async () => {
 
 .panel {
   width: 100%;
-  max-width: 420px;
+  max-width: 430px;
   background: #fff;
   border-radius: 18px;
   padding: 32px 30px 22px;
@@ -143,6 +230,15 @@ onMounted(async () => {
 
 .submit {
   width: 100%;
+}
+
+.error {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-radius: 9px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 14px;
 }
 
 .footer {

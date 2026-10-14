@@ -307,6 +307,32 @@ type LoginLog struct {
 // TableName 固定表名。
 func (LoginLog) TableName() string { return "lt_login_logs" }
 
+// EmailCode 是一次性邮箱验证码（6 位数字）。
+//
+// 与 PasswordResetToken 并存不是冗余，而是场景不同：
+//   - 网页端找回密码：点邮件里的链接最省事，用 PasswordResetToken；
+//   - 桌面客户端：在应用里点链接体验很差，填 6 位验证码更自然，用本表；
+//   - 注册邮箱验证：同理用验证码。
+//
+// 只存 SHA-256 摘要：数据库被读取时无法反推出可用的验证码。
+type EmailCode struct {
+	ID    uint   `gorm:"primarykey" json:"id"`
+	Email string `gorm:"size:128;index;not null" json:"-"`
+	// Scene 区分用途：register（注册验证）| reset（找回密码）
+	Scene    string `gorm:"size:32;index;not null" json:"-"`
+	CodeHash string `gorm:"size:64;not null" json:"-"`
+	// Attempts 记录校验失败次数。6 位数字只有 100 万种可能，
+	// 不限次数的校验等于把这个验证码变成一个可暴力枚举的口令。
+	Attempts  int        `gorm:"default:0" json:"-"`
+	UsedAt    *time.Time `json:"-"`
+	ExpireAt  time.Time  `gorm:"index" json:"-"`
+	IP        string     `gorm:"size:64" json:"-"`
+	CreatedAt time.Time  `json:"-"`
+}
+
+// TableName 固定表名。
+func (EmailCode) TableName() string { return "lt_email_codes" }
+
 // PasswordResetToken 是找回密码的一次性令牌。
 //
 // 只存 SHA-256 摘要：数据库泄露也无法据此重置他人密码。

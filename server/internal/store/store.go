@@ -81,6 +81,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.TrafficDaily{},
 		&model.LoginLog{},
 		&model.PasswordResetToken{},
+		&model.EmailCode{},
 		&model.Setting{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)

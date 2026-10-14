@@ -54,6 +54,13 @@ var (
 	ErrDomainRegisterLimited = errors.New("该邮箱域名今日注册数量已达上限，请改用其他邮箱或明日再试")
 	ErrEmailCodeNeeded = errors.New("请输入邮箱验证码")
 	ErrEmailCodeWrong  = errors.New("邮箱验证码不正确或已过期")
+
+	// 邮箱验证码相关
+	ErrEmailRequired     = errors.New("请填写有效的邮箱地址")
+	ErrEmailTaken        = errors.New("该邮箱已被其他账号使用")
+	ErrEmailCodeTooSoon  = errors.New("验证码发送过于频繁，请稍后再试")
+	ErrEmailCodeTooMany  = errors.New("该邮箱今日验证码发送次数已达上限，请明日再试")
+	ErrEmailCodeAttempts = errors.New("验证码错误次数过多，请重新获取")
 )
 
 // Services 业务服务集合。

@@ -75,7 +75,9 @@ export const authApi = {
   logout: () => http.post('/logout'),
   forgotPassword: (account) => http.post('/auth/forgot-password', { account }),
   resetPassword: (data) => http.post('/auth/reset-password', data),
-  mailStatus: () => http.get('/auth/mail-status')
+  mailStatus: () => http.get('/auth/mail-status'),
+  // 邮箱一次性验证码：scene 为 register（注册）或 reset（找回密码）
+  sendEmailCode: (data) => http.post('/auth/send-email-code', data)
 }
 
 export const profileApi = {

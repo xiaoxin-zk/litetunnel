@@ -46,10 +46,12 @@ type registerReq struct {
 	Password string `json:"password" binding:"required"`
 	Email    string `json:"email"`
 
-	// 准入校验材料：条款勾选与验证码
+	// 准入校验材料：条款勾选与图形验证码
 	Agreed        bool   `json:"agreed"`
 	CaptchaTicket string `json:"captcha_ticket"`
 	CaptchaAnswer string `json:"captcha_answer"`
+	// EmailCode 是邮箱一次性验证码。站点启用邮件后为必填。
+	EmailCode string `json:"email_code"`
 }
 
 // Register 用户注册。
@@ -70,6 +72,7 @@ func (h *Handler) Register(c *gin.Context) {
 		AgreedTerms:   req.Agreed,
 		CaptchaTicket: req.CaptchaTicket,
 		CaptchaAnswer: req.CaptchaAnswer,
+		EmailCode:     req.EmailCode,
 	})
 	if err != nil {
 		shared.Fail(c, err)
@@ -247,22 +250,104 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 }
 
 type resetPasswordReq struct {
-	Token    string `json:"token" binding:"required"`
+	// Token 是邮件链接里的令牌（网页端「点链接」流程）
+	Token string `json:"token"`
+	// Account 是用户名或邮箱，验证码模式与旧密码模式都需要
+	Account  string `json:"account"`
 	Password string `json:"password" binding:"required"`
+	// OldPassword 在「站点未启用邮件」时用于证明身份
+	OldPassword string `json:"old_password"`
+	// EmailCode 在「站点已启用邮件」时用于验证身份
+	EmailCode string `json:"email_code"`
 }
 
-// ResetPassword 使用邮件中的令牌重置密码。
+// ResetPassword 重置密码。三种入口，按站点配置与请求内容自动选择：
+//
+//  1. 邮件链接令牌（网页端点链接的既有流程）
+//  2. 旧密码 + 新密码 —— 站点**未启用**邮件时使用
+//  3. 邮箱一次性验证码 + 新密码 —— 站点**已启用**邮件时使用
+//
+// 这样在无法发信的部署环境下用户依然能自助重置，而不是只能找管理员；
+// 而一旦有了邮件通道，就自动升级为更安全的验证码流程。
 func (h *Handler) ResetPassword(c *gin.Context) {
 	var req resetPasswordReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		httpx.BadRequest(c, "参数不完整")
 		return
 	}
-	if err := h.svc.ResetPassword(req.Token, req.Password, httpx.ClientIP(c)); err != nil {
+	ip := httpx.ClientIP(c)
+	const okMsg = "密码已重置，所有设备已下线，请用新密码登录"
+
+	// 入口 1：邮件链接令牌
+	if strings.TrimSpace(req.Token) != "" {
+		if err := h.svc.ResetPassword(req.Token, req.Password, ip); err != nil {
+			shared.Fail(c, err)
+			return
+		}
+		httpx.OK(c, gin.H{"message": okMsg})
+		return
+	}
+
+	account := strings.ToLower(strings.TrimSpace(req.Account))
+	if account == "" {
+		httpx.BadRequest(c, "请填写账号或邮箱")
+		return
+	}
+
+	// 入口 2：旧密码模式（站点未启用邮件）
+	if !h.svc.MailEnabled() {
+		// 复用登录的账号锁定维度。不这么做的话，本接口会立刻变成
+		// 绕过登录锁定的旁路：被锁住的攻击者改打这里继续撞库。
+		if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account, ip) {
+			return
+		}
+		err := h.svc.ResetPasswordByOldPassword(req.Account, req.OldPassword, req.Password, ip)
+		if err != nil {
+			// 只有「凭据错误」才计入锁定次数；密码强度不合格之类不该算失败。
+			if errors.Is(err, service.ErrBadCredentials) {
+				shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account, ip)
+			}
+			shared.Fail(c, err)
+			return
+		}
+		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account, ip)
+		httpx.OK(c, gin.H{"message": okMsg})
+		return
+	}
+
+	// 入口 3：邮箱验证码模式（站点已启用邮件）
+	if err := h.svc.ResetPasswordByEmailCode(req.Account, req.EmailCode, req.Password, ip); err != nil {
 		shared.Fail(c, err)
 		return
 	}
-	httpx.OK(c, gin.H{"message": "密码已重置，所有设备已下线，请用新密码登录"})
+	httpx.OK(c, gin.H{"message": okMsg})
+}
+
+type sendEmailCodeReq struct {
+	Email string `json:"email" binding:"required"`
+	// Scene 决定用途：register（注册验证）| reset（找回密码）
+	Scene string `json:"scene" binding:"required"`
+}
+
+// SendEmailCode 发送邮箱一次性验证码。
+//
+// 两种 scene 对「邮箱是否已注册」的处理刻意不同：
+// 注册场景会明确告知邮箱已被占用（否则用户无法继续），
+// 找回场景则一律返回成功，避免接口退化成账号枚举工具。
+func (h *Handler) SendEmailCode(c *gin.Context) {
+	var req sendEmailCodeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写邮箱")
+		return
+	}
+	if err := h.svc.SendEmailCode(req.Email, req.Scene, httpx.ClientIP(c)); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{
+		"message":   "验证码已发送，请查收（10 分钟内有效）",
+		"expire_in": 600,
+	})
 }
 
 // ResetMailStatus 返回站点是否已启用邮件找回功能，供前端决定是否显示入口。

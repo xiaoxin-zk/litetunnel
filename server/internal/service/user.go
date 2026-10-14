@@ -18,10 +18,33 @@ type RegisterInput struct {
 	Password string
 	Email    string
 	IP       string
+
+	// 注册准入校验材料
+	AgreedTerms   bool
+	CaptchaTicket string
+	CaptchaAnswer string
 }
 
 // Register 创建用户并绑定默认分组。
+//
+// 注册是最容易被滥用的入口（批量注册、薅资源、拿隧道做跳板），
+// 因此准入校验集中在这里，按「成本从低到高」短路，避免无谓的数据库查询。
 func (s *Services) Register(in RegisterInput) (*model.User, error) {
+	// 1. 注册开关：管理端可一键关闭注册
+	if !s.Settings.Bool(KeyRegisterEnabled) {
+		return nil, ErrRegisterClosed
+	}
+	// 2. 必须显式同意条款（前端勾选），这是禁止滥用条款生效的前提
+	if !in.AgreedTerms {
+		return nil, fmt.Errorf("%w: 请先阅读并同意服务条款与禁止滥用规定", ErrInvalidParam)
+	}
+	// 3. 验证码：由开关控制，默认开启
+	if s.Settings.Bool(KeyRegisterCaptcha) {
+		if !s.CheckCaptcha(in.CaptchaTicket, in.CaptchaAnswer) {
+			return nil, ErrCaptchaInvalid
+		}
+	}
+
 	in.Username = strings.TrimSpace(in.Username)
 	in.Email = strings.TrimSpace(in.Email)
 	if len(in.Username) < 3 || len(in.Username) > 32 {
@@ -35,6 +58,14 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	}
 	if in.Email != "" && !IsValidEmail(in.Email) {
 		return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
+	}
+	// 4. 邮箱域名黑名单：拦住一次性邮箱批量注册
+	if in.Email != "" && s.emailDomainBlocked(in.Email) {
+		return nil, ErrEmailNotAllowed
+	}
+	// 5. 单 IP 每日注册上限：拦住同一台机器批量注册
+	if err := s.checkRegisterRate(in.IP); err != nil {
+		return nil, err
 	}
 
 	var exists int64
@@ -74,6 +105,7 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		APIKeyPrefix:    apiPrefix,
 		APIKeyEnc:       apiEnc,
 		APIKeyCreatedAt: &now,
+		RegisterIP:      truncate(in.IP, 64),
 	}
 	if group != nil {
 		user.GroupID = group.ID
@@ -83,6 +115,56 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, ErrUsernameTaken
 	}
 	return s.LoadUser(user.ID)
+}
+
+// emailDomainBlocked 判断邮箱域名是否命中黑名单。
+//
+// 支持两种写法：`example.com` 同时匹配 example.com 与其子域，
+// 也容忍误写的 `@example.com`。
+func (s *Services) emailDomainBlocked(email string) bool {
+	raw := strings.TrimSpace(s.Settings.Get(KeyRegisterBlockDomains))
+	if raw == "" {
+		return false
+	}
+	at := strings.LastIndex(email, "@")
+	if at < 0 || at == len(email)-1 {
+		return false
+	}
+	domain := strings.ToLower(email[at+1:])
+	for _, d := range strings.Split(raw, ",") {
+		d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(d), "@")))
+		if d == "" {
+			continue
+		}
+		if domain == d || strings.HasSuffix(domain, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRegisterRate 限制单个 IP 在自然日内的注册数量。
+//
+// 按自然日而不是滑动窗口：口径与运营直觉一致，也便于在管理页解释。
+func (s *Services) checkRegisterRate(ip string) error {
+	limit := s.Settings.Int(KeyRegisterMaxPerIP)
+	if limit <= 0 || ip == "" {
+		return nil
+	}
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
+	var n int64
+	if err := s.DB.Model(&model.User{}).
+		Where("register_ip = ? AND created_at >= ?", ip, dayStart).
+		Count(&n).Error; err != nil {
+		// 统计失败时放行：宁可漏拦，也不要因为统计问题挡住正常用户。
+		return nil
+	}
+	if n >= int64(limit) {
+		return ErrRegisterLimited
+	}
+	return nil
 }
 
 // Authenticate 校验用户凭据。

@@ -15,10 +15,13 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// LoginLockScope 用于区分用户域与管理域的锁定计数，两者互不影响。
+// LoginLockScope 用于区分不同登录入口的锁定计数，互不影响。
 const (
 	LoginLockScopeUser  = "user"
 	LoginLockScopeAdmin = "admin"
+	// LoginLockScopeUnified 用于统一登录入口：提交时无法预判账号属于哪一侧，
+	// 因此单独计数并采用最严的策略。
+	LoginLockScopeUnified = "unified"
 )
 
 // CheckLoginLock 检查账号是否处于登录锁定期。

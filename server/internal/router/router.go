@@ -27,6 +27,7 @@ import (
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/adminapi"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/authapi"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/frpsplugin"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/userapi"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
@@ -38,6 +39,7 @@ import (
 func New(
 	cfg *config.Config,
 	svc *service.Services,
+	authH *authapi.Handler,
 	userH *userapi.Handler,
 	adminH *adminapi.Handler,
 	plugin *frpsplugin.Handler,
@@ -64,16 +66,34 @@ func New(
 	userAuthLimiter := middleware.NewRateLimiter(0.5, 10)
 	userAPILimiter := middleware.NewRateLimiter(30, 90)
 	// 管理侧限流更严：它是公网可达的最高权限入口。
-	adminAuthLimiter := middleware.NewRateLimiter(0.1, 3)
 	adminAPILimiter := middleware.NewRateLimiter(20, 60)
 
 	// ================= 用户侧 =================
+
+	// ================= 公共入口（无需认证）=================
+
+	// 统一登录：用户控制台与管理后台共用一个入口，后端按账号自动分流。
+	// 限流采用管理侧标准（更严），因为提交时无法预判账号属于哪一侧。
+	pubAuthLimiter := middleware.NewRateLimiter(0.2, 5)
+	pubAuth := r.Group("/api/auth")
+	pubAuth.Use(middleware.Limit(pubAuthLimiter, "auth"))
+	{
+		pubAuth.POST("/login", authH.Login)
+	}
+
+	public := r.Group("/api/public")
+	public.Use(middleware.Limit(userAPILimiter, "public"))
+	{
+		// 登录/注册之前就需要知道的站点信息与验证码。
+		public.GET("/settings", authH.PublicSettings)
+		public.GET("/captcha", authH.Captcha)
+		public.POST("/captcha/verify", authH.VerifyCaptcha)
+	}
 
 	userAuth := r.Group("/api/user/auth")
 	userAuth.Use(middleware.Limit(userAuthLimiter, "user-auth"))
 	{
 		userAuth.POST("/register", userH.Register)
-		userAuth.POST("/login", userH.Login)
 		// 找回密码：发信走异步队列，账号是否存在不会体现在响应上。
 		userAuth.POST("/forgot-password", userH.ForgotPassword)
 		userAuth.POST("/reset-password", userH.ResetPassword)
@@ -128,13 +148,6 @@ func New(
 
 	// ================= 管理侧 =================
 
-	adminAuth := r.Group("/api/admin/auth")
-	adminAuth.Use(middleware.Limit(adminAuthLimiter, "admin-auth"))
-	adminAuth.Use(adminAllow.Middleware())
-	{
-		adminAuth.POST("/login", adminH.Login)
-	}
-
 	adminRead := r.Group("/api/admin")
 	adminRead.Use(middleware.Limit(adminAPILimiter, "admin-api"))
 	adminRead.Use(adminAllow.Middleware())
@@ -157,6 +170,7 @@ func New(
 		adminRead.GET("/audit-logs", adminH.ListAuditLogs)
 		adminRead.GET("/login-logs", adminH.ListLoginLogs)
 		adminRead.GET("/admins", adminH.ListAdmins)
+		adminRead.GET("/settings", adminH.GetSettings)
 	}
 
 	// 写操作额外要求 super / operator 角色，auditor 只读。
@@ -199,6 +213,10 @@ func New(
 		adminSuper.DELETE("/admins/:id", adminH.DeleteAdmin)
 		adminSuper.POST("/admins/:id/password", adminH.SetAdminPassword)
 		adminSuper.POST("/admins/:id/totp-reset", adminH.ClearAdminTOTP)
+
+		// 系统设置含 SMTP 授权码与支付密钥，只有超级管理员可读写。
+		adminSuper.PUT("/settings", adminH.UpdateSettings)
+		adminSuper.POST("/settings/test-mail", adminH.TestMail)
 	}
 
 	serveSPA(r, cfg, adminAllow)

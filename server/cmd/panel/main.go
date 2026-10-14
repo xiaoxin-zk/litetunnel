@@ -22,6 +22,7 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/adminapi"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/authapi"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/frpsplugin"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/userapi"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/router"
@@ -60,7 +61,10 @@ func main() {
 	svc.StartLoginLogWriter(ctx)
 	svc.StartMailWorker(ctx)
 
-	engine := router.New(cfg, svc, userapi.New(svc), adminapi.New(svc),
+	engine := router.New(cfg, svc,
+		authapi.New(svc, cfg.AdminPath),
+		userapi.New(svc),
+		adminapi.New(svc),
 		frpsplugin.New(svc, cfg.FrpsPluginAllowCIDRs))
 
 	srv := newServer(cfg.UserAddr, engine)

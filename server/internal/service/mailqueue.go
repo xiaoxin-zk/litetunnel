@@ -24,7 +24,7 @@ type outboundMail struct {
 
 // enqueueMail 投递一封邮件到异步队列。队列满时丢弃并记录告警。
 func (s *Services) enqueueMail(to, subject, body string) {
-	if !s.Mail.Enabled() {
+	if !s.MailEnabled() {
 		return
 	}
 	select {
@@ -38,12 +38,15 @@ func (s *Services) enqueueMail(to, subject, body string) {
 //
 // 单协程串行发送：SMTP 服务商通常对并发连接有严格限制，
 // 串行既避免了被限流，也让失败日志保持有序可读。
+//
+// 协程始终启动，而不是在未配置邮件时跳过：
+// 邮件配置可以在管理端随时开启，启动时禁用不代表之后一直禁用。
 func (s *Services) StartMailWorker(ctx context.Context) {
-	if !s.Mail.Enabled() {
-		log.Printf("[mail] 未配置 SMTP，找回密码功能将不可用")
-		return
+	if s.MailEnabled() {
+		log.Printf("[mail] 邮件发送已启用，发件人 %s", s.SMTPConfig().From)
+	} else {
+		log.Printf("[mail] 邮件发送未启用，可在管理端「系统设置 → 邮件」中配置")
 	}
-	log.Printf("[mail] 邮件发送已启用，发件人 %s", s.Mail.From())
 
 	go func() {
 		for {
@@ -51,8 +54,9 @@ func (s *Services) StartMailWorker(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case m := <-s.mailCh:
+				sender := s.Mailer()
 				done := make(chan error, 1)
-				go func() { done <- s.Mail.Send(m.To, m.Subject, m.Body) }()
+				go func() { done <- sender.Send(m.To, m.Subject, m.Body) }()
 
 				select {
 				case err := <-done:

@@ -79,6 +79,11 @@ type User struct {
 	// 使所有旧令牌立即失效（JWT 本身无状态，无法单独吊销）。
 	TokenVersion int `gorm:"default:1" json:"-"`
 
+	// RegisterIP 记录注册来源，用于「单 IP 每日注册上限」的风控统计。
+	RegisterIP string `gorm:"size:64;index" json:"-"`
+	// EmailVerified 表示邮箱是否通过验证码校验（未开启邮件验证时恒为 false）。
+	EmailVerified bool `gorm:"default:false" json:"email_verified"`
+
 	Remark      string     `gorm:"size:255" json:"remark"`
 	LastLoginAt *time.Time `json:"last_login_at"`
 	LastLoginIP string     `gorm:"size:64" json:"last_login_ip"`

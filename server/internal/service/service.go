@@ -42,6 +42,14 @@ var (
 	// 与 ErrTOTPInvalid 区分开：前者只是没填，不应计入暴力破解次数。
 	ErrTOTPRequired = errors.New("该账号已启用双因素认证，请输入动态口令")
 	ErrTOTPInvalid  = errors.New("动态口令不正确")
+
+	// 注册准入相关
+	ErrRegisterClosed  = errors.New("本站已关闭注册，请联系管理员开通账号")
+	ErrCaptchaInvalid  = errors.New("验证码不正确或已过期，请重新获取")
+	ErrRegisterLimited = errors.New("当前网络注册过于频繁，请稍后再试")
+	ErrEmailNotAllowed = errors.New("该邮箱域名不允许注册")
+	ErrEmailCodeNeeded = errors.New("请输入邮箱验证码")
+	ErrEmailCodeWrong  = errors.New("邮箱验证码不正确或已过期")
 )
 
 // Services 业务服务集合。
@@ -50,7 +58,13 @@ type Services struct {
 	Cfg     *config.Config
 	Frps    *FrpsClient
 	Runtime *Runtime
-	Mail    *mailer.Mailer
+
+	// Settings 是管理端可随时调整的运行期配置（SMTP、注册开关、支付、端口策略）。
+	// 与 Cfg 的分工见 setting.go 的注释。
+	Settings *SettingStore
+
+	// Captchas 是内存中的一次性验证码存储。
+	Captchas *CaptchaStore
 
 	// loginLogCh 与 mailCh 都是异步队列：
 	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
@@ -65,10 +79,40 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Cfg:        cfg,
 		Frps:       NewFrpsClient(cfg),
 		Runtime:    NewRuntime(),
-		Mail:       mailer.New(cfg.SMTP),
+		Settings:   NewSettingStore(db, cfg),
+		Captchas:   NewCaptchaStore(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
 	}
+}
+
+// SMTPConfig 按当前运行期配置组装邮件参数。
+//
+// 邮件配置可在管理端随时修改，因此每次都重新组装而不是启动时固定。
+func (s *Services) SMTPConfig() config.SMTPConfig {
+	return config.SMTPConfig{
+		Host:     strings.TrimSpace(s.Settings.Get(KeySMTPHost)),
+		Port:     s.Settings.Int(KeySMTPPort),
+		User:     strings.TrimSpace(s.Settings.Get(KeySMTPUser)),
+		Password: s.Settings.Get(KeySMTPPassword),
+		From:     strings.TrimSpace(s.Settings.Get(KeySMTPFrom)),
+		TLS:      strings.ToLower(strings.TrimSpace(s.Settings.Get(KeySMTPTLS))),
+		SiteName: s.Settings.Get(KeySiteName),
+	}
+}
+
+// Mailer 按当前配置构造发信器。
+func (s *Services) Mailer() *mailer.Mailer { return mailer.New(s.SMTPConfig()) }
+
+// MailEnabled 返回当前是否启用了邮件发送。
+//
+// 需要同时满足「管理端开关打开」与「参数齐全」两个条件：
+// 只填了参数但开关没开，不应静默发信。
+func (s *Services) MailEnabled() bool {
+	if !s.Settings.Bool(KeySMTPEnabled) {
+		return false
+	}
+	return s.SMTPConfig().Enabled()
 }
 
 // EffectiveGroup 返回用户当前生效的分组。

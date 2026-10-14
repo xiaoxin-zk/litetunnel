@@ -92,25 +92,40 @@ jobs:
           fi
           echo "PASS build version injected ($ver)"
 
-          # 单一入口：管理接口必须挂在同一端口上（返回 401 而非 404）
+          # 统一登录入口：账号密码错误应返回 401
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}' \
-            "$BASE/api/admin/auth/login")
+            "$BASE/api/auth/login")
           if [ "$code" != "401" ]; then
-            echo "::error::admin login on shared port returned $code, want 401"
+            echo "::error::unified login returned $code, want 401"
             exit 1
           fi
-          echo "PASS admin API mounted on the shared port"
+          echo "PASS unified login endpoint"
 
-          # 用户接口同样可用
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}' \
-            "$BASE/api/user/auth/login")
-          if [ "$code" != "401" ]; then
-            echo "::error::user login returned $code, want 401"
+          # 旧的独立登录入口必须已下线，避免留下第二条可爆破路径
+          for old in /api/user/auth/login /api/admin/auth/login; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' -d '{"username":"x","password":"y"}' \
+              "$BASE$old")
+            if [ "$code" != "404" ]; then
+              echo "::error::$old still reachable (got $code), want 404"
+              exit 1
+            fi
+          done
+          echo "PASS legacy login endpoints removed"
+
+          # 公共站点信息：登录前就要能读到
+          body=$(curl -fsS "$BASE/api/public/settings")
+          if ! printf '%s' "$body" | grep -q 'register_enabled'; then
+            echo "::error::public settings endpoint missing expected fields"
             exit 1
           fi
-          echo "PASS user API on the same port"
+          # 公共接口绝不能泄露密钥类字段
+          if printf '%s' "$body" | grep -qiE 'password|secret|smtp\.'; then
+            echo "::error::public settings leaked sensitive fields"
+            exit 1
+          fi
+          echo "PASS public settings (no sensitive fields)"
 
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
@@ -161,7 +176,7 @@ jobs:
             code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
               -H 'Content-Type: application/json' \
               -d '{"username":"bruteforce","password":"wrong-password"}' \
-              "$BASE/api/admin/auth/login")
+              "$BASE/api/auth/login")
             if [ "$code" = "429" ]; then locked=1; break; fi
           done
           if [ "$locked" != "1" ]; then

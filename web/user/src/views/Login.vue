@@ -1,84 +1,190 @@
 <template>
-  <div class="login-page">
-    <div class="login-panel">
+  <div class="page">
+    <div class="panel lt-card">
       <div class="brand">
         <div class="logo">LT</div>
         <div>
-          <h1>LiteTunnel</h1>
-          <p>轻量内网穿透 · 游戏联机 · 网站与 NAS 映射</p>
+          <h1>{{ site.site_name || 'LiteTunnel' }}</h1>
+          <p>登录后管理你的隧道、客户端与账号</p>
         </div>
       </div>
 
+      <el-alert
+        v-if="site.announcement"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        :title="site.announcement"
+      />
+
       <el-tabs v-model="tab" class="tabs">
+        <!-- ============ 登录 ============ -->
         <el-tab-pane label="登录" name="login">
-          <el-form :model="loginForm" :rules="rules" ref="loginRef" label-position="top" @submit.prevent>
-            <el-form-item label="用户名" prop="username">
-              <el-input v-model="loginForm.username" size="large" placeholder="请输入用户名" :prefix-icon="User" />
+          <el-form :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
+            <el-form-item label="账号" prop="username">
+              <el-input
+                v-model="form.username"
+                size="large"
+                :prefix-icon="User"
+                placeholder="用户名或管理员账号"
+                autocomplete="username"
+              />
             </el-form-item>
+
             <el-form-item label="密码" prop="password">
               <el-input
-                v-model="loginForm.password"
+                v-model="form.password"
                 type="password"
                 size="large"
                 show-password
-                placeholder="请输入密码"
                 :prefix-icon="Lock"
-                @keyup.enter="doLogin"
+                placeholder="登录密码"
+                autocomplete="current-password"
+                @keyup.enter="submit"
               />
             </el-form-item>
-            <div class="forgot">
-              <el-button link type="primary" @click="$router.push('/forgot-password')">忘记密码？</el-button>
-            </div>
-            <el-button type="primary" size="large" class="submit" :loading="loading" @click="doLogin">
+
+            <!-- 双因素：默认收起，后端要求时自动展开 -->
+            <el-form-item v-if="totpVisible" label="动态口令" prop="totp_code">
+              <el-input
+                v-model="form.totp_code"
+                size="large"
+                maxlength="6"
+                :prefix-icon="Key"
+                placeholder="认证器 App 中的 6 位口令"
+                @keyup.enter="submit"
+              />
+            </el-form-item>
+
+            <!-- 验证码：连续失败若干次后才要求 -->
+            <el-form-item v-if="captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
+              <el-input
+                v-model="form.captcha_answer"
+                size="large"
+                placeholder="填写计算结果"
+                @keyup.enter="submit"
+              >
+                <template #append>
+                  <el-button :icon="Refresh" @click="loadCaptcha" />
+                </template>
+              </el-input>
+            </el-form-item>
+
+            <div v-if="error" class="error">{{ error }}</div>
+
+            <el-button type="primary" size="large" class="submit" :loading="loading" @click="submit">
               登录
             </el-button>
+
+            <div class="links">
+              <el-button link type="primary" @click="$router.push('/forgot-password')">
+                忘记密码？
+              </el-button>
+              <el-button v-if="site.register_enabled" link type="primary" @click="tab = 'register'">
+                注册账号
+              </el-button>
+            </div>
           </el-form>
         </el-tab-pane>
 
-        <el-tab-pane label="注册" name="register">
-          <el-form :model="regForm" :rules="regRules" ref="regRef" label-position="top" @submit.prevent>
+        <!-- ============ 注册 ============ -->
+        <el-tab-pane v-if="site.register_enabled" label="注册" name="register">
+          <el-form :model="reg" :rules="regRules" ref="regRef" label-position="top" @submit.prevent>
             <el-form-item label="用户名" prop="username">
-              <el-input v-model="regForm.username" size="large" placeholder="3-32 位字母、数字或下划线" :prefix-icon="User" />
-            </el-form-item>
-            <el-form-item label="邮箱（选填）" prop="email">
-              <el-input v-model="regForm.email" size="large" placeholder="用于找回账号" :prefix-icon="Message" />
+              <el-input v-model="reg.username" size="large" placeholder="3-32 位字母、数字或下划线" />
             </el-form-item>
             <el-form-item label="密码" prop="password">
-              <el-input v-model="regForm.password" type="password" size="large" show-password placeholder="至少 8 位" :prefix-icon="Lock" />
+              <el-input v-model="reg.password" type="password" size="large" show-password placeholder="至少 8 位" />
             </el-form-item>
             <el-form-item label="确认密码" prop="confirm">
-              <el-input v-model="regForm.confirm" type="password" size="large" show-password placeholder="再次输入密码" :prefix-icon="Lock" />
+              <el-input v-model="reg.confirm" type="password" size="large" show-password />
             </el-form-item>
-            <el-button type="primary" size="large" class="submit" :loading="loading" @click="doRegister">
-              注册并登录
+            <el-form-item label="邮箱">
+              <el-input
+                v-model="reg.email"
+                size="large"
+                placeholder="选填，用于找回密码"
+              />
+            </el-form-item>
+
+            <el-form-item v-if="captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
+              <el-input v-model="reg.captcha_answer" size="large" placeholder="填写计算结果">
+                <template #append>
+                  <el-button :icon="Refresh" @click="loadCaptcha" />
+                </template>
+              </el-input>
+            </el-form-item>
+
+            <el-form-item prop="agreed">
+              <el-checkbox v-model="reg.agreed">
+                我已阅读并同意
+                <el-button link type="primary" style="padding: 0 2px" @click="termsVisible = true">
+                  《服务条款与禁止滥用规定》
+                </el-button>
+              </el-checkbox>
+            </el-form-item>
+
+            <div v-if="regError" class="error">{{ regError }}</div>
+
+            <el-button type="primary" size="large" class="submit" :loading="regLoading" @click="submitRegister">
+              注册
             </el-button>
           </el-form>
         </el-tab-pane>
       </el-tabs>
 
-      <p class="tip">登录后即可创建隧道、下载客户端并查看实时流量。</p>
+      <div v-if="site.icp" class="icp">{{ site.icp }}</div>
     </div>
+
+    <!-- 条款 -->
+    <el-dialog v-model="termsVisible" title="服务条款与禁止滥用规定" width="620px">
+      <pre class="terms">{{ site.terms || '暂无条款内容' }}</pre>
+      <template #footer>
+        <el-button @click="termsVisible = false">关闭</el-button>
+        <el-button type="primary" @click="agreeTerms">我已阅读并同意</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { User, Lock, Message } from '@element-plus/icons-vue'
-import { authApi, TOKEN_KEY } from '../api'
+import { User, Lock, Key, Refresh } from '@element-plus/icons-vue'
+import { authApi, publicApi, sessionApi, TOKEN_KEY } from '../api'
+
+// 管理端是独立 SPA，与用户端同源，因此 localStorage 共享：
+// 管理员登录成功后把令牌写到管理端的键上，直接跳转即可，无需跨页传参。
+const ADMIN_TOKEN_KEY = 'lt_admin_token'
 
 const router = useRouter()
 const tab = ref('login')
-const loading = ref(false)
-const loginRef = ref()
-const regRef = ref()
+const site = ref({})
+const captcha = ref(null)
+const totpVisible = ref(false)
+const termsVisible = ref(false)
 
-const loginForm = reactive({ username: '', password: '' })
-const regForm = reactive({ username: '', email: '', password: '', confirm: '' })
+const formRef = ref()
+const regRef = ref()
+const loading = ref(false)
+const regLoading = ref(false)
+const error = ref('')
+const regError = ref('')
+
+const form = reactive({ username: '', password: '', totp_code: '', captcha_answer: '' })
+const reg = reactive({
+  username: '',
+  password: '',
+  confirm: '',
+  email: '',
+  captcha_answer: '',
+  agreed: false
+})
 
 const rules = {
-  username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
+  username: [{ required: true, message: '请输入账号', trigger: 'blur' }],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }]
 }
 
@@ -93,49 +199,122 @@ const regRules = {
   ],
   confirm: [
     {
-      validator: (_r, value, cb) => {
-        if (value !== regForm.password) cb(new Error('两次输入的密码不一致'))
-        else cb()
-      },
+      validator: (_r, v, cb) => (v !== reg.password ? cb(new Error('两次输入的密码不一致')) : cb()),
       trigger: 'blur'
     }
   ]
 }
 
-async function doLogin() {
-  await loginRef.value.validate()
+async function loadSettings() {
+  try {
+    site.value = (await publicApi.settings()) || {}
+  } catch {
+    site.value = {}
+  }
+}
+
+async function loadCaptcha() {
+  try {
+    captcha.value = await publicApi.captcha()
+    form.captcha_answer = ''
+    reg.captcha_answer = ''
+  } catch {
+    captcha.value = null
+  }
+}
+
+async function submit() {
+  error.value = ''
+  await formRef.value.validate()
+
+  if (captcha.value && !form.captcha_answer.trim()) {
+    error.value = '请填写验证码'
+    return
+  }
+
   loading.value = true
   try {
-    const data = await authApi.login({ ...loginForm })
+    const data = await sessionApi.login({
+      username: form.username.trim(),
+      password: form.password,
+      totp_code: form.totp_code.trim()
+    })
+
+    if (data.role === 'admin') {
+      // 管理员：写管理端令牌后整页跳转（跨 SPA，必须用 location 而非 router）
+      localStorage.setItem(ADMIN_TOKEN_KEY, data.token)
+      ElMessage.success('登录成功，正在进入管理后台')
+      window.location.href = data.redirect || '/lt-console/'
+      return
+    }
+
     localStorage.setItem(TOKEN_KEY, data.token)
     ElMessage.success('登录成功')
-    router.push('/dashboard')
+    router.push('/')
+  } catch (e) {
+    const body = e?.response?.data
+    // 后端要求动态口令时展开输入框，并聚焦过去
+    if (body?.data?.totp_required || /动态口令/.test(body?.message || '')) {
+      totpVisible.value = true
+      error.value = '该账号已启用双因素认证，请输入动态口令'
+    } else {
+      error.value = body?.message || '登录失败，请检查账号与密码'
+      // 失败后按策略要求验证码
+      if (site.value.register_captcha) await loadCaptcha()
+    }
   } finally {
     loading.value = false
   }
 }
 
-async function doRegister() {
+async function submitRegister() {
+  regError.value = ''
   await regRef.value.validate()
-  loading.value = true
+
+  if (!reg.agreed) {
+    regError.value = '请先阅读并同意服务条款与禁止滥用规定'
+    return
+  }
+  if (captcha.value && !reg.captcha_answer.trim()) {
+    regError.value = '请填写验证码'
+    return
+  }
+
+  regLoading.value = true
   try {
     await authApi.register({
-      username: regForm.username,
-      password: regForm.password,
-      email: regForm.email
+      username: reg.username.trim(),
+      password: reg.password,
+      email: reg.email.trim(),
+      agreed: reg.agreed,
+      captcha_ticket: captcha.value?.ticket || '',
+      captcha_answer: reg.captcha_answer.trim()
     })
-    const data = await authApi.login({ username: regForm.username, password: regForm.password })
-    localStorage.setItem(TOKEN_KEY, data.token)
-    ElMessage.success('注册成功，欢迎使用')
-    router.push('/dashboard')
+    ElMessage.success('注册成功，请登录')
+    form.username = reg.username.trim()
+    tab.value = 'login'
+  } catch (e) {
+    regError.value = e?.response?.data?.message || '注册失败'
+    // 验证码是一次性的，无论成败都要换一张
+    await loadCaptcha()
   } finally {
-    loading.value = false
+    regLoading.value = false
   }
 }
+
+function agreeTerms() {
+  reg.agreed = true
+  termsVisible.value = false
+}
+
+onMounted(async () => {
+  await loadSettings()
+  if (site.value.register_captcha) await loadCaptcha()
+})
 </script>
 
 <style scoped>
-.login-page {
+.page {
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -145,65 +324,80 @@ async function doRegister() {
     radial-gradient(900px 500px at 100% 100%, #e0e7ff 0%, transparent 55%), #f5f7fb;
 }
 
-.login-panel {
+.panel {
   width: 100%;
-  max-width: 420px;
-  background: #fff;
-  border-radius: 18px;
-  padding: 32px 30px 24px;
-  box-shadow: 0 20px 50px rgba(16, 24, 40, 0.12);
+  max-width: 440px;
+  padding: 30px 28px 22px;
 }
 
 .brand {
   display: flex;
-  gap: 14px;
+  gap: 13px;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 18px;
 }
 
 .logo {
-  width: 48px;
-  height: 48px;
-  border-radius: 14px;
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
   background: linear-gradient(135deg, #2563eb, #4f46e5);
   color: #fff;
   font-weight: 700;
-  font-size: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
-  letter-spacing: 0.5px;
 }
 
 .brand h1 {
   margin: 0;
-  font-size: 20px;
+  font-size: 19px;
 }
 
 .brand p {
   margin: 4px 0 0;
-  font-size: 12px;
+  font-size: 12.5px;
   color: #6b7280;
 }
 
-.tabs {
-  margin-top: 18px;
+.tabs :deep(.el-tabs__header) {
+  margin-bottom: 18px;
 }
 
 .submit {
   width: 100%;
-  margin-top: 6px;
 }
 
-.forgot {
-  text-align: right;
-  margin: -6px 0 4px;
+.links {
+  margin-top: 10px;
+  display: flex;
+  justify-content: space-between;
 }
 
-.tip {
-  margin: 18px 0 0;
+.error {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-radius: 9px;
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+.icp {
+  margin-top: 16px;
   text-align: center;
   font-size: 12px;
   color: #9ca3af;
+}
+
+.terms {
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.9;
+  color: #374151;
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
 }
 </style>

@@ -43,8 +43,9 @@ http.interceptors.response.use(
 
 export default http
 
+// 登录已合并到 /api/auth/login（见用户控制台的 sessionApi），
+// 管理端不再提供独立登录接口。
 export const authApi = {
-  login: (data) => http.post('/auth/login', data),
   profile: () => http.get('/profile'),
   changePassword: (data) => http.put('/profile/password', data),
   totpSetup: () => http.post('/profile/totp/setup'),
@@ -97,6 +98,12 @@ export const adminApi = {
   remove: (id) => http.delete(`/admins/${id}`),
   setPassword: (id, password) => http.post(`/admins/${id}/password`, { password }),
   clearTOTP: (id) => http.post(`/admins/${id}/totp-reset`)
+}
+
+export const settingsApi = {
+  get: () => http.get('/settings'),
+  update: (data) => http.put('/settings', data),
+  testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
 export const logApi = {

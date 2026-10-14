@@ -2,12 +2,6 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 
 const routes = [
   {
-    path: '/login',
-    name: 'login',
-    component: () => import('../views/Login.vue'),
-    meta: { public: true }
-  },
-  {
     path: '/',
     component: () => import('../views/Layout.vue'),
     children: [
@@ -20,6 +14,7 @@ const routes = [
       { path: 'logs', name: 'logs', meta: { title: '审计与客户端' }, component: () => import('../views/Logs.vue') },
       { path: 'login-logs', name: 'login-logs', meta: { title: '登录日志' }, component: () => import('../views/LoginLogs.vue') },
       { path: 'admins', name: 'admins', meta: { title: '管理员管理' }, component: () => import('../views/Admins.vue') },
+      { path: 'system', name: 'system', meta: { title: '系统设置' }, component: () => import('../views/SystemSettings.vue') },
       { path: 'settings', name: 'settings', meta: { title: '账号设置' }, component: () => import('../views/Settings.vue') }
     ]
   },
@@ -36,13 +31,12 @@ const router = createRouter({
   routes
 })
 
-router.beforeEach((to) => {
-  const token = localStorage.getItem('lt_admin_token')
-  if (!to.meta.public && !token) {
-    return { path: '/login' }
-  }
-  if (to.meta.public && token) {
-    return { path: '/dashboard' }
+router.beforeEach(() => {
+  // 登录页已合并到用户控制台的 /login（同域名同端口），
+  // 未登录时整页跳过去，登录成功后按角色再跳回来。
+  if (!localStorage.getItem('lt_admin_token')) {
+    window.location.href = '/login'
+    return false
   }
   return true
 })

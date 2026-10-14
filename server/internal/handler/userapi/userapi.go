@@ -16,7 +16,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/shared"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
@@ -46,9 +45,17 @@ type registerReq struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
 	Email    string `json:"email"`
+
+	// 准入校验材料：条款勾选与验证码
+	Agreed        bool   `json:"agreed"`
+	CaptchaTicket string `json:"captcha_ticket"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // Register 用户注册。
+//
+// 准入校验（注册开关、条款、验证码、邮箱黑名单、同 IP 频率）都在 service 层完成，
+// handler 只负责把请求字段透传过去。
 func (h *Handler) Register(c *gin.Context) {
 	var req registerReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -56,21 +63,19 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 	u, err := h.svc.Register(service.RegisterInput{
-		Username: req.Username,
-		Password: req.Password,
-		Email:    req.Email,
-		IP:       httpx.ClientIP(c),
+		Username:      req.Username,
+		Password:      req.Password,
+		Email:         req.Email,
+		IP:            httpx.ClientIP(c),
+		AgreedTerms:   req.Agreed,
+		CaptchaTicket: req.CaptchaTicket,
+		CaptchaAnswer: req.CaptchaAnswer,
 	})
 	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
 	httpx.OK(c, gin.H{"id": u.ID, "username": u.Username})
-}
-
-type loginReq struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
 }
 
 // recordLogin 写入登录日志，自动补齐 IP 与 UA。
@@ -80,57 +85,8 @@ func (h *Handler) recordLogin(c *gin.Context, a service.LoginAttempt) {
 	h.svc.RecordLogin(a)
 }
 
-// Login 用户登录，签发用户域令牌。
-func (h *Handler) Login(c *gin.Context) {
-	var req loginReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		httpx.BadRequest(c, "请填写用户名与密码")
-		return
-	}
-
-	account := strings.ToLower(strings.TrimSpace(req.Username))
-	attempt := service.LoginAttempt{
-		Kind:     model.LoginKindUser,
-		Username: req.Username,
-		Source:   model.LoginSourceWeb,
-	}
-
-	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account) {
-		attempt.Result = model.LoginResultLocked
-		attempt.Detail = "账号处于登录锁定期"
-		h.recordLogin(c, attempt)
-		return
-	}
-
-	u, err := h.svc.Authenticate(req.Username, req.Password, httpx.ClientIP(c))
-	if err != nil {
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account)
-		attempt.Result = shared.LoginResultOf(err)
-		attempt.Detail = err.Error()
-		h.recordLogin(c, attempt)
-		shared.Fail(c, err)
-		return
-	}
-	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account)
-	attempt.AccountID = u.ID
-	attempt.Username = u.Username
-	attempt.Result = model.LoginResultSuccess
-	h.recordLogin(c, attempt)
-
-	token, expireAt, err := auth.Issue(
-		h.svc.Cfg.UserJWTSecret, auth.DomainUser,
-		u.ID, u.Username, "", u.TokenVersion, h.svc.Cfg.UserJWTExpire,
-	)
-	if err != nil {
-		shared.Fail(c, err)
-		return
-	}
-	httpx.OK(c, gin.H{
-		"token":      token,
-		"expires_at": expireAt,
-		"user":       h.profileVO(u),
-	})
-}
+// 说明：用户登录已合并到 /api/auth/login（见 handler/authapi），
+// 这里不再保留独立的用户登录入口，避免出现第二条可爆破的密码校验路径。
 
 // Logout 用户登出。JWT 无状态，服务端仅作审计记录，客户端需自行清除令牌。
 func (h *Handler) Logout(c *gin.Context) {

@@ -33,16 +33,13 @@ var (
 	ErrResetTokenExpired = errors.New("重置链接已过期，请重新申请")
 )
 
-// MailEnabled 返回是否可通过邮件找回密码。
-func (s *Services) MailEnabled() bool { return s.Mail.Enabled() }
-
 // RequestPasswordReset 发起找回密码。account 可以是用户名或邮箱。
 //
 // 安全要求：无论账号是否存在、是否填写邮箱、是否被禁用，
 // 本方法都返回 nil 且耗时基本一致——否则该接口会退化成账号枚举工具。
 // 真正的失败原因只写日志。
 func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
-	if !s.Mail.Enabled() {
+	if !s.MailEnabled() {
 		return ErrMailDisabled
 	}
 
@@ -83,9 +80,13 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 		return nil
 	}
 
+	siteName := s.Settings.Get(KeySiteName)
+	if siteName == "" {
+		siteName = "LiteTunnel"
+	}
 	link := strings.TrimRight(baseURL, "/") + "/reset-password?token=" + plain
-	subject := fmt.Sprintf("【%s】重置登录密码", s.Cfg.SMTP.SiteName)
-	body := resetMailBody(s.Cfg.SMTP.SiteName, u.Username, link, int(resetTokenTTL.Minutes()))
+	subject := fmt.Sprintf("【%s】重置登录密码", siteName)
+	body := resetMailBody(siteName, u.Username, link, int(resetTokenTTL.Minutes()))
 
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 若同步发送会让「账号存在」的响应明显变慢，从而泄露账号是否存在。

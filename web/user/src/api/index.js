@@ -18,34 +18,60 @@ http.interceptors.request.use((cfg) => {
   return cfg
 })
 
-http.interceptors.response.use(
-  (res) => {
-    const body = res.data
-    if (body && typeof body.code === 'number' && body.code !== 0) {
-      ElMessage.error(body.message || '请求失败')
-      return Promise.reject(new Error(body.message || '请求失败'))
-    }
-    return body ? body.data : null
-  },
-  (err) => {
-    const status = err.response?.status
-    const message = err.response?.data?.message || err.message || '网络异常'
-    if (status === 401) {
-      localStorage.removeItem(TOKEN_KEY)
-      if (router.currentRoute.value.path !== '/login') {
-        router.push('/login')
+/**
+ * 统一的响应拆包与错误提示。
+ *
+ * redirectOn401 对公共接口要关掉：登录失败本身就是 401，
+ * 而那时我们已经在登录页上，再跳转只会造成闪烁。
+ */
+function attachResponseHandlers(instance, { redirectOn401 = true } = {}) {
+  instance.interceptors.response.use(
+    (res) => {
+      const body = res.data
+      if (body && typeof body.code === 'number' && body.code !== 0) {
+        ElMessage.error(body.message || '请求失败')
+        return Promise.reject(new Error(body.message || '请求失败'))
       }
+      return body ? body.data : null
+    },
+    (err) => {
+      const status = err.response?.status
+      const message = err.response?.data?.message || err.message || '网络异常'
+      if (redirectOn401 && status === 401) {
+        localStorage.removeItem(TOKEN_KEY)
+        if (router.currentRoute.value.path !== '/login') {
+          router.push('/login')
+        }
+      }
+      ElMessage.error(message)
+      return Promise.reject(err)
     }
-    ElMessage.error(message)
-    return Promise.reject(err)
-  }
+  )
+  return instance
+}
+
+attachResponseHandlers(http)
+
+// 公共接口：统一登录、站点信息、验证码。这些在未登录时就要访问。
+const pub = attachResponseHandlers(
+  axios.create({ baseURL: '/api', timeout: 20000 }),
+  { redirectOn401: false }
 )
 
 export default http
 
+export const publicApi = {
+  settings: () => pub.get('/public/settings'),
+  captcha: () => pub.get('/public/captcha')
+}
+
+export const sessionApi = {
+  // 统一登录入口：用户与管理员共用，返回值里的 role 决定跳转到哪个控制台
+  login: (data) => pub.post('/auth/login', data)
+}
+
 export const authApi = {
   register: (data) => http.post('/auth/register', data),
-  login: (data) => http.post('/auth/login', data),
   logout: () => http.post('/logout'),
   forgotPassword: (account) => http.post('/auth/forgot-password', { account }),
   resetPassword: (data) => http.post('/auth/reset-password', data),

@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  #  控制面：静态检查 + 编译
+  # ============================================================
+  server:
+    name: Server (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          # go.sum 尚未入库，先关闭缓存；提交 go.sum 后可改为 true 加速
+          cache: false
+
+      - name: Resolve dependencies
+        working-directory: server
+        run: go mod tidy
+
+      - name: Vet
+        working-directory: server
+        run: go vet ./...
+
+      - name: Build
+        working-directory: server
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /tmp/panel ./cmd/panel
+
+      - name: Upload panel binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-linux-amd64
+          path: /tmp/panel
+          retention-days: 7
+
+  # ============================================================
+  #  前端：用户控制台 + 管理后台
+  # ============================================================
+  web:
+    name: Web (${{ matrix.app }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [user, admin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        working-directory: web/${{ matrix.app }}
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        working-directory: web/${{ matrix.app }}
+        run: npm run build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-${{ matrix.app }}
+          path: web/${{ matrix.app }}/dist
+          retention-days: 7
+
+  # ============================================================
+  #  Windows 客户端（Wails）
+  # ============================================================
+  client:
+    name: Client (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/windows/go.mod
+          cache: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Resolve dependencies
+        working-directory: client/windows
+        run: go mod tidy
+
+      - name: Build
+        working-directory: client/windows
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:PATH;$env:USERPROFILE\go\bin"
+          wails build -clean -platform windows/amd64
+
+      - name: Upload client
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteTunnel-windows-amd64
+          path: client/windows/build/bin/LiteTunnel.exe
+          retention-days: 7
+
+  # ============================================================
+  #  容器镜像构建验证（不推送）
+  # ============================================================
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          push: false
+          tags: litetunnel-panel:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

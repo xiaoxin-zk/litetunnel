@@ -32,10 +32,12 @@ services:
       - NET_BIND_SERVICE
 
   panel:
-    build:
-      context: ..
-      dockerfile: server/Dockerfile
-    image: litetunnel/panel:latest
+    # 镜像由 GitHub Actions 构建并推送到 GHCR（见 .github/workflows/release.yml）
+    image: ${LT_PANEL_IMAGE:-litetunnel/panel:latest}
+    # 如需在本机从源码构建，取消下面三行注释后执行：docker compose up -d --build
+    # build:
+    #   context: ..
+    #   dockerfile: server/Dockerfile
     container_name: lt-panel
     restart: unless-stopped
     network_mode: host

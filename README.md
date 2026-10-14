@@ -1,8 +1,11 @@
 # LiteTunnel
 
+[![CI](https://github.com/xiaoxin-zk/litetunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoxin-zk/litetunnel/actions/workflows/ci.yml)
+
 轻量内网穿透平台。以 **frp v0.71** 为数据面内核，自研轻量控制面，面向游戏联机、内网网站与 NAS 映射场景。
 
 单台公网服务器即可承载，全程 Docker 部署，管理后台与用户控制台**物理隔离**。
+所有构建产物均由 GitHub Actions 产出，服务器只负责拉取运行。
 
 ---
 
@@ -92,8 +95,11 @@ frp 的服务端插件回调是整个平台的信任边界，所有关键校验�
 │   ├── caddy/Caddyfile.template
 │   └── scripts/render.{ps1,sh}
 ├── scripts/
-│   ├── build.ps1               一键构建全部产物
+│   ├── build.ps1               可选：本地调试构建（正式产物由 CI 产出）
 │   └── check-secrets.ps1       提交前检查硬编码地址
+├── .github/workflows/
+│   ├── ci.yml                  推送即校验：Go 检查、前端构建、客户端构建、镜像构建
+│   └── release.yml             打 tag 即发布：推送 GHCR 镜像 + 打包 Release 产物
 └── .env.example                全部配置项模板
 ```
 
@@ -121,7 +127,12 @@ cd web/admin && npm install && npm run dev   # http://localhost:5175
 
 ### 2. 生产部署（Docker）
 
+镜像由 GitHub Actions 构建并推送到 GHCR，服务器只负责拉取运行。
+
 ```bash
+# 0) 首次需要登录私有镜像仓库（PAT 需勾选 read:packages）
+echo "<你的PAT>" | docker login ghcr.io -u <你的GitHub用户名> --password-stdin
+
 # 1) 准备配置
 cp .env.example .env
 # 编辑 .env：填写域名、网关地址、各项密钥（openssl rand -hex 32）
@@ -129,9 +140,13 @@ cp .env.example .env
 # 2) 渲染 frps.toml 与 Caddyfile
 bash deploy/scripts/render.sh          # Windows: powershell -File deploy/scripts/render.ps1
 
-# 3) 启动
-docker compose -f deploy/docker-compose.yml up -d --build
+# 3) 拉取并启动
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
 ```
+
+> 若需要在本机从源码构建，取消 `deploy/docker-compose.yml` 中 `build:` 段落的注释，
+> 然后执行 `docker compose -f deploy/docker-compose.yml up -d --build`。
 
 ### 3. 安全组 / 防火墙
 
@@ -154,16 +169,54 @@ ssh -L 8443:127.0.0.1:8443 user@your-server
 
 ### 4. Windows 客户端
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -SkipWeb
-```
+客户端同样由 CI 产出，**已内置官方 `frpc.exe`，解压即用**：
 
-产物在 `client/windows/build/bin/LiteTunnel.exe`。把官方 `frpc.exe` 放到同目录即可。
-也可以把客户端安装包放进 `LT_CLIENT_DIST_DIR` 目录，用户控制台会自动列出供下载。
+- 打开仓库的 **Releases** 页面下载 `LiteTunnel-windows-amd64.zip`
+- 或到 **Actions** 页面下载最近一次 CI 的 `LiteTunnel-windows-amd64` artifact
+
+把安装包放进服务器的 `LT_CLIENT_DIST_DIR` 目录，用户控制台会自动列出供下载。
+
+> 本地调试可执行 `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`，
+> 产物在 `client/windows/build/bin/LiteTunnel.exe`（需自行放置 `frpc.exe`）。
 
 ---
 
-## 五、安全清单
+## 五、构建与发布（GitHub Actions）
+
+**不在本地构建**，全部交给 CI。
+
+### `ci.yml` — 推送即校验
+
+| Job | 内容 |
+|---|---|
+| Server (Go) | `go mod tidy` → `go vet` → 交叉编译 Linux 二进制 |
+| Web (user/admin) | 分别构建两个前端，产物上传为 artifact |
+| Client (Windows) | 安装 Wails CLI → 构建 `LiteTunnel.exe`，上传为 artifact |
+| Docker image | 构建镜像验证 Dockerfile 可用（不推送） |
+
+### `release.yml` — 打 tag 即发布
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+触发后自动完成：
+
+1. 构建并推送镜像到 `ghcr.io/xiaoxin-zk/litetunnel-panel:v1.0.0`（同时更新 `latest`）
+2. 构建 Windows 客户端，并下载对应版本的官方 `frpc.exe` 一起打包
+3. 生成服务端部署包（compose + 模板 + `.env.example` + README）
+4. 创建 Release（草稿态，确认后发布）并挂载以上产物
+
+也可以到 Actions 页面手动触发 `Release` workflow 并指定版本号。
+
+> **关于 `go.sum`**：当前仓库尚未提交 `go.sum`，CI 每次会执行 `go mod tidy` 解析依赖。
+> 首次 CI 成功后，建议把生成的 `go.sum` 提交入库，并把两个 workflow 中的
+> `cache: false` 改为 `cache: true` 以获得依赖缓存加速与可复现构建。
+
+---
+
+## 六、安全清单
 
 | 项 | 实现 |
 |---|---|
@@ -184,7 +237,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -SkipWeb
 
 ---
 
-## 六、配置项
+## 七、配置项
 
 完整列表见 `.env.example`。几处关键约束：
 
@@ -195,7 +248,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -SkipWeb
 
 ---
 
-## 七、常见问题
+## 八、常见问题
 
 **Q：客户端连不上，日志提示「客户端凭据无效」？**
 在管理后台对该用户执行「重置客户端凭据」，然后重新登录客户端。
@@ -214,7 +267,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -SkipWeb
 
 ---
 
-## 八、许可
+## 九、许可
 
 数据面内核 [fatedier/frp](https://github.com/fatedier/frp) 采用 Apache-2.0。
 本项目自身代码可用于商业用途，请自行保留 frp 的版权与许可声明。

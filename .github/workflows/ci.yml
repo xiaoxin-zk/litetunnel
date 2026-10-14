@@ -48,6 +48,9 @@ jobs:
       # 只有真正跑起来才会暴露，这一步把部署风险前移到 CI。
       - name: Smoke test
         working-directory: server
+        # 超时护栏：脚本里一旦出现「等一个不会结束的进程」这类问题，
+        # 默认会一直挂到工作流上限（6 小时），白白烧掉额度。
+        timeout-minutes: 5
         env:
           LT_ENV: development
           LT_LOG_LEVEL: info
@@ -273,8 +276,12 @@ jobs:
             exit 1
           fi
 
-          # 8 个并发请求同时兑换同一张一次性码，只允许 1 个成功
+          # 8 个并发请求同时兑换同一张一次性码，只允许 1 个成功。
+          #
+          # 必须收集 PID 后精确 wait：不带参数的 wait 会连前面用 & 启动的
+          # panel 进程一起等，导致脚本永远不返回（CI 会挂到超时）。
           rm -f /tmp/smoke/redeem_results
+          redeem_pids=""
           for i in $(seq 1 8); do
             (
               curl -s -o /dev/null -w '%{http_code}\n' -X POST \
@@ -282,8 +289,10 @@ jobs:
                 -d "{\"code\":\"$redeemcode\"}" "$BASE/api/user/redeem" \
                 >> /tmp/smoke/redeem_results
             ) &
+            redeem_pids="$redeem_pids $!"
           done
-          wait
+          # shellcheck disable=SC2086
+          wait $redeem_pids
           okcount=$(grep -c '^200$' /tmp/smoke/redeem_results || true)
           if [ "$okcount" != "1" ]; then
             echo "::error::single-use redeem code was consumed $okcount times (want 1)"

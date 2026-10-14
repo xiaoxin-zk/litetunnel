@@ -266,7 +266,8 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"count":1,"type":"balance","value":100,"max_uses":1}' \
             "$BASE/api/admin/redeem-codes/generate")
-          redeemcode=$(printf '%s' "$gen" | sed -n 's/.*"code":"\([^"]*\)".*/\1/p')
+          # 响应形如 {"data":{"batch_no":"...","count":1,"codes":["LT-XXXX-XXXX-XXXX"]}}
+          redeemcode=$(printf '%s' "$gen" | sed -n 's/.*"codes":\["\([^"]*\)".*/\1/p')
           if [ -z "$redeemcode" ]; then
             echo "::error::failed to generate redeem code"
             exit 1

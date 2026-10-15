@@ -77,7 +77,6 @@ type State struct {
 	FrpcFound  bool   `json:"frpc_found"`
 	FrpcPath   string `json:"frpc_path"`
 	ConfigPath string `json:"config_path"`
-	AutoStart  bool   `json:"auto_start"`
 
 	// Group 是分组限制，客户端据此限制建隧道表单的可选项
 	// （允许哪些协议、最多几条），避免放行注定被拒的提交。
@@ -199,16 +198,30 @@ func (a *App) startup(ctx context.Context) {
 	// 因为用户在网页端改了隧道后，客户端列表应当自己跟上。
 	a.startAutoSync(ctx)
 
-	if a.cfg.AutoStart && a.cfg.APIKey != "" {
-		go func() {
-			time.Sleep(800 * time.Millisecond)
-			// 复用 Connect：它会把凭据装好，并把所有「已启用」的隧道
-			// 各自拉起来。客户端没有「启动连接」这一步，接入即连接。
-			if _, err := a.Connect(a.cfg.APIKey, a.cfg.ServerURL); err != nil {
-				log.Printf("[client] 自动连接失败: %v", err)
-			}
-		}()
-	}
+	// 打开客户端就跟上服务端的开关状态：开关打开着的隧道，各自把进程拉起来。
+	//
+	// 这里没有任何「要不要自动连接」的判断。曾经有一个「启动客户端后自动
+	// 连接」勾选框，还有一个全局「启动连接」按钮，两者都是这套模型之前的
+	// 遗留物：连接与否完全由每条隧道自己的开关决定（开关状态存在服务端），
+	// 客户端只要在跑就应该跟上。留着它们只会制造「开关是开的，但还得再点
+	// 一次才连上」这种状态不一致。
+	go func() {
+		// 稍等一下再同步：窗口刚起来时界面还没渲染，这时候推状态与日志
+		// 没有地方显示，用户会觉得「打开了什么都没发生」。
+		time.Sleep(800 * time.Millisecond)
+
+		a.mu.RLock()
+		hasKey := a.cfg.APIKey != ""
+		a.mu.RUnlock()
+		if !hasKey {
+			// 还没接入过，没有可同步的东西。
+			return
+		}
+		if _, err := a.syncLocked(); err != nil {
+			log.Printf("[client] 启动同步失败: %v", err)
+		}
+		a.emitState()
+	}()
 }
 
 // shutdown 在客户端退出前被调用，确保所有 frpc 子进程一并结束。
@@ -272,7 +285,6 @@ func (a *App) GetState() State {
 		Running:   a.mgr.AnyRunning(),
 		FrpcFound: a.mgr.Available(),
 		FrpcPath:  a.mgr.ExePath(),
-		AutoStart: a.cfg.AutoStart,
 	}
 	// 构建注入了地址时，界面上始终展示它，而不是本地残留的旧值。
 	if fixed := defaultServerURL(); fixed != "" {
@@ -1065,14 +1077,6 @@ func (a *App) GetLogs() []string {
 // ClearLogs 清空日志缓冲。
 func (a *App) ClearLogs() {
 	a.mgr.ClearLogs()
-}
-
-// SetAutoStart 设置开机自动连接。
-func (a *App) SetAutoStart(enabled bool) error {
-	a.mu.Lock()
-	a.cfg.AutoStart = enabled
-	a.mu.Unlock()
-	return saveConfig(a.cfg)
 }
 
 // OpenDataDir 在资源管理器中打开数据目录。

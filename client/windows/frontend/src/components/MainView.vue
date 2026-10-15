@@ -304,10 +304,9 @@
 
     <!-- 底部 -->
     <footer class="footer">
-      <label class="switch">
-        <input type="checkbox" :checked="state.auto_start" @change="toggleAutoStart($event.target.checked)" />
-        <span>启动客户端后自动连接</span>
-      </label>
+      <!-- 这里曾经有个「启动客户端后自动连接」勾选框。它已经没有意义：
+           连接与否完全由每条隧道自己的开关决定（开关状态存在服务端），
+           客户端一打开就会跟上。留着只会让人以为「不勾就不会连」。 -->
       <div class="footer-right">
         <!-- 版本号常驻显示：出问题时第一件事就是确认「跑的是哪个版本」，
              藏进关于页反而多一步。 -->
@@ -835,11 +834,6 @@ async function clearLogs() {
   flash('日志已清空')
 }
 
-async function toggleAutoStart(checked) {
-  await api.setAutoStart(checked)
-  emit('update')
-}
-
 async function openDataDir() {
   await api.openDataDir()
 }
@@ -1044,24 +1038,10 @@ watch(
 .footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  /* 只剩右侧一组内容了，靠右对齐 */
+  justify-content: flex-end;
   flex-shrink: 0;
   padding: 0 4px;
-}
-
-.switch {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #475569;
-  cursor: pointer;
-}
-
-.switch input {
-  width: 15px;
-  height: 15px;
-  accent-color: #2563eb;
 }
 
 .footer-right {

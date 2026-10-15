@@ -27,7 +27,6 @@ const emptyState = {
   frpc_found: false,
   frpc_path: '',
   config_path: '',
-  auto_start: false,
   // 自动同步状态：客户端每 20 秒拉取一次隧道清单与 frpc 配置
   last_sync_at: null,
   sync_err: '',
@@ -88,7 +87,6 @@ const mock = {
   StopTunnel: async () => mockConnectedState,
   GetLogs: async () => ['[mock] 当前为浏览器预览模式，未连接真实服务端'],
   ClearLogs: async () => {},
-  SetAutoStart: async () => {},
   OpenDataDir: async () => '',
   ServerMailEnabled: async () => false,
   SendEmailCode: async () => {},
@@ -113,7 +111,6 @@ export const api = {
   refresh: () => go.Refresh(),
   logs: () => go.GetLogs(),
   clearLogs: () => go.ClearLogs(),
-  setAutoStart: (v) => go.SetAutoStart(v),
   openDataDir: () => go.OpenDataDir(),
   // 重置密码：先问服务端有没有开邮件，再决定走验证码还是旧密码
   serverMailEnabled: (serverUrl) => go.ServerMailEnabled(serverUrl),

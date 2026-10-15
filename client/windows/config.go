@@ -22,8 +22,11 @@ type Config struct {
 	// 正式发布的客户端该字段始终为空，地址由 build.go 注入。
 	ServerURL string `json:"server_url,omitempty"`
 
-	// AutoStart 表示下次启动客户端时自动连接并拉起隧道。
-	AutoStart bool `json:"auto_start"`
+	// 这里曾经有个 AutoStart（「启动客户端后自动连接」）。
+	//
+	// 它已经没有意义：连接与否由每条隧道自己的开关决定，而开关状态存在
+	// 服务端，客户端一打开就会同步跟上。留着这个字段只会多出一个
+	// 「不勾就不会连」的假象。
 }
 
 // dataDir 返回应用数据目录（Windows 下为 %AppData%\LiteTunnel）。

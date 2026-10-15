@@ -283,6 +283,37 @@ jobs:
           fi
           echo "PASS server auto-allocated a port for the new tunnel"
 
+          # ---- 批量创建 ----
+          # 一次映射一串连续端口（游戏服常见），每条各自分配公网端口。
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"name_prefix":"cibatch","type":"tcp","local_ip":"127.0.0.1","ports":[25566,25567,25568]}' \
+            "$BASE/api/user/tunnels/batch")
+          if [ "$code" != "200" ]; then
+            echo "::error::batch tunnel creation returned $code"
+            exit 1
+          fi
+          body=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
+          for n in cibatch_25566 cibatch_25567 cibatch_25568; do
+            if ! printf '%s' "$body" | grep -q "\"name\":\"$n\""; then
+              echo "::error::batch tunnel $n was not created"
+              exit 1
+            fi
+          done
+          echo "PASS batch tunnel creation"
+
+          # 超出单次上限必须被拒，而不是默默只建前 20 条——
+          # 静默截断会让用户以为剩下的也建好了。
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"name_prefix":"citoo","type":"tcp","local_ip":"127.0.0.1","ports":[30001,30002,30003,30004,30005,30006,30007,30008,30009,30010,30011,30012,30013,30014,30015,30016,30017,30018,30019,30020,30021]}' \
+            "$BASE/api/user/tunnels/batch")
+          if [ "$code" != "400" ]; then
+            echo "::error::oversized batch was not rejected (got $code, want 400)"
+            exit 1
+          fi
+          echo "PASS oversized batch rejected"
+
           # 兑换：用不存在的码，只要不是 401/403/404 就说明接口可达
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \

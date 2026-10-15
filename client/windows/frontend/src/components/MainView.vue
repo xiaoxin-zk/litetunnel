@@ -134,11 +134,29 @@
     <!-- ============ 新建隧道 ============ -->
     <div v-if="createOpen" class="modal" @click.self="createOpen = false">
       <div class="modal-card">
-        <div class="modal-title">新建隧道</div>
+        <div class="modal-title">{{ createMode === 'batch' ? '批量新建隧道' : '新建隧道' }}</div>
+
+        <div class="mode-switch">
+          <label :class="{ on: createMode === 'single' }">
+            <input type="radio" value="single" v-model="createMode" />
+            <span>单条</span>
+          </label>
+          <label :class="{ on: createMode === 'batch' }">
+            <input type="radio" value="batch" v-model="createMode" />
+            <span>批量（一串端口）</span>
+          </label>
+        </div>
 
         <label class="field">
-          <span>隧道名称</span>
-          <input v-model="form.name" placeholder="例如 mc-server（仅字母数字与 -_）" spellcheck="false" />
+          <span>{{ createMode === 'batch' ? '名称前缀' : '隧道名称' }}</span>
+          <input
+            v-model="form.name"
+            :placeholder="createMode === 'batch' ? '例如 mc，将生成 mc_25565' : '例如 mcserver'"
+            spellcheck="false"
+          />
+          <em v-if="createMode === 'batch'" class="muted">
+            每条隧道命名为「前缀_端口」，一眼就能看出对应关系
+          </em>
         </label>
 
         <label class="field">
@@ -148,10 +166,24 @@
           </select>
         </label>
 
-        <label class="field">
+        <label v-if="createMode === 'single'" class="field">
           <span>本机端口</span>
           <input v-model.number="form.localPort" type="number" min="1" max="65535" placeholder="例如 Minecraft 填 25565" />
           <em class="muted">你的服务在本机监听的端口</em>
+        </label>
+
+        <label v-else class="field">
+          <span>本机端口</span>
+          <textarea
+            v-model="form.portsText"
+            rows="3"
+            placeholder="25565-25570&#10;或 25565, 25566, 25567"
+            spellcheck="false"
+          ></textarea>
+          <em class="muted">
+            支持范围（25565-25570）与逗号、空格、换行分隔，一次最多 {{ MAX_BATCH }} 条。
+            公网端口由服务端自动分配
+          </em>
         </label>
 
         <!-- 从本机监听的服务里点选。
@@ -282,7 +314,51 @@ const logBox = ref()
 const createOpen = ref(false)
 const showAdvanced = ref(false)
 const dialogError = ref('')
-const form = ref({ name: '', type: 'tcp', localIp: '127.0.0.1', localPort: null, remotePort: null })
+const form = ref({
+  name: '',
+  type: 'tcp',
+  localIp: '127.0.0.1',
+  localPort: null,
+  portsText: '',
+  remotePort: null
+})
+
+// 'single' 单条 | 'batch' 批量（一串连续端口，游戏服常见）
+const createMode = ref('single')
+// 与服务端 MaxBatchTunnels 保持一致。前端提前告知，避免用户填了
+// 40 个端口、点提交才被拒。
+const MAX_BATCH = 20
+
+/**
+ * 解析批量端口输入：支持范围、逗号、空格、换行。
+ *
+ * 范围展开要设护栏：用户手滑写成 1-65535 的话，不拦就会生成
+ * 一个六万多元素的数组，并且把它发到服务端。
+ */
+function parsePorts(text) {
+  const out = []
+  const seen = new Set()
+  const push = (p) => {
+    if (p >= 1 && p <= 65535 && !seen.has(p)) {
+      seen.add(p)
+      out.push(p)
+    }
+  }
+
+  for (const chunk of String(text || '').split(/[\s,，、;；]+/)) {
+    if (!chunk) continue
+    const m = chunk.match(/^(\d+)\s*-\s*(\d+)$/)
+    if (m) {
+      const a = Number(m[1])
+      const b = Number(m[2])
+      if (a > b) continue
+      for (let p = a; p <= b && out.length < 200; p++) push(p)
+      continue
+    }
+    if (/^\d+$/.test(chunk)) push(Number(chunk))
+  }
+  return out
+}
 
 // ---- 本机服务探测 ----
 
@@ -331,6 +407,23 @@ async function scanServices() {
 
 /** 选中一个服务，把端口、协议、监听地址一并带入表单。 */
 function pickService(s) {
+  // 批量模式下是「加入列表」而不是「替换」，否则选第二个服务时
+  // 会把第一个覆盖掉——而用户显然是想一次选好几个。
+  if (createMode.value === 'batch') {
+    const cur = parsePorts(form.value.portsText)
+    if (cur.includes(s.port)) {
+      flash(`${s.port} 已经在列表里了`)
+      return
+    }
+    cur.push(s.port)
+    form.value.portsText = cur.join(', ')
+    if (allowedProtocols.value.includes(s.proto)) {
+      form.value.type = s.proto
+    }
+    flash(`已加入 ${s.port}（当前 ${cur.length} 个端口）`)
+    return
+  }
+
   form.value.localPort = s.port
 
   // 协议必须跟着服务走。选到 UDP 服务却建了 TCP 隧道是最典型的踩坑，
@@ -402,31 +495,58 @@ const atTunnelLimit = computed(() => {
 function openCreate() {
   dialogError.value = ''
   showAdvanced.value = false
+  createMode.value = 'single'
+  scanFilter.value = ''
   // 协议默认选分组允许的第一个，避免默认值恰好不被允许
   form.value = {
     name: '',
     type: allowedProtocols.value[0] || 'tcp',
     localIp: '127.0.0.1',
     localPort: null,
+    portsText: '',
     remotePort: null
   }
   createOpen.value = true
 }
 
+/** 校验隧道名/名称前缀。
+ *
+ * 规则必须与服务端 normalizeInput 完全一致：1-32 位、仅字母数字与下划线、
+ * 不能以 lt 开头。此前这里允许连字符、长度放到 64，于是用户按提示
+ * 填「mc-server」会被服务端拒绝——提示与实际规则不符是最难自己
+ * 搞明白的一类问题。 */
+function nameError(name) {
+  if (!/^[A-Za-z0-9_]{1,32}$/.test(name)) {
+    return '名称仅允许 1-32 位字母、数字或下划线（不支持连字符）'
+  }
+  if (name.toLowerCase().startsWith('lt')) {
+    return '名称不能以 lt 开头（该前缀保留给系统使用）'
+  }
+  return ''
+}
+
 async function submitCreate() {
   dialogError.value = ''
   const f = form.value
+  const name = (f.name || '').trim()
 
-  if (!f.name || !/^[A-Za-z0-9_-]{1,64}$/.test(f.name.trim())) {
-    dialogError.value = '隧道名称仅允许 1-64 位字母、数字、下划线或连字符'
+  if (!allowedProtocols.value.includes(f.type)) {
+    dialogError.value = `当前分组不允许 ${f.type.toUpperCase()} 协议`
+    return
+  }
+
+  if (createMode.value === 'batch') {
+    await submitBatch(name)
+    return
+  }
+
+  const nerr = nameError(name)
+  if (nerr) {
+    dialogError.value = nerr
     return
   }
   if (!f.localPort || f.localPort < 1 || f.localPort > 65535) {
     dialogError.value = '请填写 1-65535 之间的本机端口'
-    return
-  }
-  if (!allowedProtocols.value.includes(f.type)) {
-    dialogError.value = `当前分组不允许 ${f.type.toUpperCase()} 协议`
     return
   }
 
@@ -443,6 +563,57 @@ async function submitCreate() {
     emit('update', next)
     createOpen.value = false
     flash('隧道已创建，公网端口由服务端自动分配')
+  } catch (e) {
+    dialogError.value = typeof e === 'string' ? e : e?.message || '创建失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 批量创建。prefix 是名称前缀，端口从 portsText 解析。 */
+async function submitBatch(prefix) {
+  // 前缀上限 24 而不是 32：最终名字是「前缀_端口」，端口部分最多
+  // 5 位加分隔符共 6 位，要给它留位置。
+  if (prefix.length > 24) {
+    dialogError.value = '批量创建时名称前缀不能超过 24 位（需为端口部分留出位置）'
+    return
+  }
+  const nerr = nameError(prefix)
+  if (nerr) {
+    dialogError.value = nerr
+    return
+  }
+
+  const ports = parsePorts(form.value.portsText)
+  if (!ports.length) {
+    dialogError.value = '请填写至少一个本机端口'
+    return
+  }
+  if (ports.length > MAX_BATCH) {
+    dialogError.value = `一次最多创建 ${MAX_BATCH} 条隧道，当前填写了 ${ports.length} 个端口`
+    return
+  }
+
+  busy.value = true
+  try {
+    const [res, next] = await api.createTunnelsBatch(
+      prefix,
+      form.value.type,
+      (form.value.localIp || '127.0.0.1').trim(),
+      ports
+    )
+    emit('update', next)
+    createOpen.value = false
+
+    // 有失败时必须逐条说明。只说「创建完成」会让用户以为全都建好了，
+    // 而他会在一段时间之后才发现少了几条——那时更难回溯。
+    const failed = res?.failures || []
+    if (failed.length) {
+      const detail = failed.map((x) => `${x.local_port}: ${x.reason}`).join('；')
+      flash(`${res?.message || '部分创建失败'}｜${detail}`, 'warn')
+    } else {
+      flash(res?.message || `已创建 ${ports.length} 条隧道`)
+    }
   } catch (e) {
     dialogError.value = typeof e === 'string' ? e : e?.message || '创建失败'
   } finally {
@@ -1035,7 +1206,8 @@ watch(
 }
 
 .field input,
-.field select {
+.field select,
+.field textarea {
   width: 100%;
   padding: 9px 12px;
   border: 1px solid #d1d5db;
@@ -1047,9 +1219,50 @@ watch(
   box-sizing: border-box;
 }
 
+.field textarea {
+  resize: vertical;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  line-height: 1.6;
+}
+
 .field input:focus,
-.field select:focus {
+.field select:focus,
+.field textarea:focus {
   border-color: #2563eb;
+}
+
+/* ---- 单条 / 批量 切换 ---- */
+
+.mode-switch {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.mode-switch label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  font-size: 13px;
+  color: #4b5563;
+  cursor: pointer;
+  user-select: none;
+}
+
+.mode-switch label.on {
+  border-color: #2563eb;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-weight: 500;
+}
+
+.mode-switch input {
+  display: none;
 }
 
 .field em {

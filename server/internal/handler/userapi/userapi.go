@@ -6,6 +6,7 @@ package userapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -673,6 +674,58 @@ func (h *Handler) CreateTunnel(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, h.tunnelVO(t, h.svc.EffectiveBandwidth(u)))
+}
+
+// CreateTunnelsBatch 批量创建隧道。
+//
+// 与单条创建共用同一套服务层校验与端口分配逻辑，只是逐条循环、
+// 把每条的结果分别收上来——不整体回滚，见 CreateTunnelsBatch 的说明。
+func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
+	var in service.CreateTunnelBatchInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		httpx.BadRequest(c, "参数格式不正确")
+		return
+	}
+	u, err := h.svc.LoadUser(middleware.CurrentUserID(c))
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	res, err := h.svc.CreateTunnelsBatch(u, in)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+
+	// 返回体里带上已建隧道的完整视图，客户端可以直接渲染列表，
+	// 不需要再为每条隧道单独请求一次。
+	created := make([]gin.H, 0, len(res.Created))
+	bl := h.svc.EffectiveBandwidth(u)
+	for i := range res.Created {
+		created = append(created, h.tunnelVO(&res.Created[i], bl))
+	}
+
+	httpx.OK(c, gin.H{
+		"created":  created,
+		"failures": res.Failures,
+		"message":  batchMessage(len(created), len(res.Failures)),
+	})
+}
+
+// batchMessage 生成一句人话总结。
+//
+// 全部成功、部分失败、全部失败三种情况应当给出不同的措辞——
+// 让用户只看到「创建完成」而漏掉失败的那几条，是最容易积累
+// 「怎么少了几条」这类困惑的地方。
+func batchMessage(ok, failed int) string {
+	switch {
+	case failed == 0:
+		return fmt.Sprintf("已创建 %d 条隧道，公网端口由服务端自动分配", ok)
+	case ok == 0:
+		return "没有成功创建任何隧道，请查看失败原因"
+	default:
+		return fmt.Sprintf("成功创建 %d 条，%d 条失败，请查看失败原因", ok, failed)
+	}
 }
 
 // UpdateTunnel 修改隧道。

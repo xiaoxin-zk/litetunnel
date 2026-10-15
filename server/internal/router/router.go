@@ -186,6 +186,10 @@ func New(
 		// 并自动排除系统已占用与保留的端口——用户不需要理解端口池。
 		userAPI.GET("/tunnels", userH.ListTunnels)
 		userAPI.POST("/tunnels", userH.CreateTunnel)
+		// 批量创建：一次映射一串连续端口（游戏服常见）。
+		// 路径放在 /tunnels/batch，不会与 /tunnels/:id 冲突——
+		// gin 对静态段优先于参数段。
+		userAPI.POST("/tunnels/batch", userH.CreateTunnelsBatch)
 		userAPI.PUT("/tunnels/:id", userH.UpdateTunnel)
 		userAPI.DELETE("/tunnels/:id", userH.DeleteTunnel)
 		userAPI.POST("/tunnels/:id/status", userH.SetTunnelStatus)

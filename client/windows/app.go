@@ -443,6 +443,62 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	return a.Refresh()
 }
 
+// BatchFailure 记录批量创建中一条失败。
+type BatchFailure struct {
+	LocalPort int    `json:"local_port"`
+	Name      string `json:"name"`
+	Reason    string `json:"reason"`
+}
+
+// BatchResult 是批量创建的结果。
+//
+// 不绑定 created 字段：建完就调 Refresh 重新拉列表，
+// 那条路径已经保证了列表与配置都是最新的，再解析一遍是多余的。
+type BatchResult struct {
+	Message  string         `json:"message"`
+	Failures []BatchFailure `json:"failures"`
+}
+
+// CreateTunnelsBatch 批量创建隧道。
+//
+// 服务端逐条创建、不整体回滚：用户要的是一批端口尽可能都建好，
+// 而不是「一条失败就全都没了」。失败原因逐条带回，用户才知道
+// 该去改哪一个。
+func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports []int) (BatchResult, State, error) {
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return BatchResult{}, a.GetState(), err
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"name_prefix": strings.TrimSpace(namePrefix),
+		"type":        strings.TrimSpace(tunnelType),
+		"local_ip":    strings.TrimSpace(localIP),
+		"ports":       ports,
+	})
+	if err != nil {
+		return BatchResult{}, a.GetState(), err
+	}
+
+	raw, err := a.do(http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
+	if err != nil {
+		return BatchResult{}, a.GetState(), err
+	}
+
+	var out BatchResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return BatchResult{}, a.GetState(), err
+	}
+
+	// 建完立刻同步：新建的隧道会带上下发的公网地址。
+	// 同步失败时不把整体判为失败——隧道其实已经建好了。
+	state, rerr := a.Refresh()
+	if rerr != nil {
+		return out, a.GetState(), nil
+	}
+	return out, state, nil
+}
+
 // DeleteTunnel 删除一条隧道。
 func (a *App) DeleteTunnel(id uint) (State, error) {
 	base, apiKey, err := a.currentCredential()

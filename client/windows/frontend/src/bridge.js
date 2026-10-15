@@ -94,6 +94,7 @@ const mock = {
     { port: 8211, proto: 'udp', addr: '0.0.0.0', pid: 2345, process: 'PalServer.exe', recommended: true }
   ],
   CreateTunnel: async () => mockConnectedState,
+  CreateTunnelsBatch: async () => [{ message: '[mock] 已创建 3 条隧道', failures: [] }, mockConnectedState],
   DeleteTunnel: async () => mockConnectedState,
   SetTunnelStatus: async () => mockConnectedState,
   Redeem: async () => ['[mock] 兑换成功', mockConnectedState]
@@ -124,6 +125,8 @@ export const api = {
   // 界面默认不暴露这个参数。
   createTunnel: (name, type, localIp, localPort, remotePort) =>
     go.CreateTunnel(name, type, localIp, localPort, remotePort || 0),
+  createTunnelsBatch: (prefix, type, localIp, ports) =>
+    go.CreateTunnelsBatch(prefix, type, localIp, ports),
   deleteTunnel: (id) => go.DeleteTunnel(id),
   setTunnelStatus: (id, status) => go.SetTunnelStatus(id, status),
   redeem: (code) => go.Redeem(code)

@@ -17,6 +17,7 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/monitor"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
@@ -711,6 +712,27 @@ func (h *Handler) TestMail(c *gin.Context) {
 	}
 	h.audit(c, "settings.test_mail", "settings", "", "测试收件人 "+req.To)
 	httpx.OK(c, gin.H{"message": "测试邮件已发送，请查收"})
+}
+
+// ---- 系统监控 ----
+
+// SystemMetrics 返回服务器实时指标与最近的采样序列。
+//
+// latest 与 series 一起返回而不是分两个接口：面板每 5 秒刷新一次，
+// 分两次请求会出现「卡片是新值、图表是旧值」这种对不上的瞬间。
+func (h *Handler) SystemMetrics(c *gin.Context) {
+	// limit 控制返回多少个采样点。0 表示全部（最多由采集器的环形缓冲决定）。
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
+
+	col := h.svc.Monitor
+	httpx.OK(c, gin.H{
+		"latest": col.Latest(),
+		"series": col.Series(limit),
+		// 一并下发采样间隔，让前端自己算出「这批数据覆盖多长时间」，
+		// 不需要在前端再硬编码一份——两处写死迟早会不一致。
+		"sample_interval": int(monitor.SampleInterval.Seconds()),
+		"max_samples":     monitor.MaxSamples,
+	})
 }
 
 // ---- 防火墙与端口池 ----

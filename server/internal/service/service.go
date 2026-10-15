@@ -17,6 +17,7 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/mailer"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/monitor"
 )
 
 // 业务错误。处理器统一映射为 HTTP 状态码。
@@ -83,6 +84,14 @@ type Services struct {
 	// TOTPReplay 记录已用过的动态口令步进码，阻止窗口内重放。
 	TOTPReplay *TOTPReplayGuard
 
+	// Monitor 采集宿主机与面板自身的运行指标。
+	//
+	// 数据存在内存环形缓冲里，**不落库**——时间序列是最容易「不修就会在
+	// 某天出事」的组件（1Panel 的运维监控就曾因数据量无限增长而拖慢面板，
+	// 官方后来专门发了清理工具）。环形缓冲天然有界，从第一天起就不存在
+	// 增长问题：采样点满了就覆盖最旧的一条，磁盘占用恒为零。
+	Monitor *monitor.Collector
+
 	// loginLogCh 与 mailCh 都是异步队列：
 	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
 	loginLogCh chan model.LoginLog
@@ -99,6 +108,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
 		TOTPReplay: NewTOTPReplayGuard(),
+		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
 	}

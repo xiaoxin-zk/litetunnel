@@ -61,6 +61,8 @@ func main() {
 	svc.StartLoginLogWriter(ctx)
 	svc.StartMailWorker(ctx)
 	svc.StartFirewallReconciler()
+	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
+	go svc.Monitor.Start(ctx)
 
 	engine := router.New(cfg, svc,
 		authapi.New(svc, cfg.AdminPath),

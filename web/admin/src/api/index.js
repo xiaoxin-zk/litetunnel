@@ -101,6 +101,12 @@ export const adminApi = {
   clearTOTP: (id) => http.post(`/admins/${id}/totp-reset`)
 }
 
+export const monitorApi = {
+  // 服务器运行指标：latest（当前值）与 series（最近一段时间的采样序列）一起返回。
+  // limit 控制点数，不传则由服务端返回全部（最多由环形缓冲容量决定）。
+  system: (limit) => http.get('/system/metrics', { params: limit ? { limit } : {} })
+}
+
 export const firewallApi = {
   status: () => http.get('/firewall/status'),
   rescan: () => http.post('/firewall/rescan'),

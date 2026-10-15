@@ -233,6 +233,9 @@ func New(
 		adminRead.POST("/profile/totp/enable", adminH.TOTPEnable)
 		adminRead.POST("/profile/totp/disable", adminH.TOTPDisable)
 		adminRead.GET("/stats/overview", adminH.StatsOverview)
+		// 服务器运行指标（CPU / 内存 / 网络 / 磁盘 / 负载 + 面板自身开销）。
+		// 归在只读组：审计角色同样需要能看到机器状态。
+		adminRead.GET("/system/metrics", adminH.SystemMetrics)
 
 		adminRead.GET("/users", adminH.ListUsers)
 		adminRead.GET("/groups", adminH.ListGroups)

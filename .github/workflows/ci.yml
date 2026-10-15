@@ -386,6 +386,25 @@ jobs:
           fi
           echo "PASS redeem code is single-use under concurrency"
 
+          # ===== 系统监控接口 =====
+          # 这条断言守的是「路由还在、字段还在」。监控接口是纯读的，
+          # 出错时不会有人立刻发现——页面上的图只是空着，看起来像
+          # 「刚好没有数据」。
+          body=$(curl -fsS -H "Authorization: Bearer $admintoken" "$BASE/api/admin/system/metrics")
+          for field in '"latest"' '"series"' '"sample_interval"' '"max_samples"'; do
+            if ! printf '%s' "$body" | grep -q "$field"; then
+              echo "::error::system metrics missing field $field"
+              exit 1
+            fi
+          done
+          # 采集必须真的读到宿主机数据，而不是返回一堆 0。
+          # CPU 核数在任何 Linux 上都大于 0，为 0 说明 /proc 没读到。
+          if printf '%s' "$body" | grep -q '"cpu_cores":0'; then
+            echo "::error::system metrics did not read host CPU info"
+            exit 1
+          fi
+          echo "PASS admin system metrics endpoint"
+
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \

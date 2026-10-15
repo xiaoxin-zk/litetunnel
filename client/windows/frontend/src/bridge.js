@@ -82,7 +82,11 @@ const mock = {
   OpenDataDir: async () => '',
   ServerMailEnabled: async () => false,
   SendEmailCode: async () => {},
-  ResetPassword: async () => {}
+  ResetPassword: async () => {},
+  CreateTunnel: async () => mockConnectedState,
+  DeleteTunnel: async () => mockConnectedState,
+  SetTunnelStatus: async () => mockConnectedState,
+  Redeem: async () => ['[mock] 兑换成功', mockConnectedState]
 }
 
 const go = isWails ? window.go.main.App : mock
@@ -103,7 +107,14 @@ export const api = {
   serverMailEnabled: (serverUrl) => go.ServerMailEnabled(serverUrl),
   sendEmailCode: (serverUrl, email, scene) => go.SendEmailCode(serverUrl, email, scene),
   resetPassword: (serverUrl, account, oldPassword, emailCode, newPassword) =>
-    go.ResetPassword(serverUrl, account, oldPassword, emailCode, newPassword)
+    go.ResetPassword(serverUrl, account, oldPassword, emailCode, newPassword),
+  // 隧道管理。remotePort 传 0 表示由服务端自动分配端口，
+  // 界面默认不暴露这个参数。
+  createTunnel: (name, type, localIp, localPort, remotePort) =>
+    go.CreateTunnel(name, type, localIp, localPort, remotePort || 0),
+  deleteTunnel: (id) => go.DeleteTunnel(id),
+  setTunnelStatus: (id, status) => go.SetTunnelStatus(id, status),
+  redeem: (code) => go.Redeem(code)
 }
 
 /** 订阅 Wails 事件；非桌面环境下静默忽略。 */

@@ -429,12 +429,20 @@ type clientInfoResp struct {
 	*service.ClientInfo
 	// 客户端只持有 API Key，因此账号信息必须由服务端下发，
 	// 不能像以前那样依赖用户在登录框里填的用户名。
-	Username     string    `json:"username"`
-	Nickname     string    `json:"nickname"`
-	Tunnels      []gin.H  `json:"tunnels"`
+	Username     string   `json:"username"`
+	Nickname     string   `json:"nickname"`
+	Tunnels      []gin.H `json:"tunnels"`
 	TrafficUsed  int64    `json:"traffic_used"`
 	TrafficQuota int64    `json:"traffic_quota"`
 	Exceeded     bool     `json:"exceeded"`
+
+	// Group 是分组限制。客户端要能自己建隧道，就必须知道
+	// 「允许哪些协议」「最多几条隧道」——否则表单会放行注定被拒的提交，
+	// 用户填完才收到「协议不允许」的报错。
+	Group *gin.H `json:"group,omitempty"`
+	// Balance 仅在站点启用支付时下发，避免客户端显示一个无法使用的余额。
+	BalanceCents   int64 `json:"balance_cents"`
+	PaymentEnabled bool  `json:"payment_enabled"`
 }
 
 // ClientInfo 返回接入信息与当前隧道清单（需已认证）。
@@ -458,14 +466,31 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 	for i := range tunnels {
 		out = append(out, h.tunnelVO(&tunnels[i]))
 	}
+	// 分组信息：客户端据此限制建隧道表单的可选项
+	var groupVO *gin.H
+	if g := h.svc.EffectiveGroup(u); g != nil {
+		groupVO = &gin.H{
+			"id":                  g.ID,
+			"name":                g.Name,
+			"max_tunnels":         g.MaxTunnels,
+			"max_ports":           g.MaxPorts,
+			"bandwidth_limit_str": service.FormatBandwidthHuman(g.BandwidthLimit),
+			"allow_protocols":     g.AllowProtocols,
+			"allow_custom_domain": g.AllowCustomDomain,
+		}
+	}
+
 	httpx.OK(c, clientInfoResp{
-		ClientInfo:   info,
-		Username:     u.Username,
-		Nickname:     u.Nickname,
-		Tunnels:      out,
-		TrafficUsed:  u.TrafficUsed,
-		TrafficQuota: h.svc.EffectiveQuota(u),
-		Exceeded:     h.svc.QuotaExceeded(u),
+		ClientInfo:     info,
+		Username:       u.Username,
+		Nickname:       u.Nickname,
+		Tunnels:        out,
+		TrafficUsed:    u.TrafficUsed,
+		TrafficQuota:   h.svc.EffectiveQuota(u),
+		Exceeded:       h.svc.QuotaExceeded(u),
+		Group:          groupVO,
+		BalanceCents:   u.Balance,
+		PaymentEnabled: h.svc.Settings.Bool(service.KeyPaymentEnabled),
 	})
 }
 

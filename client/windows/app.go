@@ -63,6 +63,14 @@ type State struct {
 	FrpcPath   string `json:"frpc_path"`
 	ConfigPath string `json:"config_path"`
 	AutoStart  bool   `json:"auto_start"`
+
+	// Group 是分组限制，客户端据此限制建隧道表单的可选项
+	// （允许哪些协议、最多几条），避免放行注定被拒的提交。
+	Group *groupLimit `json:"group,omitempty"`
+	// PaymentEnabled 为 false 时客户端不展示任何余额相关内容：
+	// 没有充值入口时，一个恒为 0 的余额只会造成困惑。
+	PaymentEnabled bool  `json:"payment_enabled"`
+	BalanceCents   int64 `json:"balance_cents"`
 }
 
 // App 是暴露给前端的应用对象。
@@ -85,6 +93,10 @@ type App struct {
 	trafficQuota int64
 	exceeded     bool
 	lastError    string
+
+	group          *groupLimit
+	paymentEnabled bool
+	balanceCents   int64
 }
 
 // maskKey 生成用于界面展示的脱敏形式，避免完整 Key 长时间暴露在屏幕上。
@@ -147,6 +159,9 @@ func (a *App) GetState() State {
 		TrafficUsed:    a.trafficUsed,
 		TrafficQuota:   a.trafficQuota,
 		Exceeded:       a.exceeded,
+		Group:          a.group,
+		PaymentEnabled: a.paymentEnabled,
+		BalanceCents:   a.balanceCents,
 		Running:        a.mgr.Running(),
 		FrpcFound:      a.mgr.Available(),
 		FrpcPath:       a.mgr.ExePath(),
@@ -174,14 +189,28 @@ type clientInfo struct {
 	TunnelDomain string `json:"tunnel_domain"`
 }
 
+// groupLimit 是分组对建隧道的约束，客户端据此限制表单可选项。
+type groupLimit struct {
+	Name              string `json:"name"`
+	MaxTunnels        int    `json:"max_tunnels"`
+	AllowProtocols    string `json:"allow_protocols"`
+	AllowCustomDomain bool   `json:"allow_custom_domain"`
+	BandwidthLimitStr string `json:"bandwidth_limit_str"`
+}
+
 type clientInfoData struct {
 	clientInfo
-	Username     string     `json:"username"`
-	Nickname     string     `json:"nickname"`
-	Tunnels      []TunnelVO `json:"tunnels"`
-	TrafficUsed  int64      `json:"traffic_used"`
-	TrafficQuota int64      `json:"traffic_quota"`
-	Exceeded     bool       `json:"exceeded"`
+	Username     string      `json:"username"`
+	Nickname     string      `json:"nickname"`
+	Tunnels      []TunnelVO  `json:"tunnels"`
+	TrafficUsed  int64       `json:"traffic_used"`
+	TrafficQuota int64       `json:"traffic_quota"`
+	Exceeded     bool        `json:"exceeded"`
+	Group        *groupLimit `json:"group,omitempty"`
+	// BalanceCents 与 PaymentEnabled 一起使用：
+	// 站点未启用支付时客户端不展示任何余额相关内容。
+	BalanceCents   int64 `json:"balance_cents"`
+	PaymentEnabled bool  `json:"payment_enabled"`
 }
 
 // serverBase 返回本次运行使用的服务端地址：构建注入的优先。
@@ -248,6 +277,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.trafficUsed = info.TrafficUsed
 	a.trafficQuota = info.TrafficQuota
 	a.exceeded = info.Exceeded
+	a.group = info.Group
+	a.paymentEnabled = info.PaymentEnabled
+	a.balanceCents = info.BalanceCents
 	a.lastError = ""
 	if a.tunnels == nil {
 		a.tunnels = []TunnelVO{}
@@ -276,10 +308,124 @@ func (a *App) Logout() State {
 	a.trafficUsed = 0
 	a.trafficQuota = 0
 	a.exceeded = false
+	a.group = nil
+	a.paymentEnabled = false
+	a.balanceCents = 0
 	a.mu.Unlock()
 
 	_ = clearConfig()
 	return a.GetState()
+}
+
+// currentCredential 返回当前接入用的长期凭据。
+//
+// 抽成一个方法而不是各处直接读 a.cfg.APIKey，是为了让加锁这件事
+// 只发生在一个地方——这类字段被多处并发读写时最容易漏锁。
+func (a *App) currentCredential() (base, apiKey string, err error) {
+	base = a.serverBase()
+	a.mu.RLock()
+	apiKey = a.cfg.APIKey
+	a.mu.RUnlock()
+	if base == "" || apiKey == "" {
+		return "", "", errors.New("尚未接入，请先连接")
+	}
+	return base, apiKey, nil
+}
+
+// CreateTunnel 创建一条隧道。
+//
+// remotePort 传 0 表示由服务端自动分配：客户端刻意不暴露「远程端口」
+// 这个概念，用户只需要知道「本机服务跑在哪个端口」。
+// 端口池的挑选、系统占用排除、保留端口过滤全在服务端完成。
+func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePort int) (State, error) {
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return a.GetState(), err
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"name":        strings.TrimSpace(name),
+		"type":        strings.TrimSpace(tunnelType),
+		"local_ip":    strings.TrimSpace(localIP),
+		"local_port":  localPort,
+		"remote_port": remotePort,
+	})
+	if err != nil {
+		return a.GetState(), err
+	}
+	if _, err := a.do(http.MethodPost, base+"/api/user/client/tunnels", apiKey, payload); err != nil {
+		return a.GetState(), err
+	}
+	// 建完立刻同步：新建的隧道会带上下发的公网地址，
+	// 让用户马上看到「该发给朋友哪个地址」。
+	return a.Refresh()
+}
+
+// DeleteTunnel 删除一条隧道。
+func (a *App) DeleteTunnel(id uint) (State, error) {
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return a.GetState(), err
+	}
+	endpoint := fmt.Sprintf("%s/api/user/client/tunnels/%d", base, id)
+	if _, err := a.do(http.MethodDelete, endpoint, apiKey, nil); err != nil {
+		return a.GetState(), err
+	}
+	return a.Refresh()
+}
+
+// SetTunnelStatus 启用或停用一条隧道。
+func (a *App) SetTunnelStatus(id uint, status string) (State, error) {
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return a.GetState(), err
+	}
+	payload, err := json.Marshal(map[string]string{"status": status})
+	if err != nil {
+		return a.GetState(), err
+	}
+	endpoint := fmt.Sprintf("%s/api/user/client/tunnels/%d/status", base, id)
+	if _, err := a.do(http.MethodPost, endpoint, apiKey, payload); err != nil {
+		return a.GetState(), err
+	}
+	return a.Refresh()
+}
+
+// Redeem 使用兑换码。
+//
+// 返回服务端给出的结果文案（例如「流量额度已增加 10 GB」），
+// 由调用方直接提示用户——不同兑换码类型的文案差别很大，
+// 在客户端里猜类型容易说错。
+func (a *App) Redeem(code string) (string, State, error) {
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return "", a.GetState(), err
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return "", a.GetState(), errors.New("请输入兑换码")
+	}
+
+	payload, err := json.Marshal(map[string]string{"code": code})
+	if err != nil {
+		return "", a.GetState(), err
+	}
+	raw, err := a.do(http.MethodPost, base+"/api/user/client/redeem", apiKey, payload)
+	if err != nil {
+		return "", a.GetState(), err
+	}
+
+	var out struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(raw, &out)
+
+	// 兑换可能改变配额或分组，同步一次让界面立刻反映最新状态。
+	state, rerr := a.Refresh()
+	if rerr != nil {
+		return out.Message, a.GetState(), nil
+	}
+	return out.Message, state, nil
 }
 
 // Refresh 从服务端同步隧道清单与最新配置。
@@ -313,6 +459,9 @@ func (a *App) Refresh() (State, error) {
 	a.trafficUsed = data.TrafficUsed
 	a.trafficQuota = data.TrafficQuota
 	a.exceeded = data.Exceeded
+	a.group = data.Group
+	a.paymentEnabled = data.PaymentEnabled
+	a.balanceCents = data.BalanceCents
 	if data.Username != "" {
 		a.username = data.Username
 	}

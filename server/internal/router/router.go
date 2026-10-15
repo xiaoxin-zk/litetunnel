@@ -135,28 +135,67 @@ func New(
 		clientPub.POST("/auth", userH.ClientAuth)
 	}
 
-	// 桌面客户端接口：支持 JWT 或长期凭据（API Key / 客户端接入凭据）。
+	// ================= 客户端接口组 =================
 	//
-	// ReadOnly 是结构性保证：API Key 会明文落在客户端本地配置里，
-	// 它的定位是「让客户端连上来」，而不是「让持有者接管账号」。
-	// 即使以后有人往这个组里加了写接口，也会被这一层直接挡住。
+	// 接受两种凭据：会话令牌（JWT）与长期凭据（API Key）。
+	//
+	// ## 权限边界：使用账号 vs 控制账号
+	//
+	// 这条线是整个设计里最需要想清楚的地方，因为它决定了一把可能泄露的
+	// 钥匙能造成多大破坏。API Key 会以明文落在客户端本地配置文件里，
+	// 因此不能让它等价于「账号被完全接管」。
+	//
+	//   允许（使用账号）：读信息、读写隧道、兑换码、看统计
+	//     —— 这些就是客户端存在的意义。隧道是可删可重建的资源，
+	//        兑换受分组限额约束，爆炸半径可控。
+	//
+	//   拒绝（控制账号）：改密码、改邮箱、重置 API Key、注销账号
+	//     —— 这些是「账号接管」的关键步骤，一旦泄露即不可逆。
+	//        它们保留在下面的 userAPI 组，只认会话令牌。
+	//
+	// 换句话说：一把可能泄露的钥匙，允许它开门，不允许它换锁。
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(userAPILimiter, "user-client"))
 	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
-	cli.Use(middleware.ReadOnly())
 	{
+		// 接入信息与配置
 		cli.GET("/info", userH.ClientInfo)
 		cli.GET("/config", userH.ClientConfig)
-		cli.GET("/downloads", userH.ClientDownloads)
-		cli.GET("/downloads/:name", userH.ClientDownloadFile)
+
+		// 隧道管理。远程端口留空时由服务端从端口池自动分配，
+		// 并自动排除系统已占用与保留的端口——客户端不需要理解端口池。
+		cli.GET("/tunnels", userH.ListTunnels)
+		cli.POST("/tunnels", userH.CreateTunnel)
+		cli.PUT("/tunnels/:id", userH.UpdateTunnel)
+		cli.DELETE("/tunnels/:id", userH.DeleteTunnel)
+		cli.POST("/tunnels/:id/status", userH.SetTunnelStatus)
+
+		// 兑换码。同样受「不能是资产操作」的约束：
+		// 兑换本身只是消费一个已发放的码，不会产生新的资产。
+		cli.POST("/redeem", userH.Redeem)
+		cli.GET("/redeem/records", userH.RedeemRecords)
+
+		// 统计
+		cli.GET("/stats/overview", userH.StatsOverview)
+		cli.GET("/stats/traffic", userH.TrafficStats)
+
+		// 客户端安装包。这一小组明确只读：即使以后有人加了写接口，
+		// 也会被 ReadOnly 挡住（下载目录的内容是管理员放的）。
+		dl := cli.Group("")
+		dl.Use(middleware.ReadOnly())
+		{
+			dl.GET("/downloads", userH.ClientDownloads)
+			dl.GET("/downloads/:name", userH.ClientDownloadFile)
+		}
 	}
 
+	// ================= 账号接口组 =================
+	//
+	// 只接受会话令牌（JWT），API Key 一律拒绝。
+	// 这里的每一个接口都能改变账号本身的安全状态，见上面的边界说明。
 	userAPI := r.Group("/api/user")
 	userAPI.Use(middleware.Limit(userAPILimiter, "user-api"))
 	userAPI.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.ResolveUserIdentity))
-	// 本组是账号操作（改密、改邮箱、重置凭据、注销），一律要求会话令牌。
-	// 当前 UserAuth 只接受 JWT，这层今天不拦任何东西；它的作用是防止
-	// 以后有人把本组改成 UserAuthFlexible 时，把写权限顺带开放给 API Key。
 	userAPI.Use(middleware.RequireSession())
 	{
 		userAPI.GET("/profile", userH.Profile)
@@ -166,21 +205,10 @@ func New(
 		userAPI.POST("/logout", userH.Logout)
 		userAPI.PUT("/profile/password", userH.ChangePassword)
 
-		userAPI.GET("/tunnels", userH.ListTunnels)
-		userAPI.POST("/tunnels", userH.CreateTunnel)
-		userAPI.PUT("/tunnels/:id", userH.UpdateTunnel)
-		userAPI.DELETE("/tunnels/:id", userH.DeleteTunnel)
-		userAPI.POST("/tunnels/:id/status", userH.SetTunnelStatus)
-
+		// 凭据自身的管理：能重置 Key 就等于能复制身份，绝不能给 API Key。
 		userAPI.GET("/apikey", userH.GetAPIKey)
 		userAPI.POST("/apikey/reveal", userH.RevealAPIKey)
 		userAPI.POST("/apikey/rotate", userH.RotateAPIKey)
-
-		userAPI.POST("/redeem", userH.Redeem)
-		userAPI.GET("/redeem/records", userH.RedeemRecords)
-
-		userAPI.GET("/stats/overview", userH.StatsOverview)
-		userAPI.GET("/stats/traffic", userH.TrafficStats)
 	}
 
 	// ================= 管理侧 =================

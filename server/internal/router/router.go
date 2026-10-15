@@ -135,52 +135,20 @@ func New(
 		clientPub.POST("/auth", userH.ClientAuth)
 	}
 
-	// ================= 客户端接口组 =================
+	// ================= 客户端专属接口 =================
 	//
-	// 接受两种凭据：会话令牌（JWT）与长期凭据（API Key）。
-	//
-	// ## 权限边界：使用账号 vs 控制账号
-	//
-	// 这条线是整个设计里最需要想清楚的地方，因为它决定了一把可能泄露的
-	// 钥匙能造成多大破坏。API Key 会以明文落在客户端本地配置文件里，
-	// 因此不能让它等价于「账号被完全接管」。
-	//
-	//   允许（使用账号）：读信息、读写隧道、兑换码、看统计
-	//     —— 这些就是客户端存在的意义。隧道是可删可重建的资源，
-	//        兑换受分组限额约束，爆炸半径可控。
-	//
-	//   拒绝（控制账号）：改密码、改邮箱、重置 API Key、注销账号
-	//     —— 这些是「账号接管」的关键步骤，一旦泄露即不可逆。
-	//        它们保留在下面的 userAPI 组，只认会话令牌。
-	//
-	// 换句话说：一把可能泄露的钥匙，允许它开门，不允许它换锁。
+	// 只放「桌面客户端才需要」的接入面：接入信息、frpc 配置、安装包。
+	// 隧道管理与兑换等业务接口放在下面的 /api/user，两种入口共用同一批
+	// handler——网页端用会话令牌，客户端用 API Key，不必注册两遍。
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(userAPILimiter, "user-client"))
 	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
 	{
-		// 接入信息与配置
 		cli.GET("/info", userH.ClientInfo)
 		cli.GET("/config", userH.ClientConfig)
 
-		// 隧道管理。远程端口留空时由服务端从端口池自动分配，
-		// 并自动排除系统已占用与保留的端口——客户端不需要理解端口池。
-		cli.GET("/tunnels", userH.ListTunnels)
-		cli.POST("/tunnels", userH.CreateTunnel)
-		cli.PUT("/tunnels/:id", userH.UpdateTunnel)
-		cli.DELETE("/tunnels/:id", userH.DeleteTunnel)
-		cli.POST("/tunnels/:id/status", userH.SetTunnelStatus)
-
-		// 兑换码。同样受「不能是资产操作」的约束：
-		// 兑换本身只是消费一个已发放的码，不会产生新的资产。
-		cli.POST("/redeem", userH.Redeem)
-		cli.GET("/redeem/records", userH.RedeemRecords)
-
-		// 统计
-		cli.GET("/stats/overview", userH.StatsOverview)
-		cli.GET("/stats/traffic", userH.TrafficStats)
-
-		// 客户端安装包。这一小组明确只读：即使以后有人加了写接口，
-		// 也会被 ReadOnly 挡住（下载目录的内容是管理员放的）。
+		// 客户端安装包。单独用 ReadOnly 包裹：目录内容由管理员放置，
+		// 以后即使有人往这里加了写接口也写不进去。
 		dl := cli.Group("")
 		dl.Use(middleware.ReadOnly())
 		{
@@ -189,26 +157,65 @@ func New(
 		}
 	}
 
-	// ================= 账号接口组 =================
+	// ================= 业务与账号接口 =================
 	//
-	// 只接受会话令牌（JWT），API Key 一律拒绝。
-	// 这里的每一个接口都能改变账号本身的安全状态，见上面的边界说明。
+	// ## 权限边界：使用账号 vs 控制账号
+	//
+	// 这条线是整个设计里最需要想清楚的地方，因为它决定了一把可能泄露的
+	// 钥匙能造成多大破坏。API Key 会以明文落在客户端本地配置文件里，
+	// 因此不能让它等价于「账号被完全接管」。
+	//
+	//   允许（使用账号）：读写隧道、兑换码、看统计
+	//     —— 这些就是客户端存在的意义。隧道是可删可重建的资源，
+	//        兑换受分组限额约束，爆炸半径可控。
+	//
+	//   拒绝（控制账号）：改密码、改邮箱、重置 API Key、注销账号
+	//     —— 这些是「账号接管」的关键步骤，一旦泄露即不可逆。
+	//
+	// 换句话说：一把可能泄露的钥匙，允许它开门，不允许它换锁。
+	//
+	// 实现上不再拆成两个组各注册一遍，而是同组内用 RequireSession
+	// 划出内层——重复注册同一批 handler 是很容易漏掉一条的地方。
 	userAPI := r.Group("/api/user")
 	userAPI.Use(middleware.Limit(userAPILimiter, "user-api"))
-	userAPI.Use(middleware.UserAuth(cfg.UserJWTSecret, svc.ResolveUserIdentity))
-	userAPI.Use(middleware.RequireSession())
+	userAPI.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
 	{
-		userAPI.GET("/profile", userH.Profile)
-		userAPI.PUT("/profile", userH.UpdateProfile)
-		// 注销账号：需要密码二次确认，且不可恢复。
-		userAPI.DELETE("/profile", userH.DeleteAccount)
-		userAPI.POST("/logout", userH.Logout)
-		userAPI.PUT("/profile/password", userH.ChangePassword)
+		// ---- 使用账号：两种凭据都放行 ----
 
-		// 凭据自身的管理：能重置 Key 就等于能复制身份，绝不能给 API Key。
-		userAPI.GET("/apikey", userH.GetAPIKey)
-		userAPI.POST("/apikey/reveal", userH.RevealAPIKey)
-		userAPI.POST("/apikey/rotate", userH.RotateAPIKey)
+		// 隧道管理。远程端口留空（0）时由服务端从端口池自动分配，
+		// 并自动排除系统已占用与保留的端口——用户不需要理解端口池。
+		userAPI.GET("/tunnels", userH.ListTunnels)
+		userAPI.POST("/tunnels", userH.CreateTunnel)
+		userAPI.PUT("/tunnels/:id", userH.UpdateTunnel)
+		userAPI.DELETE("/tunnels/:id", userH.DeleteTunnel)
+		userAPI.POST("/tunnels/:id/status", userH.SetTunnelStatus)
+
+		// 兑换码：消费一个已发放的码，不产生新资产，故允许长期凭据。
+		userAPI.POST("/redeem", userH.Redeem)
+		userAPI.GET("/redeem/records", userH.RedeemRecords)
+
+		userAPI.GET("/stats/overview", userH.StatsOverview)
+		userAPI.GET("/stats/traffic", userH.TrafficStats)
+
+		// ---- 控制账号：仅会话令牌 ----
+		//
+		// 这些接口能改变账号本身的安全状态，一旦被长期凭据调用，
+		// 一份泄露的客户端配置就等于账号被接管。
+		account := userAPI.Group("")
+		account.Use(middleware.RequireSession())
+		{
+			account.GET("/profile", userH.Profile)
+			account.PUT("/profile", userH.UpdateProfile)
+			// 注销账号：需要密码二次确认，且不可恢复。
+			account.DELETE("/profile", userH.DeleteAccount)
+			account.POST("/logout", userH.Logout)
+			account.PUT("/profile/password", userH.ChangePassword)
+
+			// 凭据自身的管理：能重置 Key 就等于能复制身份。
+			account.GET("/apikey", userH.GetAPIKey)
+			account.POST("/apikey/reveal", userH.RevealAPIKey)
+			account.POST("/apikey/rotate", userH.RotateAPIKey)
+		}
 	}
 
 	// ================= 管理侧 =================

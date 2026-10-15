@@ -275,7 +275,7 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
             -d '{"name":"citunnel","type":"tcp","local_ip":"127.0.0.1","local_port":25565}' \
-            "$BASE/api/user/client/tunnels")
+            "$BASE/api/user/tunnels")
           if [ "$code" != "200" ]; then
             echo "::error::API key cannot create a tunnel (got $code, want 200)"
             exit 1
@@ -297,7 +297,7 @@ jobs:
           # 能兑换（用不存在的码，只要不是 401 就说明接口可达）
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
-            -d '{"code":"LT-AAAA-AAAA-AAAA"}' "$BASE/api/user/client/redeem")
+            -d '{"code":"LT-AAAA-AAAA-AAAA"}' "$BASE/api/user/redeem")
           if [ "$code" = "401" ] || [ "$code" = "404" ]; then
             echo "::error::API key cannot reach redeem endpoint (got $code)"
             exit 1

@@ -15,10 +15,9 @@
       </div>
 
       <div class="actions">
-        <button v-if="!state.running" class="btn-primary" :disabled="busy || !state.frpc_found" @click="start">
-          启动连接
-        </button>
-        <button v-else class="btn-danger" :disabled="busy" @click="stop">断开连接</button>
+        <!-- 这里刻意没有「启动连接」按钮：连接由每条隧道自己的开关驱动，
+             开关打开着的隧道在接入时就会自动连上。再放一个全局按钮只会
+             制造状态不一致——「开关是开的，但还得再点一次才连上」。 -->
         <button class="btn-ghost" @click="logout">退出登录</button>
       </div>
     </header>
@@ -108,8 +107,16 @@
           <div class="tunnel-addr">
             <span class="mono">{{ t.public_addr || '—' }}</span>
             <button v-if="t.public_addr" class="btn-ghost mini" @click="copy(t.public_addr)">复制</button>
-            <button class="btn-ghost mini" :disabled="busy" @click="toggleTunnel(t)">
-              {{ t.status === 'active' ? '停用' : '启用' }}
+            <!-- 开关就是「这条隧道要不要连出去」：打开即拉起它自己的 frpc
+                 进程，关掉即停掉该进程并让服务端收回端口。 -->
+            <button
+              class="tunnel-toggle"
+              :class="{ on: t.running }"
+              :disabled="busy || !state.frpc_found"
+              :title="t.running ? '断开这条隧道' : '连接这条隧道'"
+              @click="toggleTunnel(t)"
+            >
+              <span class="knob"></span>
             </button>
             <button class="btn-ghost mini danger" :disabled="busy" @click="removeTunnel(t)">删除</button>
           </div>
@@ -125,7 +132,9 @@
           </div>
         </div>
         <div ref="logBox" class="log-box">
-          <div v-if="!logs.length" class="muted">暂无日志，启动连接后这里会显示 frpc 的输出。</div>
+          <div v-if="!logs.length" class="muted">
+            暂无日志。打开某条隧道的开关后，这里会按 Tunnel/&lt;名字&gt; 显示它的连接过程。
+          </div>
           <div v-for="(line, i) in logs" :key="i" class="log-line">{{ line }}</div>
         </div>
       </section>
@@ -674,9 +683,12 @@ async function submitBatch(prefix) {
 async function toggleTunnel(t) {
   busy.value = true
   try {
-    const next = await api.setTunnelStatus(t.id, t.status === 'active' ? 'disabled' : 'active')
+    // 开关同时决定两件事：本机是否拉起这条隧道的 frpc 进程，
+    // 以及服务端是否把它算作「启用」（启用会开放端口，停用会收回）。
+    // 两者必须一起变，否则会出现「界面显示开着、实际连不上」。
+    const next = t.running ? await api.stopTunnel(t.id) : await api.startTunnel(t.id)
     emit('update', next)
-    flash(t.status === 'active' ? '隧道已停用，端口已收回' : '隧道已启用')
+    flash(t.running ? `隧道「${t.name}」已断开，端口已收回` : `隧道「${t.name}」已连接，正在建立通道…`)
   } catch (e) {
     flash(typeof e === 'string' ? e : e?.message || '操作失败', 'warn')
   } finally {
@@ -732,7 +744,10 @@ async function submitRedeem() {
 
 
 const statusText = computed(() => {
-  if (props.state.running) return '已连接，隧道正在运行'
+  // 说清「几条在跑」：只有一条隧道开着时，笼统的「已连接」会让用户
+  // 以为所有隧道都通了。
+  const running = (props.state.tunnels || []).filter((t) => t.running).length
+  if (running > 0) return `已连接，${running} 条隧道运行中`
   if (props.state.exceeded) return '流量已用尽'
   return '未连接'
 })
@@ -764,11 +779,14 @@ const dotClass = computed(() => {
 
 function tagText(t) {
   if (t.status !== 'active') return '已停用'
-  return t.online ? '在线' : '等待连接'
+  // running 是本机视角（进程在不在），online 是服务端视角（frps 有没有
+  // 收到这条代理）。两者分开说，用户才能区分「我没开」和「开了还没通」。
+  if (!t.running) return '未连接'
+  return t.online ? '运行中' : '连接中'
 }
 
 function tagClass(t) {
-  if (t.status !== 'active') return 'tag-info'
+  if (t.status !== 'active' || !t.running) return 'tag-info'
   return t.online ? 'tag-success' : 'tag-warn'
 }
 
@@ -809,8 +827,6 @@ async function run(fn, successText) {
 // 曾经有个「立即同步」按钮，现已移除：自动同步每 20 秒跑一次，
 // 手动触发最快也只是省下这几秒，却要用户理解「为什么还需要点它」。
 // 后端接口保留（api.refresh 仍可用），需要时能随时加回入口。
-const start = () => run(() => api.start(), '已启动连接')
-const stop = () => run(() => api.stop(), '已断开连接')
 const logout = () => run(() => api.logout())
 
 async function clearLogs() {
@@ -1365,10 +1381,50 @@ watch(
   background: #fef2f2;
 }
 
-/* 隧道地址行现在最多有四个按钮（复制/启停/删除），
+/* 隧道地址行最多有四个控件（复制/开关/删除 + 地址），
    窄窗口下允许换行，避免把地址挤没。 */
 .tunnel-addr {
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+/* 隧道开关。用按钮而不是 checkbox：它表达的是一个动作
+   （拉起/停掉这条隧道的进程），不是一个会被表单提交的选项。 */
+.tunnel-toggle {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 11px;
+  background: #cbd5e1;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.18s ease;
+}
+
+.tunnel-toggle .knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.25);
+  transition: transform 0.18s ease;
+}
+
+.tunnel-toggle.on {
+  background: #16a34a;
+}
+
+.tunnel-toggle.on .knob {
+  transform: translateX(18px);
+}
+
+.tunnel-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 </style>

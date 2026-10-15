@@ -498,6 +498,11 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 }
 
 // ClientConfig 下载当前账号的 frpc.toml。
+//
+// 默认返回包含全部启用隧道的完整配置（供用户在网页端下载/排查）。
+// 带 tunnel_id 时只返回该条隧道的配置——客户端为每条隧道单独托管一个
+// frpc 进程，每条进程只能拿到属于自己的那一份，否则一条隧道的启停
+// 会连带影响其他隧道（单进程承载全部隧道时就是这个表现）。
 func (h *Handler) ClientConfig(c *gin.Context) {
 	u, err := h.svc.LoadUser(middleware.CurrentUserID(c))
 	if err != nil {
@@ -508,6 +513,27 @@ func (h *Handler) ClientConfig(c *gin.Context) {
 	if err != nil {
 		shared.Fail(c, err)
 		return
+	}
+	if raw := strings.TrimSpace(c.Query("tunnel_id")); raw != "" {
+		id, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || id == 0 {
+			shared.Fail(c, service.ErrInvalidParam)
+			return
+		}
+		// 只在该用户自己的隧道里找：他人的隧道 ID 一律按「不存在」处理，
+		// 不给出「存在但不属于你」这种能用来探测 ID 的差别。
+		one := make([]model.Tunnel, 0, 1)
+		for i := range tunnels {
+			if uint64(tunnels[i].ID) == id {
+				one = append(one, tunnels[i])
+				break
+			}
+		}
+		if len(one) == 0 {
+			shared.Fail(c, service.ErrNotFound)
+			return
+		}
+		tunnels = one
 	}
 	text, err := h.svc.BuildFrpcConfig(u, tunnels)
 	if err != nil {

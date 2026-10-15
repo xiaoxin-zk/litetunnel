@@ -55,8 +55,11 @@ const mockConnectedState = {
       local_ip: '127.0.0.1',
       local_port: 25565,
       public_addr: 'demo.invalid:20001',
-      status: 'enabled',
+      // status 的取值与服务端一致：active / disabled
+      status: 'active',
       online: true,
+      // running 表示本机是否已为这条隧道拉起 frpc 进程
+      running: true,
       traffic_used: 1073741824,
       bandwidth_limit_str: '不限速'
     },
@@ -67,8 +70,9 @@ const mockConnectedState = {
       local_ip: '192.168.1.10',
       local_port: 5000,
       public_addr: 'demo.invalid:20002',
-      status: 'enabled',
+      status: 'active',
       online: false,
+      running: false,
       traffic_used: 52428800,
       bandwidth_limit_str: '5 MB/s'
     }
@@ -80,8 +84,8 @@ const mock = {
   Connect: async () => mockConnectedState,
   Logout: async () => emptyState,
   Refresh: async () => mockConnectedState,
-  StartClient: async () => {},
-  StopClient: async () => {},
+  StartTunnel: async () => mockConnectedState,
+  StopTunnel: async () => mockConnectedState,
   GetLogs: async () => ['[mock] 当前为浏览器预览模式，未连接真实服务端'],
   ClearLogs: async () => {},
   SetAutoStart: async () => {},
@@ -96,7 +100,6 @@ const mock = {
   CreateTunnel: async () => mockConnectedState,
   CreateTunnelsBatch: async () => [{ message: '[mock] 已创建 3 条隧道', failures: [] }, mockConnectedState],
   DeleteTunnel: async () => mockConnectedState,
-  SetTunnelStatus: async () => mockConnectedState,
   Redeem: async () => ['[mock] 兑换成功', mockConnectedState]
 }
 
@@ -108,8 +111,6 @@ export const api = {
   connect: (apiKey, serverUrl) => go.Connect(apiKey, serverUrl),
   logout: () => go.Logout(),
   refresh: () => go.Refresh(),
-  start: () => go.StartClient(),
-  stop: () => go.StopClient(),
   logs: () => go.GetLogs(),
   clearLogs: () => go.ClearLogs(),
   setAutoStart: (v) => go.SetAutoStart(v),
@@ -128,7 +129,10 @@ export const api = {
   createTunnelsBatch: (prefix, type, localIp, ports) =>
     go.CreateTunnelsBatch(prefix, type, localIp, ports),
   deleteTunnel: (id) => go.DeleteTunnel(id),
-  setTunnelStatus: (id, status) => go.SetTunnelStatus(id, status),
+  // 隧道开关：开启即拉起该隧道自己的 frpc 进程，关闭即停掉它。
+  // 没有「先启用再连接」两步——两步之间必然出现「开着却没连上」的状态。
+  startTunnel: (id) => go.StartTunnel(id),
+  stopTunnel: (id) => go.StopTunnel(id),
   redeem: (code) => go.Redeem(code)
 }
 

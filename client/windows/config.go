@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 const appDirName = "LiteTunnel"
@@ -46,13 +47,32 @@ func configFilePath() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// frpcConfigPath 返回下发给 frpc 的配置文件路径。
-func frpcConfigPath() (string, error) {
+// frpcConfigPath 返回某条隧道专属的配置文件路径。
+//
+// 每条隧道一个子目录，而不是共用一个 frpc.toml：
+//   - 配置文件里 log.to 是相对路径（./frpc.log），frpc 的工作目录就是
+//     配置文件所在目录。共用一个目录的话，多个进程会往同一个 frpc.log
+//     里写，日志互相覆盖，出事时没法排查；
+//   - 出问题时可以直接把某个目录下的配置发给别人看，不会连带泄露其他隧道。
+func frpcConfigPath(tunnelID uint) (string, error) {
 	dir, err := dataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "frpc.toml"), nil
+	sub := filepath.Join(dir, "tunnels", strconv.FormatUint(uint64(tunnelID), 10))
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		return "", err
+	}
+	return filepath.Join(sub, "frpc.toml"), nil
+}
+
+// frpcTunnelsDir 返回存放各隧道配置的目录（界面上展示，便于用户找到）。
+func frpcTunnelsDir() (string, error) {
+	dir, err := dataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "tunnels"), nil
 }
 
 func loadConfig() (*Config, error) {

@@ -2,6 +2,11 @@
 //
 // 之所以不内嵌 frp 库：官方 frpc 二进制稳定、可独立升级，且能直接复用
 // 控制面下发的标准 frpc.toml，避免与 frp 内部 API 产生耦合。
+//
+// 一个 Manager 托管**多条隧道各自的 frpc 进程**：每条隧道一个进程，
+// 配置文件也只含这一条隧道。早期版本是单个进程承载全部隧道，代价是
+// 「改一条隧道，其他隧道全断一下」；而且所有隧道共用一个登录会话与
+// 运行 ID，日志里分不出哪一行属于哪条隧道。
 package frpc
 
 import (
@@ -21,20 +26,14 @@ import (
 // maxLogLines 内存中保留的日志行数。
 const maxLogLines = 500
 
-// ErrAlreadyRunning 表示客户端已在运行。
-var ErrAlreadyRunning = errors.New("客户端已在运行")
+// ErrAlreadyRunning 表示该隧道的 frpc 已在运行。
+var ErrAlreadyRunning = errors.New("该隧道的 frpc 已在运行")
 
-// Manager 管理 frpc 子进程的生命周期。
-type Manager struct {
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	running bool
-	logs    []string
-
-	exePath string
-
-	onLog  func(string)
-	onExit func(err error)
+// process 是某一条隧道的 frpc 进程。
+type process struct {
+	// name 只用于日志前缀。进程本身不认隧道名，改名不影响运行中的连接。
+	name string
+	cmd  *exec.Cmd
 
 	// exitCh 在进程**真正**退出（Wait 返回）时关闭。
 	//
@@ -44,16 +43,33 @@ type Manager struct {
 	exitCh chan struct{}
 }
 
+// Manager 托管多条隧道的 frpc 子进程。
+type Manager struct {
+	mu    sync.Mutex
+	procs map[uint]*process
+	logs  []string
+
+	exePath string
+
+	// onLog 收到的行已经带好「Tunnel/<名字>」前缀。
+	onLog func(tunnelID uint, tunnelName, line string)
+	// onExit 在某个隧道的进程退出时调用（包括被 Stop 主动停掉）。
+	onExit func(tunnelID uint, tunnelName string, err error)
+}
+
 // New 创建管理器。exePath 为空时自动在应用目录与 PATH 中查找 frpc。
 func New(exePath string) *Manager {
 	if exePath == "" {
 		exePath = findFrpc()
 	}
-	return &Manager{exePath: exePath}
+	return &Manager{exePath: exePath, procs: map[uint]*process{}}
 }
 
 // SetCallbacks 注册日志与退出回调。回调会在后台协程中被调用。
-func (m *Manager) SetCallbacks(onLog func(string), onExit func(error)) {
+func (m *Manager) SetCallbacks(
+	onLog func(tunnelID uint, tunnelName, line string),
+	onExit func(tunnelID uint, tunnelName string, err error),
+) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onLog = onLog
@@ -77,17 +93,39 @@ func (m *Manager) Available() bool {
 	return err == nil
 }
 
-// Running 返回是否正在运行。
-func (m *Manager) Running() bool {
+// Running 返回某条隧道的 frpc 是否正在运行。
+func (m *Manager) Running(tunnelID uint) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.running
+	_, ok := m.procs[tunnelID]
+	return ok
 }
 
-// Start 以指定配置文件启动 frpc。
-func (m *Manager) Start(configPath string) error {
+// RunningIDs 返回当前正在运行的隧道 ID。
+func (m *Manager) RunningIDs() []uint {
 	m.mu.Lock()
-	if m.running {
+	defer m.mu.Unlock()
+	out := make([]uint, 0, len(m.procs))
+	for id := range m.procs {
+		out = append(out, id)
+	}
+	return out
+}
+
+// AnyRunning 表示是否有任意一条隧道在运行。
+func (m *Manager) AnyRunning() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.procs) > 0
+}
+
+// Start 以指定配置文件为某条隧道启动 frpc。
+//
+// tunnelName 只用于日志前缀：进程本身只认配置文件，
+// 不依赖隧道名字，因此改名不影响正在运行的连接。
+func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
+	m.mu.Lock()
+	if _, ok := m.procs[tunnelID]; ok {
 		m.mu.Unlock()
 		return ErrAlreadyRunning
 	}
@@ -122,15 +160,11 @@ func (m *Manager) Start(configPath string) error {
 	}
 
 	exitCh := make(chan struct{})
-	m.cmd = cmd
-	m.running = true
-	m.exitCh = exitCh
-	m.logs = nil
-	onLog := m.onLog
+	m.procs[tunnelID] = &process{name: tunnelName, cmd: cmd, exitCh: exitCh}
 	onExit := m.onExit
 	m.mu.Unlock()
 
-	m.appendLog(fmt.Sprintf("[系统] 已启动 frpc（PID %d）", cmd.Process.Pid))
+	m.appendLog(tunnelID, tunnelName, fmt.Sprintf("已启动 frpc（PID %d）", cmd.Process.Pid))
 
 	// 把子进程绑到一个「随本进程终止而终止」的 Job Object。
 	//
@@ -140,61 +174,61 @@ func (m *Manager) Start(configPath string) error {
 	//
 	// 失败不致命（会退化为「仅在正常关闭时清理」），所以只记一行日志。
 	if err := attachToJob(cmd); err != nil {
-		m.appendLog("[系统] 提示：未能绑定进程生命周期，异常退出时可能残留 frpc 进程")
+		m.appendLog(tunnelID, tunnelName, "提示：未能绑定进程生命周期，异常退出时可能残留 frpc 进程")
 	}
 
-	go m.pump(stdout)
-	go m.pump(stderr)
+	go m.pump(tunnelID, tunnelName, stdout)
+	go m.pump(tunnelID, tunnelName, stderr)
 
 	go func() {
 		err := cmd.Wait()
 		m.mu.Lock()
-		m.running = false
-		m.cmd = nil
-		m.exitCh = nil
+		// 只清理仍指向本进程的记录：Stop 后紧接着 Start 会放入新的 *process，
+		// 这里无条件删除会把刚起来的那个进程从表里抹掉，
+		// 表现为「界面上显示未运行，实际进程还在」。
+		if p, ok := m.procs[tunnelID]; ok && p.exitCh == exitCh {
+			delete(m.procs, tunnelID)
+		}
 		m.mu.Unlock()
 		// 先通知等待者再写日志：让 Stop 尽早返回，
 		// 避免日志写入（可能触发前端事件）拖慢重启。
 		close(exitCh)
 
 		if err != nil {
-			m.appendLog("[系统] frpc 已退出：" + err.Error())
+			m.appendLog(tunnelID, tunnelName, "frpc 已退出："+err.Error())
 		} else {
-			m.appendLog("[系统] frpc 已正常退出")
+			m.appendLog(tunnelID, tunnelName, "frpc 已正常退出")
 		}
 		if onExit != nil {
-			onExit(err)
+			onExit(tunnelID, tunnelName, err)
 		}
 	}()
 
-	_ = onLog
 	return nil
 }
 
-// Stop 停止 frpc 进程。
-func (m *Manager) Stop() error {
+// Stop 停止某条隧道的 frpc 进程。
+func (m *Manager) Stop(tunnelID uint) error {
 	m.mu.Lock()
-	cmd := m.cmd
-	exitCh := m.exitCh
+	p := m.procs[tunnelID]
 	m.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return nil
 	}
-	m.appendLog("[系统] 正在停止 frpc…")
+	m.appendLog(tunnelID, p.name, "正在停止 frpc…")
 	// 进程可能在我们拿到锁之前就自己退出了（frpc 启动失败就是这种情况），
 	// 此时 Kill 返回 ErrProcessDone——那不是错误，目标已经达成。
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("停止 frpc 失败: %w", err)
 	}
 
 	// 等进程真正退出再返回。
 	//
 	// 不等的话，紧接着调用 Start 会撞上 ErrAlreadyRunning——
-	// 因为 m.running 是在 Wait 的协程里才被置为 false 的。
-	// 这正是「自动同步把 frpc 停掉却起不来」的根因。
-	if exitCh != nil {
+	// 因为进程记录是在 Wait 的协程里才被删除的。
+	if p.exitCh != nil {
 		select {
-		case <-exitCh:
+		case <-p.exitCh:
 		case <-time.After(5 * time.Second):
 			// 极端情况：Kill 之后进程仍未退出。
 			// 不无限等待，让上层能给出提示，而不是把界面卡死。
@@ -202,6 +236,17 @@ func (m *Manager) Stop() error {
 		}
 	}
 	return nil
+}
+
+// StopAll 停止全部隧道的 frpc 进程，返回第一个错误。
+func (m *Manager) StopAll() error {
+	var firstErr error
+	for _, id := range m.RunningIDs() {
+		if err := m.Stop(id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Logs 返回日志快照。
@@ -220,20 +265,20 @@ func (m *Manager) ClearLogs() {
 	m.logs = nil
 }
 
-func (m *Manager) pump(r io.Reader) {
+func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		m.appendLog(scanner.Text())
+		m.appendLog(tunnelID, tunnelName, scanner.Text())
 	}
 }
 
-func (m *Manager) appendLog(line string) {
+func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
 		return
 	}
-	stamped := time.Now().Format("15:04:05") + "  " + line
+	stamped := fmt.Sprintf("%s  %s  %s", time.Now().Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
 
 	m.mu.Lock()
 	m.logs = append(m.logs, stamped)
@@ -244,8 +289,19 @@ func (m *Manager) appendLog(line string) {
 	m.mu.Unlock()
 
 	if cb != nil {
-		cb(stamped)
+		cb(tunnelID, tunnelName, stamped)
 	}
+}
+
+// logPrefix 生成日志行的隧道前缀。
+//
+// 每条隧道一个进程之后，日志区是多个进程输出交织在一起，
+// 没有前缀就完全读不出「哪条隧道出了什么问题」。
+func logPrefix(tunnelID uint, tunnelName string) string {
+	if tunnelName != "" {
+		return "Tunnel/" + tunnelName
+	}
+	return fmt.Sprintf("Tunnel/#%d", tunnelID)
 }
 
 // findFrpc 依次在可执行文件目录、当前目录与 PATH 中查找 frpc。

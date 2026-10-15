@@ -519,6 +519,68 @@ jobs:
           fi
           echo "PASS oversized batch rejected"
 
+          # ---- 按隧道下发配置 ----
+          #
+          # 客户端为**每条隧道**单独托管一个 frpc 进程，因此需要能只取
+          # 某一条隧道的配置。这里断言的是「恰好只含这一条」：
+          # 混进别的 [[proxies]]，这条隧道的进程就会顺手把其他隧道也建起来，
+          # 于是「关掉一条隧道」变成关不掉——它会被隔壁的进程重新拉起来。
+          cinfo2=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
+          # 把每个隧道对象拆到单独一行再匹配名字：JSON 的键按字母序输出，
+          # id 与 name 在同一个对象里，但不保证相邻。
+          tid=$(printf '%s' "$cinfo2" | tr '{' '\n' | grep '"name":"citunnel"' \
+            | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+          if [ -z "$tid" ]; then
+            echo "::error::cannot resolve the tunnel id from client info"
+            printf '%s\n' "$cinfo2"
+            exit 1
+          fi
+
+          one=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/config?tunnel_id=$tid")
+          if ! printf '%s' "$one" | grep -q '^name = "citunnel"'; then
+            echo "::error::per-tunnel config does not contain the requested tunnel"
+            printf '%s\n' "$one"
+            exit 1
+          fi
+          if printf '%s' "$one" | grep -q '^name = "cibatch_'; then
+            echo "::error::per-tunnel config leaked another tunnel's proxy"
+            printf '%s\n' "$one"
+            exit 1
+          fi
+          pcount=$(printf '%s' "$one" | grep -c '^\[\[proxies\]\]' || true)
+          if [ "$pcount" != "1" ]; then
+            echo "::error::per-tunnel config has $pcount proxies, want 1"
+            printf '%s\n' "$one"
+            exit 1
+          fi
+          # 每份配置都必须自带接入凭据：客户端不会去拼装配置，
+          # 少了这一段，那条隧道的进程会直接认证失败。
+          if ! printf '%s' "$one" | grep -q "^metadatas = { token = \""; then
+            echo "::error::per-tunnel config is missing the access credential"
+            printf '%s\n' "$one"
+            exit 1
+          fi
+          echo "PASS per-tunnel config contains exactly one proxy"
+
+          # 他人的隧道 ID 必须按「不存在」处理（404），
+          # 不能给出「存在但不属于你」这种可以用来探测 ID 的差别。
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $apikey" "$BASE/api/user/client/config?tunnel_id=999999")
+          if [ "$code" != "404" ]; then
+            echo "::error::config for a foreign tunnel id returned $code, want 404"
+            exit 1
+          fi
+          # 非法参数是 400，而不是悄悄回退成「下发全部隧道」——
+          # 那样客户端会拿到一份包含全部隧道的配置，一条隧道的开关
+          # 就会影响所有隧道。
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $apikey" "$BASE/api/user/client/config?tunnel_id=abc")
+          if [ "$code" != "400" ]; then
+            echo "::error::config with a malformed tunnel id returned $code, want 400"
+            exit 1
+          fi
+          echo "PASS per-tunnel config rejects unknown/malformed tunnel id"
+
           # ---- frps 插件：首次登录的时序 ----
           #
           # 回归测试，对应一个真实故障：客户端永远停在「等待连接」，

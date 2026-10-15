@@ -55,3 +55,7 @@ deploy/letsencrypt/
 # 从 GitHub Release 下载下来验证/试用的安装包，体积大且每次可重新获取
 LiteTunnel-*.zip
 litetunnel-deploy.zip
+
+# 解压后的客户端目录（含 exe 与 frpc，体积大且可随时从 Release 重新下载）
+LiteTunnel-windows-amd64/
+LiteTunnel-windows-*/

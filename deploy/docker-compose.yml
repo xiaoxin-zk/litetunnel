@@ -66,26 +66,19 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # ===== 防火墙控制（默认关闭，按需开启）=====
+    # ===== 防火墙控制 =====
     #
-    # 只有在管理端「系统设置 → 端口与防火墙」里启用「防火墙控制」后，
-    # 才需要下面这些额外授权。开启后容器具备 NET_ADMIN 能力，
-    # 一旦控制面出现远程代码执行漏洞，攻击者将能改写主机防火墙规则。
+    # 这里**刻意不提供** NET_ADMIN 的开启方式。
     #
-    # 这是明确的权衡：用一部分容器隔离性换取「隧道端口自动放行」的便利。
-    # 如果你的服务器把端口放行交给云安全组，请保持下面的注释状态。
+    # 面板只做只读的事：扫描 /proc/net/* 看哪些端口在监听（不需要任何特权）。
+    # 需要改防火墙时，它把请求发给宿主机上的 lt-fw helper：
     #
-    # 开启步骤：
-    #   1. 取消下面 cap_add 与 tmpfs /run 的注释
-    #   2. 在管理端启用防火墙控制，并确认「保护端口」包含 22 与控制面端口
-    #   3. docker compose -f deploy/docker-compose.yml up -d panel
+    #     systemctl start lt-fw      # 见 deploy/systemd/lt-fw.service
     #
-    # cap_add:
-    #   - NET_ADMIN
-    #   - NET_RAW
-    # tmpfs:
-    #   # iptables 需要写 /run/xtables.lock，read_only 下必须挂 tmpfs
-    #   - /run
+    # 这样即使面板被完全控制，攻击者能做的也只是「放行/关闭端口池内的
+    # 端口」，而且仍然受保护端口列表约束，拿不到主机防火墙的完全控制权。
+    #
+    # 如果给容器 NET_ADMIN，上面这层隔离就没了——面板被攻破等于主机失守。
     depends_on:
       - frps
 

@@ -159,17 +159,4 @@ func (t *IPTables) RemovePort(port int, proto string) error {
 	return fmt.Errorf("端口 %d 的规则异常重复，已删除 8 条仍未清空，请手工检查", port)
 }
 
-// dedupeRules 按「端口+协议+来源+是否托管」去重。
-func dedupeRules(in []Rule) []Rule {
-	seen := make(map[string]bool, len(in))
-	out := make([]Rule, 0, len(in))
-	for _, r := range in {
-		key := fmt.Sprintf("%d|%s|%s|%v", r.Port, r.Proto, r.Source, r.Managed)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, r)
-	}
-	return out
-}
+

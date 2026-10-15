@@ -31,10 +31,11 @@ RUN go build -trimpath \
 
 # ---------- 运行镜像 ----------
 FROM alpine:3.21
-# iptables 与 ip6tables 供「防火墙控制」功能使用。
-# 镜像里带上它们不代表会用到：该功能默认关闭，只有管理端显式开启
-# 并且容器被授予 NET_ADMIN 时才会真正操作主机防火墙。
-RUN apk add --no-cache ca-certificates tzdata wget iptables ip6tables \
+# 刻意**不装** iptables / nftables：
+# 面板不执行任何防火墙写操作，它把写请求转发给宿主机上的 lt-fw helper。
+# 镜像里没有这些工具，也就杜绝了「哪天有人顺手加了 NET_ADMIN 就能改主机
+# 防火墙」的可能——能力不存在，就没法被误用。
+RUN apk add --no-cache ca-certificates tzdata wget \
     && adduser -D -u 10001 -h /app lt
 
 WORKDIR /app

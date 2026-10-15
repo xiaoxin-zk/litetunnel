@@ -23,14 +23,30 @@ func ProtoOfTunnel(tunnelType string) string {
 
 // FirewallBackend 按当前设置构造防火墙后端。
 //
-// 每次调用都重新探测，而不是缓存一个实例：
-//   - 探测成本极低（只是判断命令是否存在）
-//   - 管理员可能刚装上 firewalld 或改了后端偏好，缓存会导致配置不生效
+// # 只有 helper 一条路
+//
+// 面板**不持有任何防火墙写能力**：容器里没有 iptables、没有 NET_ADMIN，
+// 代码里也没有本地执行路径。所有写操作都转发给宿主机上的 lt-fw helper。
+//
+// helper 不可用时返回 None（即「什么都不做」），而不是退回本地执行——
+// 那条路径已经不存在，也不应该存在：一旦容器能被授予 NET_ADMIN，
+// 面板被攻破的后果就从「服务不可用」升级为「整台主机的防火墙失守」。
+//
+// 每次调用都重新探测而不是缓存：helper 可能刚被重启，缓存会让面板
+// 在十几分钟内持续报「不可达」。
 func (s *Services) FirewallBackend() firewall.Backend {
 	if !s.Settings.Bool(KeyFirewallEnabled) {
 		return firewall.NewNone("防火墙控制未启用")
 	}
-	return firewall.Detect(s.Settings.Get(KeyFirewallBackend))
+
+	h := firewall.NewHelperBackend(
+		s.Settings.Get(KeyFirewallHelperAddr),
+		s.Settings.Get(KeyFirewallHelperToken),
+	)
+	if !h.Available() {
+		return firewall.NewNone(h.Reason())
+	}
+	return h
 }
 
 // FirewallGuard 按当前设置构造安全护栏。

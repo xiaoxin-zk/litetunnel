@@ -265,18 +265,37 @@
 
           <el-divider />
 
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 16px"
+            title="防火墙写操作由宿主机上的 helper 执行"
+            description="面板容器不含 iptables，也不持有 NET_ADMIN。它只做只读的端口扫描；需要改防火墙时，请求会转发给宿主机上的 lt-fw 服务。这样即使面板被攻破，攻击者也无法接管主机防火墙。"
+          />
+
           <el-form-item label="启用防火墙控制">
             <el-switch v-model="boolForm['firewall.enabled']" />
             <span class="hint">关闭时面板完全不碰系统防火墙</span>
           </el-form-item>
-          <el-form-item label="防火墙后端">
-            <el-select v-model="form['firewall.backend']" style="width: 240px">
-              <el-option label="自动探测" value="auto" />
-              <el-option label="iptables" value="iptables" />
-              <el-option label="nftables" value="nftables" />
-              <el-option label="ufw" value="ufw" />
-              <el-option label="firewalld" value="firewalld" />
-            </el-select>
+          <el-form-item label="helper 地址">
+            <el-input
+              v-model="form['firewall.helper_addr']"
+              placeholder="http://127.0.0.1:7849"
+            />
+            <span class="hint">宿主机 lt-fw 服务的回环地址，通常保持默认即可</span>
+          </el-form-item>
+          <el-form-item label="helper 访问令牌">
+            <el-input
+              v-model="form['firewall.helper_token']"
+              type="password"
+              show-password
+              placeholder="与 /etc/litetunnel/lt-fw.env 中的 LT_FW_TOKEN 一致"
+            />
+            <span class="hint">
+              必须与宿主机上 <code>LT_FW_TOKEN</code> 完全一致。
+              留空表示不修改；令牌至少 16 个字符
+            </span>
           </el-form-item>
           <el-form-item label="自动放行隧道端口">
             <el-switch v-model="boolForm['firewall.auto_open']" />
@@ -286,6 +305,7 @@
             <el-input v-model="form['firewall.protected_ports']" placeholder="如 22,80,443,7848" />
             <span class="hint">
               这些端口永远不会被面板关闭。必须包含 SSH 与控制面端口，作为最后一道保险。
+              建议与 helper 的 <code>LT_FW_PROTECTED_PORTS</code> 保持一致
             </span>
           </el-form-item>
         </el-form>

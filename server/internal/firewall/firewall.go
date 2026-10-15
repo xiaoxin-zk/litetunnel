@@ -36,6 +36,11 @@ type Rule struct {
 	Source string `json:"source,omitempty"`
 	// Managed 表示该规则位于本面板的专属链/表中，即由本面板管理
 	Managed bool `json:"managed"`
+	// Chain 是这条规则**实际所在**的链名。
+	//
+	// 跳转链展开后，规则往往来自 DOCKER、IN_BT 这类自定义链。
+	// 不标明来源链的话，管理员在 INPUT 里翻不到它，只会以为面板读错了。
+	Chain string `json:"chain,omitempty"`
 }
 
 // Backend 是防火墙后端的能力集合。

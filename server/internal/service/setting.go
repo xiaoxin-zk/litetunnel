@@ -78,11 +78,20 @@ const (
 	KeyPaymentProduct   SettingKey = "payment.product_name"
 
 	// ---- 端口与防火墙 ----
+	//
+	// 面板自身**不执行**任何防火墙写操作：它不含 iptables 调用，
+	// 也不持有 NET_ADMIN。所有写请求转发给宿主机上的 lt-fw helper，
+	// 由后者在受控条件下执行。
+	//
+	// 因此这里没有「后端选择」——那是 helper 自己的启动参数，
+	// 因为只有它才需要知道本机跑的是 iptables 还是 firewalld。
 	KeyPortReserved      SettingKey = "port.reserved"
 	KeyFirewallEnabled   SettingKey = "firewall.enabled"
-	KeyFirewallBackend   SettingKey = "firewall.backend"
 	KeyFirewallAutoOpen  SettingKey = "firewall.auto_open"
 	KeyFirewallProtected SettingKey = "firewall.protected_ports"
+	// 宿主机 helper 的回环地址与访问令牌
+	KeyFirewallHelperAddr  SettingKey = "firewall.helper_addr"
+	KeyFirewallHelperToken SettingKey = "firewall.helper_token"
 
 	// ---- 站点 ----
 	KeySiteName         SettingKey = "site.name"
@@ -167,8 +176,9 @@ var settingSpecs = []settingSpec{
 		return "22,80,443,3306,5432,6379,8080,8443"
 	}},
 	{Key: KeyFirewallEnabled, Default: func(*config.Config) string { return "false" }},
-	{Key: KeyFirewallBackend, Default: func(*config.Config) string { return "auto" }},
 	{Key: KeyFirewallAutoOpen, Default: func(*config.Config) string { return "true" }},
+	{Key: KeyFirewallHelperAddr, Default: func(*config.Config) string { return "http://127.0.0.1:7849" }},
+	{Key: KeyFirewallHelperToken, Secret: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyFirewallProtected, Default: func(c *config.Config) string {
 		// 这些端口永远不会被面板关闭，防止把自己锁在门外。
 		parts := []string{"22", "80", "443"}
@@ -433,6 +443,21 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 			if !ParsePortList(view(KeyFirewallProtected))[p] {
 				return fmt.Errorf("%w: 保护端口必须包含控制面自身端口 %d", ErrInvalidParam, p)
 			}
+		}
+	}
+
+	// ---- 防火墙 ----
+	//
+	// 启用前必须配好 helper。不校验的话，表现会是「开关打开了但没有任何
+	// 效果」——管理员只能靠翻容器日志才知道 helper 没配。
+	if truthy(KeyFirewallEnabled) {
+		addr := view(KeyFirewallHelperAddr)
+		if !strings.HasPrefix(addr, "http") {
+			return fmt.Errorf("%w: 启用防火墙前请填写 helper 地址（形如 http://127.0.0.1:7849）", ErrInvalidParam)
+		}
+		token := view(KeyFirewallHelperToken)
+		if len(token) < 16 {
+			return fmt.Errorf("%w: helper 访问令牌至少 16 个字符，否则本机任意进程都能调用它改防火墙", ErrInvalidParam)
 		}
 	}
 

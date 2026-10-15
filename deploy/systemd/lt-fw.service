@@ -1,0 +1,51 @@
+[Unit]
+Description=LiteTunnel 防火墙 helper（宿主机侧受控操作端点）
+Documentation=https://github.com/xiaoxin-zk/litetunnel
+# 等网络就绪再启动。iptables 在系统早期阶段可能还不可用。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 必须以 root 运行：它要操作主机防火墙，而这正是它存在的唯一理由。
+#
+# 权限边界不是靠降权保证的，而是靠三重约束：
+#   1. 只监听回环地址，外网与内网都无法直连
+#   2. 所有请求必须带 Bearer token（常量时间比较）
+#   3. 保护端口与端口池范围的双重护栏，即使面板被攻破也绕不过
+User=root
+
+# 配置从这里读。首次部署请复制 lt-fw.env.example 并生成随机 token。
+EnvironmentFile=-/etc/litetunnel/lt-fw.env
+
+ExecStart=/usr/local/bin/lt-fw
+
+Restart=on-failure
+RestartSec=3
+
+# ---- 加固 ----
+# 这里的目标是「即使 helper 自身出现漏洞，也难以横向移动」，
+# 而不是限制它对防火墙的操作（那由护栏负责）。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+# iptables 需要在 /run 下创建 xtables 锁文件。
+# ProtectSystem=full 会把 /usr、/boot、/etc 置为只读，但不影响 /run，
+# 这里显式声明以避免将来调整加固等级时踩坑。
+ReadWritePaths=/run
+
+# 刻意**不开** ProtectKernelModules：
+# 部分精简系统上 iptable_filter、nf_conntrack 等模块是按需加载的，
+# 禁掉会让 iptables 直接报 "Table does not exist"，且错误信息极具误导性
+# （看起来像防火墙没装，实际是被 systemd 挡住了）。
+
+[Install]
+WantedBy=multi-user.target

@@ -119,8 +119,13 @@
                 <el-tag size="small" effect="plain">{{ row.proto.toUpperCase() }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="来源" prop="source" min-width="140">
+            <el-table-column label="来源网段" prop="source" min-width="130">
               <template #default="{ row }">{{ row.source || '不限' }}</template>
+            </el-table-column>
+            <el-table-column label="所在链" width="130">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain" type="success">{{ row.chain || 'INPUT' }}</el-tag>
+              </template>
             </el-table-column>
             <el-table-column label="操作" width="100">
               <template #default="{ row }">
@@ -138,7 +143,7 @@
             show-icon
             style="margin-bottom: 12px"
             title="这些规则由系统或你手工添加，面板只读展示"
-            description="面板不会修改它们。之所以要展示，是为了避免你误以为「端口没放行」而重复添加。"
+            description="面板不会修改它们。列表已递归展开跳转链——DOCKER、IN_BT 等自定义链里的放行规则也会出现在这里，因此你在 INPUT 里找不到它们时不必怀疑读错了。"
           />
           <el-table :data="fw.external_rules || []" size="small" stripe>
             <el-table-column label="端口" prop="port" width="100" />
@@ -147,8 +152,13 @@
                 <el-tag size="small" effect="plain">{{ row.proto.toUpperCase() }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="来源" prop="source" min-width="140">
+            <el-table-column label="来源网段" prop="source" min-width="130">
               <template #default="{ row }">{{ row.source || '不限' }}</template>
+            </el-table-column>
+            <el-table-column label="所在链" width="130">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain">{{ row.chain || 'INPUT' }}</el-tag>
+              </template>
             </el-table-column>
             <template #empty><el-empty description="暂无系统规则" /></template>
           </el-table>

@@ -797,6 +797,31 @@ func (a *App) applySync() (changed bool, err error) {
 	tunnels := make([]TunnelVO, len(data.Tunnels))
 	copy(tunnels, data.Tunnels)
 
+	// 先收掉「服务端已经没有这条隧道」的进程。
+	//
+	// 这一步必须单独做：下面那个循环只遍历**当前还存在**的隧道，
+	// 被删掉的隧道根本不会进入循环，它的进程就会一直留在那里重连。
+	// 而界面上已经没有这条隧道了——用户找不到是谁在报错，只能看到
+	// frps 一直在刷「隧道不存在」，最后把问题归到认证或防火墙上。
+	alive := make(map[uint]bool, len(tunnels))
+	for _, t := range tunnels {
+		alive[t.ID] = true
+	}
+	for _, id := range a.mgr.RunningIDs() {
+		if alive[id] {
+			continue
+		}
+		name := a.mgr.TunnelName(id)
+		if name == "" {
+			name = fmt.Sprintf("#%d", id)
+		}
+		a.emitTunnelLog(name, "隧道已不存在，正在断开")
+		if err := a.mgr.Stop(id); err != nil {
+			return changed, err
+		}
+		changed = true
+	}
+
 	for _, t := range tunnels {
 		if t.Status != tunnelStatusActive {
 			if a.mgr.Running(t.ID) {

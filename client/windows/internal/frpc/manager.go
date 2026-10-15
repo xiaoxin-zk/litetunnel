@@ -112,6 +112,19 @@ func (m *Manager) RunningIDs() []uint {
 	return out
 }
 
+// TunnelName 返回某条隧道进程在日志里用的名字；该隧道没有进程时返回空串。
+//
+// 用途：隧道在服务端被删掉之后，客户端只剩一个隧道 ID，日志前缀需要靠它
+// 还原——否则那条「正在断开」的日志会以 #12 这种形式出现，用户对不上号。
+func (m *Manager) TunnelName(tunnelID uint) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.procs[tunnelID]; ok {
+		return p.name
+	}
+	return ""
+}
+
 // AnyRunning 表示是否有任意一条隧道在运行。
 func (m *Manager) AnyRunning() bool {
 	m.mu.Lock()

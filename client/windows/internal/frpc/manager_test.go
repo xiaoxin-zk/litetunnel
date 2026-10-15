@@ -114,6 +114,12 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	c.waitForLine(t, "Tunnel/mc1", "start proxy success")
 	c.waitForLine(t, "Tunnel/nas", "start proxy success")
 
+	// 名字要在运行期间取得到：隧道在服务端被删掉后，客户端只剩一个 ID，
+	// 「正在断开」这条日志的前缀得靠它还原。
+	if got := m.TunnelName(1); got != "mc1" {
+		t.Fatalf("TunnelName(1) = %q，期望 mc1", got)
+	}
+
 	if err := m.Stop(1); err != nil {
 		t.Fatalf("停止隧道 1 失败: %v", err)
 	}
@@ -122,6 +128,9 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	}
 	if !m.Running(2) {
 		t.Fatal("停掉隧道 1 不应影响隧道 2")
+	}
+	if got := m.TunnelName(1); got != "" {
+		t.Fatalf("已停止的隧道不应还记着名字: %q", got)
 	}
 
 	// Stop 必须等到进程真的消失才返回。否则紧接着的 Start 会撞上

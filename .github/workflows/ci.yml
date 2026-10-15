@@ -519,6 +519,54 @@ jobs:
           fi
           echo "PASS oversized batch rejected"
 
+          # ---- frps 插件：首次登录的时序 ----
+          #
+          # 回归测试，对应一个真实故障：客户端永远停在「等待连接」，
+          # frps 反复记录「客户端未完成认证，请重启客户端后重试」，
+          # 而重启客户端、放行端口都毫无作用。
+          #
+          # 根因是时序：frp 在客户端**首次**登录时，插件拿到的 run_id
+          # 是空的——frps 要等插件回调通过之后才生成它并回给客户端。
+          # 而 onLogin 需要 run_id 才能登记认证会话，于是会话没有写入；
+          # 紧接着的 NewProxy 带着 frps 新分配的 run_id 来查，查不到，
+          # 就被拒了。
+          #
+          # 这里按 frp 的真实顺序构造两次回调。凭据与 frp 用户名直接从
+          # 下发给客户端的配置里取——那正是 frpc 实际会带上的东西。
+          cfg=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/config")
+          frpuser=$(printf '%s' "$cfg" | sed -n 's/^user = "\([^"]*\)".*/\1/p' | head -1)
+          token=$(printf '%s' "$cfg" | sed -n 's/.*lt_token = "\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$frpuser" ] || [ -z "$token" ]; then
+            echo "::error::cannot extract frp user/token from client config"
+            printf '%s\n' "$cfg"
+            exit 1
+          fi
+
+          # 1) 首次登录：run_id 为空。必须放行。
+          login=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"Login\",\"content\":{\"version\":\"0.71.0\",\"hostname\":\"ci\",\"os\":\"linux\",\"arch\":\"amd64\",\"user\":\"$frpuser\",\"timestamp\":0,\"privilege_key\":\"\",\"run_id\":\"\",\"metas\":{\"lt_token\":\"$token\"},\"client_address\":\"127.0.0.1:1\"}}" \
+            "$BASE/api/frps/plugin")
+          if printf '%s' "$login" | grep -q '"reject":true'; then
+            echo "::error::Login with empty run_id was rejected: $login"
+            exit 1
+          fi
+          echo "PASS plugin login with empty run_id"
+
+          # 2) 紧接着的 NewProxy 带 frps 新分配的 run_id。
+          #
+          # 不断言「一定放行」——onNewProxy 后面还有一串隧道级校验
+          # （端口、协议、归属），构造一份完全合法的载荷成本很高且脆弱。
+          # 断言的是**它不能死于认证**：只要拒绝原因不是「未完成认证」，
+          # 就说明凭据复核这条回落生效了。
+          proxy=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"lt_token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"citunnel\",\"proxy_type\":\"tcp\",\"use_encryption\":false,\"use_compression\":false,\"remote_port\":0,\"custom_domains\":[],\"subdomain\":\"\",\"metas\":{}}}" \
+            "$BASE/api/frps/plugin")
+          if printf '%s' "$proxy" | grep -q '未完成认证'; then
+            echo "::error::NewProxy still fails authentication with a fresh run_id: $proxy"
+            exit 1
+          fi
+          echo "PASS plugin NewProxy authorized after first login"
+
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \

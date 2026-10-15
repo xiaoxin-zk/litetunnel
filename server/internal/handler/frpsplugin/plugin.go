@@ -225,52 +225,116 @@ func (h *Handler) Handle(c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
-// resolveUser 依据 frp 的 user / run_id 定位平台账号。
+// resolveUser 依据 frp 的 user / run_id / metas 定位平台账号。
 //
-// 安全要求：run_id 是**唯一**的身份依据，客户端自报的 user 字段只用于交叉核对。
-// 会话必须来自「已通过每用户凭据校验」的来源，否则拒绝。
+// # 回落顺序
 //
-// 回落顺序：
-//  1. 内存会话缓存（由 onLogin 在凭据校验通过后写入）；
-//  2. 数据库会话表（同样只在凭据校验通过后写入，用于控制面重启后的平滑过渡）。
+//  1. 内存会话缓存（onLogin 在凭据校验通过后写入）
+//  2. 数据库会话表（同样只在凭据校验通过后写入，用于控制面重启后的过渡）
+//  3. 用本次回调携带的 metas 复核每用户凭据
 //
-// 绝不能仅凭 frpUser 就查库放行：那等于绕过了 Login 的凭据校验，
-// 任何人只要知道目标用户名与全局 token 就能冒充该用户。
-func (h *Handler) resolveUser(frpUser, runID string) (*model.User, bool) {
+// # 为什么必须有第 3 条
+//
+// frp 在客户端**首次**登录时，插件拿到的 run_id 是空的——frps 要等插件
+// 回调通过之后才生成它，并通过 LoginResp 回给客户端。而我们的 onLogin
+// 需要 run_id 才能登记会话，于是：
+//
+//	Login(run_id="")  → 会话没写入（UpsertClientSession 直接 return）
+//	NewProxy(run_id="X") → 查不到会话 → deny
+//
+// 现象是客户端永远停在「等待连接」，frps 反复记录
+// 「客户端未完成认证，请重启客户端后重试」，而重启客户端毫无作用。
+//
+// # 第 3 条的安全性
+//
+// 它**不是**「信任 frpUser」。那等于绕过 Login 的凭据校验——知道全局
+// token 的人就能冒充任意在线用户。这里校验的是**同一个每用户凭据**
+// （frpc.toml 的 metadatas 里那一份），强度与 onLogin 完全一致。
+//
+// frp 官方文档明确：客户端登录时携带的全局 metadata 会在其他 RPC 请求里
+// 附加到 user.metas 上，所以 NewProxy / NewWorkConn 阶段拿得到它。
+//
+// 复核通过后会顺手把会话补登记到真实 run_id 上，后续热路径
+// （onNewUserConn，每次用户连接都经过）依然走内存查表，不产生额外开销。
+func (h *Handler) resolveUser(frpUser, runID string, metas map[string]string) (*model.User, bool) {
 	userID, ok := service.UserIDFromFrpUser(frpUser)
-	if !ok || runID == "" {
+	if !ok {
 		return nil, false
 	}
 
-	// 1) 内存会话
-	if s, ok := h.svc.Runtime.LookupSession(runID); ok {
-		if s.UserID != userID {
-			log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
-				runID, userID, s.UserID)
-			return nil, false
+	if runID != "" {
+		// 1) 内存会话
+		if s, ok := h.svc.Runtime.LookupSession(runID); ok {
+			if s.UserID != userID {
+				log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
+					runID, userID, s.UserID)
+				return nil, false
+			}
+			u, err := h.svc.LoadUser(s.UserID)
+			if err != nil {
+				return nil, false
+			}
+			return u, true
 		}
-		u, err := h.svc.LoadUser(s.UserID)
-		if err != nil {
-			return nil, false
+
+		// 2) 数据库会话
+		if sess, err := h.svc.FindTrustedClientSession(runID); err == nil {
+			if sess.UserID != userID {
+				log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
+					runID, userID, sess.UserID)
+				return nil, false
+			}
+			if u, err := h.svc.LoadUser(sess.UserID); err == nil {
+				h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+				return u, true
+			}
 		}
-		return u, true
 	}
 
-	// 2) 数据库会话
-	sess, err := h.svc.FindTrustedClientSession(runID)
+	// 3) 凭据复核（覆盖首次登录时 run_id 尚不存在的窗口）
+	return h.authenticateByMeta(frpUser, runID, metas)
+}
+
+// authenticateByMeta 用回调携带的 metadata 复核每用户凭据。
+//
+// 复核通过后会把会话补登记到 run_id 上，使后续回调重新走上「查缓存」
+// 这条快路径。run_id 为空时（理论上只在 Login 阶段，而 Login 不走这里）
+// 跳过补登记，但不影响本次判定。
+func (h *Handler) authenticateByMeta(frpUser, runID string, metas map[string]string) (*model.User, bool) {
+	got := ""
+	if metas != nil {
+		got = metas[service.MetaTokenKey]
+	}
+	if got == "" {
+		// 这条日志是排查「客户端停在等待连接」的第一线索：
+		// 它说明本次回调既没有可用会话、也没有携带凭据。
+		log.Printf("[plugin] 无可用会话且回调未携带凭据（user=%s run_id=%q），已拒绝", frpUser, runID)
+		return nil, false
+	}
+
+	userID, ok := service.UserIDFromFrpUser(frpUser)
+	if !ok {
+		return nil, false
+	}
+	u, err := h.svc.LoadUser(userID)
 	if err != nil {
 		return nil, false
 	}
-	if sess.UserID != userID {
-		log.Printf("[plugin] run_id %s 声明的用户 ID %d 与会话不符（实际 %d），已拒绝",
-			runID, userID, sess.UserID)
+	if !service.VerifyClientSecret(u.ClientSecret, got) {
+		log.Printf("[plugin] 用户 %s 的凭据复核失败（run_id=%q）", u.Username, runID)
 		return nil, false
 	}
-	u, err := h.svc.LoadUser(sess.UserID)
-	if err != nil {
+	if u.Status != model.UserStatusActive {
 		return nil, false
 	}
-	h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+
+	if runID != "" {
+		h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+		// 传空串表示「这些字段本次拿不到」——UpsertClientSession 会
+		// 保留登录时记录的真实值，不会把它们抹成空。
+		h.UpsertClientSession(u.ID, u.Username, runID, "", "", "", "")
+	}
+	log.Printf("[plugin] 用户 %s 通过凭据复核补登记会话（run_id=%q）", u.Username, runID)
 	return u, true
 }
 
@@ -302,6 +366,18 @@ func (h *Handler) onLogin(req *request) response {
 		return deny("客户端凭据无效，请在控制台重新下载客户端配置")
 	}
 
+	// 首次登录时 frps **还没有**分配 run_id：它要等本次回调通过之后才生成，
+	// 并通过 LoginResp 回给客户端。所以这里 content.RunID 通常是空的。
+	//
+	// 此刻无法按 run_id 登记会话，但也不能就此静默返回——那正是这个
+	// 问题长期查不出来的原因：登录「成功」了，会话表却是空的，而
+	// 日志里没有任何线索。会话会由紧接着的 NewProxy 通过凭据复核补登记
+	// （见 resolveUser 的第 3 级回落）。
+	if content.RunID == "" {
+		log.Printf("[plugin] 用户 %s 登录通过（首次登录，frps 尚未分配 run_id，会话将在 NewProxy 阶段补登记）", u.Username)
+		return allow()
+	}
+
 	h.svc.Runtime.RecordLogin(content.RunID, u.ID, u.Username)
 	h.UpsertClientSession(u.ID, u.Username, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
 	return allow()
@@ -313,7 +389,8 @@ func (h *Handler) onNewProxy(req *request) response {
 		return deny("代理参数解析失败")
 	}
 
-	u, ok := h.resolveUser(content.User.User, content.User.RunID)
+	// 传 metas：首次登录时会话尚未登记，需要靠它复核凭据。
+	u, ok := h.resolveUser(content.User.User, content.User.RunID, content.User.Metas)
 	if !ok {
 		return deny("客户端未完成认证，请重启客户端后重试")
 	}
@@ -432,7 +509,7 @@ func (h *Handler) onNewUserConn(req *request) response {
 			return allow()
 		}
 	}
-	u, ok := h.resolveUser(content.User.User, content.User.RunID)
+	u, ok := h.resolveUser(content.User.User, content.User.RunID, content.User.Metas)
 	if !ok {
 		return deny("客户端未完成认证")
 	}
@@ -464,14 +541,31 @@ func (h *Handler) UpsertClientSession(userID uint, username, runID, addr, versio
 		Online:     true,
 		LastSeenAt: now,
 	}
-	h.svc.DB.Where("run_id = ?", runID).Assign(map[string]any{
+
+	fields := map[string]any{
 		"user_id":      userID,
 		"username":     username,
-		"addr":         addr,
-		"version":      version,
-		"os":           osName,
-		"arch":         arch,
 		"online":       true,
 		"last_seen_at": now,
-	}).FirstOrCreate(&s)
+	}
+	// 空值不参与更新。
+	//
+	// 这个方法有两条调用路径：onLogin（四个字段都有值）与
+	// resolveUser 的凭据复核补登记（只有 user / run_id，其余拿不到）。
+	// 无脑 Assign 的话，补登记会把登录时记录的真实来源 IP 与版本号
+	// 抹成空——而恰好是这两个字段在排查连接问题时最有用。
+	if addr != "" {
+		fields["addr"] = addr
+	}
+	if version != "" {
+		fields["version"] = version
+	}
+	if osName != "" {
+		fields["os"] = osName
+	}
+	if arch != "" {
+		fields["arch"] = arch
+	}
+
+	h.svc.DB.Where("run_id = ?", runID).Assign(fields).FirstOrCreate(&s)
 }

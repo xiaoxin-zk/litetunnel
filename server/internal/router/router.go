@@ -243,6 +243,9 @@ func New(
 		adminRead.GET("/redeem-codes", adminH.ListRedeemCodes)
 		adminRead.GET("/redeem-records", adminH.ListRedeemRecords)
 		adminRead.GET("/clients", adminH.ListClients)
+		// 客户端安装包分发。查看归只读组（审计角色也该能看），
+		// 上传与删除仅超管——上传的文件会被分发给所有用户。
+		adminRead.GET("/client-packages", adminH.ListClientPackages)
 		adminRead.GET("/audit-logs", adminH.ListAuditLogs)
 		adminRead.GET("/login-logs", adminH.ListLoginLogs)
 		adminRead.GET("/admins", adminH.ListAdmins)
@@ -299,6 +302,11 @@ func New(
 		adminSuper.POST("/firewall/rescan", adminH.FirewallRescan)
 		adminSuper.POST("/firewall/ports", adminH.FirewallOpenPort)
 		adminSuper.DELETE("/firewall/ports", adminH.FirewallClosePort)
+
+		// 客户端安装包分发。上传的文件会被分发给所有用户下载，
+		// 因此仅超级管理员可写（查看在只读组）。
+		adminSuper.POST("/client-packages", adminH.UploadClientPackage)
+		adminSuper.DELETE("/client-packages/:name", adminH.DeleteClientPackage)
 	}
 
 	serveSPA(r, cfg, adminAllow)

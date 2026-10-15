@@ -101,6 +101,28 @@ export const adminApi = {
   clearTOTP: (id) => http.post(`/admins/${id}/totp-reset`)
 }
 
+export const clientPkgApi = {
+  list: () => http.get('/client-packages'),
+  /**
+   * 上传安装包。
+   *
+   * 探针：包体近 30 MB，必须放开默认超时并回调进度——
+   * 否则大文件会在中途被 axios 超时切断，而界面上看不出任何原因。
+   * 不手动设置 Content-Type：浏览器需要自己补 multipart 的 boundary。
+   */
+  upload: (file, onProgress) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return http.post('/client-packages', fd, {
+      timeout: 0,
+      onUploadProgress: (e) => {
+        if (onProgress && e.total) onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    })
+  },
+  remove: (name) => http.delete(`/client-packages/${encodeURIComponent(name)}`)
+}
+
 export const monitorApi = {
   // 服务器运行指标：latest（当前值）与 series（最近一段时间的采样序列）一起返回。
   // limit 控制点数，不传则由服务端返回全部（最多由环形缓冲容量决定）。

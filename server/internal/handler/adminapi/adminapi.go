@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -733,6 +734,78 @@ func (h *Handler) SystemMetrics(c *gin.Context) {
 		"sample_interval": int(monitor.SampleInterval.Seconds()),
 		"max_samples":     monitor.MaxSamples,
 	})
+}
+
+// ---- 客户端安装包分发 ----
+
+// ListClientPackages 列出已分发的客户端安装包。
+//
+// 路径用 client-packages 而不是 clients：后者已经被「在线客户端会话」
+// 占用，两个概念完全不同（一个是会话，一个是安装包）。
+func (h *Handler) ListClientPackages(c *gin.Context) {
+	list, err := h.svc.ListClientPackages()
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{
+		"files": list,
+		// 一并下发两种分发方式的当前状态，管理端才能告诉管理员
+		// 「用户现在实际会从哪里拿到客户端」。
+		"download_url": strings.TrimSpace(h.svc.Settings.Get(service.KeySiteClientDownloadURL)),
+		"dist_dir":     h.svc.Cfg.ClientDistDir,
+		"max_size":     service.MaxClientPackageSize,
+		"uploadable":   true,
+	})
+}
+
+// UploadClientPackage 上传客户端安装包。
+//
+// 仅超管可用：上传的文件会被分发给**所有用户**下载。
+func (h *Handler) UploadClientPackage(c *gin.Context) {
+	file, err := c.FormFile("file")
+	if err != nil {
+		httpx.BadRequest(c, "请选择要上传的文件")
+		return
+	}
+	// 文件名校验必须在打开文件之前完成：它来自客户端，是不可信输入。
+	name, err := service.SanitizeClientFileName(file.Filename)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+
+	src, err := file.Open()
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	defer func() { _ = src.Close() }()
+
+	n, err := h.svc.SaveClientPackage(name, src)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+
+	h.audit(c, "client.upload", "client_dist", name,
+		fmt.Sprintf("上传客户端安装包 %s（%d 字节）", name, n))
+	httpx.OK(c, gin.H{
+		"message": "上传成功",
+		"name":    name,
+		"size":    n,
+	})
+}
+
+// DeleteClientPackage 删除客户端安装包。
+func (h *Handler) DeleteClientPackage(c *gin.Context) {
+	name := c.Param("name")
+	if err := h.svc.DeleteClientPackage(name); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "client.delete", "client_dist", name, "删除客户端安装包 "+name)
+	httpx.OK(c, gin.H{"message": "已删除"})
 }
 
 // ---- 防火墙与端口池 ----

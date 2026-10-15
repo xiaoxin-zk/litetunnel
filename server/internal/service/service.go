@@ -158,6 +158,27 @@ func (s *Services) EffectiveGroup(u *model.User) *model.Group {
 	return s.defaultGroup()
 }
 
+// EffectiveBandwidth 返回用户在**当前**分组下实际生效的单隧道限速。
+//
+// # 为什么以分组为准，而不是读隧道上存的那份快照
+//
+// Tunnel.BandwidthLimit 是建隧道时从分组复制的。改分组后靠两处传播逻辑
+// （AdminSetUserGroup / UpdateGroup）去刷新它——但「同一件事存在两份数据」
+// 本身就是缺陷来源：任何一条没覆盖到的路径都会让显示与实际不一致，
+// 而这类不一致只会以「数字对不上」的形式暴露，永远不报错。
+//
+// 已经能指出至少一条漏网路径：分组**过期**的用户会被 EffectiveGroup
+// 回落到默认分组，而传播逻辑只按 group_id 匹配，刷新不到这些人。
+//
+// 所以这里统一以分组为唯一真相来源。隧道表里那一列保留仅为兼容历史数据，
+// 不再作为判断依据。
+func (s *Services) EffectiveBandwidth(u *model.User) int64 {
+	if g := s.EffectiveGroup(u); g != nil {
+		return g.BandwidthLimit
+	}
+	return 0
+}
+
 func (s *Services) defaultGroup() *model.Group {
 	var g model.Group
 	if err := s.DB.Where("is_default = ?", true).First(&g).Error; err != nil {

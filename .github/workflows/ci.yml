@@ -405,6 +405,60 @@ jobs:
           fi
           echo "PASS admin system metrics endpoint"
 
+          # ===== 限速显示的一致性 =====
+          #
+          # 覆盖范围（务必如实理解，别把它当成万能的）：
+          #   守住的是「显示口径」与「取值链路」——
+          #     - 文案必须是 bit 口径（4 Mbps），用 frp 的字节口径会变成
+          #       512.00KB。两个数字其实相等，但用户看不出是同一回事，
+          #       只会以为自己被少给了带宽。
+          #     - 分组限速改完必须立刻反映到用户侧接口上，
+          #       取值链路断了会显示成空或旧值。
+          #
+          #   守不住的是「快照与分组不一致」这个场景本身：CI 里改分组时，
+          #   传播逻辑会顺带把快照也刷成新值，两边恰好一致，看不出差别。
+          #   要构造出真正的不一致得让用户的 group_id 指不到分组
+          #  （例如分组过期后回落到默认分组），代价过高且脆弱。
+          #   那个场景靠「统一以分组为唯一来源」这个设计消除，
+          #   而不是靠这条断言。
+          #
+          # 换句话说：这条断言防的是「口径改回去」和「链路断掉」，
+          # 防不了「有人又把快照读了回来」——后者需要 code review 把关。
+          groups=$(curl -fsS -H "Authorization: Bearer $admintoken" "$BASE/api/admin/groups")
+          gid=$(printf '%s' "$groups" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+          gname=$(printf '%s' "$groups" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ -z "$gid" ]; then
+            echo "::error::could not resolve group id"
+            exit 1
+          fi
+          # 把分组限速设成 4 Mbps（4194304 bit/s）
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer $admintoken" -H 'Content-Type: application/json' \
+            -d "{\"name\":\"$gname\",\"max_tunnels\":20,\"max_ports\":20,\"traffic_quota\":0,\"bandwidth_limit\":4194304,\"allow_protocols\":\"tcp,udp,http,https\",\"allow_custom_domain\":false,\"allow_privileged_port\":false,\"priority\":0}" \
+            "$BASE/api/admin/groups/$gid")
+          if [ "$code" != "200" ]; then
+            echo "::error::update group bandwidth returned $code"
+            exit 1
+          fi
+
+          # 用户侧：隧道列表里的限速必须与分组一致，且是 bit 口径的文案。
+          # 用 frp 的字节口径（FormatBandwidth）会显示成 512.00KB —— 两个
+          # 数字其实相等，但用户看不出是同一回事，只会以为被少给了带宽。
+          tlist=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/tunnels")
+          tlimit=$(printf '%s' "$tlist" | grep -o '"bandwidth_limit_str":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ "$tlimit" != "4 Mbps" ]; then
+            echo "::error::tunnel bandwidth shows '$tlimit', want '4 Mbps' (group=4Mbps)"
+            exit 1
+          fi
+
+          info=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
+          glimit=$(printf '%s' "$info" | grep -o '"bandwidth_limit_str":"[^"]*"' | head -1 | cut -d'"' -f4)
+          if [ "$glimit" != "4 Mbps" ]; then
+            echo "::error::client group bandwidth shows '$glimit', want '4 Mbps'"
+            exit 1
+          fi
+          echo "PASS bandwidth limit is consistent and human-readable"
+
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \

@@ -462,9 +462,11 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
+	// 限速以分组当前值为准（不在循环里逐条查库）。
+	bl := h.svc.EffectiveBandwidth(u)
 	out := make([]gin.H, 0, len(tunnels))
 	for i := range tunnels {
-		out = append(out, h.tunnelVO(&tunnels[i]))
+		out = append(out, h.tunnelVO(&tunnels[i], bl))
 	}
 	// 分组信息：客户端据此限制建隧道表单的可选项
 	var groupVO *gin.H
@@ -588,14 +590,28 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
+	// 限速来自分组，与隧道条数无关，因此只解析一次。
+	// LoadUser 已预加载 Group，这里不会产生额外查询。
+	u, err := h.svc.LoadUser(uid)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	bl := h.svc.EffectiveBandwidth(u)
 	out := make([]gin.H, 0, len(list))
 	for i := range list {
-		out = append(out, h.tunnelVO(&list[i]))
+		out = append(out, h.tunnelVO(&list[i], bl))
 	}
 	httpx.OK(c, out)
 }
 
-func (h *Handler) tunnelVO(t *model.Tunnel) gin.H {
+// tunnelVO 组装单条隧道的返回结构。
+//
+// bandwidthLimit 由调用方传入，而不是读 t.BandwidthLimit：
+// 那是建隧道时的快照，可能已经与分组当前值不一致。
+// 由调用方统一解析一次（同一个用户的所有隧道限速必然相同），
+// 既保证与强制下发的值同源，也避免每条隧道各查一次库。
+func (h *Handler) tunnelVO(t *model.Tunnel, bandwidthLimit int64) gin.H {
 	return gin.H{
 		"id":                   t.ID,
 		"name":                 t.Name,
@@ -609,8 +625,8 @@ func (h *Handler) tunnelVO(t *model.Tunnel) gin.H {
 		"status":               t.Status,
 		"online":               h.svc.Runtime.IsTunnelOnline(t.ID),
 		"traffic_used":         t.TrafficUsed,
-		"bandwidth_limit":      t.BandwidthLimit,
-		"bandwidth_limit_str":  service.FormatBandwidthHuman(t.BandwidthLimit),
+		"bandwidth_limit":      bandwidthLimit,
+		"bandwidth_limit_str":  service.FormatBandwidthHuman(bandwidthLimit),
 		"use_encryption":       t.UseEncryption,
 		"use_compression":      t.UseCompression,
 		"last_online_at":       t.LastOnlineAt,
@@ -656,7 +672,7 @@ func (h *Handler) CreateTunnel(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	httpx.OK(c, h.tunnelVO(t))
+	httpx.OK(c, h.tunnelVO(t, h.svc.EffectiveBandwidth(u)))
 }
 
 // UpdateTunnel 修改隧道。
@@ -681,7 +697,7 @@ func (h *Handler) UpdateTunnel(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	httpx.OK(c, h.tunnelVO(t))
+	httpx.OK(c, h.tunnelVO(t, h.svc.EffectiveBandwidth(u)))
 }
 
 // DeleteTunnel 删除隧道。

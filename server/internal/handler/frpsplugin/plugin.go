@@ -346,10 +346,15 @@ func (h *Handler) onNewProxy(req *request) response {
 		}
 	}
 
-	// 服务端强制限速：以数据库中的限速为准覆盖客户端声明，
+	// 服务端强制限速：以**分组当前值**为准覆盖客户端声明，
 	// 并把限速模式固定为 server，客户端改配置也无法绕过。
+	//
+	// 这里与展示层（userapi.tunnelVO）必须用同一个来源。
+	// 读 t.BandwidthLimit 那份建隧道时的快照会造成更难查的不一致：
+	// 界面上显示 4 Mbps，实际却按旧快照放行——用户看到的限制和
+	// 真正生效的限制对不上，而他无从判断哪个是真的。
 	changed := false
-	want := service.FormatBandwidth(t.BandwidthLimit)
+	want := service.FormatBandwidth(h.svc.EffectiveBandwidth(u))
 	if want != "" {
 		if content.BandwidthLimit != want {
 			content.BandwidthLimit = want

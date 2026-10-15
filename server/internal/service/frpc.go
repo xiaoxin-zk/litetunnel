@@ -173,7 +173,12 @@ func (s *Services) BuildFrpcConfig(u *model.User, tunnels []model.Tunnel) (strin
 		if t.UseCompression {
 			b.WriteString("transport.useCompression = true\n")
 		}
-		if limit := FormatBandwidth(t.BandwidthLimit); limit != "" {
+		// 限速取分组当前值，与强制下发（onNewProxy）和界面展示同一来源。
+		//
+		// 虽然服务端会在 NewProxy 时覆盖这个声明、改错了也不影响实际生效，
+		// 但生成的文件要给用户看——里面写着一个旧值会让人以为限制就是那样。
+		// EffectiveGroup 用的是已预加载的 u.Group，这里不产生额外查询。
+		if limit := FormatBandwidth(s.EffectiveBandwidth(u)); limit != "" {
 			fmt.Fprintf(&b, "transport.bandwidthLimit = %s\n", tomlString(limit))
 			// 由服务端强制限速，客户端侧无法通过改配置绕过。
 			b.WriteString("transport.bandwidthLimitMode = \"server\"\n")

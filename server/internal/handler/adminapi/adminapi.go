@@ -738,7 +738,8 @@ func (h *Handler) FirewallOpenPort(c *gin.Context) {
 	if req.Proto == "" {
 		req.Proto = "tcp"
 	}
-	if err := h.svc.FirewallOpenPort(req.Port, req.Proto); err != nil {
+	// 走手工路径：必须真的放行，不能像自动放行那样「开关没开就静默跳过」。
+	if err := h.svc.FirewallManualOpen(req.Port, req.Proto); err != nil {
 		shared.Fail(c, err)
 		return
 	}
@@ -757,12 +758,8 @@ func (h *Handler) FirewallClosePort(c *gin.Context) {
 	if req.Proto == "" {
 		req.Proto = "tcp"
 	}
-	// 关闭端口必须过护栏：保护端口与池外端口都会被拒绝。
-	if err := h.svc.FirewallGuard().CheckRemove(req.Port); err != nil {
-		shared.Fail(c, err)
-		return
-	}
-	if err := h.svc.FirewallClosePort(req.Port, req.Proto); err != nil {
+	// 走手工路径：护栏（保护端口、池外端口）在服务层内校验。
+	if err := h.svc.FirewallManualClose(req.Port, req.Proto); err != nil {
 		shared.Fail(c, err)
 		return
 	}

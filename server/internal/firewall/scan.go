@@ -3,10 +3,41 @@ package firewall
 import (
 	"bufio"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// LocalPortRange 读取内核分配给**出站连接**的本地源端口范围
+// （即 net.ipv4.ip_local_port_range，默认 32768-60999）。
+//
+// # 为什么隧道端口池要避开它
+//
+// frps 监听端口时，若该端口正被一条出站连接当作源端口占用，绑定会失败
+// （EADDRINUSE）。Linux 分配临时端口时会避开已被监听的端口，但反过来
+// 不成立——监听方后绑定就会撞上。
+//
+// 这类失败是偶发的、随机的，且只在隧道建立时才暴露，排查成本极高。
+// 与其等它发生，不如在配置阶段就提示管理员避开。
+//
+// 读取不需要任何特权：这是个普通的可读 sysctl。
+func LocalPortRange() (start, end int, err error) {
+	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(raw)))
+	if len(fields) < 2 {
+		return 0, 0, fmt.Errorf("无法解析出站端口范围: %q", strings.TrimSpace(string(raw)))
+	}
+	lo, err1 := strconv.Atoi(fields[0])
+	hi, err2 := strconv.Atoi(fields[1])
+	if err1 != nil || err2 != nil || lo <= 0 || hi <= lo {
+		return 0, 0, fmt.Errorf("出站端口范围取值异常: %q", strings.TrimSpace(string(raw)))
+	}
+	return lo, hi, nil
+}
 
 // ListeningPort 描述一个正在被监听的端口。
 type ListeningPort struct {

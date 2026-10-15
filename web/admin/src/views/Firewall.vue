@@ -70,6 +70,42 @@
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">端口池使用情况</div>
 
+      <!-- 配置诊断：端口池配错不会在启动时报错，只在用户建隧道时
+           表现为「连不上」，所以把关键判断前置到这里 -->
+      <el-alert
+        v-for="(tip, i) in pool.advice || []"
+        :key="i"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        :title="tip"
+      />
+
+      <el-alert
+        v-if="pool.firewall_note"
+        :type="pool.firewall_needed ? 'success' : 'info'"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        :title="pool.firewall_needed ? '防火墙控制已启用' : '防火墙控制未启用'"
+        :description="pool.firewall_note"
+      />
+
+      <el-descriptions :column="4" border size="small" style="margin-bottom: 14px">
+        <el-descriptions-item label="池范围">
+          {{ pool.pool_start }}-{{ pool.pool_end }}
+        </el-descriptions-item>
+        <el-descriptions-item label="总容量">{{ pool.total || 0 }}</el-descriptions-item>
+        <el-descriptions-item label="可用">{{ pool.free || 0 }}</el-descriptions-item>
+        <el-descriptions-item label="内核出站端口段">
+          <span v-if="pool.ephemeral_start" class="mono">
+            {{ pool.ephemeral_start }}-{{ pool.ephemeral_end }}
+          </span>
+          <span v-else>-</span>
+        </el-descriptions-item>
+      </el-descriptions>
+
       <div class="pool-bar">
         <div class="seg reserved" :style="{ width: pct(pool.reserved?.length) }" />
         <div class="seg system" :style="{ width: pct(pool.system_listening?.length) }" />
@@ -107,7 +143,16 @@
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>放行规则</span>
-        <el-button type="primary" :icon="Plus" @click="openVisible = true">手工放行端口</el-button>
+        <!-- 未启用防火墙控制时不显示：面板没有写能力，
+             点了也只会得到一句「未启用」的错误 -->
+        <el-button
+          v-if="fw.enabled"
+          type="primary"
+          :icon="Plus"
+          @click="openVisible = true"
+        >
+          手工放行端口
+        </el-button>
       </div>
 
       <el-tabs v-model="ruleTab">

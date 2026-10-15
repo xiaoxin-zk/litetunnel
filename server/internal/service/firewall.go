@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -114,6 +115,51 @@ func (s *Services) FirewallClosePort(port int, proto string) error {
 	return nil
 }
 
+// FirewallManualOpen 管理员手工放行端口。
+//
+// 与 FirewallOpenPort 的区别在于「失败时的态度」：
+//
+//   - FirewallOpenPort 是自动路径。防火墙没配好就静默跳过是合理的——
+//     不该因为防火墙配置不完整就让用户建不了隧道。
+//
+//   - 本函数是管理员明确点了按钮。必须如实反馈：否则界面提示「已放行」
+//     而实际什么都没做，管理员会带着「端口已经开了」的错误认知去排查
+//     为什么用户连不上——这是本模块最容易误导人的地方。
+func (s *Services) FirewallManualOpen(port int, proto string) error {
+	be, err := s.requireWritableBackend()
+	if err != nil {
+		return err
+	}
+	if err := s.FirewallGuard().CheckAdd(port); err != nil {
+		return err
+	}
+	return be.AddPort(port, proto)
+}
+
+// FirewallManualClose 管理员手工关闭端口。
+func (s *Services) FirewallManualClose(port int, proto string) error {
+	be, err := s.requireWritableBackend()
+	if err != nil {
+		return err
+	}
+	if err := s.FirewallGuard().CheckRemove(port); err != nil {
+		return err
+	}
+	return be.RemovePort(port, proto)
+}
+
+// requireWritableBackend 取一个「确实能写」的后端，取不到时说明原因。
+func (s *Services) requireWritableBackend() (firewall.Backend, error) {
+	if !s.Settings.Bool(KeyFirewallEnabled) {
+		return nil, fmt.Errorf("%w: 防火墙控制未启用，面板不会修改任何防火墙规则", ErrInvalidParam)
+	}
+	be := s.FirewallBackend()
+	if n, ok := be.(*firewall.None); ok {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidParam, n.Reason())
+	}
+	return be, nil
+}
+
 // ReconcileFirewall 让防火墙规则与当前隧道列表对齐。
 //
 // 做两件事：
@@ -225,6 +271,23 @@ type PortPoolUsage struct {
 	Free int `json:"free"`
 	// Total 是端口池总容量
 	Total int `json:"total"`
+
+	// ---- 诊断信息 ----
+	//
+	// 这些字段回答的是「为什么端口分配了却连不上」。
+	// 端口池配错不会在启动时报错，只在用户建隧道时表现为「连不上」，
+	// 排查成本极高——所以把关键判断前置到这里。
+
+	// EphemeralStart/End 是内核分配给出站连接的源端口范围。
+	// 端口池与它重叠会导致偶发的绑定失败。
+	EphemeralStart int `json:"ephemeral_start,omitempty"`
+	EphemeralEnd   int `json:"ephemeral_end,omitempty"`
+	// Advice 是端口池配置的建议与警告，为空表示未发现问题。
+	Advice []string `json:"advice,omitempty"`
+	// FirewallNeeded 说明当前是否需要启用防火墙控制。
+	FirewallNeeded bool `json:"firewall_needed"`
+	// FirewallNote 解释判断依据。
+	FirewallNote string `json:"firewall_note,omitempty"`
 }
 
 // PortPoolUsageOf 统计端口池使用情况。
@@ -268,7 +331,50 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 	if u.Free < 0 {
 		u.Free = 0
 	}
+
+	s.diagnosePortRange(u)
 	return u
+}
+
+// diagnosePortRange 检查端口池配置并给出可执行的建议。
+//
+// 这里的判断只基于「能在本机无损获取」的信息：内核的出站端口范围、
+// 实际监听的端口、以及面板自己的设置。
+//
+// **云安全组读不到**，所以只做提示而不下结论——
+// 谎称「已放行」比不说更糟：管理员会以为配好了，直到用户报障。
+func (s *Services) diagnosePortRange(u *PortPoolUsage) {
+	// 1. 与内核出站端口范围重叠
+	if lo, hi, err := firewall.LocalPortRange(); err == nil {
+		u.EphemeralStart, u.EphemeralEnd = lo, hi
+		if u.PoolStart <= hi && u.PoolEnd >= lo {
+			u.Advice = append(u.Advice, fmt.Sprintf(
+				"端口池 %d-%d 与内核的出站端口范围 %d-%d 重叠。"+
+					"这会导致 frps 偶发绑定失败（目标端口正被一条出站连接占用），"+
+					"表现为随机的隧道建立失败。建议把池上限压到 %d 以下。",
+				u.PoolStart, u.PoolEnd, lo, hi, lo-1))
+		}
+	}
+
+	// 2. 池内可用端口过少
+	if u.Total > 0 && u.Free*100/u.Total < 10 {
+		u.Advice = append(u.Advice, fmt.Sprintf(
+			"端口池仅剩 %d 个可用端口（共 %d 个），新建隧道可能因无端口可用而失败",
+			u.Free, u.Total))
+	}
+
+	// 3. 说明是否需要防火墙控制
+	//
+	// 面板读不到云安全组，也无法判断「主机防火墙是否真的在拦截」，
+	// 所以这里只解释依赖关系，把结论留给管理员。
+	if s.Settings.Bool(KeyFirewallEnabled) {
+		u.FirewallNeeded = true
+		u.FirewallNote = "已启用：面板会通过宿主机 helper 自动放行隧道端口"
+	} else {
+		u.FirewallNote = "未启用。只有在主机防火墙确实会拦截隧道端口时才需要开启；" +
+			"若端口放行由云安全组负责、主机上未启用防火墙，保持关闭即可——" +
+			"此时没有任何规则需要面板去操作。"
+	}
 }
 
 // StartFirewallReconciler 在启动时对齐一次规则。

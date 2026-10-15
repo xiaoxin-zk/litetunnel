@@ -505,6 +505,12 @@ func (a *App) autoSyncOnce() {
 	changed, err := a.syncLocked()
 	if err != nil {
 		a.setSyncErr(err)
+		// 重启失败意味着 frpc 已经被停掉且没能起来——这必须显式提示。
+		// 只放在状态区的小字里，用户根本不会注意到，
+		// 只会发现「隧道莫名其妙全掉线了」。
+		if changed {
+			a.emitNotice("配置已更新，但重启 frpc 失败：" + err.Error())
+		}
 		a.emitState()
 		return
 	}
@@ -665,8 +671,6 @@ func (a *App) Refresh() (State, error) {
 
 // StartClient 写入最新配置并启动 frpc。
 func (a *App) StartClient() error {
-	base := a.serverBase()
-
 	a.mu.RLock()
 	apiKey := a.cfg.APIKey
 	a.mu.RUnlock()
@@ -675,12 +679,20 @@ func (a *App) StartClient() error {
 		return errors.New("请先使用 API Key 接入")
 	}
 
-	// 启动前先同步一次配置，避免使用过期隧道列表。
-	var cfgText string
-	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err == nil && cfgText != "" {
-		if err := writeFrpcConfig(cfgText); err != nil {
-			return err
-		}
+	// 启动前先同步一次，避免使用过期配置。
+	//
+	// 这里必须走 syncLocked 而不是自己拼一遍请求：syncLocked 会记录
+	// appliedConfig，而手工拉取不会——那样下一个自动同步的 tick 就会
+	// 误判「配置变了」并触发一次完全没必要的重启。
+	// 更糟的是那次重启会把刚起来的 frpc 停掉，用户看到的就是
+	// 「连上十几秒后自动断开」。
+	//
+	// frpc 此刻尚未运行，因此 syncLocked 内部的 reloadRunning 会直接返回，
+	// 不会出现「先重启再启动」的怪事。
+	if _, err := a.syncLocked(); err != nil {
+		// 同步失败不阻塞启动：本地已有的 frpc.toml 可能仍然可用，
+		// 直接启动比什么都不做要好。错误记下来供状态区展示。
+		a.setSyncErr(err)
 	}
 
 	path, err := frpcConfigPath()

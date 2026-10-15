@@ -35,6 +35,13 @@ type Manager struct {
 
 	onLog  func(string)
 	onExit func(err error)
+
+	// exitCh 在进程**真正**退出（Wait 返回）时关闭。
+	//
+	// 存在的意义：Kill 只是「发出终止信号」，进程可能还要几毫秒才消失。
+	// 没有它就无法保证「Stop 返回时进程一定已经不在」，
+	// 而这恰恰是紧接着调用 Start 的前提条件。
+	exitCh chan struct{}
 }
 
 // New 创建管理器。exePath 为空时自动在应用目录与 PATH 中查找 frpc。
@@ -114,8 +121,10 @@ func (m *Manager) Start(configPath string) error {
 		return fmt.Errorf("启动 frpc 失败: %w", err)
 	}
 
+	exitCh := make(chan struct{})
 	m.cmd = cmd
 	m.running = true
+	m.exitCh = exitCh
 	m.logs = nil
 	onLog := m.onLog
 	onExit := m.onExit
@@ -131,7 +140,11 @@ func (m *Manager) Start(configPath string) error {
 		m.mu.Lock()
 		m.running = false
 		m.cmd = nil
+		m.exitCh = nil
 		m.mu.Unlock()
+		// 先通知等待者再写日志：让 Stop 尽早返回，
+		// 避免日志写入（可能触发前端事件）拖慢重启。
+		close(exitCh)
 
 		if err != nil {
 			m.appendLog("[系统] frpc 已退出：" + err.Error())
@@ -151,13 +164,31 @@ func (m *Manager) Start(configPath string) error {
 func (m *Manager) Stop() error {
 	m.mu.Lock()
 	cmd := m.cmd
+	exitCh := m.exitCh
 	m.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 	m.appendLog("[系统] 正在停止 frpc…")
-	if err := cmd.Process.Kill(); err != nil {
+	// 进程可能在我们拿到锁之前就自己退出了（frpc 启动失败就是这种情况），
+	// 此时 Kill 返回 ErrProcessDone——那不是错误，目标已经达成。
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return fmt.Errorf("停止 frpc 失败: %w", err)
+	}
+
+	// 等进程真正退出再返回。
+	//
+	// 不等的话，紧接着调用 Start 会撞上 ErrAlreadyRunning——
+	// 因为 m.running 是在 Wait 的协程里才被置为 false 的。
+	// 这正是「自动同步把 frpc 停掉却起不来」的根因。
+	if exitCh != nil {
+		select {
+		case <-exitCh:
+		case <-time.After(5 * time.Second):
+			// 极端情况：Kill 之后进程仍未退出。
+			// 不无限等待，让上层能给出提示，而不是把界面卡死。
+			return errors.New("等待 frpc 退出超时")
+		}
 	}
 	return nil
 }

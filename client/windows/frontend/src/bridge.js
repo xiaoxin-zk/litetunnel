@@ -123,8 +123,8 @@ export const api = {
   listLocalServices: () => go.ListLocalServices(),
   // 隧道管理。remotePort 传 0 表示由服务端自动分配端口，
   // 界面默认不暴露这个参数。
-  createTunnel: (name, type, localIp, localPort, remotePort) =>
-    go.CreateTunnel(name, type, localIp, localPort, remotePort || 0),
+  createTunnel: (name, type, localIp, localPort, remotePort, subdomain) =>
+    go.CreateTunnel(name, type, localIp, localPort, remotePort || 0, subdomain || ''),
   createTunnelsBatch: (prefix, type, localIp, ports) =>
     go.CreateTunnelsBatch(prefix, type, localIp, ports),
   deleteTunnel: (id) => go.DeleteTunnel(id),

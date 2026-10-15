@@ -141,7 +141,9 @@
             <input type="radio" value="single" v-model="createMode" />
             <span>单条</span>
           </label>
-          <label :class="{ on: createMode === 'batch' }">
+          <!-- 批量创建是按端口展开的，而 HTTP/HTTPS 隧道没有公网端口、
+               靠域名区分，展开不了——因此这两类只提供单条创建。 -->
+          <label v-if="!isWebType" :class="{ on: createMode === 'batch' }">
             <input type="radio" value="batch" v-model="createMode" />
             <span>批量（一串端口）</span>
           </label>
@@ -225,6 +227,21 @@
           <input v-model="form.localIp" placeholder="127.0.0.1" spellcheck="false" />
           <em class="muted">通常填 127.0.0.1；服务在别的机器上时填它的局域网 IP</em>
         </label>
+
+        <!-- HTTP/HTTPS 类隧道没有公网端口，靠域名区分。
+             服务端在域名与二级域名都为空时会直接拒绝，所以这个字段必须给。 -->
+        <template v-if="isWebType">
+          <label class="field">
+            <span>二级域名</span>
+            <input v-model="form.subdomain" :placeholder="subdomainPlaceholder" spellcheck="false" />
+            <em class="muted">
+              访问地址将是 <span class="mono">{{ subdomainPreview }}</span>
+            </em>
+          </label>
+          <div class="https-note">
+            <b>HTTPS 自动生效。</b>证书由服务端按域名自动签发，你不需要做任何配置。
+          </div>
+        </template>
 
         <!-- 远程端口默认自动分配，放在「高级」里避免干扰 -->
         <label class="switch-line">
@@ -320,7 +337,30 @@ const form = ref({
   localIp: '127.0.0.1',
   localPort: null,
   portsText: '',
-  remotePort: null
+  remotePort: null,
+  subdomain: ''
+})
+
+/** 是否为 HTTP/HTTPS 类隧道。这两类没有公网端口，靠域名区分。 */
+const isWebType = computed(() => form.value.type === 'http' || form.value.type === 'https')
+
+const subdomainPlaceholder = computed(() => {
+  const d = props.state.tunnel_domain
+  return d ? `例如 mc（访问地址将是 mc.${d}）` : '例如 mc'
+})
+
+/** 实时预览访问地址，让用户填之前就知道会得到什么。 */
+const subdomainPreview = computed(() => {
+  const s = (form.value.subdomain || '').trim().toLowerCase()
+  if (!s) return '（填写后显示）'
+  const d = props.state.tunnel_domain
+  return d ? `https://${s}.${d}` : `https://${s}`
+})
+
+// 切成 HTTP/HTTPS 时强制回到单条模式：批量是按端口展开的，
+// 而这两类隧道没有公网端口。
+watch(isWebType, (web) => {
+  if (web) createMode.value = 'single'
 })
 
 // 'single' 单条 | 'batch' 批量（一串连续端口，游戏服常见）
@@ -504,7 +544,8 @@ function openCreate() {
     localIp: '127.0.0.1',
     localPort: null,
     portsText: '',
-    remotePort: null
+    remotePort: null,
+    subdomain: ''
   }
   createOpen.value = true
 }
@@ -545,6 +586,14 @@ async function submitCreate() {
     dialogError.value = nerr
     return
   }
+
+  // HTTP/HTTPS 必须有二级域名（服务端两者都为空时会直接拒绝）。
+  // 没填就用隧道名兜底：隧道名的字符集与二级域名完全一致，
+  // 而且这样用户少填一个字段就能建好，比报错让他重填更省事。
+  if (isWebType.value && !(f.subdomain || '').trim()) {
+    f.subdomain = name.toLowerCase()
+  }
+
   if (!f.localPort || f.localPort < 1 || f.localPort > 65535) {
     dialogError.value = '请填写 1-65535 之间的本机端口'
     return
@@ -558,7 +607,8 @@ async function submitCreate() {
       f.type,
       (f.localIp || '127.0.0.1').trim(),
       Number(f.localPort),
-      showAdvanced.value ? Number(f.remotePort) || 0 : 0
+      showAdvanced.value ? Number(f.remotePort) || 0 : 0,
+      (f.subdomain || '').trim()
     )
     emit('update', next)
     createOpen.value = false
@@ -1229,6 +1279,19 @@ watch(
 .field select:focus,
 .field textarea:focus {
   border-color: #2563eb;
+}
+
+/* HTTPS 自动签发说明。用中性偏正面的样式而不是警告色：
+   这是一件好事（用户不用配证书），不该看起来像风险提示。 */
+.https-note {
+  margin: -4px 0 14px;
+  padding: 9px 12px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 9px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #166534;
 }
 
 /* ---- 单条 / 批量 切换 ---- */

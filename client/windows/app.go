@@ -419,18 +419,21 @@ func (a *App) ListLocalServices() ([]localsvc.Service, error) {
 // remotePort 传 0 表示由服务端自动分配：客户端刻意不暴露「远程端口」
 // 这个概念，用户只需要知道「本机服务跑在哪个端口」。
 // 端口池的挑选、系统占用排除、保留端口过滤全在服务端完成。
-func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePort int) (State, error) {
+func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePort int, subdomain string) (State, error) {
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
 		return a.GetState(), err
 	}
 
+	// subdomain 只对 HTTP/HTTPS 有意义：那两类隧道没有公网端口，
+	// 靠域名区分。服务端在两者都为空时会直接拒绝，所以必须带上。
 	payload, err := json.Marshal(map[string]any{
 		"name":        strings.TrimSpace(name),
 		"type":        strings.TrimSpace(tunnelType),
 		"local_ip":    strings.TrimSpace(localIP),
 		"local_port":  localPort,
 		"remote_port": remotePort,
+		"subdomain":   strings.TrimSpace(subdomain),
 	})
 	if err != nil {
 		return a.GetState(), err

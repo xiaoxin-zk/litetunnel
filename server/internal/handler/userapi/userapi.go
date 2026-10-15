@@ -646,11 +646,21 @@ func (h *Handler) publicAddr(t *model.Tunnel) string {
 		}
 		return host + ":" + strconv.Itoa(t.RemotePort)
 	case model.ProxyTypeHTTP, model.ProxyTypeHTTPS:
+		// HTTP 类隧道统一带上 https:// 前缀。
+		//
+		// 证书由 Caddy 按域名自动签发——这本来就是这套架构的一部分，
+		// 但只给一个裸域名的话，用户不知道该加 http 还是 https：
+		// 加 http 会先跳转一次，而且浏览器会在地址栏标成「不安全」，
+		// 用户会以为是自己配错了。
+		//
+		// 这里可以放心用 https：自定义域名必须落在平台泛域名之下
+		//（normalizeInput 会校验），二级域名更是直接拼在泛域名前面，
+		// 两者都在 Caddy 的证书覆盖范围内。
 		if t.Domain != "" {
-			return t.Domain
+			return "https://" + t.Domain
 		}
 		if t.Subdomain != "" && h.svc.Cfg.TunnelDomain != "" {
-			return t.Subdomain + "." + h.svc.Cfg.TunnelDomain
+			return "https://" + t.Subdomain + "." + h.svc.Cfg.TunnelDomain
 		}
 	}
 	return ""

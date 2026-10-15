@@ -547,9 +547,14 @@ jobs:
             exit 1
           fi
 
+          # 下面两次回调里的 metas 键名必须写成 "token"（= service.MetaTokenKey）。
+          # 这里曾经写成 "lt_token"：服务端读的是 metas["token"]，于是取到空串，
+          # 凭据比对必然失败，报「客户端凭据无效」——看起来像是时序回归没修好，
+          # 实际只是这条断言自己写错了键名。
+          #
           # 1) 首次登录：run_id 为空。必须放行。
           login=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d "{\"op\":\"Login\",\"content\":{\"version\":\"0.71.0\",\"hostname\":\"ci\",\"os\":\"linux\",\"arch\":\"amd64\",\"user\":\"$frpuser\",\"timestamp\":0,\"privilege_key\":\"\",\"run_id\":\"\",\"metas\":{\"lt_token\":\"$token\"},\"client_address\":\"127.0.0.1:1\"}}" \
+            -d "{\"op\":\"Login\",\"content\":{\"version\":\"0.71.0\",\"hostname\":\"ci\",\"os\":\"linux\",\"arch\":\"amd64\",\"user\":\"$frpuser\",\"timestamp\":0,\"privilege_key\":\"\",\"run_id\":\"\",\"metas\":{\"token\":\"$token\"},\"client_address\":\"127.0.0.1:1\"}}" \
             "$BASE/api/frps/plugin")
           if printf '%s' "$login" | grep -q '"reject":true'; then
             echo "::error::Login with empty run_id was rejected: $login"
@@ -564,7 +569,7 @@ jobs:
           # 断言的是**它不能死于认证**：只要拒绝原因不是「未完成认证」，
           # 就说明凭据复核这条回落生效了。
           proxy=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"lt_token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"citunnel\",\"proxy_type\":\"tcp\",\"use_encryption\":false,\"use_compression\":false,\"remote_port\":0,\"custom_domains\":[],\"subdomain\":\"\",\"metas\":{}}}" \
+            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"citunnel\",\"proxy_type\":\"tcp\",\"use_encryption\":false,\"use_compression\":false,\"remote_port\":0,\"custom_domains\":[],\"subdomain\":\"\",\"metas\":{}}}" \
             "$BASE/api/frps/plugin")
           if printf '%s' "$proxy" | grep -q '未完成认证'; then
             echo "::error::NewProxy still fails authentication with a fresh run_id: $proxy"

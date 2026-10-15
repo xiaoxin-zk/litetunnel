@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,6 +77,11 @@ type State struct {
 	LastSyncAt *time.Time `json:"last_sync_at"`
 	// SyncErr 非空表示最近一次自动同步失败（通常是网络问题）。
 	SyncErr string `json:"sync_err"`
+	// Version 是客户端构建版本。
+	//
+	// 客户端出问题时第一个要确认的永远是「你跑的是哪个版本」——
+	// 没有它就只能靠对比 exe 体积去猜，既不可靠也让排查绕远路。
+	Version string `json:"version"`
 }
 
 // App 是暴露给前端的应用对象。
@@ -134,9 +140,19 @@ func maskKey(k string) string {
 // NewApp 构造应用对象。
 func NewApp() *App {
 	cfg, _ := loadConfig()
+
+	// 优先使用内嵌的 frpc：正式发布包里只有这一个 exe。
+	// 取不到（开发构建或释放失败）时传空串，
+	// 由 Manager 回退到「在程序目录与 PATH 中查找」。
+	exePath, err := ensureFrpc()
+	if err != nil {
+		log.Printf("[client] %v，将回退到同目录查找 frpc.exe", err)
+		exePath = ""
+	}
+
 	return &App{
 		cfg: cfg,
-		mgr: frpc.New(""),
+		mgr: frpc.New(exePath),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -200,6 +216,7 @@ func (a *App) GetState() State {
 		BalanceCents:   a.balanceCents,
 		SyncErr:        a.syncErr,
 		LastSyncAt:     lastSync,
+		Version:        Version(),
 		Running:        a.mgr.Running(),
 		FrpcFound:      a.mgr.Available(),
 		FrpcPath:       a.mgr.ExePath(),
@@ -291,7 +308,8 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err != nil {
 		return a.GetState(), err
 	}
-	if strings.TrimSpace(cfgText) == "" {
+	cfgText = strings.TrimSpace(cfgText)
+	if cfgText == "" {
 		return a.GetState(), errors.New("服务端未返回客户端配置，请先在控制台创建隧道")
 	}
 	if err := writeFrpcConfig(cfgText); err != nil {
@@ -306,6 +324,12 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.mu.Lock()
 	a.cfg.APIKey = apiKey
 	a.cfg.ServerURL = base
+	// 记录「已写入磁盘的配置」。
+	//
+	// 必须在这里记，否则自动同步的第一个 tick 会把刚写好的配置
+	// 误判成「服务端有更新」，触发一次完全没必要的 frpc 重启——
+	// 用户看到的就是「刚连上就闪断一次」。
+	a.appliedConfig = cfgText
 	a.username = username
 	a.apiKeyMask = maskKey(apiKey)
 	a.gatewayHost = info.ServerAddr

@@ -86,6 +86,23 @@ jobs:
         working-directory: client/windows
         run: go mod tidy
 
+      # 必须先于构建执行：go:embed 在**编译期**读取文件，
+      # 顺序反了会直接编译失败（找不到 assets/frpc.exe）。
+      - name: Download frpc
+        shell: pwsh
+        run: |
+          $ver = $env:FRP_VERSION
+          $url = "https://github.com/fatedier/frp/releases/download/v$ver/frp_${ver}_windows_amd64.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile frp.zip
+          Expand-Archive -Path frp.zip -DestinationPath frp -Force
+          $exe = Get-ChildItem -Path frp -Recurse -Filter frpc.exe | Select-Object -First 1
+          if (-not $exe) { throw 'frpc.exe not found in frp release archive' }
+          New-Item -ItemType Directory -Force -Path client/windows/assets | Out-Null
+          Copy-Item $exe.FullName -Destination client/windows/assets/frpc.exe -Force
+          $lic = Get-ChildItem -Path frp -Recurse -Filter LICENSE | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName -Destination client/windows/assets/LICENSE-frp.txt -Force }
+
       - name: Build client
         working-directory: client/windows
         shell: pwsh
@@ -99,21 +116,11 @@ jobs:
           if (-not $env:LT_CLIENT_SERVER) {
             Write-Host "::warning::LT_CLIENT_SERVER 未设置，客户端将回退为手动填写服务器地址"
           }
-          wails build -clean -platform windows/amd64 -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER"
-
-      - name: Download frpc
-        shell: pwsh
-        run: |
-          $ver = $env:FRP_VERSION
-          $url = "https://github.com/fatedier/frp/releases/download/v$ver/frp_${ver}_windows_amd64.zip"
-          Write-Host "Downloading $url"
-          Invoke-WebRequest -Uri $url -OutFile frp.zip
-          Expand-Archive -Path frp.zip -DestinationPath frp -Force
-          $exe = Get-ChildItem -Path frp -Recurse -Filter frpc.exe | Select-Object -First 1
-          if (-not $exe) { throw 'frpc.exe not found in frp release archive' }
-          Copy-Item $exe.FullName -Destination client/windows/build/bin/frpc.exe
-          $lic = Get-ChildItem -Path frp -Recurse -Filter LICENSE | Select-Object -First 1
-          if ($lic) { Copy-Item $lic.FullName -Destination client/windows/build/bin/LICENSE-frp.txt }
+          # -tags embedfrpc：把上面下载的 frpc 内嵌进主程序，
+          # 用户最终只拿到**一个 exe**。
+          # 同时注入平台地址与版本号，版本号会显示在客户端界面上，
+          # 用户报障时能直接说出自己在跑哪个版本。
+          wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=${{ github.ref_name }}"
 
       - name: Assemble package
         shell: pwsh
@@ -121,22 +128,24 @@ jobs:
           $bin = 'client/windows/build/bin'
           # 注意：这里不能用 PowerShell here-string，其结束符必须顶格，
           # 会破坏 YAML 块标量，因此改用数组拼接。
+          $bundleLic = 'client/windows/assets/LICENSE-frp.txt'
+          if (Test-Path $bundleLic) { Copy-Item $bundleLic -Destination "$bin/LICENSE-frp.txt" -Force }
           $readme = @(
             'LiteTunnel Windows Client',
             '=========================',
             '',
             'Quick start',
             '-----------',
-            '1. Keep LiteTunnel.exe and frpc.exe in the SAME folder.',
-            '2. Run LiteTunnel.exe.',
-            '3. Enter your console URL (e.g. https://panel.example.com), username and password.',
-            '4. Click "Connect". Tunnels are pulled from the server automatically.',
+            '1. Run LiteTunnel.exe (single file, no installation needed).',
+            '2. Paste your API Key from the console, then click "Connect".',
+            '3. Tunnels are pulled from the server automatically and stay in sync.',
             '',
             'Notes',
             '-----',
-            '- This client stores only a revocable access credential, never your password.',
-            '- Config and logs live in %AppData%\LiteTunnel',
-            '- frpc.exe is bundled from the official frp release (Apache-2.0), see LICENSE-frp.txt'
+            '- The client bundles frpc internally, so there is nothing else to copy.',
+            '- It stores only a revocable API Key, never your password.',
+            '- Config, logs and the extracted frpc live in %AppData%\LiteTunnel',
+            '- frpc is bundled from the official frp release (Apache-2.0), see LICENSE-frp.txt'
           ) -join "`n"
           Set-Content -Path "$bin/README-client.txt" -Value $readme -Encoding UTF8
           Compress-Archive -Path "$bin/*" -DestinationPath LiteTunnel-windows-amd64.zip -Force

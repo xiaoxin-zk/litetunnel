@@ -56,6 +56,8 @@
         <p class="hint muted">
           <a class="link" @click="openReset">忘记密码？</a>
         </p>
+        <!-- 版本号放在登录页：连不上时第一件事就是确认客户端版本 -->
+        <p class="hint muted version">{{ state.version }}</p>
       </template>
 
       <!-- ============ 重置密码 ============ -->
@@ -388,6 +390,15 @@ h1 {
   color: #2563eb;
   cursor: pointer;
   text-decoration: none;
+}
+
+.version {
+  margin-top: 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  opacity: 0.75;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .link:hover {

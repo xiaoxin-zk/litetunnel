@@ -59,3 +59,7 @@ litetunnel-deploy.zip
 # 解压后的客户端目录（含 exe 与 frpc，体积大且可随时从 Release 重新下载）
 LiteTunnel-windows-amd64/
 LiteTunnel-windows-*/
+
+# 构建时下载的 frpc，由 go:embed 打进主程序。
+# 不入库：十几 MB 的二进制，且每次构建都会重新下载。
+client/windows/assets/frpc.exe

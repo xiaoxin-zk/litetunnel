@@ -182,6 +182,9 @@
         <span>启动客户端后自动连接</span>
       </label>
       <div class="footer-right">
+        <!-- 版本号常驻显示：出问题时第一件事就是确认「跑的是哪个版本」，
+             藏进关于页反而多一步。 -->
+        <span class="muted mono" v-if="state.version">{{ state.version }}</span>
         <span class="muted mono" v-if="state.config_path">{{ state.config_path }}</span>
         <button class="btn-ghost mini" @click="openDataDir">打开数据目录</button>
       </div>

@@ -243,35 +243,22 @@ jobs:
           fi
           echo "PASS forged API key rejected"
 
-          # ===== API Key 的权限边界 =====
-          # 回归测试：API Key 会以明文落在客户端本地配置文件里，
-          # 它的定位是「让客户端连上来」，不是「让持有者接管账号」。
-          # 因此只能读，不能写——否则一份泄露的配置就等于账号被接管。
-
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
-            -d '{"nickname":"hacked"}' "$BASE/api/user/profile")
-          if [ "$code" != "401" ]; then
-            echo "::error::API key could modify profile (got $code, want 401)"
-            exit 1
-          fi
-          echo "PASS api key cannot modify profile"
-
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $apikey" "$BASE/api/user/apikey/reveal")
-          if [ "$code" != "401" ]; then
-            echo "::error::API key could reveal credentials (got $code, want 401)"
-            exit 1
-          fi
-          echo "PASS api key cannot reveal credentials"
-
-          # ---- 权限边界：使用账号 vs 控制账号 ----
+          # ===== 权限边界：使用账号 vs 控制账号 =====
           #
-          # API Key 必须能做客户端该做的事（建隧道、兑换），
-          # 但不能做「账号接管」类操作。这条线改动时最容易改错方向，
-          # 所以两个方向都要有断言守着。
+          # API Key 会以明文落在客户端本地配置文件里，因此它必须能完成
+          # 客户端该做的事（建隧道、兑换），但不能做「账号接管」类操作。
+          #
+          # 这条线改动时最容易改错方向，所以两个方向都要有断言守着。
+          #
+          # 关于状态码：账号安全接口现在的守卫是 RequireSession，它返回
+          # **403**（已认证但无权限），而不是 401。这是刻意的——API Key
+          # 本身是有效凭据，只是没有这项权限，用 403 语义更准确。
+          # 断言 403 而不是「非 200」，是为了区分「被权限挡住」与
+          # 「路由根本不存在」这两种情况。
 
-          # 能建隧道：这是客户端存在的意义
+          # ---- 必须能做 ----
+
+          # 建隧道：这是客户端存在的意义
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
             -d '{"name":"citunnel","type":"tcp","local_ip":"127.0.0.1","local_port":25565}' \
@@ -282,59 +269,66 @@ jobs:
           fi
           echo "PASS api key can create tunnel"
 
-          # 建隧道后应当能读到它，并且公网端口已由服务端分配
+          # 建完应当能读到，并且公网地址已由服务端分配。
+          # 检查 public_addr 而不是 remote_port：后者不一定出现在 VO 里，
+          # 拿它做断言会变成一条永远通过的空断言。
           body=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
           if ! printf '%s' "$body" | grep -q '"name":"citunnel"'; then
             echo "::error::created tunnel not visible via client info"
             exit 1
           fi
-          if printf '%s' "$body" | grep -q '"remote_port":0'; then
-            echo "::error::server did not allocate a remote port for the new tunnel"
+          if ! printf '%s' "$body" | grep -q '"public_addr":"[^"]'; then
+            echo "::error::server did not allocate a public address for the new tunnel"
             exit 1
           fi
           echo "PASS server auto-allocated a port for the new tunnel"
 
-          # 能兑换（用不存在的码，只要不是 401 就说明接口可达）
+          # 兑换：用不存在的码，只要不是 401/403/404 就说明接口可达
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
             -d '{"code":"LT-AAAA-AAAA-AAAA"}' "$BASE/api/user/redeem")
-          if [ "$code" = "401" ] || [ "$code" = "404" ]; then
+          if [ "$code" = "401" ] || [ "$code" = "403" ] || [ "$code" = "404" ]; then
             echo "::error::API key cannot reach redeem endpoint (got $code)"
             exit 1
           fi
           echo "PASS api key can reach redeem endpoint"
 
-          # 不能改密码
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
-            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+          # ---- 必须不能做（全部期望 403）----
+
+          check_forbidden() {
+            # $1=说明 $2=curl 的其余参数拼接结果
+            local label="$1"
+            shift
+            local got
+            got=$(curl -s -o /dev/null -w '%{http_code}' "$@")
+            if [ "$got" != "403" ]; then
+              echo "::error::API key could $label (got $got, want 403)"
+              exit 1
+            fi
+            echo "PASS api key cannot $label"
+          }
+
+          check_forbidden "modify profile" \
+            -X PUT -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"nickname":"hacked"}' "$BASE/api/user/profile"
+
+          check_forbidden "change password" \
+            -X PUT -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
             -d '{"old_password":"SmokePass123","new_password":"HackedPass123"}' \
-            "$BASE/api/user/profile/password")
-          if [ "$code" != "401" ]; then
-            echo "::error::API key could change password (got $code, want 401)"
-            exit 1
-          fi
-          echo "PASS api key cannot change password"
+            "$BASE/api/user/profile/password"
 
-          # 不能重置自己的 Key（能重置就等于能复制身份）
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $apikey" "$BASE/api/user/apikey/rotate")
-          if [ "$code" != "401" ]; then
-            echo "::error::API key could rotate itself (got $code, want 401)"
-            exit 1
-          fi
-          echo "PASS api key cannot rotate itself"
+          check_forbidden "reveal credentials" \
+            -X POST -H "Authorization: Bearer $apikey" "$BASE/api/user/apikey/reveal"
 
-          # 不能注销账号
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-            -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
-            -d '{"password":"SmokePass123"}' "$BASE/api/user/profile")
-          if [ "$code" != "401" ]; then
-            echo "::error::API key could delete the account (got $code, want 401)"
-            exit 1
-          fi
-          echo "PASS api key cannot delete account"
+          # 能重置自己的 Key 就等于能复制身份
+          check_forbidden "rotate itself" \
+            -X POST -H "Authorization: Bearer $apikey" "$BASE/api/user/apikey/rotate"
 
-          # 只读接口必须可用
+          check_forbidden "delete account" \
+            -X DELETE -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
+            -d '{"password":"SmokePass123"}' "$BASE/api/user/profile"
+
+          # ---- 只读接口必须可用 ----
           code=$(curl -s -o /dev/null -w '%{http_code}' \
             -H "Authorization: Bearer $apikey" "$BASE/api/user/client/downloads")
           if [ "$code" != "200" ]; then

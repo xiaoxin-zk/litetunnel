@@ -10,11 +10,12 @@
             {{ state.gateway_host || '-' }}:{{ state.gateway_port || '-' }}
             <template v-if="state.username"> · {{ state.username }}</template>
           </div>
+          <div class="muted" :class="{ 'sync-warn': state.sync_err }">{{ syncText }}</div>
         </div>
       </div>
 
       <div class="actions">
-        <button class="btn-ghost" :disabled="busy" @click="refresh">同步配置</button>
+        <button class="btn-ghost" :disabled="busy" @click="refresh">立即同步</button>
         <button v-if="!state.running" class="btn-primary" :disabled="busy || !state.frpc_found" @click="start">
           启动连接
         </button>
@@ -194,7 +195,9 @@ import { api } from '../bridge'
 
 const props = defineProps({
   state: { type: Object, required: true },
-  logs: { type: Array, default: () => [] }
+  logs: { type: Array, default: () => [] },
+  // 主进程推送的轻提示，例如「检测到配置变更，已自动同步并重新连接」
+  notice: { type: Object, default: null }
 })
 const emit = defineEmits(['update'])
 
@@ -359,6 +362,25 @@ const statusText = computed(() => {
   if (props.state.exceeded) return '流量已用尽'
   return '未连接'
 })
+
+/** 同步状态文案。让用户确信「网页端改的东西客户端已经跟上了」。 */
+const syncText = computed(() => {
+  if (props.state.sync_err) return `自动同步异常：${props.state.sync_err}`
+  if (!props.state.last_sync_at) return '尚未同步'
+  const d = new Date(props.state.last_sync_at)
+  if (Number.isNaN(d.getTime())) return '已同步'
+  const p = (n) => String(n).padStart(2, '0')
+  return `每 20 秒自动同步 · 上次 ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+})
+
+// 自动同步在配置变化时会重启 frpc，必须让用户知道原因，
+// 否则「连接闪了一下」会被当成故障。
+watch(
+  () => props.notice,
+  (n) => {
+    if (n?.text) flash(n.text)
+  }
+)
 
 const dotClass = computed(() => {
   if (props.state.running) return 'on'
@@ -662,6 +684,12 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 同步异常时用暖色提示，但不用红色报错样式：
+   网络抖动是常态，每 20 秒闪一次红色会让人以为坏了。 */
+.sync-warn {
+  color: #b45309;
+}
+
 /* ---- 弹层（新建隧道 / 兑换码）---- */
 
 .modal {

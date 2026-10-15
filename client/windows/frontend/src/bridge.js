@@ -27,7 +27,13 @@ const emptyState = {
   frpc_found: false,
   frpc_path: '',
   config_path: '',
-  auto_start: false
+  auto_start: false,
+  // 自动同步状态：客户端每 20 秒拉取一次隧道清单与 frpc 配置
+  last_sync_at: null,
+  sync_err: '',
+  group: null,
+  payment_enabled: false,
+  balance_cents: 0
 }
 
 /** 浏览器内预览时使用的假实现，方便纯前端调试样式。 */

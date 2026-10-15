@@ -2,7 +2,7 @@
   <div class="app">
     <transition name="fade" mode="out-in">
       <LoginView v-if="!state.logged_in" :state="state" @connected="onConnected" />
-      <MainView v-else :state="state" :logs="logs" @update="onUpdate" />
+      <MainView v-else :state="state" :logs="logs" :notice="notice" @update="onUpdate" />
     </transition>
   </div>
 </template>
@@ -22,6 +22,11 @@ const state = ref({
   running: false
 })
 const logs = ref([])
+// 主进程推送的轻提示（例如「检测到配置变更，已自动同步并重新连接」）。
+//
+// 用带时间戳的对象而不是纯字符串：同一条消息连续推送两次时，
+// 字符串相等不会触发子组件的 watch，第二次提示就丢了。
+const notice = ref(null)
 
 async function loadState() {
   state.value = await api.getState()
@@ -51,6 +56,9 @@ onMounted(async () => {
   })
   onEvent('log', (line) => {
     logs.value = [...logs.value.slice(-499), line]
+  })
+  onEvent('notice', (msg) => {
+    notice.value = { text: msg, at: Date.now() }
   })
 })
 </script>

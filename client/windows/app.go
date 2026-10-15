@@ -71,6 +71,11 @@ type State struct {
 	// 没有充值入口时，一个恒为 0 的余额只会造成困惑。
 	PaymentEnabled bool  `json:"payment_enabled"`
 	BalanceCents   int64 `json:"balance_cents"`
+
+	// LastSyncAt 是最近一次成功同步的时间，界面上用于显示「刚刚同步」。
+	LastSyncAt *time.Time `json:"last_sync_at"`
+	// SyncErr 非空表示最近一次自动同步失败（通常是网络问题）。
+	SyncErr string `json:"sync_err"`
 }
 
 // App 是暴露给前端的应用对象。
@@ -97,7 +102,26 @@ type App struct {
 	group          *groupLimit
 	paymentEnabled bool
 	balanceCents   int64
+
+	// appliedConfig 是最近一次写入磁盘的 frpc 配置原文。
+	//
+	// 自动同步靠比较它来判断「服务端配置有没有变」：只有真的变了才重启 frpc。
+	// 不比较的话每 20 秒重启一次，隧道会处于持续的断连抖动中。
+	appliedConfig string
+	lastSyncAt    time.Time
+	syncErr       string
+
+	// syncMu 串行化同步操作。后台定时同步与用户手动点「立即同步」
+	// 可能同时发生，两者都会写 frpc.toml 并可能重启 frpc，
+	// 重叠执行会造成无谓的重复重启（表现为连接反复闪断）。
+	syncMu sync.Mutex
 }
+
+// syncInterval 是后台自动同步的间隔。
+//
+// 取 20 秒是折中：用户在网页端加完隧道再切回客户端，基本已经同步好了；
+// 而每次同步只是两个轻量 GET，不会给服务端造成压力。
+const syncInterval = 20 * time.Second
 
 // maskKey 生成用于界面展示的脱敏形式，避免完整 Key 长时间暴露在屏幕上。
 func maskKey(k string) string {
@@ -130,6 +154,10 @@ func (a *App) startup(ctx context.Context) {
 		_ = err
 	})
 
+	// 自动同步常驻运行：即使没连 frpc 也要同步，
+	// 因为用户在网页端改了隧道后，客户端列表应当自己跟上。
+	a.startAutoSync(ctx)
+
 	if a.cfg.AutoStart && a.cfg.APIKey != "" {
 		go func() {
 			time.Sleep(800 * time.Millisecond)
@@ -144,6 +172,14 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) GetState() State {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
+
+	// 零值时间序列化成 "0001-01-01T00:00:00Z"，前端没法用它判断
+	// 「还没同步过」，所以未同步时下发 null。
+	var lastSync *time.Time
+	if !a.lastSyncAt.IsZero() {
+		t := a.lastSyncAt
+		lastSync = &t
+	}
 
 	state := State{
 		ServerURL:      a.cfg.ServerURL,
@@ -162,6 +198,8 @@ func (a *App) GetState() State {
 		Group:          a.group,
 		PaymentEnabled: a.paymentEnabled,
 		BalanceCents:   a.balanceCents,
+		SyncErr:        a.syncErr,
+		LastSyncAt:     lastSync,
 		Running:        a.mgr.Running(),
 		FrpcFound:      a.mgr.Available(),
 		FrpcPath:       a.mgr.ExePath(),
@@ -428,30 +466,120 @@ func (a *App) Redeem(code string) (string, State, error) {
 	return out.Message, state, nil
 }
 
-// Refresh 从服务端同步隧道清单与最新配置。
-func (a *App) Refresh() (State, error) {
+// ---- 自动同步 ----
+
+// startAutoSync 启动后台自动同步，随应用退出而结束。
+//
+// 为什么必须有它：用户完全可能在网页控制台里加一条隧道，
+// 而客户端此刻正在运行。没有自动同步的话，他必须手动点「同步配置」，
+// 更糟的是——即使点了，运行中的 frpc 也不会加载新配置，
+// 于是「隧道明明建好了却连不上」，用户只会认为产品坏了。
+func (a *App) startAutoSync(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.autoSyncOnce()
+			}
+		}
+	}()
+}
+
+// autoSyncOnce 执行一次后台同步。
+//
+// 失败只记录不弹窗：网络抖动是常态，每 20 秒弹一次错误会把人逼疯。
+// 错误信息通过 State.SyncErr 呈现为一个低调的提示。
+func (a *App) autoSyncOnce() {
+	a.mu.RLock()
+	apiKey := a.cfg.APIKey
+	a.mu.RUnlock()
+	if apiKey == "" {
+		// 尚未接入，没有可同步的东西。
+		return
+	}
+
+	changed, err := a.syncLocked()
+	if err != nil {
+		a.setSyncErr(err)
+		a.emitState()
+		return
+	}
+
+	if changed && a.mgr.Running() {
+		// 明确告知用户「列表变了、已自动重连」，否则他会疑惑
+		// 为什么隧道列表自己动了、连接为什么闪了一下。
+		a.emitNotice("检测到配置变更，已自动同步并重新连接")
+	}
+	a.emitState()
+}
+
+// syncLocked 在一次互斥的保护下完成「拉取 → 判断变化 → 必要时重启 frpc」。
+//
+// 抽出这个方法而不是让两处各自组合：手动同步和自动同步一旦逻辑分叉，
+// 迟早会出现「按钮点的能用、后台同步的不能用」这类难以复现的问题。
+func (a *App) syncLocked() (cfgChanged bool, err error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
+	cfgChanged, err = a.applySync()
+	if err != nil {
+		return false, err
+	}
+	if cfgChanged {
+		if err := a.reloadRunning(); err != nil {
+			return true, err
+		}
+	}
+	return cfgChanged, nil
+}
+
+// applySync 从服务端拉取隧道清单与 frpc 配置。
+//
+// 返回 cfgChanged 表示服务端生成的配置与本地已写入的不同。
+// 这个返回值是「是否需要重启 frpc」的唯一依据——不比较就重启的话，
+// 隧道会每 20 秒抖动一次。
+func (a *App) applySync() (cfgChanged bool, err error) {
 	base := a.serverBase()
 
 	a.mu.RLock()
 	apiKey := a.cfg.APIKey
+	prevCfg := a.appliedConfig
 	a.mu.RUnlock()
 
 	if base == "" || apiKey == "" {
-		return a.GetState(), errors.New("尚未接入")
+		return false, errors.New("尚未接入")
 	}
 
 	var data clientInfoData
 	if err := a.getJSON(base+"/api/user/client/info", apiKey, &data); err != nil {
-		return a.GetState(), err
+		return false, err
 	}
 
-	// 同时刷新 frpc.toml，保证新增/删除隧道后本地配置同步。
+	// 配置拉取失败不拖垮整次同步：清单已经拿到了，
+	// 只是这次不判断配置变化（cfgText 保持空 → cfgChanged 为 false）。
 	var cfgText string
-	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err == nil && cfgText != "" {
-		_ = writeFrpcConfig(cfgText)
+	if err := a.getRaw(base+"/api/user/client/config", apiKey, &cfgText); err != nil {
+		cfgText = ""
+	}
+	cfgText = strings.TrimSpace(cfgText)
+
+	// 服务端没返回配置（例如一条隧道都没有）时不覆盖本地文件，
+	// 否则会把一份可用的配置清空。
+	cfgChanged = cfgText != "" && cfgText != prevCfg
+	if cfgChanged {
+		if err := writeFrpcConfig(cfgText); err != nil {
+			return false, err
+		}
 	}
 
 	a.mu.Lock()
+	if cfgChanged {
+		a.appliedConfig = cfgText
+	}
 	a.tunnels = data.Tunnels
 	a.gatewayHost = data.ServerAddr
 	a.gatewayPort = data.ServerPort
@@ -468,12 +596,68 @@ func (a *App) Refresh() (State, error) {
 	if a.tunnels == nil {
 		a.tunnels = []TunnelVO{}
 	}
+	a.lastSyncAt = time.Now()
+	a.syncErr = ""
 	a.mu.Unlock()
 
-	state := a.GetState()
-	if a.ctx != nil {
-		wailsruntime.EventsEmit(a.ctx, "state", state)
+	return cfgChanged, nil
+}
+
+// reloadRunning 在 frpc 运行中时重启它，让新配置生效。
+//
+// 用「停 + 起」而不是 frpc 的 reload 接口：后者需要在 frpc.toml 里
+// 额外开一个本地管理端口，多一个暴露面；而重启的代价只是约一秒的连接中断。
+func (a *App) reloadRunning() error {
+	if !a.mgr.Running() {
+		return nil
 	}
+	path, err := frpcConfigPath()
+	if err != nil {
+		return err
+	}
+	_ = a.mgr.Stop()
+	if err := a.mgr.Start(path); err != nil {
+		return fmt.Errorf("配置已更新，但重启 frpc 失败: %w", err)
+	}
+	return nil
+}
+
+func (a *App) setSyncErr(err error) {
+	a.mu.Lock()
+	a.syncErr = err.Error()
+	a.mu.Unlock()
+}
+
+func (a *App) emitState() {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(a.ctx, "state", a.GetState())
+}
+
+func (a *App) emitNotice(msg string) {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(a.ctx, "notice", msg)
+}
+
+// Refresh 手工同步（界面上的「立即同步」）。
+//
+// 与后台同步走同一条路径，区别只有一点：手工触发时把错误直接返回给界面，
+// 让用户看到「为什么没同步上」，而不是悄悄失败。
+func (a *App) Refresh() (State, error) {
+	// 与后台自动同步走完全相同的路径，区别只有一点：手工触发时
+	// 把错误直接返回给界面，让用户看到「为什么没同步上」，
+	// 而不是像后台那样只留一个低调的提示。
+	_, err := a.syncLocked()
+	if err != nil {
+		a.setSyncErr(err)
+		a.emitState()
+		return a.GetState(), err
+	}
+	state := a.GetState()
+	a.emitState()
 	return state, nil
 }
 

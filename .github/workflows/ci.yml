@@ -464,18 +464,17 @@ jobs:
           # 必须放在「分组上限已调大」之后：默认分组的 max_tunnels 很小，
           # 批量创建会被上限拦下并提前结束——那样失败的不是批量功能，
           # 而是这条断言自己没准备好前置条件。
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+          batchresp=$(curl -fsS -X POST \
             -H "Authorization: Bearer $apikey" -H 'Content-Type: application/json' \
             -d '{"name_prefix":"cibatch","type":"tcp","local_ip":"127.0.0.1","ports":[25566,25567,25568]}' \
             "$BASE/api/user/tunnels/batch")
-          if [ "$code" != "200" ]; then
-            echo "::error::batch tunnel creation returned $code"
-            exit 1
-          fi
           body=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
           for n in cibatch_25566 cibatch_25567 cibatch_25568; do
             if ! printf '%s' "$body" | grep -q "\"name\":\"$n\""; then
               echo "::error::batch tunnel $n was not created"
+              # 批量接口会把每条失败的原因单独返回，直接打出来——
+              # 只说「没建出来」会让人只能靠猜。
+              echo "batch response: $batchresp"
               exit 1
             fi
           done

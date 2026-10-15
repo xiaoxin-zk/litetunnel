@@ -109,7 +109,18 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 
 		normalized.UserID = u.ID
 		normalized.BandwidthLimit = g.BandwidthLimit
-		return tx.Create(&normalized).Error
+		if err := tx.Create(&normalized).Error; err != nil {
+			return err
+		}
+		// 把写入后的结果带出去（含自增 ID 与分配到的公网端口）。
+		//
+		// 少了这一步，CreateTunnel 会返回一个**零值隧道**：上面的
+		// tx.Create 填的是 normalized，而不是外面声明的 created。
+		// 这个错误长期没被发现，是因为调用方大多紧接着重新拉一次列表，
+		// 拿到的是真实数据；但直接读接口返回值的人（包括新加的批量创建）
+		// 会拿到一个 id=0、name 为空的对象。
+		created = normalized
+		return nil
 	})
 	if err != nil {
 		return nil, err

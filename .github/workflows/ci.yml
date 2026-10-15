@@ -424,11 +424,22 @@ jobs:
           #
           # 换句话说：这条断言防的是「口径改回去」和「链路断掉」，
           # 防不了「有人又把快照读了回来」——后者需要 code review 把关。
-          groups=$(curl -fsS -H "Authorization: Bearer $admintoken" "$BASE/api/admin/groups")
-          gid=$(printf '%s' "$groups" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-          gname=$(printf '%s' "$groups" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
-          if [ -z "$gid" ]; then
-            echo "::error::could not resolve group id"
+          # 取**用户当前所在的分组**来改，而不是「分组列表里的第一项」。
+          #
+          # 列表按优先级排序，第一项是「专业版」（100 Mbps、不限隧道数），
+          # 而测试用户默认落在「免费版」（4 Mbps、2 条隧道）上。
+          # 改错分组对用户毫无影响，断言却会通过——那是一条永远为真的
+          # 空断言。而且后面的批量创建需要容量，改错分组还会让它在
+          # 分组上限处失败，看起来像是批量功能坏了。
+          cinfo=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/info")
+          # 分组对象是 gin.H（map），JSON 的键按字母序输出，
+          # 不能假设 id 在前面。先整体切出 group，再逐项取。
+          gjson=$(printf '%s' "$cinfo" | sed -n 's/.*"group":{\([^}]*\)}.*/\1/p')
+          gid=$(printf '%s' "$gjson" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+          gname=$(printf '%s' "$gjson" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+          if [ -z "$gid" ] || [ -z "$gname" ]; then
+            echo "::error::could not resolve the user group (id=$gid name=$gname)"
+            echo "client info: $cinfo"
             exit 1
           fi
           # 把分组限速设成 4 Mbps（4194304 bit/s）
@@ -478,6 +489,22 @@ jobs:
               exit 1
             fi
           done
+          # 接口返回的 created 必须是**真实隧道**，而不是零值。
+          #
+          # 曾经 CreateTunnel 里声明的 created 变量从未被赋值
+          # （tx.Create 填的是另一个变量），于是创建接口返回
+          # id=0、name 为空的对象。因为调用方大多紧接着重新拉一次列表，
+          # 这个错误长期没被任何断言发现。
+          if ! printf '%s' "$batchresp" | grep -q '"name":"cibatch_25566"'; then
+            echo "::error::create response contains a zero-value tunnel"
+            echo "batch response: $batchresp"
+            exit 1
+          fi
+          if printf '%s' "$batchresp" | grep -q '"id":0'; then
+            echo "::error::create response tunnel has id=0"
+            echo "batch response: $batchresp"
+            exit 1
+          fi
           echo "PASS batch tunnel creation"
 
           # 超出单次上限必须被拒，而不是默默只建前 20 条——

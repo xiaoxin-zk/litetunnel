@@ -15,7 +15,6 @@
       </div>
 
       <div class="actions">
-        <button class="btn-ghost" :disabled="busy" @click="refresh">立即同步</button>
         <button v-if="!state.running" class="btn-primary" :disabled="busy || !state.frpc_found" @click="start">
           启动连接
         </button>
@@ -23,6 +22,42 @@
         <button class="btn-ghost" @click="logout">退出登录</button>
       </div>
     </header>
+
+    <!-- 账户信息。连上之后应当一眼看到「我是谁、什么分组、还剩多少」，
+         而不是只能从隧道列表里反推。 -->
+    <div class="account card">
+      <div class="acc">
+        <span>账号</span>
+        <b>{{ state.username || '—' }}</b>
+      </div>
+      <div class="acc">
+        <span>当前分组</span>
+        <b>{{ state.group?.name || '默认' }}</b>
+      </div>
+      <div class="acc">
+        <span>单隧道限速</span>
+        <b>{{ state.group?.bandwidth_limit_str || '不限' }}</b>
+      </div>
+      <div class="acc">
+        <span>可用协议</span>
+        <b>{{ protocolText }}</b>
+      </div>
+      <div class="acc">
+        <span>隧道数</span>
+        <b>
+          {{ state.tunnels.length }}<template v-if="maxTunnels"> / {{ maxTunnels }}</template>
+        </b>
+      </div>
+      <div class="acc">
+        <span>流量</span>
+        <b :class="{ 'acc-err': state.exceeded }">{{ trafficText }}</b>
+      </div>
+      <!-- 余额与支付开关绑定：没有充值入口时显示它只会造成困惑 -->
+      <div v-if="state.payment_enabled" class="acc">
+        <span>余额</span>
+        <b>¥ {{ ((state.balance_cents || 0) / 100).toFixed(2) }}</b>
+      </div>
+    </div>
 
     <div v-if="message" class="banner" :class="messageType">{{ message }}</div>
     <div v-if="!state.frpc_found" class="banner warn">
@@ -231,6 +266,22 @@ const allowedProtocols = computed(() => {
 
 const protocolLabel = (p) => ({ tcp: 'TCP', udp: 'UDP', http: 'HTTP（网站）', https: 'HTTPS（网站）' }[p] || p.toUpperCase())
 
+/** 可用协议的展示文案。 */
+const protocolText = computed(() => allowedProtocols.value.map((p) => p.toUpperCase()).join(' / '))
+
+/** 隧道数上限。0 表示不限，此时不显示分母。 */
+const maxTunnels = computed(() => {
+  const n = props.state.group?.max_tunnels
+  return n && n > 0 ? n : 0
+})
+
+/** 流量用量文案：有配额时显示「已用 / 配额」。 */
+const trafficText = computed(() => {
+  const used = fmtBytes(props.state.traffic_used)
+  const quota = Number(props.state.traffic_quota || 0)
+  return quota > 0 ? `${used} / ${fmtBytes(quota)}` : used
+})
+
 /** 分组限制提示。为空表示不限，不显示。 */
 const groupHint = computed(() => {
   const g = props.state.group
@@ -435,7 +486,9 @@ async function run(fn, successText) {
   }
 }
 
-const refresh = () => run(() => api.refresh(), '配置已同步')
+// 曾经有个「立即同步」按钮，现已移除：自动同步每 20 秒跑一次，
+// 手动触发最快也只是省下这几秒，却要用户理解「为什么还需要点它」。
+// 后端接口保留（api.refresh 仍可用），需要时能随时加回入口。
 const start = () => run(() => api.start(), '已启动连接')
 const stop = () => run(() => api.stop(), '已断开连接')
 const logout = () => run(() => api.logout())
@@ -687,6 +740,45 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* ---- 账户信息条 ---- */
+
+.account {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 26px;
+  padding: 12px 18px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.acc {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.acc > span {
+  font-size: 11.5px;
+  color: #9ca3af;
+}
+
+.acc > b {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #0f172a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 流量超额时用红色点出来——这是最需要用户立刻知道的一件事 */
+.acc-err {
+  color: #b91c1c;
+}
+
 /* 同步异常时用暖色提示，但不用红色报错样式：
    网络抖动是常态，每 20 秒闪一次红色会让人以为坏了。 */
 .sync-warn {

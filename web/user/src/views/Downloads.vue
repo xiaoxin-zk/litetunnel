@@ -51,14 +51,6 @@
                 <el-empty description="管理员尚未上传客户端安装包" />
               </template>
             </el-table>
-            <el-alert
-              type="warning"
-              :closable="false"
-              show-icon
-              style="margin-top: 12px"
-              title="当前从本站服务器分发客户端"
-              description="管理员可在「系统设置 → 站点」中填写外部下载地址（如 GitHub Releases），改为从官方发布页分发。"
-            />
           </template>
         </div>
       </el-col>

@@ -33,7 +33,7 @@ ProtectSystem=full
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 LockPersonality=true
 

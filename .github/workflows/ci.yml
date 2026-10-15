@@ -585,6 +585,13 @@ jobs:
         working-directory: client/windows
         run: go mod tidy
 
+      # 只测子包，不测 main：main 依赖 //go:embed frontend/dist，
+      # 没构建前端就跑不了。而这里最容易坏掉的是解析逻辑
+      # （netstat / tasklist 的输出格式），它全在子包里。
+      - name: Unit tests
+        working-directory: client/windows
+        run: go test ./internal/...
+
       - name: Build
         working-directory: client/windows
         shell: pwsh

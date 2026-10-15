@@ -154,6 +154,40 @@
           <em class="muted">你的服务在本机监听的端口</em>
         </label>
 
+        <!-- 从本机监听的服务里点选。
+             多数用户并不知道自己的服务跑在哪个端口，让他们去查
+             是把程序该解决的问题推给了用户。 -->
+        <div class="scan-wrap">
+          <button class="btn-ghost mini" :disabled="scanning" @click="toggleScan">
+            {{ scanning ? '正在扫描本机服务…' : showScan ? '收起服务列表' : '从本机服务中选择' }}
+          </button>
+          <span v-if="scanErr" class="scan-err">{{ scanErr }}</span>
+
+          <div v-if="showScan && !scanning" class="scan-list">
+            <input
+              v-model="scanFilter"
+              class="scan-filter"
+              placeholder="按端口或进程名过滤"
+              spellcheck="false"
+            />
+            <div v-if="!filteredServices.length" class="scan-empty">
+              没找到正在监听的服务。请确认你的服务已经启动，然后重新打开这个列表。
+            </div>
+            <div
+              v-for="s in filteredServices"
+              :key="s.proto + ':' + s.port"
+              class="scan-item"
+              :class="{ rec: s.recommended }"
+              @click="pickService(s)"
+            >
+              <span class="mono scan-port">{{ s.port }}</span>
+              <span class="scan-proto">{{ s.proto.toUpperCase() }}</span>
+              <span class="scan-proc">{{ s.process || '未知进程' }}</span>
+              <span v-if="s.recommended" class="scan-badge">像是你的服务</span>
+            </div>
+          </div>
+        </div>
+
         <label class="field">
           <span>本机地址</span>
           <input v-model="form.localIp" placeholder="127.0.0.1" spellcheck="false" />
@@ -249,6 +283,71 @@ const createOpen = ref(false)
 const showAdvanced = ref(false)
 const dialogError = ref('')
 const form = ref({ name: '', type: 'tcp', localIp: '127.0.0.1', localPort: null, remotePort: null })
+
+// ---- 本机服务探测 ----
+
+const showScan = ref(false)
+const scanning = ref(false)
+const scanErr = ref('')
+const scanFilter = ref('')
+const services = ref([])
+
+/** 过滤后的服务列表。
+ *
+ * 不筛选时也截断：一台跑了一阵的机器上系统服务可能上百条，
+ * 全部铺出来反而找不到自己要的那个。 */
+const filteredServices = computed(() => {
+  const q = scanFilter.value.trim().toLowerCase()
+  if (!q) return services.value.slice(0, 60)
+  return services.value
+    .filter((s) => String(s.port).includes(q) || (s.process || '').toLowerCase().includes(q))
+    .slice(0, 60)
+})
+
+async function toggleScan() {
+  if (showScan.value) {
+    showScan.value = false
+    return
+  }
+  showScan.value = true
+  // 已经扫过就直接复用：反复扫描会启动 netstat 与 tasklist 两个进程，
+  // 在慢机器上有可见的卡顿。
+  if (!services.value.length) {
+    await scanServices()
+  }
+}
+
+async function scanServices() {
+  scanning.value = true
+  scanErr.value = ''
+  try {
+    services.value = (await api.listLocalServices()) || []
+  } catch (e) {
+    scanErr.value = typeof e === 'string' ? e : e?.message || '无法读取本机服务列表'
+  } finally {
+    scanning.value = false
+  }
+}
+
+/** 选中一个服务，把端口、协议、监听地址一并带入表单。 */
+function pickService(s) {
+  form.value.localPort = s.port
+
+  // 协议必须跟着服务走。选到 UDP 服务却建了 TCP 隧道是最典型的踩坑，
+  // 而现象是「隧道建好了但连不上」，用户基本不可能自己想到原因。
+  if (allowedProtocols.value.includes(s.proto)) {
+    form.value.type = s.proto
+  }
+
+  // 监听在具体地址（非通配）上的服务，把地址也带过去；
+  // 否则会在隧道里填 127.0.0.1，而服务其实绑在局域网 IP 上，照样连不通。
+  if (s.addr && s.addr !== '0.0.0.0' && s.addr !== '::') {
+    form.value.localIp = s.addr === '::1' ? '127.0.0.1' : s.addr
+  }
+
+  showScan.value = false
+  flash(`已选择 ${s.process || '服务'}（${s.port}/${s.proto.toUpperCase()}）`)
+}
 
 // ---- 兑换码 ----
 const redeemOpen = ref(false)
@@ -783,6 +882,105 @@ watch(
    网络抖动是常态，每 20 秒闪一次红色会让人以为坏了。 */
 .sync-warn {
   color: #b45309;
+}
+
+/* ---- 本机服务选择 ---- */
+
+.scan-wrap {
+  margin: -6px 0 14px;
+}
+
+.scan-err {
+  display: block;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: #b91c1c;
+  line-height: 1.6;
+}
+
+.scan-list {
+  margin-top: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  overflow-y: auto;
+  /* 系统服务可能有上百条，限高避免把对话框撑到屏幕外 */
+  max-height: 230px;
+  background: #fff;
+}
+
+.scan-filter {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 9px 12px;
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+  position: sticky;
+  top: 0;
+  background: #fff;
+}
+
+.scan-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 13px;
+}
+
+.scan-item:last-child {
+  border-bottom: none;
+}
+
+.scan-item:hover {
+  background: #f8fafc;
+}
+
+.scan-item.rec {
+  border-left: 2px solid #10b981;
+}
+
+.scan-port {
+  font-weight: 600;
+  color: #0f172a;
+  min-width: 56px;
+}
+
+.scan-proto {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #6b7280;
+  background: #f1f5f9;
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+
+.scan-proc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #374151;
+}
+
+.scan-badge {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #047857;
+  background: #ecfdf5;
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+
+.scan-empty {
+  padding: 14px 12px;
+  font-size: 13px;
+  color: #6b7280;
+  line-height: 1.7;
 }
 
 /* ---- 弹层（新建隧道 / 兑换码）---- */

@@ -89,6 +89,10 @@ const mock = {
   ServerMailEnabled: async () => false,
   SendEmailCode: async () => {},
   ResetPassword: async () => {},
+  ListLocalServices: async () => [
+    { port: 25565, proto: 'tcp', addr: '0.0.0.0', pid: 1234, process: 'java.exe', recommended: true },
+    { port: 8211, proto: 'udp', addr: '0.0.0.0', pid: 2345, process: 'PalServer.exe', recommended: true }
+  ],
   CreateTunnel: async () => mockConnectedState,
   DeleteTunnel: async () => mockConnectedState,
   SetTunnelStatus: async () => mockConnectedState,
@@ -114,6 +118,8 @@ export const api = {
   sendEmailCode: (serverUrl, email, scene) => go.SendEmailCode(serverUrl, email, scene),
   resetPassword: (serverUrl, account, oldPassword, emailCode, newPassword) =>
     go.ResetPassword(serverUrl, account, oldPassword, emailCode, newPassword),
+  // 枚举本机正在监听的服务，供用户点选而不是手填端口
+  listLocalServices: () => go.ListLocalServices(),
   // 隧道管理。remotePort 传 0 表示由服务端自动分配端口，
   // 界面默认不暴露这个参数。
   createTunnel: (name, type, localIp, localPort, remotePort) =>

@@ -20,6 +20,7 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/xiaoxin-zk/litetunnel/client/internal/frpc"
+	"github.com/xiaoxin-zk/litetunnel/client/internal/localsvc"
 )
 
 // TunnelVO 隧道视图对象。
@@ -403,6 +404,14 @@ func (a *App) currentCredential() (base, apiKey string, err error) {
 		return "", "", errors.New("尚未接入，请先连接")
 	}
 	return base, apiKey, nil
+}
+
+// ListLocalServices 枚举本机正在监听的服务，供用户在建隧道时点选。
+//
+// 刻意不要求已登录：用户完全可能在连接之前就想看看自己有哪些服务，
+// 而这个动作既不访问网络、也不涉及账号数据。
+func (a *App) ListLocalServices() ([]localsvc.Service, error) {
+	return localsvc.List()
 }
 
 // CreateTunnel 创建一条隧道。

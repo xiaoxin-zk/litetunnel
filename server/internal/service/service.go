@@ -268,10 +268,47 @@ func AllowedProtocols(g *model.Group) map[string]bool {
 	return out
 }
 
+// FormatBandwidthHuman 把 bit/s 限速转成给人看的形式。
+//
+// 与 FormatBandwidth 的分工必须分清楚，两者不可混用：
+//
+//   - FormatBandwidth  产出**写给 frp 的配置值**：字节/秒 + KB/MB 后缀
+//   - FormatBandwidthHuman 产出**显示给用户的文案**：bit/s + Mbps/Kbps
+//
+// 之前用户控制台直接复用了前者，结果是管理员在后台填「4 Mbps」、
+// 用户在控制台看到「512.00KB」——明明是同一个值，但一个是 bit 口径、
+// 一个是 byte 口径，用户只会以为自己被少给了带宽。
+//
+// 进制用 1024 而不是 1000：必须与后台分组表单的换算保持一致
+// （表单是 bandwidth_limit / 1024 / 1024），否则同一个限速在
+// 两处会显示成不同的数字，反而制造新的困惑。
+func FormatBandwidthHuman(bitsPerSec int64) string {
+	if bitsPerSec <= 0 {
+		return ""
+	}
+	const (
+		k = 1024.0
+		m = 1024.0 * 1024.0
+	)
+	b := float64(bitsPerSec)
+	switch {
+	case b >= m:
+		// 用 -1 精度输出最短表示：4 就显示 "4"，2.5 就显示 "2.5"。
+		return strconv.FormatFloat(b/m, 'f', -1, 64) + " Mbps"
+	case b >= k:
+		return strconv.FormatFloat(b/k, 'f', -1, 64) + " Kbps"
+	default:
+		return strconv.FormatInt(bitsPerSec, 10) + " bps"
+	}
+}
+
 // FormatBandwidth 将 bit/s 转为 frp 可识别的限速字符串。
 //
 // 注意：frp 的 BandwidthQuantity 仅接受 "MB" 与 "KB" 后缀，
 // 且语义为「字节/秒」。因此这里必须先除以 8 再格式化。
+//
+// 这个函数的输出会直接写进 frpc.toml，不要用它做界面展示——
+// 展示请用 FormatBandwidthHuman。
 func FormatBandwidth(bitsPerSec int64) string {
 	if bitsPerSec <= 0 {
 		return ""

@@ -201,7 +201,9 @@ func (h *Handler) profileVO(u *model.User) gin.H {
 			"max_ports":           g.MaxPorts,
 			"traffic_quota":       g.TrafficQuota,
 			"bandwidth_limit":     g.BandwidthLimit,
-			"bandwidth_limit_str": service.FormatBandwidth(g.BandwidthLimit),
+			// 给用户看的文案用 Human 版本（Mbps 口径），
+			// 与后台分组表单填写的数字保持一致。
+			"bandwidth_limit_str": service.FormatBandwidthHuman(g.BandwidthLimit),
 			"allow_protocols":     g.AllowProtocols,
 			"allow_custom_domain": g.AllowCustomDomain,
 		}
@@ -502,10 +504,18 @@ type ClientDownload struct {
 // 只读取固定目录下的一级文件，且拒绝任何路径穿越，
 // 目录不存在时返回空列表而不是报错。
 func (h *Handler) ClientDownloads(c *gin.Context) {
+	// 配置了外部下载地址（通常是 GitHub Releases）时只返回该地址，
+	// 不列本地目录：两套来源同时出现会让用户不知道该点哪个，
+	// 而且外部地址往往版本更新，本地那份可能是旧的。
+	if url := strings.TrimSpace(h.svc.Settings.Get(service.KeySiteClientDownloadURL)); url != "" {
+		httpx.OK(c, gin.H{"download_url": url, "files": []ClientDownload{}})
+		return
+	}
+
 	dir := h.svc.Cfg.ClientDistDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		httpx.OK(c, []ClientDownload{})
+		httpx.OK(c, gin.H{"download_url": "", "files": []ClientDownload{}})
 		return
 	}
 	list := make([]ClientDownload, 0, len(entries))
@@ -528,7 +538,7 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 		})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-	httpx.OK(c, list)
+	httpx.OK(c, gin.H{"download_url": "", "files": list})
 }
 
 // ClientDownloadFile 下载指定的客户端安装包。
@@ -575,7 +585,7 @@ func (h *Handler) tunnelVO(t *model.Tunnel) gin.H {
 		"online":               h.svc.Runtime.IsTunnelOnline(t.ID),
 		"traffic_used":         t.TrafficUsed,
 		"bandwidth_limit":      t.BandwidthLimit,
-		"bandwidth_limit_str":  service.FormatBandwidth(t.BandwidthLimit),
+		"bandwidth_limit_str":  service.FormatBandwidthHuman(t.BandwidthLimit),
 		"use_encryption":       t.UseEncryption,
 		"use_compression":      t.UseCompression,
 		"last_online_at":       t.LastOnlineAt,

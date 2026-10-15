@@ -53,7 +53,8 @@
             <el-descriptions-item label="分组到期">
               {{ profile?.group_expire_at ? formatTime(profile.group_expire_at) : '长期有效' }}
             </el-descriptions-item>
-            <el-descriptions-item label="账户余额">
+            <!-- 余额只在站点启用支付后展示：没有充值入口时它没有任何操作意义 -->
+            <el-descriptions-item v-if="paymentEnabled" label="账户余额">
               ¥ {{ ((profile?.balance || 0) / 100).toFixed(2) }}
             </el-descriptions-item>
             <el-descriptions-item label="注册时间">{{ formatTime(profile?.created_at) }}</el-descriptions-item>
@@ -96,14 +97,25 @@
 </template>
 
 <script setup>
-import { inject, reactive, ref, watch } from 'vue'
+import { inject, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { profileApi, TOKEN_KEY } from '../api'
+import { profileApi, publicApi, TOKEN_KEY } from '../api'
 import { formatTime } from '../utils/format'
 
 const props = defineProps({ profile: Object })
 const router = useRouter()
+// 站点是否启用支付。未启用时不展示余额（没有充值入口，显示它只会造成困惑）。
+const paymentEnabled = ref(false)
+
+onMounted(async () => {
+  try {
+    const s = await publicApi.settings()
+    paymentEnabled.value = !!s?.payment_enabled
+  } catch {
+    paymentEnabled.value = false
+  }
+})
 const reloadProfile = inject('reloadProfile', null)
 
 const formRef = ref()

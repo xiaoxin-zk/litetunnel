@@ -5,31 +5,61 @@
         <div class="lt-card">
           <div class="lt-card-title">
             <span>客户端下载</span>
-            <el-button link :icon="Refresh" @click="load">刷新</el-button>
+            <el-button v-if="!downloadUrl" link :icon="Refresh" @click="load">刷新</el-button>
           </div>
 
-          <el-table :data="files" v-loading="loading" stripe>
-            <el-table-column label="文件" prop="name" min-width="220">
-              <template #default="{ row }">
-                <el-icon style="vertical-align: -2px"><Monitor /></el-icon>
-                <span style="margin-left: 6px">{{ row.name }}</span>
+          <!-- 管理员配置了外部下载地址（通常是 GitHub Releases）：
+               直接引导过去，不列本地文件。 -->
+          <template v-if="downloadUrl">
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              title="客户端由官方发布页提供"
+              description="点击下方按钮前往下载。发布页同时提供历史版本与校验信息，建议始终使用最新版。"
+              style="margin-bottom: 16px"
+            />
+            <el-button type="primary" size="large" :icon="Download" style="width: 100%" @click="openDownloadUrl">
+              前往下载客户端
+            </el-button>
+            <div class="lt-muted" style="margin-top: 12px; word-break: break-all; line-height: 1.7">
+              {{ downloadUrl }}
+            </div>
+          </template>
+
+          <!-- 未配置外部地址：回退到服务器本地目录分发 -->
+          <template v-else>
+            <el-table :data="files" v-loading="loading" stripe>
+              <el-table-column label="文件" prop="name" min-width="220">
+                <template #default="{ row }">
+                  <el-icon style="vertical-align: -2px"><Monitor /></el-icon>
+                  <span style="margin-left: 6px">{{ row.name }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="大小" width="110">
+                <template #default="{ row }">{{ fmtBytes(row.size) }}</template>
+              </el-table-column>
+              <el-table-column label="更新时间" width="160">
+                <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
+              </el-table-column>
+              <el-table-column label="操作" width="100">
+                <template #default="{ row }">
+                  <el-button link type="primary" @click="downloadFile(row.name)">下载</el-button>
+                </template>
+              </el-table-column>
+              <template #empty>
+                <el-empty description="管理员尚未上传客户端安装包" />
               </template>
-            </el-table-column>
-            <el-table-column label="大小" width="110">
-              <template #default="{ row }">{{ fmtBytes(row.size) }}</template>
-            </el-table-column>
-            <el-table-column label="更新时间" width="160">
-              <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
-            </el-table-column>
-            <el-table-column label="操作" width="100">
-              <template #default="{ row }">
-                <el-button link type="primary" @click="downloadFile(row.name)">下载</el-button>
-              </template>
-            </el-table-column>
-            <template #empty>
-              <el-empty description="管理员尚未上传客户端安装包" />
-            </template>
-          </el-table>
+            </el-table>
+            <el-alert
+              type="warning"
+              :closable="false"
+              show-icon
+              style="margin-top: 12px"
+              title="当前从本站服务器分发客户端"
+              description="管理员可在「系统设置 → 站点」中填写外部下载地址（如 GitHub Releases），改为从官方发布页分发。"
+            />
+          </template>
         </div>
       </el-col>
 
@@ -125,16 +155,30 @@ import { formatBytes, formatTime } from '../utils/format'
 const files = ref([])
 const info = ref({})
 const loading = ref(false)
+// 管理员配置的外部下载地址，为空时回退到本地目录分发
+const downloadUrl = ref('')
 
 function fmtBytes(v) {
   return formatBytes(v)
 }
 
+/** 在新标签打开外部下载页。
+ *
+ * 用 window.open 而不是直接跳转：用户可能正在对照本页的「三步接入」
+ * 操作，跳走会打断流程。加 noopener 防止新页面通过 window.opener 反向操作本页。 */
+function openDownloadUrl() {
+  if (!downloadUrl.value) return
+  window.open(downloadUrl.value, '_blank', 'noopener,noreferrer')
+}
+
 async function load() {
   loading.value = true
   try {
-    const [f, i] = await Promise.all([clientApi.downloads(), clientApi.info()])
-    files.value = f || []
+    const [d, i] = await Promise.all([clientApi.downloads(), clientApi.info()])
+    // 后端在配置了外部地址时返回 { download_url, files }，
+    // 未配置时 files 为本地目录内容、download_url 为空。
+    files.value = d?.files || []
+    downloadUrl.value = d?.download_url || ''
     info.value = i || {}
   } finally {
     loading.value = false

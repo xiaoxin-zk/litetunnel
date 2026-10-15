@@ -30,6 +30,16 @@
           <el-form-item label="ICP 备案号">
             <el-input v-model="form['site.icp']" placeholder="如 京ICP备xxxxxxxx号，留空则不显示" />
           </el-form-item>
+          <el-form-item label="客户端下载地址">
+            <el-input
+              v-model="form['site.client_download_url']"
+              placeholder="https://github.com/你的账号/仓库/releases/latest"
+            />
+            <span class="hint">
+              填写后控制台的「客户端下载」页会引导用户前往该地址，不再从本站服务器分发。
+              留空则回退到本地目录（<code>LT_CLIENT_DIST_DIR</code>）分发
+            </span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 

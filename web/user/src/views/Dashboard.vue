@@ -59,7 +59,10 @@
             <span>可用协议</span>
             <b>{{ (profile?.group?.allow_protocols || '-').toUpperCase() }}</b>
           </div>
-          <div class="quota-row">
+          <!-- 余额只在站点启用了支付后展示。
+               没开支付就没有充值入口，此时恒为 0 的余额只会让人困惑
+               「这钱哪来的、怎么用、为什么充不了」。 -->
+          <div v-if="paymentEnabled" class="quota-row">
             <span>余额</span>
             <b>¥ {{ ((profile?.balance || 0) / 100).toFixed(2) }}</b>
           </div>
@@ -72,7 +75,7 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
-import { statsApi, profileApi } from '../api'
+import { statsApi, profileApi, publicApi } from '../api'
 import { formatBytes, formatTime } from '../utils/format'
 
 const props = defineProps({ profile: Object })
@@ -81,34 +84,42 @@ const loading = ref(false)
 const stats = ref({})
 const series = ref([])
 const chartRef = ref()
+// 站点是否启用了支付。未启用时不展示任何与余额/充值相关的入口。
+const paymentEnabled = ref(false)
 let chart = null
 
-const cards = computed(() => [
-  {
-    label: '隧道总数',
-    value: stats.value.tunnel_total ?? 0,
-    sub: `在线 ${stats.value.tunnel_online ?? 0} 条`,
-    color: '#2563eb'
-  },
-  {
-    label: '已用流量',
-    value: fmtBytes(stats.value.traffic_used),
-    sub: `配额 ${quotaText.value}`,
-    color: stats.value.traffic_exceeded ? '#dc2626' : '#0f172a'
-  },
-  {
-    label: '在线客户端',
-    value: stats.value.tunnel_online ?? 0,
-    sub: '实时在线隧道数',
-    color: '#059669'
-  },
-  {
-    label: '账户余额',
-    value: '¥ ' + ((stats.value.balance || 0) / 100).toFixed(2),
-    sub: '可通过兑换码充值',
-    color: '#7c3aed'
+const cards = computed(() => {
+  const list = [
+    {
+      label: '隧道总数',
+      value: stats.value.tunnel_total ?? 0,
+      sub: `在线 ${stats.value.tunnel_online ?? 0} 条`,
+      color: '#2563eb'
+    },
+    {
+      label: '已用流量',
+      value: fmtBytes(stats.value.traffic_used),
+      sub: `配额 ${quotaText.value}`,
+      color: stats.value.traffic_exceeded ? '#dc2626' : '#0f172a'
+    },
+    {
+      label: '在线客户端',
+      value: stats.value.tunnel_online ?? 0,
+      sub: '实时在线隧道数',
+      color: '#059669'
+    }
+  ]
+  // 余额卡片同样受支付开关控制：没有充值入口时它没有意义。
+  if (paymentEnabled.value) {
+    list.push({
+      label: '账户余额',
+      value: '¥ ' + ((stats.value.balance || 0) / 100).toFixed(2),
+      sub: '可通过兑换码或在线充值获取',
+      color: '#7c3aed'
+    })
   }
-])
+  return list
+})
 
 const quotaText = computed(() => {
   const q = stats.value.traffic_quota ?? props.profile?.traffic_quota ?? 0
@@ -169,6 +180,16 @@ function renderChart() {
   })
 }
 
+async function loadSettings() {
+  try {
+    const s = await publicApi.settings()
+    paymentEnabled.value = !!s?.payment_enabled
+  } catch {
+    // 探测失败时按「未启用支付」处理：少显示总比误导用户去充值好。
+    paymentEnabled.value = false
+  }
+}
+
 async function load() {
   loading.value = true
   try {
@@ -182,7 +203,11 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await loadSettings()
+  await load()
+})
+
 watch(() => props.profile, () => load())
 window.addEventListener('resize', () => chart?.resize())
 </script>

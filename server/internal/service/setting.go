@@ -88,6 +88,13 @@ const (
 	KeySiteName         SettingKey = "site.name"
 	KeySiteAnnouncement SettingKey = "site.announcement"
 	KeySiteICP          SettingKey = "site.icp"
+	// KeySiteClientDownloadURL 是客户端下载地址。
+	//
+	// 填写后控制台的「客户端下载」页会直接引导用户去该地址（通常是
+	// GitHub Releases），而不是列出服务器本地目录里的文件。
+	// 这样做的好处是客户端不再需要人工搬运到服务器、也不会因为
+	// 服务器磁盘被大文件占满而出问题；留空则回退到本地目录分发。
+	KeySiteClientDownloadURL SettingKey = "site.client_download_url"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -175,6 +182,7 @@ var settingSpecs = []settingSpec{
 	{Key: KeySiteName, Default: func(c *config.Config) string { return c.SMTP.SiteName }},
 	{Key: KeySiteAnnouncement, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteICP, Default: func(*config.Config) string { return "" }},
+	{Key: KeySiteClientDownloadURL, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。

@@ -615,6 +615,12 @@ func (a *App) applySync() (cfgChanged bool, err error) {
 		if err := writeFrpcConfig(cfgText); err != nil {
 			return false, err
 		}
+		// 把「哪一行变了」写进日志。
+		//
+		// 自动同步在配置变化时会重启 frpc，表现为「隧道莫名断一下」。
+		// 没有这条信息的话，用户只知道「又重启了」，而我们从日志里
+		// 完全看不出是哪一行变了——只能靠猜。有了它一眼就能定位。
+		a.emitLog("服务端配置有变化，已更新本地 frpc.toml（" + diffHint(prevCfg, cfgText) + "）")
 	}
 
 	a.mu.Lock()
@@ -681,6 +687,52 @@ func (a *App) emitNotice(msg string) {
 		return
 	}
 	wailsruntime.EventsEmit(a.ctx, "notice", msg)
+}
+
+// emitLog 往客户端的运行日志里追加一行。
+//
+// 与 frpc 自己的输出走同一个通道，这样用户在界面上看到的顺序
+// 就是真实发生的顺序——排查时序问题时这一点很重要。
+func (a *App) emitLog(line string) {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(a.ctx, "log", "[系统] "+line)
+}
+
+// diffHint 给出两份配置的第一处差异，用于日志。
+//
+// 只在排查时用，所以刻意保持简单：逐行比对，报第一处不同。
+// 配置只有几十行，这个开销可以忽略。
+func diffHint(prev, cur string) string {
+	if prev == "" {
+		return "首次写入"
+	}
+	pl := strings.Split(prev, "\n")
+	cl := strings.Split(cur, "\n")
+
+	n := len(pl)
+	if len(cl) < n {
+		n = len(cl)
+	}
+	for i := 0; i < n; i++ {
+		if pl[i] != cl[i] {
+			return fmt.Sprintf("第 %d 行 %q → %q", i+1, shortLine(pl[i]), shortLine(cl[i]))
+		}
+	}
+	if len(pl) != len(cl) {
+		return fmt.Sprintf("行数 %d → %d", len(pl), len(cl))
+	}
+	// 逐行相同却没判等，说明差异在行分隔符或首尾空白上。
+	return "逐行一致，差异在空白字符"
+}
+
+func shortLine(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 64 {
+		return s[:64] + "…"
+	}
+	return s
 }
 
 // Refresh 手工同步（界面上的「立即同步」）。

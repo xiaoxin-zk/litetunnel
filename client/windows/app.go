@@ -182,6 +182,17 @@ func (a *App) startup(ctx context.Context) {
 	}
 }
 
+// shutdown 在客户端退出前被调用，确保 frpc 子进程一并结束。
+//
+// 这是「正常关闭」这条路径的清理。异常退出（崩溃、被任务管理器强杀、
+// 系统关机时的强制终止）走不到这里，由 frpc 包里的 Job Object 兜底——
+// 两者是互补关系，缺任何一层都会留下孤儿进程。
+func (a *App) shutdown(ctx context.Context) {
+	if err := a.mgr.Stop(); err != nil {
+		log.Printf("[client] 退出时停止 frpc 失败: %v", err)
+	}
+}
+
 // ---- 状态 ----
 
 // GetState 返回当前完整状态。

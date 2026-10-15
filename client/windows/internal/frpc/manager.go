@@ -132,6 +132,17 @@ func (m *Manager) Start(configPath string) error {
 
 	m.appendLog(fmt.Sprintf("[系统] 已启动 frpc（PID %d）", cmd.Process.Pid))
 
+	// 把子进程绑到一个「随本进程终止而终止」的 Job Object。
+	//
+	// Windows 上父进程退出不会自动结束子进程，不绑的话用户关掉客户端后
+	// frpc 会继续在后台跑。放在解锁之后调用：它会做几次系统调用，
+	// 没必要占着锁。
+	//
+	// 失败不致命（会退化为「仅在正常关闭时清理」），所以只记一行日志。
+	if err := attachToJob(cmd); err != nil {
+		m.appendLog("[系统] 提示：未能绑定进程生命周期，异常退出时可能残留 frpc 进程")
+	}
+
 	go m.pump(stdout)
 	go m.pump(stderr)
 

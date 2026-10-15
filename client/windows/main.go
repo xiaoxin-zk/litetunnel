@@ -31,6 +31,10 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 245, G: 247, B: 251, A: 1},
 		OnStartup:        app.startup,
+		// 关闭窗口时必须显式停掉 frpc：
+		// Windows 上父进程退出不会结束子进程，不处理的话用户点 X 之后
+		// frpc.exe 会继续在后台跑，端口仍被占用、隧道仍在转发。
+		OnShutdown: app.shutdown,
 		Bind: []any{
 			app,
 		},

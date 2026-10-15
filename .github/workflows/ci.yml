@@ -535,9 +535,14 @@ jobs:
           # 下发给客户端的配置里取——那正是 frpc 实际会带上的东西。
           cfg=$(curl -fsS -H "Authorization: Bearer $apikey" "$BASE/api/user/client/config")
           frpuser=$(printf '%s' "$cfg" | sed -n 's/^user = "\([^"]*\)".*/\1/p' | head -1)
-          token=$(printf '%s' "$cfg" | sed -n 's/.*lt_token = "\([^"]*\)".*/\1/p' | head -1)
+          # 键名与 service.MetaTokenKey 一致（"token"）。
+          # 必须锚定 metadatas 那一行：配置里还有 auth.token，
+          # 只匹配 "token = " 会把 frps 的全局令牌当成每用户凭据取出来，
+          # 而那个值校验不过，失败原因会指向完全错误的方向。
+          token=$(printf '%s' "$cfg" | sed -n 's/^metadatas = { token = "\([^"]*\)".*/\1/p' | head -1)
           if [ -z "$frpuser" ] || [ -z "$token" ]; then
             echo "::error::cannot extract frp user/token from client config"
+            # 打出来便于比对：键名或格式变了要能一眼看出
             printf '%s\n' "$cfg"
             exit 1
           fi

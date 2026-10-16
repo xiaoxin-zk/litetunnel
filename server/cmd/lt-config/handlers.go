@@ -108,6 +108,11 @@ func (s *service) handleApply(w http.ResponseWriter, r *http.Request) {
 		failJSON(w, http.StatusForbidden, errors.New("本服务以只渲染模式启动（LT_CFG_APPLY=false），不会重建容器"))
 		return
 	}
+	// 与 /render 共用同一把锁：否则容器可能重建在「文件替换到一半」的瞬间，
+	// 起出来的进程读到的就是一份新旧混合的配置。
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	out, err := s.composeUp()
 	if err != nil {
 		failJSON(w, http.StatusBadGateway, err)

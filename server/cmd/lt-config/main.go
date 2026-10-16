@@ -4,10 +4,10 @@
 //
 // 面板上的「域名与证书」页保存配置后，由本服务：
 //
-//	1. 把配置合并进部署目录的 .env（只有白名单里的键能被覆盖）；
-//	2. 用 deploy 目录下的模板渲染 Caddyfile 与 frps.toml；
-//	3. 用**将要上线的那个镜像**校验渲染结果，不通过就不写盘；
-//	4. 写入文件并重建 caddy / frps 容器。
+//  1. 把配置合并进部署目录的 .env（只有白名单里的键能被覆盖）；
+//  2. 用 deploy 目录下的模板渲染 Caddyfile 与 frps.toml；
+//  3. 用**将要上线的那个镜像**校验渲染结果，不通过就不写盘；
+//  4. 写入文件并重建 caddy / frps 容器。
 //
 // # 为什么校验和应用必须放在宿主机
 //
@@ -52,6 +52,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -233,6 +234,16 @@ func writable(dir string) error {
 type service struct {
 	token string
 	paths paths
+
+	// applyMu 把「渲染 → 写盘 → 重建容器」整段串行化。
+	//
+	// 两个并发的 /render 会交错读 .env、写三个文件并各自触发一次容器重建：
+	// 磁盘上的配置可能来自两次请求的混合，容器则被重建两轮。而 /apply
+	// （只用磁盘上的文件重建）与 /render 并发时，容器甚至可能重建在
+	// 「文件只替换了一半」的瞬间。
+	//
+	// 面板通常只有一个页面在调它，但接口的安全性不该建立在调用方克制上。
+	applyMu sync.Mutex
 
 	caddyImage   string
 	frpsImage    string

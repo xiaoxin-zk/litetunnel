@@ -8,6 +8,24 @@ import (
 	"strings"
 )
 
+// 产物文件的权限。集中在这里定义，避免「某处 0644、某处 0600」这种
+// 看代码看不出来、只有 ls -l 才能发现的分叉。
+const (
+	// modeSecret 用于含凭据的文件：.env 与 frps.toml。
+	//
+	// .env 里有 DNS API 凭据、JWT 密钥与数据库口令；frps.toml 里有 frps 的
+	// 全局 token 与管理 API 密码。0644 意味着同机器上的**任何**普通账号都能
+	// 读走它们——足以伪装成客户端接入网关，或者直接调用 frps 管理接口。
+	//
+	// 0600 不会挡住容器：lt-config 以 root 运行（deploy/systemd/lt-config.service
+	// 的 User=root），文件属主就是 root，而以 root 运行的 frps 容器读属主为
+	// root、属主位可读的文件，不需要任何额外能力位。
+	modeSecret os.FileMode = 0o600
+	// modeConfig 用于不含凭据的产物：Caddyfile 里只有域名与 {env.*} 引用，
+	// 凭据在容器环境变量里。
+	modeConfig os.FileMode = 0o644
+)
+
 // envFile 是部署目录下的 .env，按行保存以便「只改动需要改的那几行」。
 //
 // 为什么不整体重写：.env 是运维手工维护的文件，里面全是注释与分组。
@@ -80,16 +98,91 @@ func (e *envFile) set(key, value string) bool {
 	return changed
 }
 
-// write 原子写入。
+// content 返回写回磁盘的完整内容。
+func (e *envFile) content() string {
+	return strings.Join(e.lines, "\n") + "\n"
+}
+
+// write 原子写入 .env。
 //
-// secret 为真时把权限收紧到 0600：这个文件里有 DNS API 凭据、
-// JWT 密钥与数据库口令，默认的 0644 在同机多用户场景下等于公开。
-func (e *envFile) write(secret bool) error {
-	mode := os.FileMode(0o600)
-	if !secret {
-		mode = 0o644
+// 权限**无条件**为 0600：这个文件里有 DNS API 凭据、JWT 密钥与数据库口令。
+// 早期版本只在「本次请求带了凭据字段」时才收紧权限，那等于让文件权限取决于
+// 调用方这一次带了哪些字段——一个省略字段的合法请求就能把它放回 0644。
+func (e *envFile) write() error {
+	return writeFileAtomic(e.path, e.content(), modeSecret)
+}
+
+// stagedFile 是一个已经落到临时文件、但尚未替换到目标路径的产物。
+//
+// 为什么要有这一层：Caddyfile、frps.toml 与 .env 是**互相引用**的一组文件
+// （Caddyfile 里的域名要与 frps.toml 的 subDomainHost 一致，.env 里的凭据
+// 要被 Caddyfile 的 {env.X} 取到）。写成「写完一个再写下一个」的话，中途
+// 失败会在磁盘上留下新旧混合的状态，而它要到下一次容器重建时才以配置错误
+// 的形式暴露出来。两阶段的做法是：候选内容全部准备好之后，再逐个替换。
+type stagedFile struct {
+	name string
+	path string
+	tmp  string
+}
+
+// stageFile 把内容写进同目录的临时文件并设好权限，内容尚未生效。
+func stageFile(name, path, content string, mode os.FileMode) (*stagedFile, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".lt-config-tmp-*")
+	if err != nil {
+		return nil, err
 	}
-	return writeFileAtomic(e.path, strings.Join(e.lines, "\n")+"\n", mode)
+	tmp := f.Name()
+	st := &stagedFile{name: name, path: path, tmp: tmp}
+
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		st.discard()
+		return nil, err
+	}
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		st.discard()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		st.discard()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		st.discard()
+		return nil, err
+	}
+	return st, nil
+}
+
+// commit 把候选内容原子替换到目标路径。
+func (s *stagedFile) commit() error {
+	return os.Rename(s.tmp, s.path)
+}
+
+// discard 放弃候选内容，删掉临时文件。成功 commit 之后调用它也无害。
+func (s *stagedFile) discard() {
+	_ = os.Remove(s.tmp)
+}
+
+// ensureMode 把已存在文件的权限纠正到期望值，返回是否真的改动过。
+//
+// 内容没变时不会重写文件，但权限可能是早期版本留下的 0644（或被人手工放宽
+// 过）：只比较内容就跳过的话，那份宽松权限会一直留在磁盘上。
+func ensureMode(path string, mode os.FileMode) (bool, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	want := mode.Perm()
+	if fi.Mode().Perm() == want {
+		return false, nil
+	}
+	if err := os.Chmod(path, want); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // writeFileAtomic 先写同目录临时文件再 rename。
@@ -97,33 +190,15 @@ func (e *envFile) write(secret bool) error {
 // 直接截断原文件的话，写到一半失败（磁盘满、被 kill）就会留下半份配置，
 // 而 Caddy 与 frps 都会拒绝加载——一次失败变成一次停机。
 func writeFileAtomic(path, content string, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".lt-config-tmp-*")
+	st, err := stageFile(filepath.Base(path), path, content, mode)
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	defer func() {
-		// 成功路径上文件已被 rename，这里的 Remove 会失败，忽略即可。
-		_ = os.Remove(tmp)
-	}()
-
-	if _, err := f.WriteString(content); err != nil {
-		_ = f.Close()
+	if err := st.commit(); err != nil {
+		st.discard()
 		return err
 	}
-	if err := f.Chmod(mode); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return nil
 }
 
 // sortedKeys 返回有序键名，便于输出稳定的日志与结果。

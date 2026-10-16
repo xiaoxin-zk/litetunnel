@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -682,6 +683,14 @@ func TestEmailCodeKeepsOldCodeWhenDeliveryFails(t *testing.T) {
 	if out.Attempts < mailMaxAttempts {
 		t.Errorf("应记录重试次数，实际 %d", out.Attempts)
 	}
+	// 不会重发了，正文（含明文验证码）就该立刻抹掉，而不是等记录过期——
+	// 数据库备份或只读泄露期间，留在库里的明文凭据仍然可用。
+	if out.Body != "" {
+		t.Error("确定不再重发后应清空正文")
+	}
+	if out.Payload != "" {
+		t.Error("确定不会激活后应清空参数")
+	}
 }
 
 // TestEmailCodeActivatesOnDelivery 覆盖送达之后的行为：新码生效、旧码作废。
@@ -1279,6 +1288,194 @@ func TestTrafficCollectorRestoresBaselineOnStart(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("采集器启动时应先恢复采样基线，否则重启后会重复计入当天流量")
+}
+
+// TestTrafficCollectorSkipsWhenBaselineUnavailable 覆盖「基线读失败仍继续采集」。
+//
+// 读不到基线却照常采集，与「没有基线」是同一件事：当天累计值会被整个算成
+// 新增量，用户配额被凭空扣掉一大截。所以读失败时必须跳过这一轮，等下个周期
+// 重试；恢复之后要能自动继续。
+func TestTrafficCollectorSkipsWhenBaselineUnavailable(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	u := &model.User{Username: "skipcollect", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20091,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	// frps 今天已经累计了 5000 字节。
+	frps.total.Store(5000)
+
+	// 制造「基线读不出来」：把基线表删掉。
+	if err := svc.DB.Migrator().DropTable(&model.TrafficBaseline{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartTrafficCollector(ctx)
+
+	// 给它足够时间跑第一次（被跳过的）采集。
+	//
+	// 观测点用「在线状态」而不是「已用流量」：这一轮里落库本身也会失败
+	// （基线表刚被删掉，flushTraffic 的事务会整体回滚），所以只看流量的话，
+	// 旧代码也能「碰巧」通过。在线状态是在落库**之前**更新的，能干净地区分
+	// 「跳过采集」与「采集了但落库失败」。
+	time.Sleep(700 * time.Millisecond)
+	if svc.Runtime.IsTunnelOnline(tun.ID) {
+		t.Fatal("基线不可用时不该采集（会把当天累计值整个记成新增量），本轮连在线状态都不该更新")
+	}
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 0 {
+		t.Fatalf("基线不可用时不该记入流量，实际已记 %d", got)
+	}
+
+	// 基线表恢复后，下一轮应当自动继续，并把当天累计值作为基线对齐。
+	if err := svc.DB.AutoMigrate(&model.TrafficBaseline{}); err != nil {
+		t.Fatalf("重建表失败: %v", err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if tunnelTrafficUsed(t, svc, tun.ID) == 5000 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("基线恢复后应继续采集，实际已记 %d，期望 5000", tunnelTrafficUsed(t, svc, tun.ID))
+}
+
+// TestDeliveredCodeIsValidFromDeliveryTime 覆盖「重试/积压导致收到已过期的码」。
+//
+// 有效期若从**入队**时刻起算，发件箱重试（1/2/4/8 分钟）加上积压很容易让用户
+// 收到一个已经失效的码：邮件正文写着「10 分钟内有效」，实际一到手就过期。
+// 所以入队时只存 TTL，有效期从**送达时刻**起算。
+func TestDeliveredCodeIsValidFromDeliveryTime(t *testing.T) {
+	svc, _ := newMailTestServices(t)
+
+	const email = "ttl@example.com"
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("入队应成功: %v", err)
+	}
+
+	// 结构断言：入队时存的是 TTL，而不是一个「入队时刻 + 有效期」的绝对时间。
+	var queued model.MailOutbox
+	if err := svc.DB.Where("to_addr = ?", email).First(&queued).Error; err != nil {
+		t.Fatalf("读发件箱失败: %v", err)
+	}
+	if !strings.Contains(queued.Payload, "ttl_seconds") {
+		t.Fatalf("载荷应记录 TTL（有效期从送达起算），实际 %s", queued.Payload)
+	}
+	if strings.Contains(queued.Payload, "expire_at") {
+		t.Fatalf("载荷不该记录绝对过期时间（排队久了就会过期），实际 %s", queued.Payload)
+	}
+
+	// 模拟这封信在发件箱里压了很久（进程停机、SMTP 故障等）。
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", queued.ID).
+		Update("created_at", time.Now().Add(-2*time.Hour)).Error; err != nil {
+		t.Fatalf("调整入队时间失败: %v", err)
+	}
+
+	deliverAll(svc)
+
+	var rec model.EmailCode
+	if err := svc.DB.Where("email = ?", email).Order("id desc").First(&rec).Error; err != nil {
+		t.Fatalf("送达后应创建验证码: %v", err)
+	}
+	// 有效期必须从现在起算：压了两小时之后送达，用户仍应有完整的 10 分钟。
+	if rec.ExpireAt.Before(time.Now().Add(9 * time.Minute)) {
+		t.Fatalf("有效期应从送达时刻起算，实际 %s（距今 %s）",
+			rec.ExpireAt, time.Until(rec.ExpireAt).Round(time.Second))
+	}
+}
+
+// TestMailActionRetriedWithoutResending 覆盖「激活失败被永久标为失败」。
+//
+// 邮件已经送达、用户手里有验证码，此时数据库瞬时故障让激活失败。若把两者绑成
+// 一步，整封邮件会被标成 failed 而不再重试——用户拿着一个库里不存在的码，
+// 谁也救不回来。所以「已送达」与「凭据已生效」必须能分别重试，且**不重发邮件**。
+func TestMailActionRetriedWithoutResending(t *testing.T) {
+	svc, fm := newMailTestServices(t)
+
+	const email = "retryaction@example.com"
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("入队应成功: %v", err)
+	}
+
+	// 制造「激活失败」：把验证码表删掉，激活事务必然失败。
+	if err := svc.DB.Migrator().DropTable(&model.EmailCode{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+
+	deliverAll(svc)
+
+	if fm.sentCount() != 1 {
+		t.Fatalf("应发出 1 封，实际 %d 封", fm.sentCount())
+	}
+	var row model.MailOutbox
+	if err := svc.DB.Where("to_addr = ?", email).First(&row).Error; err != nil {
+		t.Fatalf("读发件箱失败: %v", err)
+	}
+	if row.Status != model.MailDelivered {
+		t.Fatalf("邮件已送达但激活失败时应停在 delivered（等待重试），实际 %q", row.Status)
+	}
+	if row.ActionAttempts == 0 {
+		t.Error("应记录激活尝试次数")
+	}
+	// 正文在送达那一刻就该清掉（不会重发，留着只是把明文验证码多放一段时间）。
+	if row.Body != "" {
+		t.Error("送达后应清空正文（含明文验证码）")
+	}
+	// 参数要留着——激活还要用。
+	if row.Payload == "" {
+		t.Error("激活完成之前不该清空参数")
+	}
+
+	// 数据库恢复后重试：应当只补做激活，不重发邮件。
+	if err := svc.DB.AutoMigrate(&model.EmailCode{}); err != nil {
+		t.Fatalf("重建表失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+		Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("调整重试时间失败: %v", err)
+	}
+	deliverAll(svc)
+
+	if fm.sentCount() != 1 {
+		t.Fatalf("重试激活不该重发邮件，实际已发 %d 封", fm.sentCount())
+	}
+
+	if err := svc.DB.Where("to_addr = ?", email).First(&row).Error; err != nil {
+		t.Fatalf("读发件箱失败: %v", err)
+	}
+	if row.Status != model.MailSent {
+		t.Fatalf("激活成功后应标为 sent，实际 %q（错误: %s）", row.Status, row.LastErr)
+	}
+	if row.Payload != "" {
+		t.Error("激活完成后应清空参数（里面是验证码摘要）")
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).
+		Count(&n).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("激活后应有一条可用的验证码，实际 %d 条", n)
+	}
 }
 
 // TestCreateTunnelWaitsForUserLock 覆盖「建隧道与删除用户互斥」。

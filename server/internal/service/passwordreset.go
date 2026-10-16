@@ -98,8 +98,10 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	if err := s.queueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
 		UserID:    u.ID,
 		TokenHash: hash,
-		ExpireAt:  time.Now().Add(resetTokenTTL),
-		IP:        truncate(ip, 64),
+		// 存 TTL 而不是绝对时间：有效期从**送达时刻**起算，否则排队或重试
+		// 拖久了，用户点开链接时它已经过期。
+		TTLSeconds: int(resetTokenTTL.Seconds()),
+		IP:         truncate(ip, 64),
 	}); err != nil {
 		log.Printf("[reset] 重置邮件入队失败（账号 %d），原有令牌未受影响: %v", u.ID, err)
 		return nil

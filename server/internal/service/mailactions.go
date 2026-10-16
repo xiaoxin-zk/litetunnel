@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,20 +14,27 @@ import (
 //
 // 验证码记录**不在这封信进发件箱时就创建**，而是等它真的送达之后才创建：
 // 只有这样，投递失败时才不会出现「新码没到、旧码已废」的窘境。
+//
+// 有效期同样从**送达时刻**起算（存 TTL 而不是绝对时间）。存绝对时间的话，
+// 发件箱重试（1/2/4/8 分钟）加上积压，很容易让用户收到一个已经过期的码：
+// 邮件正文写着「10 分钟内有效」，而实际上它一到手就已经失效。
 type emailCodePayload struct {
-	Email    string    `json:"email"`
-	Scene    string    `json:"scene"`
-	CodeHash string    `json:"code_hash"`
-	ExpireAt time.Time `json:"expire_at"`
-	IP       string    `json:"ip"`
+	Email    string `json:"email"`
+	Scene    string `json:"scene"`
+	CodeHash string `json:"code_hash"`
+	// TTLSeconds 是验证码自**送达**起的有效秒数。
+	TTLSeconds int    `json:"ttl_seconds"`
+	IP         string `json:"ip"`
 }
 
 // resetLinkPayload 是「重置密码链接」类邮件的凭据参数。
+//
+// TTL 的含义同上：从送达时刻起算，而不是从入队时刻。
 type resetLinkPayload struct {
-	UserID    uint      `json:"user_id"`
-	TokenHash string    `json:"token_hash"`
-	ExpireAt  time.Time `json:"expire_at"`
-	IP        string    `json:"ip"`
+	UserID     uint   `json:"user_id"`
+	TokenHash  string `json:"token_hash"`
+	TTLSeconds int    `json:"ttl_seconds"`
+	IP         string `json:"ip"`
 }
 
 // applyMailAction 在邮件**确认送达之后**让新凭据生效，并作废同类的旧凭据。
@@ -61,6 +69,9 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return err
 	}
+	if p.TTLSeconds <= 0 {
+		return errors.New("验证码缺少有效期参数")
+	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
 		// 同一邮箱同一场景只保留最新一个可用验证码：否则用户连点几次后，
 		// 前面几封邮件里的码也都还能用，等于扩大了攻击面。
@@ -73,7 +84,8 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 			Email:    p.Email,
 			Scene:    p.Scene,
 			CodeHash: p.CodeHash,
-			ExpireAt: p.ExpireAt,
+			// 有效期从**现在**（送达时刻）起算。
+			ExpireAt: time.Now().Add(time.Duration(p.TTLSeconds) * time.Second),
 			IP:       p.IP,
 		}).Error
 	})
@@ -85,6 +97,9 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return err
 	}
+	if p.TTLSeconds <= 0 {
+		return errors.New("重置令牌缺少有效期参数")
+	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
 		// 同一账号只保留一个有效令牌：避免多封邮件里的链接同时可用。
 		if err := tx.Model(&model.PasswordResetToken{}).
@@ -95,8 +110,9 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return tx.Create(&model.PasswordResetToken{
 			UserID:    p.UserID,
 			TokenHash: p.TokenHash,
-			ExpireAt:  p.ExpireAt,
-			IP:        p.IP,
+			// 有效期从**现在**（送达时刻）起算。
+			ExpireAt: time.Now().Add(time.Duration(p.TTLSeconds) * time.Second),
+			IP:       p.IP,
 		}).Error
 	})
 }

@@ -127,8 +127,12 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			Email:    email,
 			Scene:    scene,
 			CodeHash: hex.EncodeToString(sum[:]),
-			ExpireAt: now.Add(emailCodeTTL),
-			IP:       truncate(ip, 64),
+			// 存 TTL 而不是绝对时间：有效期从**送达时刻**起算。
+			// 存绝对时间的话，发件箱重试（1/2/4/8 分钟）加上积压，很容易让
+			// 用户收到一个已经过期的码——邮件正文写着「10 分钟内有效」，
+			// 实际上一到手就失效了。
+			TTLSeconds: int(emailCodeTTL.Seconds()),
+			IP:         truncate(ip, 64),
 		}); err != nil {
 		// 找回场景必须保持「不暴露账号是否存在」：这里已经走完了账号判断，
 		// 返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。

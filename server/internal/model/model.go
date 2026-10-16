@@ -354,7 +354,14 @@ func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens"
 const (
 	// MailPending 待发送（含等待重试）。
 	MailPending = "pending"
-	// MailSent 已送达（并已执行凭据动作）。
+	// MailDelivered 邮件已送达，但凭据动作还没完成。
+	//
+	// 必须与 MailSent 分开：凭据激活是数据库操作，可能瞬时失败。若把它和
+	// 「发送」绑成一步，激活失败就会把整封邮件标成 failed 而不再重试——
+	// 用户手里拿着一个验证码，库里却没有对应记录，谁也救不回来。
+	// 分开之后，这一步只重试**数据库动作**，不会重复发信。
+	MailDelivered = "delivered"
+	// MailSent 已送达且凭据动作已完成，整件事结束。
 	MailSent = "sent"
 	// MailFailed 重试次数耗尽，已放弃。需要人工介入。
 	MailFailed = "failed"
@@ -381,23 +388,29 @@ const (
 // 落库之后：重启不丢信、失败可重试，并且**凭据只在送达之后才生效**
 // （见 Payload 与 service 里的 applyMailAction）。
 //
-// 注意 Body 里含有明文验证码/重置链接，这是「可重发」的前提。发出去之后
-// 由清理逻辑删除记录，不长期保留。
+// Body 里含有明文验证码/重置链接，这是「可重发」的前提，但也意味着它是一份
+// 敏感数据。因此它的生命周期被压到最短：**发送成功那一刻就清空**（不会再重发），
+// 而不是等 24 小时后随记录一起清理——数据库备份或只读泄露期间，留在库里的
+// 明文凭据仍然可用。Payload 里是凭据摘要与参数，在凭据动作完成后同样清空。
 type MailOutbox struct {
 	ID uint `gorm:"primarykey" json:"id"`
 	// To 收件人。列名用 to_addr：to 在部分数据库里是保留字。
 	To      string `gorm:"column:to_addr;size:255;not null;index" json:"to"`
 	Subject string `gorm:"size:255;not null" json:"subject"`
-	Body    string `gorm:"type:text;not null" json:"-"`
+	Body    string `gorm:"type:text" json:"-"`
 
 	// Kind 决定送达后执行哪个凭据动作。
 	Kind string `gorm:"size:32;not null;index" json:"kind"`
 	// Payload 是凭据动作所需的参数（JSON）。
 	Payload string `gorm:"type:text" json:"-"`
 
-	Attempts int    `gorm:"not null;default:0" json:"attempts"`
-	Status   string `gorm:"size:16;not null;index;default:pending" json:"status"`
-	// NextAt 下次尝试时间，用于退避。
+	// Attempts 是**发送**的尝试次数。
+	Attempts int `gorm:"not null;default:0" json:"attempts"`
+	// ActionAttempts 是凭据激活的尝试次数，与发送分开计数：
+	// 两者失败原因完全不同（网络 vs 数据库），混在一起会让排查无从下手。
+	ActionAttempts int    `gorm:"not null;default:0" json:"action_attempts"`
+	Status         string `gorm:"size:16;not null;index;default:pending" json:"status"`
+	// NextAt 下次尝试时间，用于退避（发送与激活共用）。
 	NextAt  time.Time `gorm:"not null;index" json:"next_at"`
 	LastErr string    `gorm:"size:255" json:"last_err"`
 

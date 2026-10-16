@@ -330,16 +330,31 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 		//
 		// 顺序不能反：第一次采集如果先跑，就会拿空基线去算增量，把 frps 的
 		// 当天累计值整个记成新增量（用户配额被凭空扣掉一大截）。
-		s.loadTrafficBaseline()
-
-		// 启动即跑一次，避免控制台首屏空白。
-		s.collectTraffic(ctx)
+		//
+		// 读失败时**必须跳过采集**，而不是「读不到就当空基线」：空基线的效果
+		// 与「没有基线」完全一样——当天累计值会被整个记成新增量，正是这条
+		// 逻辑要防的事。数据库读失败通常是瞬时的，等下一轮重试即可。
+		baselineReady := s.loadTrafficBaseline()
+		if baselineReady {
+			// 启动即跑一次，避免控制台首屏空白。
+			s.collectTraffic(ctx)
+		} else {
+			log.Printf("[traffic] 采样基线尚未就绪，本轮跳过采集（下个周期重试）")
+		}
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if !baselineReady {
+					// 只在恢复时打一行：数据库长时间不可用时，每轮都打
+					// 只会把日志刷满，而结论一直是同一个。
+					if baselineReady = s.loadTrafficBaseline(); !baselineReady {
+						continue
+					}
+					log.Printf("[traffic] 采样基线已恢复，继续采集")
+				}
 				s.collectTraffic(ctx)
 			case <-gcTicker.C:
 				s.Runtime.GC(15 * time.Minute)
@@ -586,17 +601,21 @@ func (s *Services) flushTraffic(
 	return err
 }
 
-// loadTrafficBaseline 把当天的采样基线读回内存。采集器启动时调用一次。
+// loadTrafficBaseline 把当天的采样基线读回内存。返回是否读取成功。
 //
 // 不恢复的话，控制面重启后第一次采集会把 frps 的**当天累计值**整个当成
 // 新增量记一遍——用户配额被凭空扣掉一大截，统计翻倍。这只在「只重启控制面、
 // frps 没重启」时出现，而滚动升级恰好就是这个形态。
-func (s *Services) loadTrafficBaseline() {
+//
+// 返回值必须被调用方当回事：读失败时不能「当作空基线继续跑」——那与没有基线
+// 是同一件事，照样会把当天累计值重复记一遍。正确做法是跳过这一轮采集，
+// 等下个周期重试。
+func (s *Services) loadTrafficBaseline() bool {
 	today := time.Now().Format("2006-01-02")
 	var rows []model.TrafficBaseline
 	if err := s.DB.Where("date = ?", today).Find(&rows).Error; err != nil {
-		log.Printf("[traffic] 读取采样基线失败，本轮可能重复计入当天流量: %v", err)
-		return
+		log.Printf("[traffic] 读取采样基线失败，将跳过采集以避免重复计入当天流量: %v", err)
+		return false
 	}
 
 	m := make(map[string]trafficPair, len(rows))
@@ -611,6 +630,7 @@ func (s *Services) loadTrafficBaseline() {
 	if len(m) > 0 {
 		log.Printf("[traffic] 已恢复 %d 条采样基线（避免重启后重复计入当天流量）", len(m))
 	}
+	return true
 }
 
 // refreshQuotaFlags 刷新内存中的超额与禁用标记，供 frps 插件实时拦截。

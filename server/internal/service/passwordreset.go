@@ -266,9 +266,7 @@ func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error
 		}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.ClientSession{}).
-			Where("user_id = ?", userID).
-			Update("online", false).Error
+		return revokeClientSessionsTx(tx, userID)
 	})
 	if err != nil {
 		return err

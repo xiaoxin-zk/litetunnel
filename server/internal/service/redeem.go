@@ -229,6 +229,14 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 兑换成功后立刻重算运行时的超额标记。
+	//
+	// 这个标记是插件实时拦截的依据，平时靠流量采集刷新。而兑换（加流量、
+	// 换分组、延长有效期）恰恰是为了让已经超额的账号重新能用——如果 frps
+	// 管理接口恰好不可用，采集刷不动，用户就会看到「兑换成功了，但连接
+	// 依然被拒」，而且等多久都不会恢复。
+	s.refreshQuotaFor(userID)
 	return &result, nil
 }
 

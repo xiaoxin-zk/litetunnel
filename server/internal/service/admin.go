@@ -658,22 +658,37 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) erro
 	if err := s.DB.First(&g, groupID).Error; err != nil {
 		return fmt.Errorf("%w: 分组不存在", ErrInvalidParam)
 	}
-	return s.DB.Transaction(func(tx *gorm.DB) error {
+
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{"group_id": groupID}
 		if expireAt != nil {
 			updates["group_expire_at"] = *expireAt
 		}
-		if err := tx.Model(&model.User{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-			return err
+		res := tx.Model(&model.User{}).Where("id = ?", id).Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		// 用户不存在时必须报错。不看 RowsAffected 的话，改一个不存在的
+		// 用户会「成功」返回，管理员以为改好了，实际什么都没发生。
+		if res.RowsAffected == 0 {
+			return ErrNotFound
 		}
 		// 分组变化后刷新该用户所有隧道的限速快照。
-		if err := tx.Model(&model.Tunnel{}).Where("user_id = ?", id).
-			Update("bandwidth_limit", g.BandwidthLimit).Error; err != nil {
-			return err
-		}
-		s.refreshQuotaFor(id)
-		return nil
+		return tx.Model(&model.Tunnel{}).Where("user_id = ?", id).
+			Update("bandwidth_limit", g.BandwidthLimit).Error
 	})
+	if err != nil {
+		return err
+	}
+
+	// 配额刷新必须放在事务**提交之后**。
+	//
+	// 它内部要用主连接重新查一次用户，而 SQLite 默认只开一个连接
+	// （store.go 里 SetMaxOpenConns(1)）：事务占着那唯一的连接时，
+	// 这次查询永远等不到它释放，而事务又在等查询返回——整个请求就卡死在
+	// 那里。管理后台的表现是「点一下没反应」，日志里什么都没有。
+	s.refreshQuotaFor(id)
+	return nil
 }
 
 // AdminResetUserPassword 重置用户密码。

@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
@@ -225,6 +227,137 @@ func TestAdminSetUserStatusRecomputesQuotaOnEnable(t *testing.T) {
 	}
 	if svc.Runtime.IsQuotaExceeded(u.ID) {
 		t.Error("重新启用后应立即按真实配额重算，而不是等下一轮采集")
+	}
+}
+
+// TestAdminSetUserGroupDoesNotDeadlock 覆盖 SQLite 单连接下的自锁。
+//
+// AdminSetUserGroup 曾经在事务里调用 refreshQuotaFor，而后者要用**主连接**
+// 重新查一次用户。SQLite 默认只开一个连接（store.go 的 SetMaxOpenConns(1)）：
+// 事务占着那唯一的连接，这次查询永远等不到它释放，事务又在等查询返回——
+// 请求就永久卡在那里。管理后台的表现是「点一下没反应」，日志里什么都没有。
+//
+// 卡死无法用返回值断言，所以这里用超时把它变成一条会失败的用例。
+func TestAdminSetUserGroupDoesNotDeadlock(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "groupuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	g := &model.Group{
+		Name: "测试分组", MaxTunnels: 2, MaxPorts: 2,
+		TrafficQuota: 1 << 30, BandwidthLimit: 1 << 20,
+		AllowProtocols: "tcp", IsDefault: true,
+	}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- svc.AdminSetUserGroup(u.ID, g.ID, nil) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("调整分组失败: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("AdminSetUserGroup 卡住了：配额刷新必须在事务提交之后，否则 SQLite 单连接会自锁")
+	}
+}
+
+// TestAdminSetUserGroupRejectsUnknownUser 覆盖 RowsAffected 检查。
+//
+// 不看它的话，改一个不存在的用户会「成功」返回，管理员以为改好了，
+// 实际什么都没发生。
+func TestAdminSetUserGroupRejectsUnknownUser(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	g := &model.Group{
+		Name: "测试分组", MaxTunnels: 2, MaxPorts: 2,
+		TrafficQuota: 1 << 30, BandwidthLimit: 1 << 20,
+		AllowProtocols: "tcp", IsDefault: true,
+	}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+
+	if err := svc.AdminSetUserGroup(999999, g.ID, nil); err == nil {
+		t.Fatal("用户不存在时必须报错，而不是静默成功")
+	}
+}
+
+// TestDeleteAccountDropsRuntimeSessions 覆盖自助注销路径的会话清理。
+//
+// 管理员删除与密码重置都清了内存会话，自助注销曾经漏了：数据库里的会话行
+// 随事务删除，但插件热路径查的是内存会话表，命中后只看配额就放行——
+// 账号都注销了，已连接的 frpc 还能继续建新连接。
+func TestDeleteAccountDropsRuntimeSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	hashed, err := auth.HashPassword("Passw0rd12345")
+	if err != nil {
+		t.Fatalf("生成密码失败: %v", err)
+	}
+	u := &model.User{Username: "selfdel", Password: hashed, Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-selfdel-1"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID, Online: true,
+	}).Error; err != nil {
+		t.Fatalf("建会话失败: %v", err)
+	}
+
+	if err := svc.DeleteAccount(u.ID, "Passw0rd12345"); err != nil {
+		t.Fatalf("注销失败: %v", err)
+	}
+
+	if _, ok := svc.Runtime.LookupSession(runID); ok {
+		t.Error("注销后内存会话必须被清掉：插件热路径只查它，留着就还会放行新连接")
+	}
+}
+
+// TestRedeemRefreshesQuotaFlag 覆盖「兑换成功后仍被拒」。
+//
+// 超额标记是插件实时拦截的依据，平时靠流量采集刷新。兑换恰恰是为了让超额
+// 账号重新能用；如果 frps 管理接口不可用、采集刷不动，用户就会看到
+// 「兑换成功了，但连接依然被拒」，而且等多久都不会恢复。
+func TestRedeemRefreshesQuotaFlag(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "redeemuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	// 配额 1 字节、已用 2 字节 → 处于超额状态。
+	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Updates(map[string]any{"traffic_quota": 1, "traffic_used": 2}).Error; err != nil {
+		t.Fatalf("设置配额失败: %v", err)
+	}
+	svc.refreshQuotaFor(u.ID)
+	if !svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("前置条件不成立：该用户应处于超额状态")
+	}
+
+	code := &model.RedeemCode{
+		Code: "TEST-TRAFFIC-0001", Type: model.RedeemTypeTraffic,
+		Value: 1 << 30, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	if err := svc.DB.Create(code).Error; err != nil {
+		t.Fatalf("建兑换码失败: %v", err)
+	}
+
+	if _, err := svc.Redeem(u.ID, code.Code, "127.0.0.1"); err != nil {
+		t.Fatalf("兑换失败: %v", err)
+	}
+
+	if svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Error("兑换流量后应立即解除超额，而不是等下一轮采集")
 	}
 }
 

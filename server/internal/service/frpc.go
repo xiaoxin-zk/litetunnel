@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"gorm.io/gorm"
+
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -62,18 +64,28 @@ func (s *Services) ResetClientSecret(u *model.User) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
-		Update("client_secret", secret).Error; err != nil {
+
+	// 换凭据与让旧会话失效必须在**同一个事务**里。
+	//
+	// 分两步写会留下一个谁都说不清的中间态：凭据已经换掉、会话还没失效，
+	// 而接口此时报错返回。用户以为没成功，实际旧凭据已经作废（客户端连不上），
+	// 同时内存里的旧会话还在——插件热路径照样放行。两边都不对。
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.User{}).Where("id = ?", u.ID).
+			Update("client_secret", secret).Error; err != nil {
+			return err
+		}
+		return revokeClientSessionsTx(tx, u.ID)
+	})
+	if err != nil {
 		return "", err
 	}
 	u.ClientSecret = secret
 
-	// 光换凭据不够：已经登录的 frpc 手里那份旧配置里的凭据虽然失效了，
-	// 但它的**会话**还在，插件热路径只看会话与配额，会继续放行新连接。
-	// 必须把会话一起吊销，逼它下次回调走凭据复核。
-	if err := s.RevokeClientSessions(u.ID); err != nil {
-		return "", err
-	}
+	// 内存会话在事务提交之后再清。它不参与事务，但顺序不能反：
+	// 先清内存、事务又失败的话，用户手里那份凭据仍然有效，
+	// 而他的会话已经没了——客户端会被迫重连一次。
+	s.Runtime.DropUserSessions(u.ID)
 	return secret, nil
 }
 
@@ -88,13 +100,19 @@ func (s *Services) ResetClientSecret(u *model.User) (string, error) {
 // 说明清楚边界：已经建立的数据连接断不掉（那是 frps 与 frpc 之间的事，
 // 插件无权插手），但此后**新建**的连接会走凭据复核并被拒绝。
 func (s *Services) RevokeClientSessions(userID uint) error {
-	if err := s.DB.Model(&model.ClientSession{}).
-		Where("user_id = ?", userID).
-		Update("online", false).Error; err != nil {
+	if err := revokeClientSessionsTx(s.DB, userID); err != nil {
 		return err
 	}
 	s.Runtime.DropUserSessions(userID)
 	return nil
+}
+
+// revokeClientSessionsTx 是「让数据库里的会话失效」这一步，
+// 可被包进调用方自己的事务。
+func revokeClientSessionsTx(tx *gorm.DB, userID uint) error {
+	return tx.Model(&model.ClientSession{}).
+		Where("user_id = ?", userID).
+		Update("online", false).Error
 }
 
 // VerifyClientSecret 常量时间比较，抵御时序侧信道。

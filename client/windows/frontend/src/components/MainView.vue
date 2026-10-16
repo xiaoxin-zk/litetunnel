@@ -41,6 +41,10 @@
         <span>可用协议</span>
         <b>{{ protocolText }}</b>
       </div>
+      <div v-if="httpsEntry" class="acc">
+        <span>HTTPS 隧道入口</span>
+        <b>{{ httpsEntry }}</b>
+      </div>
       <div class="acc">
         <span>隧道数</span>
         <b>
@@ -507,11 +511,26 @@ const redeemCode = ref('')
 const allowedProtocols = computed(() => {
   const raw = props.state.group?.allow_protocols
   if (!raw) return ['tcp', 'udp', 'http', 'https']
-  return String(raw)
+  const list = String(raw)
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
+
+  // HTTPS 隧道与 HTTP 隧道的入口不是同一条：HTTP 走平台的 443（Caddy 终止
+  // TLS 后转发），HTTPS 需要平台在独立端口上做 SNI 透传，而那条入口只在
+  // 端到端模式下存在。没有入口时就把选项拿掉——留着它，用户只会建出一条
+  // 永远打不开的隧道，然后去查自己的证书和防火墙。
+  //
+  // 只在服务端明确下发 false 时才过滤：老版本服务端没有这个字段，
+  // 那时按原来的行为处理，不能因为字段缺失就把选项吃掉。
+  if (props.state.group && props.state.group.https_tunnel_enabled === false) {
+    return list.filter((p) => p !== 'https')
+  }
+  return list
 })
+
+/** HTTPS 隧道的公网入口（host:port），没有入口时为空。 */
+const httpsEntry = computed(() => props.state.group?.https_entry || '')
 
 const protocolLabel = (p) => ({ tcp: 'TCP', udp: 'UDP', http: 'HTTP（网站）', https: 'HTTPS（网站）' }[p] || p.toUpperCase())
 

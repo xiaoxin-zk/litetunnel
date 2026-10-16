@@ -192,12 +192,32 @@ type App struct {
 	// 由 start proxy success 置位，进程退出/主动停止/重新拉起时清掉。
 	registered map[uint]bool
 
+	// registeredAt 记录 registered 置位的时刻，用于「宽限期」校准。
+	//
+	// 标记本身只是一行日志的产物，是**瞬时**结论：进程不退出它就永远为真，
+	// 哪怕 frps 重启过、代理早被踢掉、frpc 正在无限重连。服务端的 online
+	// 才是权威，但它有延迟（采集 30 秒一轮 + 同步 20 秒一轮），所以只能
+	// 「先信本机、过了宽限期再信服务端」——没有这个时间戳就无从判断
+	// 「服务端说离线」到底是它还没采到，还是这条隧道真的掉了。
+	registeredAt map[uint]time.Time
+
 	// errEmitAt 是「上一次因错误推送状态」的时间，用于限频。
 	//
 	// frpc 的日志现在走 console，一次连接失败可能瞬间刷出上千行错误；每行都
 	// 推一次状态意味着反复序列化整个状态再发给前端。这里对同一隧道限到 1 秒
 	// 一次，重复的错误对用户没有新信息。
 	errEmitAt map[uint]time.Time
+
+	// logMu / logBuf / logKick 是日志的批量推送队列，见 appendLogLine。
+	//
+	// 不直接逐行 EventsEmit 的原因：frpc 出错时会瞬间刷出上千行，
+	// 每行一次 Wails 调用都要跨进程、序列化、唤醒 JS，这条桥会被堵住，
+	// 反过来把读取管道的协程也拖慢（管道写满后子进程跟着阻塞）。
+	logMu  sync.Mutex
+	logBuf []string
+	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
+	// 不排队也不阻塞——推送协程醒来时会把积压全部取走。
+	logKick chan struct{}
 
 	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。
 	//
@@ -260,8 +280,10 @@ func NewApp() *App {
 		applied:    map[uint]string{},
 		tunnelErrs: map[uint]tunnelErr{},
 		retries:    map[uint]*retryState{},
-		registered: map[uint]bool{},
-		errEmitAt:  map[uint]time.Time{},
+		registered:   map[uint]bool{},
+		registeredAt: map[uint]time.Time{},
+		errEmitAt:    map[uint]time.Time{},
+		logKick:      make(chan struct{}, 1),
 		startedAt:  time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
@@ -279,8 +301,11 @@ func NewApp() *App {
 // 原因见那里。
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// 日志出的第一行就进批量队列：只要开始产生日志，推送到前端的节奏就
+	// 由推送协程决定，而不是「一行一次 Wails 调用」。
+	a.startLogFlusher()
 	a.mgr.SetCallbacks(func(id uint, name, line string) {
-		wailsruntime.EventsEmit(a.ctx, "log", line)
+		a.appendLogLine(line)
 		switch {
 		case strings.Contains(line, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
@@ -408,6 +433,9 @@ func (a *App) shutdown(ctx context.Context) {
 	if err := a.mgr.StopAll(); err != nil {
 		log.Printf("[client] 退出时停止 frpc 失败: %v", err)
 	}
+	// 把队列里剩下的日志推出去：停止进程会产出「隧道已断开」「frpc 已退出」
+	// 这类收尾日志，攒在队列里不发，用户下次打开客户端时日志就断在退出前。
+	a.flushLogs()
 }
 
 // ---- 状态 ----
@@ -852,6 +880,13 @@ func (a *App) StartTunnel(id uint) (State, error) {
 		if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusActive); err != nil {
 			return a.GetState(), err
 		}
+		// 服务端状态已经改了，本机缓存也要跟上：GetState 直接读它，
+		// 不更新的话返回给前端的快照仍是「已停用」——用户点了开启，
+		// 界面上的开关却弹回去，直到下一轮后台同步（≤20 秒）才纠正。
+		a.applyLocalStatus(id, tunnelStatusActive)
+		if nt, ok := a.findTunnel(id); ok {
+			t = nt
+		}
 	}
 	if err := a.startTunnelProcess(t); err != nil {
 		a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
@@ -910,11 +945,43 @@ func (a *App) StopTunnel(id uint) (State, error) {
 		if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusDisabled); err != nil {
 			return a.GetState(), err
 		}
+		// 与 StartTunnel 同理：本机缓存先落下，界面上的开关立刻响应。
+		a.applyLocalStatus(id, tunnelStatusDisabled)
 	}
 	if err := a.stopTunnelProcess(t); err != nil {
 		return a.GetState(), err
 	}
-	return a.syncAndState(), nil
+
+	// 与 StartTunnel 对称：不在这里等整轮同步。
+	//
+	// 同步会为每条活动隧道各发一次配置请求（超时 15 秒），隧道一多或网络
+	// 一慢，停止按钮就要转很久——而本机进程其实已经停了、状态也已经更新。
+	// 后台同步照常跑（拿最新清单做最终对账），只是不再挡着返回。
+	//
+	// syncMu 仍由本函数持有（defer 解锁），因此这个协程会在返回之后才开始同步。
+	state := a.GetState()
+	a.emitState()
+	go func() {
+		a.syncMu.Lock()
+		defer a.syncMu.Unlock()
+		a.syncAndState()
+	}()
+	return state, nil
+}
+
+// applyLocalStatus 就地更新本机缓存的隧道状态。
+//
+// 只动本机那一份：服务端状态由调用方在此之前改完。抽出来是为了让开关操作
+// 与「返回给前端的快照」保持一致——快照落后一轮同步，用户会以为操作没生效。
+func (a *App) applyLocalStatus(id uint, status string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.tunnels {
+		if a.tunnels[i].ID == id {
+			a.tunnels[i].Status = status
+			return
+		}
+	}
 }
 
 // syncAndState 在**已持有 syncMu** 的前提下对账一次并广播最新状态。
@@ -1175,6 +1242,10 @@ func (a *App) applySync() (changed bool, err error) {
 	}
 
 	for _, t := range tunnels {
+		// 先校准「已注册」标记：本机还挂着「注册成功」的印象、而服务端已经
+		// 报告离线时，以服务端为准（详见 calibrateRegistered 的说明）。
+		a.calibrateRegistered(t.ID, t.Online)
+
 		if t.Status != tunnelStatusActive {
 			if a.mgr.Running(t.ID) {
 				if err := a.stopTunnelProcess(t); err != nil {
@@ -1478,7 +1549,7 @@ func (a *App) warnConfigCleanup(id uint, msg string) {
 // 不按运行中的进程来清，是因为一条隧道可能因为启动失败而没有进程：
 // 之后它被服务端删掉，这些记录就再也没有机会被访问或清理。
 //
-// 四张表都要清，包括 applied：它存的是「最近一次写入磁盘的配置原文」，
+// 每张按隧道记账的表都要清，包括 applied：它存的是「最近一次写入磁盘的配置原文」，
 // 每条几百字节到几 KB。反复「建了、删掉」会让它一直占着内存，
 // 而它的用途（判断配置有没有变）只对还存在的隧道有意义。
 //
@@ -1505,6 +1576,24 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 	for id := range a.cleanupWarned {
 		if !alive[id] {
 			delete(a.cleanupWarned, id)
+		}
+	}
+	// 下面这几张表是后加的，同样要清：它们都是「按隧道 id 记账」的小结构，
+	// 每项只有几十字节，但一条隧道被删掉之后就再没有人会读写它——
+	// 反复「建了、报错、删掉」会让它们随进程寿命一直长下去，属于纯粹的泄漏。
+	for id := range a.registered {
+		if !alive[id] {
+			delete(a.registered, id)
+		}
+	}
+	for id := range a.registeredAt {
+		if !alive[id] {
+			delete(a.registeredAt, id)
+		}
+	}
+	for id := range a.errEmitAt {
+		if !alive[id] {
+			delete(a.errEmitAt, id)
 		}
 	}
 }
@@ -1614,10 +1703,7 @@ func (a *App) Refresh() (State, error) {
 // 不带前缀的行是「客户端整体在做什么」（启动同步、用时统计）。
 // 混在一起会让用户以为启动统计也属于某条隧道。
 func (a *App) emitLog(msg string) {
-	if a.ctx == nil {
-		return
-	}
-	wailsruntime.EventsEmit(a.ctx, "log", time.Now().Format("15:04:05")+"  "+msg)
+	a.appendLogLine(time.Now().Format("15:04:05") + "  " + msg)
 }
 
 // emitTunnelLog 往运行日志里追加一行带隧道前缀的说明。
@@ -1627,11 +1713,82 @@ func (a *App) emitLog(msg string) {
 // 每条隧道一个进程之后，日志是多个进程交织在一起的，
 // 没有前缀就分不出哪一行属于哪条隧道。
 func (a *App) emitTunnelLog(name, msg string) {
+	a.appendLogLine(fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+}
+
+// ---- 日志的批量推送 ----
+
+// maxLogBatch 是一批日志的上限。
+//
+// 有上限是为了控制单次事件的大小：一次推几千行会让前端在一次事件处理里
+// 做几千次数组操作，首屏也要等更久才看到第一行。
+const maxLogBatch = 200
+
+// logFlushInterval 是日志批量推送的间隔。
+//
+// 取 120ms：略大于人眼能分辨的停顿，日志看起来仍是实时滚动的；而事件数
+// 上限变为约 8 次/秒，无论瞬间涌进多少行。frpc 连接失败时会在一瞬间刷出
+// 上千行错误，逐行推送意味着上千次跨进程调用——前端那边的 200ms 合并渲染
+// 只减少了 DOM 更新，挡不住这层开销，真正被堵住的是这条桥。
+const logFlushInterval = 120 * time.Millisecond
+
+// appendLogLine 把一行日志放进待推送队列。
+//
+// 所有往日志区写字的路径都必须走它（frpc 输出、客户端自己的说明），
+// 否则同一段时间里的日志会出现两种先后顺序。
+func (a *App) appendLogLine(line string) {
 	if a.ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "log",
-		fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+	a.logMu.Lock()
+	a.logBuf = append(a.logBuf, line)
+	full := len(a.logBuf) >= maxLogBatch
+	a.logMu.Unlock()
+
+	// 攒满一批就立刻推，不等下一个时间片：一味等间隔会让日志洪峰时的
+	// 延迟随着挤压行数一起增长（队列越长，轮到它越晚）。
+	if full {
+		select {
+		case a.logKick <- struct{}{}:
+		default:
+			// 推送协程还没处理完上一次通知：它醒来时会一次性取走全部积压。
+		}
+	}
+}
+
+// flushLogs 把队列里攒下的日志行成批推给前端。
+func (a *App) flushLogs() {
+	if a.ctx == nil {
+		return
+	}
+	a.logMu.Lock()
+	if len(a.logBuf) == 0 {
+		a.logMu.Unlock()
+		return
+	}
+	batch := a.logBuf
+	a.logBuf = nil
+	a.logMu.Unlock()
+
+	wailsruntime.EventsEmit(a.ctx, "logs", batch)
+}
+
+// startLogFlusher 启动批量推送协程，进程生命周期内常驻。
+//
+// logKick 为 nil 时这里仍要能工作：nil 通道在 select 里永远不就绪，
+// 于是退化成纯定时推送——不能因为少初始化一个 channel 就让日志彻底不显示。
+func (a *App) startLogFlusher() {
+	go func() {
+		ticker := time.NewTicker(logFlushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+			case <-a.logKick:
+			}
+			a.flushLogs()
+		}
+	}()
 }
 
 // recordTunnelErr 记下一条隧道的 frpc 错误（从原始输出行里取）。
@@ -1650,11 +1807,62 @@ func (a *App) setTunnelRegistered(id uint, up bool) {
 	if a.registered == nil {
 		a.registered = map[uint]bool{}
 	}
+	if a.registeredAt == nil {
+		a.registeredAt = map[uint]time.Time{}
+	}
 	if up {
 		a.registered[id] = true
+		a.registeredAt[id] = time.Now()
 		return
 	}
 	delete(a.registered, id)
+	delete(a.registeredAt, id)
+}
+
+// registeredGrace 是本机「已注册」标记不被服务端结论推翻的宽限期。
+//
+// 服务端 online 的延迟上限约 50 秒（采集 30 秒 + 同步 20 秒），
+// 留到 90 秒：小于它就把刚连上的隧道判成离线（界面一闪一闪），
+// 大于它则「服务端早就说离线、本地还显示运行中」会持续过久。
+const registeredGrace = 90 * time.Second
+
+// calibrateRegistered 用服务端的事实校准本机的「已注册」标记。
+//
+// 这条路径解决的是「界面长期显示运行中，实际早就掉线」：
+//
+//	frpc 报告 start proxy success → 本地标记置位；
+//	之后 frps 重启 / 代理被踢掉 / 连接被切断，frpc 进入重连循环，
+//	进程一直活着 → 本地标记永远为真，而服务端的 online 早已是 false。
+//
+// 宽限期内的服务端 false 不采信（那时它多半还没采到），过了宽限期则采信：
+// 清掉标记，并记下原因，让隧道行显示的是「服务端确认离线」而不是一片沉默。
+func (a *App) calibrateRegistered(id uint, serverOnline bool) {
+	a.mu.Lock()
+	if !a.registered[id] {
+		a.mu.Unlock()
+		return
+	}
+	if serverOnline {
+		// 服务端认了，顺带把时间戳刷新：下一次掉线要重新算宽限期。
+		if a.registeredAt != nil {
+			a.registeredAt[id] = time.Now()
+		}
+		a.mu.Unlock()
+		return
+	}
+	at, ok := a.registeredAt[id]
+	a.mu.Unlock()
+
+	if ok && time.Since(at) < registeredGrace {
+		return
+	}
+
+	a.setTunnelRegistered(id, false)
+	// 记原因，但不升级成「启动失败」：进程还在，frpc 自己会重连，
+	// 进退避只会让它更晚恢复。
+	if a.recordTunnelErrMsg(id, "服务端报告该隧道已离线（本机 frpc 仍在运行，可能正在重连）") {
+		a.emitStateThrottled(id)
+	}
 }
 
 // emitStateThrottled 推一次状态，但同一隧道 1 秒内只推一次。

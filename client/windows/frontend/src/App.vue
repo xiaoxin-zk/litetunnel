@@ -43,14 +43,24 @@ async function loadLogs() {
 // 一遍并触发一次渲染，上千行就是上千次，界面会明显卡住（鼠标划过列表都在卡）。
 //
 // 合并之后每 200 毫秒只重建一次，日志一条不少，只是显示晚一点点。
+//
+// 注意这一层**不减少事件数量**：主进程那侧已经按 120 毫秒成批推送（事件
+// 「logs」带数组），这里还会再合并一次，是因为多个批次可能在同一个渲染
+// 周期内到达——两边各管一段：主进程管跨进程调用的次数，这里管 DOM 更新次数。
 const pendingLogs = []
 // 缓冲上限：200 毫秒内涌入的极端量（例如日志被反复重试刷屏）也不至于把
 // 内存撑起来。界面本来就只保留最近 500 行，丢掉更早的那部分没有损失。
 const maxPendingLogs = 2000
 let logTimer = null
 
-function pushLog(line) {
-  pendingLogs.push(line)
+function pushLog(payload) {
+  // 主进程成批推送（数组）；也接受单行字符串，这样前端热重载、或与旧版
+  // 主进程混跑时都不会丢日志。
+  if (Array.isArray(payload)) {
+    for (const line of payload) pendingLogs.push(line)
+  } else {
+    pendingLogs.push(payload)
+  }
   if (pendingLogs.length > maxPendingLogs) {
     pendingLogs.splice(0, pendingLogs.length - maxPendingLogs)
   }
@@ -81,6 +91,7 @@ onMounted(async () => {
   onEvent('state', (payload) => {
     state.value = payload
   })
+  onEvent('logs', pushLog)
   onEvent('log', pushLog)
   onEvent('notice', (msg) => {
     notice.value = { text: msg, at: Date.now() }

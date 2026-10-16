@@ -202,24 +202,70 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		m.appendLog(tunnelID, tunnelName, "提示：未能绑定进程生命周期，异常退出时可能残留 frpc 进程")
 	}
 
-	go m.pump(tunnelID, tunnelName, stdout)
-	go m.pump(tunnelID, tunnelName, stderr)
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() {
+		defer pumps.Done()
+		m.pump(tunnelID, tunnelName, stdout)
+	}()
+	go func() {
+		defer pumps.Done()
+		m.pump(tunnelID, tunnelName, stderr)
+	}()
 
 	go func() {
+		// 等两个读取协程收工，再 Wait。
+		//
+		// os/exec 的文档写得很明确：Wait 会关闭管道，所以「在读完管道之前
+		// 调用 Wait」是不对的。进程退出时管道里往往还有最后几行没读完，
+		// 而最后几行恰恰是崩溃原因——那几行就这么丢了，日志会停在
+		// 一个看不出所以然的地方。
+		//
+		// 读取端会在写端关闭（进程退出）时自然拿到 EOF，正常情况下这里
+		// 只是多等几毫秒。超时是防御性的：万一有孙进程继承了管道，
+		// 不能让整个退出流程挂在原地——Stop 的 5 秒超时也在等这一步。
+		drained := make(chan struct{})
+		go func() {
+			pumps.Wait()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+			m.appendLog(tunnelID, tunnelName, "日志管道未在 2 秒内读取完毕，可能仍有输出未被记录")
+		}
+
 		err := cmd.Wait()
+
 		m.mu.Lock()
 		// 只清理仍指向本进程的记录：Stop 后紧接着 Start 会放入新的 *process，
 		// 这里无条件删除会把刚起来的那个进程从表里抹掉，
 		// 表现为「界面上显示未运行，实际进程还在」。
 		requested := false
+		current := false
 		if p, ok := m.procs[tunnelID]; ok && p.exitCh == exitCh {
 			requested = p.stopping
 			delete(m.procs, tunnelID)
+			current = true
 		}
 		m.mu.Unlock()
 		// 先通知等待者再写日志：让 Stop 尽早返回，
 		// 避免日志写入（可能触发前端事件）拖慢重启。
 		close(exitCh)
+
+		if !current {
+			// 这个进程已经被同一隧道的新进程取代了（Stop 之后紧接 Start
+			// 时，close(exitCh) 会让 Stop 先返回，回调可能随后才跑到这里）。
+			//
+			// exitCh 必须照常关闭（Stop 正在等它），但**不能**再回调 onExit：
+			// 上层会用这个回调清掉「已注册」标记，而那个标记现在是新进程的
+			// ——结果就是刚刚连上的隧道被标成「未连接」，用户看到刚打开
+			// 又变回未连接，然后下一轮同步才纠正。
+			//
+			// 日志照记：进程确实退出了，排查时需要看到它。
+			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
+			return
+		}
 
 		if err != nil {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出："+err.Error())

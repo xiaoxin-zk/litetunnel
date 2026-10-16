@@ -553,14 +553,23 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 
 // AdminDeleteUser 删除用户及其全部隧道与流量记录。
 func (s *Services) AdminDeleteUser(id uint) error {
-	// 端口要在删除前取出来：记录一删就再也查不回来了。
-	ports := s.tunnelPortsOf(id)
+	// 端口在**事务内**读取，删完之后再用（见下面 closePorts 的位置）。
+	//
+	// 事务外先读、再开事务删，中间有个竞态窗口：用户此刻并发创建一条隧道，
+	// 它会在读完之后才出现，随后被事务删掉——端口却不在回收清单里，
+	// 规则永久残留在宿主机防火墙上。
+	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		var u model.User
 		if err := tx.First(&u, id).Error; err != nil {
 			return ErrNotFound
 		}
+		var tunnels []model.Tunnel
+		if err := tx.Where("user_id = ? AND remote_port > 0", id).Find(&tunnels).Error; err != nil {
+			return err
+		}
+		ports = portsOfTunnels(tunnels)
 		if err := tx.Where("user_id = ?", id).Delete(&model.Tunnel{}).Error; err != nil {
 			return err
 		}
@@ -593,6 +602,14 @@ func (s *Services) AdminDeleteUser(id uint) error {
 	s.Runtime.DropUserSessions(id)
 
 	// 隧道没了，主机防火墙上的放行规则也要收回，否则会一直留在那里。
+	//
+	// 放在事务提交之后：回收失败（helper 不可达、端口受保护）不该让
+	// 已经完成的删除回滚；失败会记日志，由人工清理。
+	//
+	// 残留窗口说明：并发创建且晚于本事务快照的隧道，在 READ COMMITTED
+	// 下仍可能被 DELETE 删掉而没进 ports（SQL 没有「删除并返回」的统一
+	// 写法，RETURNING 也不是所有方言都支持）。这个窗口比事务外读取小得多，
+	// 且需要「删除用户的同时另一路正在建隧道」才会命中。
 	s.closePorts(ports)
 	return nil
 }
@@ -925,28 +942,62 @@ func (s *Services) ListAllTunnels(keyword, status string, userID uint, offset, l
 }
 
 // AdminSetTunnelStatus 启用/停用任意隧道。
+//
+// 与用户侧的 SetTunnelStatus 一样必须联动防火墙：停用即收回端口、
+// 启用即重新放行。管理员这条路径不联动的话，「停用」只改了数据库，
+// 主机防火墙上的规则仍然放行——后台显示已停用，端口其实还开着。
+// 而启动时的规则对齐只负责「补开活跃端口」，不会清理这种残留。
 func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
 		return ErrInvalidParam
 	}
-	res := s.DB.Model(&model.Tunnel{}).Where("id = ?", id).Update("status", status)
-	if res.Error != nil {
-		return res.Error
+
+	// 需要 Type 与 RemotePort 才能操作防火墙，先取出来。
+	var t model.Tunnel
+	if err := s.DB.First(&t, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
 	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
+
+	if err := s.DB.Model(&model.Tunnel{}).Where("id = ?", id).
+		Update("status", status).Error; err != nil {
+		return err
+	}
+
+	if t.RemotePort > 0 {
+		if status == model.TunnelStatusActive {
+			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
+		} else {
+			_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+		}
 	}
 	return nil
 }
 
-// AdminDeleteTunnel 删除任意隧道。
+// AdminDeleteTunnel 删除任意隧道并回收其端口。
 func (s *Services) AdminDeleteTunnel(id uint) error {
+	// 端口要在删除前读出来：记录删掉之后就查不回来了，
+	// 而防火墙规则会一直留在宿主机上。
+	var t model.Tunnel
+	if err := s.DB.First(&t, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+
 	res := s.DB.Where("id = ?", id).Delete(&model.Tunnel{})
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
 		return ErrNotFound
+	}
+
+	if t.RemotePort > 0 {
+		s.closePorts([]portProto{{port: t.RemotePort, proto: ProtoOfTunnel(t.Type)}})
 	}
 	return nil
 }

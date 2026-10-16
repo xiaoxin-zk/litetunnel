@@ -514,11 +514,19 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 	}
 
-	// 端口要在删除前取出来：记录一删就再也查不回来了，
-	// 而防火墙上的放行规则会一直留在宿主机上。
-	ports := s.tunnelPortsOf(userID)
+	// 端口在**事务内**读取，删完之后再用（见下面 closePorts 的位置）。
+	//
+	// 事务外先读、再开事务删，中间有个竞态窗口：此刻并发创建一条隧道，
+	// 它会在读完之后才出现，随后被事务删掉——端口却不在回收清单里，
+	// 规则永久残留在宿主机防火墙上。
+	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var tunnels []model.Tunnel
+		if err := tx.Where("user_id = ? AND remote_port > 0", userID).Find(&tunnels).Error; err != nil {
+			return err
+		}
+		ports = portsOfTunnels(tunnels)
 		if err := tx.Where("user_id = ?", userID).Delete(&model.Tunnel{}).Error; err != nil {
 			return err
 		}

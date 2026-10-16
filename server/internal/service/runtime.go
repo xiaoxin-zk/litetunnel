@@ -216,6 +216,9 @@ func (r *Runtime) DropSession(runID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.sessions, runID)
+	// 节流记录一并清掉：它只为「这个 runID 还活着」服务，
+	// 会话没了就没有保留价值，留着只会随客户端重连越积越多。
+	delete(r.touchAt, runID)
 }
 
 // DropUserSessions 注销某用户的全部会话，返回清理掉的条数。
@@ -231,6 +234,7 @@ func (r *Runtime) DropUserSessions(userID uint) int {
 	for runID, s := range r.sessions {
 		if s.UserID == userID {
 			delete(r.sessions, runID)
+			delete(r.touchAt, runID)
 			n++
 		}
 	}
@@ -297,6 +301,15 @@ func (r *Runtime) GC(maxIdle time.Duration) {
 	for k, v := range r.sessions {
 		if v.LastSeen.Before(cutoff) {
 			delete(r.sessions, k)
+			delete(r.touchAt, k)
+		}
+	}
+	// 还有一类节流记录没有对应会话：心跳对「库里存在、内存里没有」的
+	// runID 同样生效（重启后就是这样），它们只能按时间清。
+	// 不按时间清的话，客户端反复重连会让这张表只增不减。
+	for k, at := range r.touchAt {
+		if at.Before(cutoff) {
+			delete(r.touchAt, k)
 		}
 	}
 }

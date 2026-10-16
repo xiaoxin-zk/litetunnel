@@ -64,6 +64,25 @@ func TestHandleAllowsExplicitlySafeOp(t *testing.T) {
 	}
 }
 
+// TestNewUserConnRejectsMalformedBody 覆盖「解析失败就放行」。
+//
+// NewUserConn 是配额与封禁的实时拦截点，每次新建用户连接都会经过。
+// 读不懂身份时放行，等于在这个点上跳过拦截——与未知操作曾经的
+// allow() 是同一类问题，只是位置更关键。
+func TestNewUserConnRejectsMalformedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := New(nil, nil)
+	r := gin.New()
+	r.POST("/plugin", h.Handle)
+
+	// content 不是合法 JSON：解析必然失败。
+	rec := postPlugin(t, r, `{"op":"NewUserConn","content":`)
+	if res := decodeResponse(t, rec); !res.Reject {
+		t.Fatalf("NewUserConn 解析失败必须拒绝，实际放行: %s", rec.Body.String())
+	}
+}
+
 // TestHandleRejectsMalformedBody 覆盖请求体本身解析失败的情况。
 func TestHandleRejectsMalformedBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)

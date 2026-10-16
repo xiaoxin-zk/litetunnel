@@ -673,6 +673,35 @@ jobs:
           fi
           echo "PASS plugin rejects a proxy name without a user prefix"
 
+          # ---- NewUserConn：用户数据连接放行/拒绝 ----
+          #
+          # 这条是配额与封禁的实时拦截点，每次新建用户连接都会经过。
+          # 它同时也是「解析失败一律拒绝」这条 fail-closed 策略最容易误伤
+          # 的地方：一旦 frps 的载荷形状与我们预期不同，所有用户连接都会被
+          # 拒，而现象是「隧道在线但连不上」。所以正向必须有一条断言兜住。
+          #
+          # 载荷用凭据复核路径（run_id 为空、带 metas.token），
+          # 与真实回调在「首次登录后 run_id 尚未登记」时的形态一致。
+          newconn=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"NewUserConn\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"\"},\"proxy_name\":\"$frpuser.citunnel\",\"proxy_type\":\"tcp\",\"remote_addr\":\"127.0.0.1:12345\"}}" \
+            "$BASE/api/frps/plugin")
+          if printf '%s' "$newconn" | grep -q '"reject":true'; then
+            echo "::error::NewUserConn was rejected for a valid credential: $newconn"
+            exit 1
+          fi
+          echo "PASS plugin NewUserConn authorized with a valid credential"
+
+          # 反过来：载荷解析不出来时必须拒绝。
+          # 放行等于在这个拦截点上跳过配额与封禁判断。
+          badconn=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"op":"NewUserConn","content":' \
+            "$BASE/api/frps/plugin")
+          if ! printf '%s' "$badconn" | grep -q '"reject":true'; then
+            echo "::error::NewUserConn with a malformed body was not rejected: $badconn"
+            exit 1
+          fi
+          echo "PASS plugin rejects a malformed NewUserConn body"
+
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H 'Content-Type: application/json' -d '{"version":"0.1.0","op":"Ping","content":{}}' \

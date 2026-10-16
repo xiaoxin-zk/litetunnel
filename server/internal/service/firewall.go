@@ -121,18 +121,17 @@ type portProto struct {
 	proto string
 }
 
-// tunnelPortsOf 取出某用户当前所有已放行的隧道端口。
+// portsOfTunnels 把一批隧道映射成待回收的端口清单。
 //
-// 必须在删除之前取：隧道记录一旦删掉，端口号就再也查不回来了，
-// 而防火墙规则会留在宿主机上。启动时的规则对齐只负责「放行已有的」，
-// 刻意不清理孤立规则（那需要判断哪些是孤立的，误删会让管理员连不上机器）。
-func (s *Services) tunnelPortsOf(userID uint) []portProto {
-	var tunnels []model.Tunnel
-	if err := s.DB.Where("user_id = ? AND remote_port > 0", userID).
-		Find(&tunnels).Error; err != nil {
-		log.Printf("[firewall] 读取用户 %d 的隧道端口失败，删除后可能有残留规则: %v", userID, err)
-		return nil
-	}
+// 删除用户时要「先读端口、再删记录、最后回收」——顺序不能换：
+// 记录一删，端口号就再也查不回来了，而防火墙规则会留在宿主机上。
+// 启动时的规则对齐只负责「放行已有的」，刻意不清理孤立规则
+// （那需要判断哪些是孤立的，误删会让管理员连不上机器）。
+//
+// 读取放在调用方的事务里（传 tx 进来），而不是用主连接单独查一遍：
+// 事务外先读再删会漏掉「读完之后、删除之前」并发创建的隧道，
+// 那些隧道的记录被删掉，端口却不在回收清单里。
+func portsOfTunnels(tunnels []model.Tunnel) []portProto {
 	out := make([]portProto, 0, len(tunnels))
 	for i := range tunnels {
 		out = append(out, portProto{

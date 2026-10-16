@@ -532,7 +532,11 @@ func (h *Handler) onPing(req *request) response {
 func (h *Handler) onNewUserConn(req *request) response {
 	var content newUserConnContent
 	if err := json.Unmarshal(req.Content, &content); err != nil {
-		return allow()
+		// 解析失败不能放行。这里是配额与封禁的实时拦截点，
+		// 读不懂身份就无法判断该不该拦，而「放行」等于跳过拦截——
+		// 与未知操作的处理保持一致（fail-closed）。
+		log.Printf("[plugin] NewUserConn 请求体解析失败，已拒绝: %v", err)
+		return deny("请求格式非法")
 	}
 
 	// 优先走会话缓存；缓存未命中时才回落数据库。

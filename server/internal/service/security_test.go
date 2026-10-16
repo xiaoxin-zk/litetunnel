@@ -460,6 +460,7 @@ type fakeFirewallHelper struct {
 	*httptest.Server
 
 	mu     sync.Mutex
+	opened []string
 	closed []string
 }
 
@@ -481,6 +482,14 @@ func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
 			f.mu.Unlock()
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case "/ports/open":
+			var body struct {
+				Port  int    `json:"port"`
+				Proto string `json:"proto"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.opened = append(f.opened, fmt.Sprintf("%d/%s", body.Port, body.Proto))
+			f.mu.Unlock()
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -496,6 +505,164 @@ func (f *fakeFirewallHelper) closedPorts() []string {
 	out := make([]string, len(f.closed))
 	copy(out, f.closed)
 	return out
+}
+
+func (f *fakeFirewallHelper) openedPorts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.opened))
+	copy(out, f.opened)
+	return out
+}
+
+// TestAdminTunnelOpsTouchFirewall 覆盖「管理员操作不联动防火墙」。
+//
+// 用户侧的启停与删除都会开关端口，管理员侧却只改数据库：后台显示「已停用」，
+// 主机防火墙上的规则仍然放行；删除后规则更是永久残留。
+// 而启动时的规则对齐只负责「补开活跃端口」，不会清理这种残留。
+func TestAdminTunnelOpsTouchFirewall(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "admintun", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20005,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	// 停用 → 收回端口
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("管理员停用失败: %v", err)
+	}
+	if got := helper.closedPorts(); len(got) != 1 || got[0] != "20005/tcp" {
+		t.Fatalf("管理员停用后应收回 20005/tcp，实际 %v", got)
+	}
+
+	// 启用 → 重新放行
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusActive); err != nil {
+		t.Fatalf("管理员启用失败: %v", err)
+	}
+	if got := helper.openedPorts(); len(got) != 1 || got[0] != "20005/tcp" {
+		t.Fatalf("管理员启用后应重新放行 20005/tcp，实际 %v", got)
+	}
+
+	// 删除 → 收回端口
+	if err := svc.AdminDeleteTunnel(tun.ID); err != nil {
+		t.Fatalf("管理员删除失败: %v", err)
+	}
+	closed := helper.closedPorts()
+	if len(closed) != 2 || closed[1] != "20005/tcp" {
+		t.Fatalf("管理员删除后应再次收回 20005/tcp，实际 %v", closed)
+	}
+}
+
+// TestRuntimeTouchAtIsPrunedWithSessions 覆盖心跳节流表只增不减。
+//
+// touchAt 按 runID 记录「上次落库时间」。客户端反复重连会产生大量
+// runID，而这些条目既不会被会话清理带走，也不在 GC 的范围内——
+// 长期运行的面板会一直攒着它们。
+func TestRuntimeTouchAtIsPrunedWithSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	svc.Runtime.RecordLogin("run-a", 1, "a")
+	svc.Runtime.RecordLogin("run-b", 2, "b")
+	if !svc.Runtime.ShouldTouch("run-a", time.Minute) {
+		t.Fatal("前置条件：首次心跳应允许落库")
+	}
+	if !svc.Runtime.ShouldTouch("run-b", time.Minute) {
+		t.Fatal("前置条件：首次心跳应允许落库")
+	}
+
+	// 撤销某个用户的会话时，节流记录要一起清。
+	svc.Runtime.DropUserSessions(1)
+	if _, ok := svc.Runtime.touchAt["run-a"]; ok {
+		t.Error("撤销会话后应一并清掉它的心跳节流记录")
+	}
+	if _, ok := svc.Runtime.touchAt["run-b"]; !ok {
+		t.Error("不该动其他用户的节流记录")
+	}
+
+	// GC 清理过期会话时同样要清。
+	//
+	// 把时间戳回拨一小时再按 10 分钟窗口清理，而不是用 GC(0)：
+	// GC(0) 的截止时刻就是「现在」，而它依赖两次 time.Now() 之间有可分辨的
+	// 间隔——Windows 上时钟粒度不足时两次调用可能落在同一刻度，
+	// Before 判为 false，测试就会随机失败（我自己写的用例踩过一次）。
+	backdateSession(t, svc.Runtime, "run-b", time.Hour)
+	svc.Runtime.GC(10 * time.Minute)
+
+	if _, ok := svc.Runtime.sessions["run-b"]; ok {
+		t.Fatal("前置条件：久未活动的会话应被回收")
+	}
+	if _, ok := svc.Runtime.touchAt["run-b"]; ok {
+		t.Error("GC 回收会话时应一并清掉它的心跳节流记录")
+	}
+}
+
+// TestRuntimeGCPrunesOrphanTouchAt 覆盖「没有对应会话」的节流记录。
+//
+// 心跳节流对「库里存在、内存里没有」的 runID 同样生效（面板重启后就是这样），
+// 这类记录没有任何会话清理路径会经过，只能按时间清。
+func TestRuntimeGCPrunesOrphanTouchAt(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 只写节流记录，不登记会话。
+	if !svc.Runtime.ShouldTouch("run-orphan", time.Minute) {
+		t.Fatal("前置条件：首次心跳应允许落库")
+	}
+	if _, ok := svc.Runtime.touchAt["run-orphan"]; !ok {
+		t.Fatal("前置条件：节流记录应已写入")
+	}
+
+	backdateTouchAt(t, svc.Runtime, "run-orphan", time.Hour)
+	svc.Runtime.GC(10 * time.Minute)
+
+	if _, ok := svc.Runtime.touchAt["run-orphan"]; ok {
+		t.Error("孤儿节流记录也要按时间清理，否则客户端反复重连会让它只增不减")
+	}
+}
+
+// backdateSession 把某条会话的活跃时间往前拨，用于确定性地制造「久未活动」。
+//
+// 不用「GC(0)」这种把截止时刻设成现在的写法：它依赖两次 time.Now()
+// 之间有可分辨的间隔，时钟粒度不足时会随机失败。
+func backdateSession(t *testing.T, r *Runtime, runID string, by time.Duration) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.sessions[runID]
+	if !ok {
+		t.Fatalf("前置条件不成立：会话 %s 不存在", runID)
+	}
+	s.LastSeen = s.LastSeen.Add(-by)
+	r.sessions[runID] = s
+}
+
+// backdateTouchAt 把某条心跳节流记录的时间往前拨。
+func backdateTouchAt(t *testing.T, r *Runtime, runID string, by time.Duration) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	at, ok := r.touchAt[runID]
+	if !ok {
+		t.Fatalf("前置条件不成立：节流记录 %s 不存在", runID)
+	}
+	r.touchAt[runID] = at.Add(-by)
 }
 
 // TestAdminDeleteUserClosesFirewallPorts 覆盖「删除用户后规则残留」。

@@ -592,11 +592,20 @@ func (a *App) Logout() (State, error) {
 	a.retries = map[uint]*retryState{}
 	a.mu.Unlock()
 
+	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。
+	//
+	// 每条隧道的 frpc.toml 里同样是凭据（客户端接入密钥 + frps 全局 token），
+	// 只删 config.json 等于「退出了但钥匙还留在磁盘上」——换个账号登录后，
+	// 上一个账号的接入密钥仍然可以被读出来使用。
 	if err := clearConfig(); err != nil {
 		// 内存里的凭据已经清了，但磁盘上那份还在——下次启动会重新读到它。
 		// 这必须让用户知道，所以照样推状态、并把错误抛出去。
 		a.emitState()
 		return a.GetState(), fmt.Errorf("已退出，但本地凭据文件删除失败: %w", err)
+	}
+	if err := removeAllFrpcConfigs(); err != nil {
+		a.emitState()
+		return a.GetState(), fmt.Errorf("已退出，但隧道配置文件删除失败（其中含接入密钥）: %w", err)
 	}
 	return a.GetState(), nil
 }
@@ -712,8 +721,18 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 	return out, state, nil
 }
 
-// DeleteTunnel 删除一条隧道。
+// DeleteTunnel 删除一条隧道，并清掉它在本机留下的配置。
+//
+// 顺序是「服务端删除 → 停进程 → 删本地配置」：
+//   - 先删本地配置的话，正在跑的 frpc 会在下一次重连时读不到自己的配置；
+//   - 本地配置必须删：frpc.toml 里含客户端接入密钥与 frps 全局 token，
+//     隧道都删了、凭据还留在磁盘上，任何能读到这个目录的进程都能拿去接入。
 func (a *App) DeleteTunnel(id uint) (State, error) {
+	// 与后台同步互斥：否则同步可能刚按旧清单把这条隧道的进程拉起来，
+	// 而我们紧接着删掉了它的配置文件——进程还在，配置没了。
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
 		return a.GetState(), err
@@ -722,7 +741,21 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 	if _, err := a.do(http.MethodDelete, endpoint, apiKey, nil); err != nil {
 		return a.GetState(), err
 	}
-	return a.Refresh()
+
+	// 停进程：它已经没有服务端记录，继续跑只会刷重连错误。
+	_ = a.mgr.Stop(id)
+
+	// 状态记录一并清掉：这条隧道不会再回来了。
+	a.clearTunnelErr(id)
+	a.clearRetry(id)
+
+	state := a.syncAndState()
+	if err := removeFrpcConfig(id); err != nil {
+		// 删除失败必须让用户知道：磁盘上还留着一份含凭据的配置。
+		a.emitNotice("隧道已删除，但本地配置文件删除失败（其中含接入密钥）：" + err.Error())
+		return a.GetState(), err
+	}
+	return state, nil
 }
 
 // StartTunnel 启用一条隧道并立即建立连接。

@@ -145,12 +145,51 @@ func saveConfig(cfg *Config) error {
 	return nil
 }
 
+// clearConfig 删除本地凭据文件，**连同可能残留的兄弟文件**。
+//
+// 主文件之外还有两个同类文件里同样存着 API Key：
+//   - config.json.corrupt：配置损坏时留下的备份（见 loadConfig）；
+//   - config.json.tmp：原子写入中途失败留下的临时文件（见 saveConfig）。
+//
+// 只删主文件的话，用户以为「退出登录了」，而密钥还躺在同一个目录里。
 func clearConfig() error {
 	path, err := configFilePath()
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	var firstErr error
+	for _, p := range []string{path, path + ".corrupt", path + ".tmp"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// removeFrpcConfig 删除某条隧道的本地配置目录（配置 + 日志）。
+//
+// 必须删：frpc.toml 里含客户端接入密钥与 frps 全局 token，隧道已经在服务端
+// 删掉了，凭据却还躺在磁盘上——任何能读到这个目录的进程都能拿去接入。
+func removeFrpcConfig(tunnelID uint) error {
+	dir, err := dataDir()
+	if err != nil {
+		return err
+	}
+	sub := filepath.Join(dir, "tunnels", strconv.FormatUint(uint64(tunnelID), 10))
+	// RemoveAll 对不存在的路径返回 nil，这里不会因为「本来就没有」而报错。
+	if err := os.RemoveAll(sub); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// removeAllFrpcConfigs 删除全部隧道的本地配置目录（退出登录时用）。
+func removeAllFrpcConfigs() error {
+	dir, err := frpcTunnelsDir()
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil

@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -61,6 +62,71 @@ func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
 		tunnelErrs: map[uint]tunnelErr{},
 		retries:    map[uint]*retryState{},
 		http:       &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// TestLogoutRemovesAllCredentialFiles 覆盖「退出登录后磁盘上仍留着凭据」。
+//
+// 主配置里是 API Key，每条隧道的 frpc.toml 里是客户端接入密钥与 frps 全局
+// token。只删主配置的话，用户以为「退出了」，换个账号登录后上一个账号的
+// 凭据仍然可以被读出来使用。
+func TestLogoutRemovesAllCredentialFiles(t *testing.T) {
+	withTempConfigDir(t)
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	// 前置：主配置 + 两条隧道的配置都在磁盘上。
+	if err := saveConfig(&Config{APIKey: "secret-key", ServerURL: srv.URL}); err != nil {
+		t.Fatalf("保存主配置失败: %v", err)
+	}
+	for _, id := range []uint{1, 2} {
+		if err := writeFrpcConfig(id, "token = \"secret\"\n"); err != nil {
+			t.Fatalf("写隧道 %d 配置失败: %v", id, err)
+		}
+	}
+
+	if _, err := a.Logout(); err != nil {
+		t.Fatalf("退出登录失败: %v", err)
+	}
+
+	cfgPath, err := configFilePath()
+	if err != nil {
+		t.Fatalf("取配置路径失败: %v", err)
+	}
+	if _, serr := os.Stat(cfgPath); !os.IsNotExist(serr) {
+		t.Error("退出登录后应删除主配置（其中含 API Key）")
+	}
+	tunnels, err := frpcTunnelsDir()
+	if err != nil {
+		t.Fatalf("取隧道目录失败: %v", err)
+	}
+	if _, serr := os.Stat(tunnels); !os.IsNotExist(serr) {
+		t.Error("退出登录后应删除全部隧道配置（其中含接入密钥）")
+	}
+}
+
+// TestDeleteTunnelRemovesLocalConfig 覆盖「隧道删了、本地配置还留着凭据」。
+func TestDeleteTunnelRemovesLocalConfig(t *testing.T) {
+	withTempConfigDir(t)
+	srv, _, _, noTunnels := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	if err := writeFrpcConfig(1, "token = \"secret\"\n"); err != nil {
+		t.Fatalf("写隧道配置失败: %v", err)
+	}
+	path, err := frpcConfigPath(1)
+	if err != nil {
+		t.Fatalf("取隧道配置路径失败: %v", err)
+	}
+
+	// 服务端删除成功后就不再返回这条隧道。
+	noTunnels.Store(true)
+	if _, err := a.DeleteTunnel(1); err != nil {
+		t.Fatalf("删除隧道失败: %v", err)
+	}
+
+	if _, serr := os.Stat(filepath.Dir(path)); !os.IsNotExist(serr) {
+		t.Error("删除隧道后应清掉本地配置（其中含接入密钥）")
 	}
 }
 

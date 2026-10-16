@@ -162,3 +162,85 @@ func TestLoadConfigMissingFileIsNotAnError(t *testing.T) {
 		t.Fatalf("期望拿到一个空配置，实际: %+v", cfg)
 	}
 }
+
+// TestClearConfigRemovesSiblings 覆盖「只删主文件、备份里还留着密钥」。
+//
+// config.json 之外还有两个同类文件里同样存着 API Key：损坏时留下的
+// config.json.corrupt、原子写入失败留下的 config.json.tmp。
+// 只删主文件的话，用户以为「退出登录了」，密钥却还躺在同一个目录里。
+func TestClearConfigRemovesSiblings(t *testing.T) {
+	withTempConfigDir(t)
+
+	path, err := configFilePath()
+	if err != nil {
+		t.Fatalf("取配置路径失败: %v", err)
+	}
+	files := []string{path, path + ".corrupt", path + ".tmp"}
+	for _, p := range files {
+		if werr := os.WriteFile(p, []byte(`{"api_key":"secret"}`), 0o600); werr != nil {
+			t.Fatalf("写入 %s 失败: %v", p, werr)
+		}
+	}
+
+	if err := clearConfig(); err != nil {
+		t.Fatalf("清理配置失败: %v", err)
+	}
+	for _, p := range files {
+		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
+			t.Errorf("%s 应被删除（其中含 API Key）", filepath.Base(p))
+		}
+	}
+}
+
+// TestRemoveFrpcConfigDeletesDir 覆盖「隧道删了、凭据还留在磁盘上」。
+//
+// frpc.toml 里含客户端接入密钥与 frps 全局 token：隧道已经在服务端删掉，
+// 这些文件却仍然可以被任何能读到该目录的进程拿去接入。
+func TestRemoveFrpcConfigDeletesDir(t *testing.T) {
+	withTempConfigDir(t)
+
+	if err := writeFrpcConfig(7, "serverAddr = \"127.0.0.1\"\ntoken = \"secret\"\n"); err != nil {
+		t.Fatalf("写隧道配置失败: %v", err)
+	}
+	path, err := frpcConfigPath(7)
+	if err != nil {
+		t.Fatalf("取隧道配置路径失败: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("前置条件：隧道配置应已落盘: %v", err)
+	}
+
+	if err := removeFrpcConfig(7); err != nil {
+		t.Fatalf("删除隧道配置失败: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+		t.Error("隧道配置目录应被删除（其中含接入密钥）")
+	}
+
+	// 再删一次不应报错：调用方（删除隧道、退出登录）可能重复执行。
+	if err := removeFrpcConfig(7); err != nil {
+		t.Errorf("删除不存在的配置不应报错: %v", err)
+	}
+}
+
+// TestRemoveAllFrpcConfigsDeletesAllTunnels 覆盖登出时的整目录清理。
+func TestRemoveAllFrpcConfigsDeletesAllTunnels(t *testing.T) {
+	withTempConfigDir(t)
+
+	for _, id := range []uint{1, 2, 3} {
+		if err := writeFrpcConfig(id, "token = \"secret\"\n"); err != nil {
+			t.Fatalf("写隧道 %d 配置失败: %v", id, err)
+		}
+	}
+	dir, err := frpcTunnelsDir()
+	if err != nil {
+		t.Fatalf("取隧道目录失败: %v", err)
+	}
+
+	if err := removeAllFrpcConfigs(); err != nil {
+		t.Fatalf("清理隧道配置失败: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("登出后应删除全部隧道配置（其中含接入密钥）")
+	}
+}

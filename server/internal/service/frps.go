@@ -70,18 +70,34 @@ type frpsPage[T any] struct {
 	Items    []T `json:"items"`
 }
 
+// frpsSuccessCode 是 frps v0.71 管理接口的成功码。
+//
+// 注意它**不是 0**：frps 用的是 HTTP 风格的状态码，实测成功响应是
+//
+//	{"code":200,"msg":"success","data":{...}}
+//
+// 这里曾经按 `code != 0` 判错，于是把每一个成功响应都当成业务错误：
+// 采集器持续报错、保留旧状态，隧道永远显示不了在线。而当时的单元测试
+// 用的是自己编的 `code:0`，全绿——fixture 与真实契约不一致时，
+// 测试不但测不出问题，还会给出「已验证」的假象。
+const frpsSuccessCode = 200
+
 // frpsEnvelope 是 frps 管理 API 的统一响应包装。
 //
 // frps v0.71 的所有管理接口都返回 {code, msg, data}，分页对象在 data 里：
 //
-//	{"code":0,"msg":"","data":{"total":1,"page":1,"pageSize":200,"items":[...]}}
+//	{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":200,"items":[...]}}
 //
 // 这里必须显式解包。曾经是把整个响应体直接反序列化成 frpsPage：json 对
 // 多余的字段是宽容的，**不会报错**，只是 Items 恒为空。采集器于是拿到一份
 // 「空代理列表」，把所有隧道判成离线，客户端一直显示「连接中」，
 // 而面板日志里没有任何异常。静默失败比报错难查得多。
 type frpsEnvelope struct {
-	Code int             `json:"code"`
+	// Code 用指针，必须区分「字段缺失」与「值为 0」。
+	//
+	// 解成普通 int 时，缺字段会默认成 0；一旦 data 恰好合法就会被放行，
+	// 而我们对这份响应其实一无所知。缺字段本身就是「读不懂」。
+	Code *int            `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
@@ -96,9 +112,13 @@ type frpsEnvelope struct {
 //
 // 任何格式不符都走第一条，绝不退化成空列表。
 func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
-	const pageSize = 200
+	const (
+		pageSize = 200
+		// maxPages 是分页上限，防止对端给出异常分页信息时无限抓取。
+		maxPages = 50
+	)
 	var all []FrpsProxy
-	for page := 1; page <= 50; page++ {
+	for page := 1; page <= maxPages; page++ {
 		endpoint := fmt.Sprintf("%s/api/v2/proxies?page=%d&pageSize=%d", c.baseURL, page, pageSize)
 		var out frpsPage[FrpsProxy]
 		if err := c.getJSON(ctx, endpoint, &out); err != nil {
@@ -106,17 +126,21 @@ func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 		}
 		all = append(all, out.Items...)
 		if len(out.Items) < pageSize || len(all) >= out.Total {
-			break
+			return all, nil
 		}
 	}
-	return all, nil
+	// 取满 maxPages 页后仍有数据：宁可报错，也不返回一份不完整的列表。
+	// 悄悄截断的后果是「没读到的那些隧道被判成离线」，而日志里看不出
+	// 是分页被截断导致的——正是这次故障那种最难查的形态。
+	return nil, fmt.Errorf("frps 代理数超过分页上限（%d 页 × %d 条），拒绝返回不完整列表",
+		maxPages, pageSize)
 }
 
 // getJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。
 //
-// 每一步不对都返回错误：状态码非 200、响应不是合法 JSON、业务错误码非 0、
-// 缺少 data、data 解不出来。**绝不返回「零值 + nil」**——那等于告诉调用方
-// 「代理列表是空的」，而真实情况是我们根本没读懂响应。
+// 每一步不对都返回错误：HTTP 状态码非 200、响应不是合法 JSON、缺少 code、
+// code 不是成功码、缺少 data、data 解不出来。**绝不返回「零值 + nil」**
+// ——那等于告诉调用方「代理列表是空的」，而真实情况是我们根本没读懂响应。
 func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) error {
 	if _, err := url.Parse(endpoint); err != nil {
 		return err
@@ -147,13 +171,16 @@ func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) erro
 	if err := json.Unmarshal(body, &env); err != nil {
 		return fmt.Errorf("frps 管理接口响应不是合法 JSON: %w", err)
 	}
+	if env.Code == nil {
+		return errors.New("frps 管理接口响应缺少 code 字段")
+	}
 	// frps 用 code 表达业务错误，此时 HTTP 状态码仍然是 200。
-	if env.Code != 0 {
+	if *env.Code != frpsSuccessCode {
 		msg := strings.TrimSpace(env.Msg)
 		if msg == "" {
 			msg = "未提供原因"
 		}
-		return fmt.Errorf("frps 管理接口返回错误码 %d: %s", env.Code, msg)
+		return fmt.Errorf("frps 管理接口返回非成功码 %d: %s", *env.Code, msg)
 	}
 	if len(env.Data) == 0 || string(env.Data) == "null" {
 		return errors.New("frps 管理接口响应缺少 data 字段")

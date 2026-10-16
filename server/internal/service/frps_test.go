@@ -24,49 +24,21 @@ func newTestFrps(t *testing.T, handler http.HandlerFunc) *FrpsClient {
 	})
 }
 
-// frpsEnvelopeJSON 按 frps v0.71 的真实形状包一层。
+// frpsOK 按 frps v0.71 的**真实**成功响应包一层。
 //
-// 分页对象在 data 里，外面还有 {code,msg}。这正是曾经被漏掉的一层：
-// 直接把整个响应体当成分页对象解析时，json 不会报错，只是 Items 恒为空，
-// 于是所有隧道都被判成离线，客户端一直显示「连接中」。
-func frpsEnvelopeJSON(data string) string {
-	return `{"code":0,"msg":"","data":` + data + `}`
+// 成功码是 200，不是 0。这个细节必须由 fixture 如实反映：上一版实现按
+// `code != 0` 判错，而 fixture 又全用 `code:0`，于是「把成功当失败」这个
+// 缺陷被测试完美地掩盖了——测试全绿，线上一条隧道也显示不了在线。
+func frpsOK(data string) string {
+	return `{"code":200,"msg":"success","data":` + data + `}`
 }
 
-// TestListProxiesParsesFrpsV071Envelope 是本组测试的主用例。
+// TestListProxiesParsesFrpsV071Response 是本组测试的主用例。
 //
-// fixture 按 frps v0.71 的真实响应抄写：分页对象包在 data 里，
-// 代理名带 user 前缀，状态是 status.phase。
-func TestListProxiesParsesFrpsV071Envelope(t *testing.T) {
-	const body = `{
-		"code": 0,
-		"msg": "",
-		"data": {
-			"total": 2,
-			"page": 1,
-			"pageSize": 200,
-			"items": [
-				{
-					"name": "lt_u1.mc",
-					"user": "lt_u1",
-					"clientID": "2cf2d682ced5530b",
-					"status": {
-						"phase": "online",
-						"todayTrafficIn": 1024,
-						"todayTrafficOut": 2048,
-						"curConns": 3,
-						"lastStartAt": 1700000000
-					}
-				},
-				{
-					"name": "lt_u1.nas",
-					"user": "lt_u1",
-					"clientID": "2cf2d682ced5530b",
-					"status": { "phase": "closed" }
-				}
-			]
-		}
-	}`
+// fixture 逐字来自线上 frps v0.71 的实测响应：成功码 200，分页对象包在
+// data 里，代理名带 user 前缀，状态在 status.phase。
+func TestListProxiesParsesFrpsV071Response(t *testing.T) {
+	const body = `{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":200,"items":[{"name":"lt_u1.mc","status":{"phase":"online"}}]}}`
 
 	var authOK bool
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
@@ -78,32 +50,69 @@ func TestListProxiesParsesFrpsV071Envelope(t *testing.T) {
 
 	proxies, err := c.ListProxies(context.Background())
 	if err != nil {
-		t.Fatalf("ListProxies 报错: %v", err)
+		t.Fatalf("线上实测响应必须能解析，实际报错: %v", err)
 	}
-	if len(proxies) != 2 {
-		t.Fatalf("代理数 = %d，期望 2（data 没被解开就会得到 0）", len(proxies))
+	if len(proxies) != 1 {
+		t.Fatalf("代理数 = %d，期望 1", len(proxies))
 	}
 	if proxies[0].Name != "lt_u1.mc" {
-		t.Errorf("第一条代理名 = %q，期望 lt_u1.mc", proxies[0].Name)
+		t.Errorf("代理名 = %q，期望 lt_u1.mc", proxies[0].Name)
 	}
-	if proxies[0].User != "lt_u1" {
-		t.Errorf("第一条代理的 user = %q，期望 lt_u1", proxies[0].User)
-	}
-	// 在线判定必须能从真实响应里读出来：这是客户端「运行中/连接中」的来源。
+	// 这一条就是客户端「运行中/连接中」的来源。
 	if !IsProxyOnline(proxies[0].Status.Phase) {
 		t.Errorf("phase=%q 应判为在线", proxies[0].Status.Phase)
 	}
-	if IsProxyOnline(proxies[1].Status.Phase) {
-		t.Errorf("phase=%q 不应判为在线", proxies[1].Status.Phase)
+	if !authOK {
+		t.Error("没有带上 frps 管理接口的 basic auth")
+	}
+}
+
+// TestListProxiesParsesFullProxyFields 覆盖代理对象的各个字段。
+func TestListProxiesParsesFullProxyFields(t *testing.T) {
+	body := frpsOK(`{"total":2,"page":1,"pageSize":200,"items":[
+		{"name":"lt_u1.mc","user":"lt_u1","clientID":"2cf2d682ced5530b",
+		 "status":{"phase":"online","todayTrafficIn":1024,"todayTrafficOut":2048,"curConns":3,"lastStartAt":1700000000}},
+		{"name":"lt_u1.nas","user":"lt_u1","clientID":"2cf2d682ced5530b",
+		 "status":{"phase":"closed"}}
+	]}`)
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	})
+	proxies, err := c.ListProxies(context.Background())
+	if err != nil {
+		t.Fatalf("ListProxies 报错: %v", err)
+	}
+	if len(proxies) != 2 {
+		t.Fatalf("代理数 = %d，期望 2", len(proxies))
+	}
+	if proxies[0].User != "lt_u1" || proxies[0].ClientID != "2cf2d682ced5530b" {
+		t.Errorf("user/clientID 没解析出来: %+v", proxies[0])
 	}
 	if proxies[0].Status.TodayTrafficIn != 1024 || proxies[0].Status.TodayTrafficOut != 2048 {
 		t.Errorf("流量字段没解析出来: %+v", proxies[0].Status)
 	}
-	if proxies[0].Status.CurConns != 3 {
-		t.Errorf("curConns = %d，期望 3", proxies[0].Status.CurConns)
+	if proxies[0].Status.CurConns != 3 || proxies[0].Status.LastStartAt != 1700000000 {
+		t.Errorf("运行态字段没解析出来: %+v", proxies[0].Status)
 	}
-	if !authOK {
-		t.Error("没有带上 frps 管理接口的 basic auth")
+	if IsProxyOnline(proxies[1].Status.Phase) {
+		t.Errorf("phase=%q 不应判为在线", proxies[1].Status.Phase)
+	}
+}
+
+// TestListProxiesAcceptsSuccessCodeWithoutMsg 覆盖成功码 + 缺 msg。
+//
+// msg 只是给人看的字符串，缺失不影响成功判定；code 缺失才致命。
+func TestListProxiesAcceptsSuccessCodeWithoutMsg(t *testing.T) {
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":200,"data":{"total":0,"page":1,"pageSize":200,"items":[]}}`))
+	})
+	proxies, err := c.ListProxies(context.Background())
+	if err != nil {
+		t.Fatalf("成功码 + 缺 msg 不应报错: %v", err)
+	}
+	if len(proxies) != 0 {
+		t.Fatalf("代理数 = %d，期望 0", len(proxies))
 	}
 }
 
@@ -116,11 +125,17 @@ func TestListProxiesRejectsMalformedResponses(t *testing.T) {
 		name string
 		body string
 	}{
-		{"业务错误码", `{"code":1001,"msg":"invalid token","data":null}`},
-		{"错误码但带 data", `{"code":7,"msg":"boom","data":{"total":0,"items":[]}}`},
-		{"缺少 data", `{"code":0,"msg":""}`},
-		{"data 为 null", `{"code":0,"msg":"","data":null}`},
-		{"data 不是分页对象", frpsEnvelopeJSON(`"unexpected"`)},
+		{"非成功码（401）", `{"code":401,"msg":"unauthorized","data":null}`},
+		{"非成功码但带 data", `{"code":1001,"msg":"invalid token","data":{"total":0,"items":[]}}`},
+		// 曾经把 code 解成普通 int，缺字段默认成 0；如果 data 恰好合法
+		// 就会被当成成功放行，而我们对这份响应其实一无所知。
+		{"缺 code 但有合法 data", `{"msg":"success","data":{"total":0,"items":[]}}`},
+		{"code 为 null", `{"code":null,"data":{"total":0,"items":[]}}`},
+		// frps 的成功码是 200，0 不是成功码。
+		{"code 为 0", `{"code":0,"msg":"","data":{"total":0,"items":[]}}`},
+		{"缺 data", `{"code":200,"msg":"success"}`},
+		{"data 为 null", `{"code":200,"msg":"success","data":null}`},
+		{"data 不是分页对象", frpsOK(`"unexpected"`)},
 		{"响应不是 JSON", `<html>502 Bad Gateway</html>`},
 		{"裸分页对象（缺 envelope）", `{"total":1,"page":1,"pageSize":200,"items":[{"name":"lt_u1.mc"}]}`},
 	}
@@ -158,7 +173,7 @@ func TestListProxiesNonOKStatusIsError(t *testing.T) {
 // 当前没有任何代理（所有客户端都停了），此时把隧道判为离线才是对的。
 func TestListProxiesEmptyListIsValid(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(frpsEnvelopeJSON(`{"total":0,"page":1,"pageSize":200,"items":[]}`)))
+		_, _ = w.Write([]byte(frpsOK(`{"total":0,"page":1,"pageSize":200,"items":[]}`)))
 	})
 	proxies, err := c.ListProxies(context.Background())
 	if err != nil {
@@ -191,7 +206,7 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 		case "2":
 			items = append(items, `{"name":"lt_u1.last","status":{"phase":"online"}}`)
 		}
-		fmt.Fprintf(w, `{"code":0,"msg":"","data":{"total":201,"page":%s,"pageSize":200,"items":[%s]}}`,
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":201,"page":%s,"pageSize":200,"items":[%s]}}`,
 			page, strings.Join(items, ","))
 	})
 
@@ -209,5 +224,44 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 	if proxies[200].Name != "lt_u1.last" {
 		t.Fatalf("最后一条 = %q，期望 lt_u1.last", proxies[200].Name)
+	}
+}
+
+// TestListProxiesRejectsPageCapOverflow 覆盖分页上限。
+//
+// 取满上限仍有数据时必须报错：悄悄返回一份不完整的列表，会让没读到的
+// 那些隧道被判成离线，而日志里看不出是分页被截断导致的。
+func TestListProxiesRejectsPageCapOverflow(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+
+		// 每一页都返回满页，total 远大于能取到的数量。
+		items := make([]string, 0, 200)
+		for i := 0; i < 200; i++ {
+			items = append(items, `{"name":"lt_u1.x","status":{"phase":"online"}}`)
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":999999,"page":1,"pageSize":200,"items":[%s]}}`,
+			strings.Join(items, ","))
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("超过分页上限应返回错误，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("超过分页上限时不应返回（不完整的）代理列表")
+	}
+	if !strings.Contains(err.Error(), "分页上限") {
+		t.Fatalf("错误信息应说明是分页上限，实际: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 50 {
+		t.Fatalf("请求了 %d 页，期望取满 50 页后再报错", requests)
 	}
 }

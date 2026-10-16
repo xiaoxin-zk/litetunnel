@@ -624,20 +624,54 @@ jobs:
           fi
           echo "PASS plugin login with empty run_id"
 
-          # 2) 紧接着的 NewProxy 带 frps 新分配的 run_id。
+          # 2) 紧接着的 NewProxy 带 frps 新分配的 run_id，并且代理名是
+          #    frp 规范化之后的 "<user>.<隧道名>"。
           #
-          # 不断言「一定放行」——onNewProxy 后面还有一串隧道级校验
-          # （端口、协议、归属），构造一份完全合法的载荷成本很高且脆弱。
-          # 断言的是**它不能死于认证**：只要拒绝原因不是「未完成认证」，
-          # 就说明凭据复核这条回落生效了。
-          proxy=$(curl -fsS -X POST -H 'Content-Type: application/json' \
-            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"citunnel\",\"proxy_type\":\"tcp\",\"use_encryption\":false,\"use_compression\":false,\"remote_port\":0,\"custom_domains\":[],\"subdomain\":\"\",\"metas\":{}}}" \
-            "$BASE/api/frps/plugin")
-          if printf '%s' "$proxy" | grep -q '未完成认证'; then
-            echo "::error::NewProxy still fails authentication with a fresh run_id: $proxy"
+          # 代理名**必须带前缀**：真实 frpc 发来的就是 "lt_u1.mc"，服务端
+          # 要先拆掉前缀才能查到库里的 "mc"。这条断言原先用的是裸名
+          # "citunnel"，于是「拿原始代理名直接查库」这个缺陷完全测不出来
+          # ——测试全绿，真实客户端却一直卡在「连接中」。
+          #
+          # 载荷按真实形态构造完整（协议与远程端口都取该隧道的实际值），
+          # 所以这里可以断言「整个 NewProxy 不能被拒绝」，而不只是
+          # 「不能死于认证」：查隧道这一步出任何错都会在响应里带 reject。
+          cport=$(printf '%s' "$cinfo2" | tr '{' '\n' | grep '"name":"citunnel"' \
+            | sed -n 's/.*"public_addr":"[^"]*:\([0-9]*\)".*/\1/p' | head -1)
+          if [ -z "$cport" ]; then
+            echo "::error::cannot resolve the public port of citunnel"
+            printf '%s\n' "$cinfo2"
             exit 1
           fi
-          echo "PASS plugin NewProxy authorized after first login"
+          proxy=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"$frpuser.citunnel\",\"proxy_type\":\"tcp\",\"use_encryption\":false,\"use_compression\":false,\"remote_port\":$cport,\"custom_domains\":[],\"subdomain\":\"\",\"metas\":{}}}" \
+            "$BASE/api/frps/plugin")
+          if printf '%s' "$proxy" | grep -q '"reject":true'; then
+            echo "::error::NewProxy was rejected for a valid prefixed proxy name: $proxy"
+            exit 1
+          fi
+          echo "PASS plugin NewProxy authorized with the prefixed proxy name"
+
+          # 前缀是身份标识，必须与本次回调认定的账号一致：
+          # 不允许「用 A 的凭据、在代理名里声称自己是 B」。
+          mismatch=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"lt_u999999.citunnel\",\"proxy_type\":\"tcp\",\"remote_port\":$cport}}" \
+            "$BASE/api/frps/plugin")
+          if ! printf '%s' "$mismatch" | grep -q '与当前账号不匹配'; then
+            echo "::error::a proxy name with a foreign user prefix was not rejected: $mismatch"
+            exit 1
+          fi
+          echo "PASS plugin rejects a proxy name with a foreign user prefix"
+
+          # 没有前缀的代理名同样要拒——它不是 frp 规范化的形态，
+          # 放行就等于承认「代理名可以不跟 user 走」。
+          malformed=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d "{\"op\":\"NewProxy\",\"content\":{\"user\":{\"user\":\"$frpuser\",\"metas\":{\"token\":\"$token\"},\"run_id\":\"ci-run-0001\"},\"proxy_name\":\"citunnel\",\"proxy_type\":\"tcp\",\"remote_port\":$cport}}" \
+            "$BASE/api/frps/plugin")
+          if ! printf '%s' "$malformed" | grep -q '格式非法'; then
+            echo "::error::a proxy name without a user prefix was not rejected: $malformed"
+            exit 1
+          fi
+          echo "PASS plugin rejects a proxy name without a user prefix"
 
           # frps 插件回调：必须能从回环访问
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \

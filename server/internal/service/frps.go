@@ -117,8 +117,10 @@ func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) erro
 
 // ParseProxyName 拆分 frp 代理名。
 //
-// frpc 配置了 user = "lt_<username>"，frp 会把代理名规范为 "<user>.<proxy_name>"，
-// 且用户名被限制为 [A-Za-z0-9_]，因此第一个 "." 即分隔符。
+// frpc 配置了 user = "lt_u<用户ID>"，frp 会把代理名规范为 "<user>.<proxy_name>"。
+// 第一个 "." 即分隔符：用户名被限制为 [A-Za-z0-9_]，而隧道名由
+// IsSafeName 限制为字母/数字/下划线且不允许以 "lt" 开头，
+// 因此两边都不可能出现 "."，不存在歧义。
 func ParseProxyName(name string) (frpUser, proxyName string, ok bool) {
 	idx := strings.Index(name, ".")
 	if idx <= 0 || idx == len(name)-1 {

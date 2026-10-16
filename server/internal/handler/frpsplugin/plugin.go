@@ -401,7 +401,32 @@ func (h *Handler) onNewProxy(req *request) response {
 		return deny("流量额度已用尽，请兑换流量或联系管理员")
 	}
 
-	t, err := h.svc.FindTunnelByName(u.ID, content.ProxyName)
+	// frp 会把代理名规范成 "<user>.<proxy_name>"——也就是 frpc.toml 里的
+	// user 加上隧道名（见 service.ClientInfo.ProxyNameFmt），而数据库里存的
+	// 是不带前缀的隧道名。必须先把前缀拆掉再查库。
+	//
+	// 这里曾经直接拿 content.ProxyName 查库：真实客户端发来的 "lt_u1.mc"
+	// 永远查不到数据库里的 "mc"，客户端就一直卡在「连接中」，而报错说的是
+	// 「隧道不存在或不属于当前账号」——把排查方向指向了账号、权限、
+	// 甚至是防火墙，与真正的原因（少了一步拆前缀）毫无关系。
+	frpUser, tunnelName, ok := service.ParseProxyName(content.ProxyName)
+	if !ok {
+		log.Printf("[plugin] 代理名缺少用户前缀（proxy_name=%q, user=%q），已拒绝",
+			content.ProxyName, content.User.User)
+		return deny("代理名格式非法，请重新下载客户端配置")
+	}
+	// 前缀必须与本次回调认定的账号一致。
+	//
+	// u 是用凭据解析出来的，而前缀是客户端自己填在代理名里的。两者不一致
+	// 说明它在伪造别人的身份标识。查库本身已按 u.ID 限定、跨不了账号，
+	// 但这里显式挡住：前缀是身份标识，任何地方都不该允许它与账号脱钩。
+	if frpUser != service.FrpUserOf(u.ID) {
+		log.Printf("[plugin] 代理名前缀与账号不匹配（proxy_name=%q, user=%q, 期望前缀=%q），已拒绝",
+			content.ProxyName, content.User.User, service.FrpUserOf(u.ID))
+		return deny("代理名与当前账号不匹配")
+	}
+
+	t, err := h.svc.FindTunnelByName(u.ID, tunnelName)
 	if err != nil {
 		return deny("隧道不存在或不属于当前账号，请重新下载客户端配置")
 	}

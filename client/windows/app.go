@@ -1026,13 +1026,27 @@ func (a *App) applySync() (changed bool, err error) {
 	// 完全成功——SyncErr 被清空、LastSyncAt 被更新，而那条隧道其实没连上。
 	// 用户看到的是「一切正常」，隧道却一直不工作。
 	var failures []string
-	fail := func(t TunnelVO, msg string) {
+
+	// 记录一次失败。两类失败的**退避**处理不同，所以分成两个函数：
+	//
+	//   - failSync：同步本身没成（配置拉不到、服务端没返回配置）。
+	//     这是网络或服务端的问题，与「这条隧道的进程起不来」无关，
+	//     不该推进进程退避——否则配置接口恢复之后，客户端还要为
+	//     「每次拉取失败都算一次启动失败」而多等最长 5 分钟。
+	//   - failStart：进程起不来。这类才需要退避，避免每 20 秒重复拉起。
+	recordFailure := func(t TunnelVO, msg string) {
 		a.emitTunnelLog(t.Name, msg)
 		// 同时记进该隧道的错误，让隧道行自己把原因显示出来，
 		// 而不是只躺在日志里等着被翻出来。
 		a.recordTunnelErrMsg(t.ID, msg)
-		a.noteStartFailure(t.ID, t.Name, msg)
 		failures = append(failures, t.Name+"："+msg)
+	}
+	failSync := func(t TunnelVO, msg string) {
+		recordFailure(t, msg)
+	}
+	failStart := func(t TunnelVO, msg string) {
+		recordFailure(t, msg)
+		a.noteStartFailure(t.ID, t.Name, msg)
 	}
 
 	for _, t := range tunnels {
@@ -1046,14 +1060,27 @@ func (a *App) applySync() (changed bool, err error) {
 			continue
 		}
 
+		// 退避中的隧道连配置都不用取：反正这一轮不会拉起它。
+		// 放在取配置之前，既省掉一次请求，也避免「拉取失败」被误记成
+		// 一次启动失败而把退避越推越长。
+		if !a.mgr.Running(t.ID) && !a.retryAllowed(t.ID) {
+			continue
+		}
+
 		cfgText, err := a.fetchTunnelConfig(base, apiKey, t.ID)
 		if err != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
-			fail(t, "拉取配置失败："+err.Error())
+			failSync(t, "拉取配置失败："+err.Error())
 			continue
 		}
 		if cfgText == "" {
+			// 空配置必须当成失败，不能静默跳过。
+			//
+			// 跳过的话这一轮会被记成完全成功（SyncErr 清空、LastSyncAt 更新），
+			// 而那条隧道什么都没连上，界面上也没有任何原因——
+			// 用户只能看到一个「连接中」，等多久都不会变。
+			failSync(t, "服务端未返回该隧道的配置")
 			continue
 		}
 
@@ -1062,13 +1089,8 @@ func (a *App) applySync() (changed bool, err error) {
 
 		switch {
 		case !a.mgr.Running(t.ID):
-			// 退避中就不再重复拉起：上次失败的原因已经写在日志和隧道行上，
-			// 每 20 秒重来一次只会把同样的错误刷屏。
-			if !a.retryAllowed(t.ID) {
-				continue
-			}
 			if err := a.writeAndStart(t, cfgText); err != nil {
-				fail(t, "启动失败："+err.Error())
+				failStart(t, "启动失败："+err.Error())
 				continue
 			}
 			a.clearRetry(t.ID)
@@ -1080,7 +1102,7 @@ func (a *App) applySync() (changed bool, err error) {
 				return changed, err
 			}
 			if err := a.writeAndStart(t, cfgText); err != nil {
-				fail(t, "重连失败："+err.Error())
+				failStart(t, "重连失败："+err.Error())
 				continue
 			}
 			changed = true

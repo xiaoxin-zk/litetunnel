@@ -7,6 +7,7 @@ package userapi
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -230,17 +231,23 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 		return
 	}
 
+	// 链接只能由**服务端配置**的对外地址生成，绝不从请求里推断。
+	//
+	// 这里曾经在未配置 LT_USER_PUBLIC_URL 时用 Host 与 X-Forwarded-Proto 拼
+	// 地址——而这两个头完全由请求方控制：攻击者往本接口提交伪造的 Host，
+	// 服务端就会把「指向攻击者域名」的重置链接发到用户邮箱里，用户一点，
+	// 链接里的重置令牌就交到了攻击者手上（Host 头投毒）。
+	//
+	// 未配置时不发信、但对外仍返回统一提示：一来不暴露「服务端配置有误」，
+	// 二来本接口不能因为内部状态而变得可区分（否则又会退化成账号枚举工具）。
+	// 配置问题通过启动期提示与这里的日志暴露给管理员。
 	baseURL := h.svc.Cfg.UserPublicURL
 	if baseURL == "" {
-		// 未配置对外地址时用请求来源推断，保证链接在部署后仍然可用。
-		scheme := "https"
-		if c.Request.TLS == nil && c.GetHeader("X-Forwarded-Proto") == "" {
-			scheme = "http"
-		}
-		if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
-			scheme = proto
-		}
-		baseURL = scheme + "://" + c.Request.Host
+		log.Printf("[reset] 未配置 LT_USER_PUBLIC_URL，无法生成重置链接，本次不发信")
+		httpx.OK(c, gin.H{
+			"message": "如果该账号存在且已绑定邮箱，我们已发送重置链接，请查收（30 分钟内有效）",
+		})
+		return
 	}
 
 	if err := h.svc.RequestPasswordReset(req.Account, httpx.ClientIP(c), baseURL); err != nil {

@@ -137,8 +137,8 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		return
 	}
 
-	s.pruneMailOutbox()
-
+	// 记录清理交给维护任务（StartMaintenanceWorker）统一做，这里只管收发：
+	// 两处都清会让「谁删了什么」变得难以追溯。
 	now := time.Now()
 
 	var pendingActions []model.MailOutbox
@@ -204,6 +204,10 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", row.ID, uerr)
 	}
 
+	// 本地也同步加一：下面的凭据动作会把尝试次数写回终态，
+	// 沿用旧值的话每轮激活重试都会把「发送次数」再加一次
+	// （激活重试并不是发送尝试），审计数据就不准了。
+	row.Attempts++
 	row.Body = ""
 	s.finishMailAction(row)
 }
@@ -218,9 +222,11 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 	if err == nil {
 		log.Printf("[mail] 凭据已生效（收件人 %s，类型 %s）", maskEmail(row.To), row.Kind)
 		// 凭据已生效：参数（含验证码摘要）也没有保留价值了，一并清掉。
+		// attempts 用 row.Attempts（发送次数，已由调用方同步过），
+		// 而不是 +1——激活重试不是发送尝试。
 		s.finishMail(row.ID, mailFinish{
 			status:         model.MailSent,
-			attempts:       row.Attempts + 1,
+			attempts:       row.Attempts,
 			actionAttempts: row.ActionAttempts,
 			clearSensitive: true,
 		})
@@ -234,7 +240,7 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 			attempts, maskEmail(row.To), row.ID, err)
 		s.finishMail(row.ID, mailFinish{
 			status:         model.MailFailed,
-			attempts:       row.Attempts + 1,
+			attempts:       row.Attempts,
 			actionAttempts: attempts,
 			lastErr:        "凭据激活失败: " + err.Error(),
 			clearSensitive: true,
@@ -322,16 +328,13 @@ func (s *Services) finishMail(id uint, f mailFinish) {
 	}
 }
 
-// pruneMailOutbox 清理已办结的记录。
+// pruneMailOutbox 清理已办结的记录（由清理任务调用，分批进行）。
 //
 // 只留「事件」本身（发给谁、什么时候、成功没有）供审计；正文与参数在办结时
 // 就已经清空，不依赖这里。
 func (s *Services) pruneMailOutbox() {
-	cutoff := time.Now().Add(-mailSentRetention)
-	if err := s.DB.Where("status = ? AND updated_at < ?", model.MailSent, cutoff).
-		Delete(&model.MailOutbox{}).Error; err != nil {
-		log.Printf("[mail] 清理已发送记录失败: %v", err)
-	}
+	s.pruneTable("已送达邮件", &model.MailOutbox{},
+		"status = ? AND updated_at < ?", model.MailSent, time.Now().Add(-mailSentRetention))
 }
 
 // maskEmail 对日志中的邮箱做脱敏，避免日志成为邮箱收集来源。

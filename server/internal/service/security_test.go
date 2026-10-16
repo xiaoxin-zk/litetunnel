@@ -1290,6 +1290,124 @@ func TestTrafficCollectorRestoresBaselineOnStart(t *testing.T) {
 	t.Fatal("采集器启动时应先恢复采样基线，否则重启后会重复计入当天流量")
 }
 
+// TestRunMaintenancePrunesExpiredCredentials 覆盖「短期数据没有任何清理路径」。
+//
+// 验证码过期、令牌用完、邮件发送失败之后，这些行原先会一直留着：公网服务跑上
+// 几个月，这几张表会明显变大，索引也跟着变慢。清理必须保留近期记录
+// （排查「用户说没收到码」要用），只删过期的。
+func TestRunMaintenancePrunesExpiredCredentials(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	old := time.Now().Add(-48 * time.Hour)
+	// 过期验证码：一旧一新
+	for i, createdAt := range []time.Time{old, time.Now()} {
+		rec := model.EmailCode{
+			Email: fmt.Sprintf("prune%d@example.com", i), Scene: EmailSceneRegister,
+			CodeHash: "h", ExpireAt: createdAt.Add(10 * time.Minute), CreatedAt: createdAt,
+		}
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建验证码失败: %v", err)
+		}
+	}
+	// 重置令牌：一旧一新
+	for i, createdAt := range []time.Time{old, time.Now()} {
+		rec := model.PasswordResetToken{
+			UserID: uint(i + 1), TokenHash: fmt.Sprintf("tok-%d", i),
+			ExpireAt: createdAt.Add(30 * time.Minute), CreatedAt: createdAt,
+		}
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建令牌失败: %v", err)
+		}
+	}
+	// 发件箱：一条 8 天前的失败邮件（该清）、一条刚失败的（该留）、
+	// 一条 2 小时前的已送达（在 24 小时保留期内，该留）。
+	for _, rec := range []model.MailOutbox{
+		{To: "a@example.com", Subject: "s", Kind: model.MailKindResetLink, Status: model.MailFailed,
+			NextAt: time.Now(), UpdatedAt: time.Now().Add(-8 * 24 * time.Hour)},
+		{To: "b@example.com", Subject: "s", Kind: model.MailKindResetLink, Status: model.MailFailed,
+			NextAt: time.Now(), UpdatedAt: time.Now()},
+		{To: "c@example.com", Subject: "s", Kind: model.MailKindResetLink, Status: model.MailSent,
+			NextAt: time.Now(), UpdatedAt: time.Now().Add(-2 * time.Hour)},
+	} {
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建邮件记录失败: %v", err)
+		}
+	}
+
+	svc.RunMaintenance()
+
+	var codes int64
+	if err := svc.DB.Model(&model.EmailCode{}).Count(&codes).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if codes != 1 {
+		t.Errorf("过期验证码应被清理、近期的保留，实际剩 %d 条（期望 1）", codes)
+	}
+
+	var tokens int64
+	if err := svc.DB.Model(&model.PasswordResetToken{}).Count(&tokens).Error; err != nil {
+		t.Fatalf("统计令牌失败: %v", err)
+	}
+	if tokens != 1 {
+		t.Errorf("过期令牌应被清理、近期的保留，实际剩 %d 条（期望 1）", tokens)
+	}
+
+	var mails int64
+	if err := svc.DB.Model(&model.MailOutbox{}).Count(&mails).Error; err != nil {
+		t.Fatalf("统计邮件失败: %v", err)
+	}
+	if mails != 2 {
+		t.Errorf("只该清掉超过保留期的失败邮件，实际剩 %d 条（期望 2）", mails)
+	}
+	var stale int64
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("to_addr = ?", "a@example.com").
+		Count(&stale).Error; err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if stale != 0 {
+		t.Error("超过保留期的失败邮件应被清理（否则这张表只增不减）")
+	}
+}
+
+// TestRunMaintenanceIsBatched 覆盖「清理任务一次删太多」。
+//
+// 一次性大删会长时间占住写锁（SQLite 更是整库阻塞），在业务高峰期尤其危险。
+// 每轮每表必须有上限，剩下的下一轮继续。
+func TestRunMaintenanceIsBatched(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	old := time.Now().Add(-48 * time.Hour)
+	total := maintenanceBatchSize + 50
+	for i := 0; i < total; i++ {
+		rec := model.EmailCode{
+			Email: fmt.Sprintf("batch%d@example.com", i), Scene: EmailSceneRegister,
+			CodeHash: "h", ExpireAt: old.Add(10 * time.Minute), CreatedAt: old,
+		}
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建验证码失败: %v", err)
+		}
+	}
+
+	svc.RunMaintenance()
+
+	var left int64
+	if err := svc.DB.Model(&model.EmailCode{}).Count(&left).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if want := int64(total - maintenanceBatchSize); left != want {
+		t.Fatalf("单轮最多删 %d 条，实际剩 %d 条（期望 %d）", maintenanceBatchSize, left, want)
+	}
+
+	// 再跑一轮：剩下的应当被清掉（说明「剩余下轮继续」确实成立）。
+	svc.RunMaintenance()
+	if err := svc.DB.Model(&model.EmailCode{}).Count(&left).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if left != 0 {
+		t.Fatalf("第二轮应把剩余的清完，实际剩 %d 条", left)
+	}
+}
+
 // TestTrafficCollectorSkipsWhenBaselineUnavailable 覆盖「基线读失败仍继续采集」。
 //
 // 读不到基线却照常采集，与「没有基线」是同一件事：当天累计值会被整个算成
@@ -1435,6 +1553,11 @@ func TestMailActionRetriedWithoutResending(t *testing.T) {
 	if row.ActionAttempts == 0 {
 		t.Error("应记录激活尝试次数")
 	}
+	// 激活重试**不是**发送尝试：发送次数必须还是 1。
+	// 写回 row.Attempts + 1 的话，每轮激活重试都会把它多加一次，审计数据就废了。
+	if row.Attempts != 1 {
+		t.Errorf("激活重试不该增加发送次数，实际 attempts=%d，期望 1", row.Attempts)
+	}
 	// 正文在送达那一刻就该清掉（不会重发，留着只是把明文验证码多放一段时间）。
 	if row.Body != "" {
 		t.Error("送达后应清空正文（含明文验证码）")
@@ -1466,6 +1589,9 @@ func TestMailActionRetriedWithoutResending(t *testing.T) {
 	}
 	if row.Payload != "" {
 		t.Error("激活完成后应清空参数（里面是验证码摘要）")
+	}
+	if row.Attempts != 1 {
+		t.Errorf("激活成功后发送次数仍应是 1，实际 %d", row.Attempts)
 	}
 
 	var n int64

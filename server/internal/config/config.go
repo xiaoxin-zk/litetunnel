@@ -334,6 +334,13 @@ func (c *Config) validate() error {
 			c.Warnings = append(c.Warnings,
 				fmt.Sprintf("当前为非生产环境且监听在 %s，任何人都可能访问；请勿用于公网", c.UserAddr))
 		}
+		if c.UserPublicURL == "" {
+			// 这里必须提示：找回密码的重置链接要用它，而运行时不会再从请求头
+			// 推断（那会被 Host 投毒）。不提示的话，用户点了「忘记密码」之后
+			// 什么都不会发生，管理员却不知道原因。
+			c.Warnings = append(c.Warnings,
+				"未配置 LT_USER_PUBLIC_URL，找回密码的邮件不会发出（重置链接无法生成）；本地调试请设为 http://localhost:<端口>")
+		}
 		return nil
 	}
 
@@ -351,6 +358,13 @@ func (c *Config) validate() error {
 	require("LT_GATEWAY_HOST", c.GatewayHost)
 	require("LT_FRPS_TOKEN", c.FrpsToken)
 	require("LT_FRPS_API_PASSWORD", c.FrpsAPIPassword)
+	// 对外地址必须显式配置：找回密码的重置链接要用它。
+	//
+	// 没有它就只能从请求的 Host / X-Forwarded-Proto 推断，而这两个头完全由
+	// 请求方控制——攻击者往找回密码接口提交伪造的 Host，就能让发给用户的邮件
+	// 里的链接指向他自己的域名，用户一点，重置令牌就落到他手里。
+	// 因此生产环境必须配置，运行时也**绝不**再退回到请求头（见 userapi.ForgotPassword）。
+	require("LT_USER_PUBLIC_URL", c.UserPublicURL)
 
 	if len(missing) > 0 {
 		return fmt.Errorf("生产环境缺少或仍为占位符的配置项: %s", strings.Join(missing, ", "))

@@ -60,6 +60,9 @@ func main() {
 	svc.StartTrafficCollector(ctx)
 	svc.StartLoginLogWriter(ctx)
 	svc.StartMailWorker(ctx)
+	// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
+	// 没有它，公网服务跑久了这几张表会一直膨胀。
+	svc.StartMaintenanceWorker(ctx)
 	svc.StartFirewallReconciler()
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
 	go svc.Monitor.Start(ctx)

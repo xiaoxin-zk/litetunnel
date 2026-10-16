@@ -61,6 +61,15 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 		return nil
 	}
 
+	// 没有对外地址就生成不出可用的链接（拼出来会是相对路径），直接静默返回。
+	//
+	// 这里是第二道防线：调用方本来就会检查配置，但凭据链接的地址只能来自
+	// 服务端配置，不能靠「调用方记得传对」来保证。
+	if strings.TrimSpace(baseURL) == "" {
+		log.Printf("[reset] 缺少对外地址，无法生成重置链接，本次不发信")
+		return nil
+	}
+
 	u, err := s.findUserByAccount(account)
 	if err != nil || u.Email == "" || u.Status != model.UserStatusActive {
 		// 静默返回，不区分具体原因。

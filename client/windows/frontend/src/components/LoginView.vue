@@ -30,6 +30,10 @@
 
       <div v-if="notice" class="notice">{{ notice }}</div>
 
+      <!-- 本地配置损坏：这时客户端必然是「未登录」状态，必须说明原因，
+           否则用户只会以为自己被莫名其妙登出了。 -->
+      <div v-if="state.config_error" class="notice">{{ state.config_error }}</div>
+
       <!-- ============ 连接 ============ -->
       <template v-if="mode === 'login'">
         <label class="field">

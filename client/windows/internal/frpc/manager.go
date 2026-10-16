@@ -317,6 +317,45 @@ func logPrefix(tunnelID uint, tunnelName string) string {
 	return fmt.Sprintf("Tunnel/#%d", tunnelID)
 }
 
+// StripLogPrefix 去掉日志行上的「时间 + Tunnel/<名字>」前缀，只留原文。
+//
+// 前缀由本包的 appendLog 拼成，格式固定为
+//
+//	<时间>  Tunnel/<名字>  <原文>
+//
+// 调用方需要看 frpc 原文时（例如判断这行是不是报错）必须先把前缀剥掉：
+// 隧道名是用户自己取的，一个叫 errorlog 的隧道不该让它的正常输出被当成错误。
+//
+// 剥离方式是「跳过时间后的第一个双空格，再找下一个双空格」，而不是直接找
+// 最后一个双空格：frpc 自己的输出里也可能出现连续空格，从后面切会把原文
+// 截断（例如把 "[mc] start error: x" 截成 "x"），而这段原文正是要给用户看的。
+func StripLogPrefix(line string) string {
+	afterTime := strings.Index(line, "  ")
+	if afterTime < 0 {
+		return line
+	}
+	rest := line[afterTime+2:]
+	afterPrefix := strings.Index(rest, "  ")
+	if afterPrefix < 0 {
+		return line
+	}
+	return rest[afterPrefix+2:]
+}
+
+// IsErrorLine 判断一行 frpc 输出是否表示出错。
+//
+// frpc 的失败输出形如：
+//
+//	[W] [client/control.go:172] [run id] [mc] start error: 隧道不存在…
+//	[E] [client/service.go:312] login to server failed: …
+//
+// 它没有结构化字段可用，只能按关键词识别；error / failed 覆盖了它的全部
+// 失败路径。判定前先剥掉前缀，避免隧道名本身带出误判。
+func IsErrorLine(line string) bool {
+	l := strings.ToLower(StripLogPrefix(line))
+	return strings.Contains(l, "error") || strings.Contains(l, "failed")
+}
+
 // findFrpc 依次在可执行文件目录、当前目录与 PATH 中查找 frpc。
 func findFrpc() string {
 	name := "frpc"

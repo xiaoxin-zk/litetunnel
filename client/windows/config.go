@@ -92,8 +92,17 @@ func loadConfig() (*Config, error) {
 	}
 	cfg := &Config{}
 	if err := json.Unmarshal(raw, cfg); err != nil {
-		// 配置损坏时重置，避免客户端彻底无法启动。
-		return &Config{}, nil
+		// 配置损坏：把原文件留一份，并把原因返回给上层。
+		//
+		// 这里曾经是「静默重置为空配置」——用户下次打开客户端会发现自己
+		// 被登出了，而磁盘上那份或许还能人工救回来的文件已经被覆盖掉了，
+		// 也没有任何地方说明发生过什么。
+		backup := path + ".corrupt"
+		if rerr := os.Rename(path, backup); rerr != nil {
+			// 备份失败就留在原地：宁可下次还报同一个错，也别把用户的文件弄丢。
+			backup = path
+		}
+		return &Config{}, fmt.Errorf("本地配置已损坏（%v），原文件保留为 %s，请重新填写 API Key", err, backup)
 	}
 	return cfg, nil
 }
@@ -107,8 +116,21 @@ func saveConfig(cfg *Config) error {
 	if err != nil {
 		return err
 	}
+
+	// 先写临时文件再原子替换。
+	//
+	// 直接覆盖的话，写到一半断电 / 被强杀会留下半截 JSON，而下次启动读不动
+	// 它时客户端会当成「没有配置」——用户看到的是自己莫名其妙被登出了。
+	// 同目录下改名在同一文件系统内是原子的（Windows 上 os.Rename 走
+	// MoveFileEx + MOVEFILE_REPLACE_EXISTING，可以直接替换已存在的目标）。
+	//
 	// 0600：仅当前用户可读写。API Key 等同于账号凭据。
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("保存配置失败: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
 	return nil

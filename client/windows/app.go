@@ -48,6 +48,14 @@ type TunnelVO struct {
 	// frps），Running 是本机视角（进程在不在）。界面上的开关看的是
 	// Running——用户点的是「我这台机器上要不要连出去」。
 	Running bool `json:"running"`
+
+	// LastError 是最近一次从该隧道的 frpc 输出里识别到的错误原文。
+	//
+	// 为什么需要它：「连接中」这个状态本身不说明任何原因——凭据失效、
+	// 服务地址不对、网络不通都会停在它上面，用户只能干等。把 frpc 自己
+	// 报的错摆出来，才能立刻区分是配置问题还是网络问题。
+	LastError   string     `json:"last_error"`
+	LastErrorAt *time.Time `json:"last_error_at"`
 }
 
 // State 是前端渲染所需的完整状态。
@@ -90,6 +98,12 @@ type State struct {
 	LastSyncAt *time.Time `json:"last_sync_at"`
 	// SyncErr 非空表示最近一次自动同步失败（通常是网络问题）。
 	SyncErr string `json:"sync_err"`
+
+	// ConfigError 非空表示本地配置文件读取失败（通常是文件损坏）。
+	//
+	// 必须让用户看到：这种情况下客户端会以「未登录」启动，而用户完全
+	// 不知道自己是被重置了，只会以为凭据丢了。
+	ConfigError string `json:"config_error"`
 	// Version 是客户端构建版本。
 	//
 	// 客户端出问题时第一个要确认的永远是「你跑的是哪个版本」——
@@ -152,6 +166,20 @@ type App struct {
 	// HMR、或任何一次导航）都会再触发一遍。不挡的话会起出第二个自动同步
 	// 协程，表现为「同步频率翻倍」这种很难解释的现象。
 	domReadyOnce sync.Once
+
+	// tunnelErrs 记录每条隧道最近一次从 frpc 输出里识别到的错误。
+	//
+	// 不落盘：它描述的是「这一次运行」的情况，重启后重连一次就有结果了。
+	tunnelErrs map[uint]tunnelErr
+
+	// cfgErr 记录本地配置读取失败的原因，通过 State 呈现给用户。
+	cfgErr string
+}
+
+// tunnelErr 是一次 frpc 错误记录。
+type tunnelErr struct {
+	msg string
+	at  time.Time
 }
 
 // syncInterval 是后台自动同步的间隔。
@@ -170,7 +198,12 @@ func maskKey(k string) string {
 
 // NewApp 构造应用对象。
 func NewApp() *App {
-	cfg, _ := loadConfig()
+	// 配置读取失败不能吞掉：那通常意味着文件损坏被重置，用户下次打开
+	// 会发现自己被登出了，而没有任何线索说明为什么。
+	cfg, cfgErr := loadConfig()
+	if cfgErr != nil {
+		log.Printf("[client] %v", cfgErr)
+	}
 
 	// 优先使用内嵌的 frpc：正式发布包里只有这一个 exe。
 	// 取不到（开发构建或释放失败）时传空串，
@@ -181,15 +214,20 @@ func NewApp() *App {
 		exePath = ""
 	}
 
-	return &App{
-		cfg:       cfg,
-		mgr:       frpc.New(exePath),
-		applied:   map[uint]string{},
-		startedAt: time.Now(),
+	app := &App{
+		cfg:        cfg,
+		mgr:        frpc.New(exePath),
+		applied:    map[uint]string{},
+		tunnelErrs: map[uint]tunnelErr{},
+		startedAt:  time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
 		},
 	}
+	if cfgErr != nil {
+		app.cfgErr = cfgErr.Error()
+	}
+	return app
 }
 
 // startup 由 Wails 在应用启动时调用（早于窗口加载完成）。
@@ -200,11 +238,18 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.mgr.SetCallbacks(func(id uint, name, line string) {
 		wailsruntime.EventsEmit(a.ctx, "log", line)
-		// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
-		// 原始输出只有一行 start proxy success，用户看不出这意味着
-		// 「可以把地址发给朋友了」——而那恰恰是他最需要的信息。
-		if strings.Contains(line, "start proxy success") {
+		switch {
+		case strings.Contains(line, "start proxy success"):
+			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
+			// 原始输出只有一行 start proxy success，用户看不出这意味着
+			// 「可以把地址发给朋友了」——而那恰恰是他最需要的信息。
+			a.clearTunnelErr(id)
 			a.emitTunnelReady(id, name)
+		case frpc.IsErrorLine(line):
+			// 记下错误原文并刷新状态，让界面能显示「为什么一直连不上」，
+			// 而不是永远停在一句「连接中」上。
+			a.recordTunnelErr(id, line)
+			a.emitState()
 		}
 	}, func(id uint, name string, err error) {
 		_ = id
@@ -312,6 +357,12 @@ func (a *App) GetState() State {
 	copy(tunnels, a.tunnels)
 	for i := range tunnels {
 		tunnels[i].Running = a.mgr.Running(tunnels[i].ID)
+		// 连上之后错误记录已被清掉，这里取不到就表示当前没有已知错误。
+		if e, ok := a.tunnelErrs[tunnels[i].ID]; ok {
+			at := e.at
+			tunnels[i].LastError = e.msg
+			tunnels[i].LastErrorAt = &at
+		}
 	}
 	if tunnels == nil {
 		tunnels = []TunnelVO{}
@@ -336,6 +387,7 @@ func (a *App) GetState() State {
 		BalanceCents:   a.balanceCents,
 		SyncErr:        a.syncErr,
 		LastSyncAt:     lastSync,
+		ConfigError:    a.cfgErr,
 		Version:        Version(),
 		// Running 是「有没有任意一条隧道在连」，界面的状态点用它。
 		Running:   a.mgr.AnyRunning(),
@@ -463,9 +515,21 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	return a.GetState(), nil
 }
 
-// Logout 清除本地凭据并停止所有隧道。
-func (a *App) Logout() State {
-	_ = a.mgr.StopAll()
+// Logout 停止所有隧道并清除本地凭据。
+//
+// 两处顺序上的要求，都是为了避免「用户以为退出了、进程还在跑」：
+//
+//  1. 必须与同步互斥。后台同步可能正跑在对账中途，它会在本方法停掉进程
+//     之后按服务端状态把隧道重新拉起来——凭据已清、进程却还在。
+//  2. 必须确认进程都停了再清凭据。停止失败还照样清除登录状态的话，
+//     界面上是「已退出」，而 frpc 还在后台占着端口、继续转发。
+func (a *App) Logout() (State, error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
+	if err := a.mgr.StopAll(); err != nil {
+		return a.GetState(), fmt.Errorf("停止隧道失败，未退出登录: %w", err)
+	}
 
 	a.mu.Lock()
 	a.cfg.APIKey = ""
@@ -484,10 +548,17 @@ func (a *App) Logout() State {
 	a.balanceCents = 0
 	// 清掉已写入的配置记录：换个账号接入后，旧账号的配置文本不该再参与比对。
 	a.applied = map[uint]string{}
+	// 隧道错误记录也一并清掉：换个账号后，旧账号的失败原因会指向错误的排查方向。
+	a.tunnelErrs = map[uint]tunnelErr{}
 	a.mu.Unlock()
 
-	_ = clearConfig()
-	return a.GetState()
+	if err := clearConfig(); err != nil {
+		// 内存里的凭据已经清了，但磁盘上那份还在——下次启动会重新读到它。
+		// 这必须让用户知道，所以照样推状态、并把错误抛出去。
+		a.emitState()
+		return a.GetState(), fmt.Errorf("已退出，但本地凭据文件删除失败: %w", err)
+	}
+	return a.GetState(), nil
 }
 
 // currentCredential 返回当前接入用的长期凭据。
@@ -653,8 +724,17 @@ func (a *App) StartTunnel(id uint) (State, error) {
 
 // StopTunnel 断开一条隧道并停用它。
 //
-// 先停本机进程再改服务端状态：反过来的话端口先被收回、进程还在，
-// frpc 会不停地重连并在日志里刷错误，用户会以为「关了还在跑」。
+// 顺序与 StartTunnel 相反：**先改服务端状态，再停本机进程**。
+//
+// 这里曾经是先停进程、再请求服务端停用，失败时会静默反转用户的操作：
+// 服务端请求失败后状态仍是 active，而下一轮自动同步（≤20 秒）会按服务端
+// 状态把进程重新拉起来——用户看到「停用失败」，然后隧道自己又跑起来了，
+// 而且找不到是谁干的。
+//
+// 反过来之后，失败发生在本机进程被停掉之前，提示与实际状态一致；
+// 而「服务端已停用、本机进程还在」这种中间态会被下一轮同步收掉，
+// 是自愈的。代价是有一瞬间服务端已停用而进程还没停——frpc 可能刷一两行
+// 重连错误，比「操作被静默反转」好得多。
 func (a *App) StopTunnel(id uint) (State, error) {
 	// 与 StartTunnel 同理：必须和后台同步互斥，否则会被旧清单重新拉起来。
 	a.syncMu.Lock()
@@ -668,10 +748,12 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	if !ok {
 		return a.GetState(), errors.New("找不到这条隧道，请等待同步完成后重试")
 	}
-	if err := a.stopTunnelProcess(t); err != nil {
-		return a.GetState(), err
+	if t.Status != tunnelStatusDisabled {
+		if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusDisabled); err != nil {
+			return a.GetState(), err
+		}
 	}
-	if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusDisabled); err != nil {
+	if err := a.stopTunnelProcess(t); err != nil {
 		return a.GetState(), err
 	}
 	return a.syncAndState(), nil
@@ -1132,6 +1214,30 @@ func (a *App) emitTunnelLog(name, msg string) {
 	}
 	wailsruntime.EventsEmit(a.ctx, "log",
 		fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+}
+
+// recordTunnelErr 记下一条隧道的 frpc 错误。
+func (a *App) recordTunnelErr(id uint, line string) {
+	msg := strings.TrimSpace(frpc.StripLogPrefix(line))
+	if msg == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tunnelErrs == nil {
+		a.tunnelErrs = map[uint]tunnelErr{}
+	}
+	a.tunnelErrs[id] = tunnelErr{msg: msg, at: time.Now()}
+}
+
+// clearTunnelErr 清掉一条隧道的错误记录。
+//
+// 连上之后必须清：否则界面会一直挂着一次已经过去的失败，
+// 用户会以为现在还是坏的。
+func (a *App) clearTunnelErr(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.tunnelErrs, id)
 }
 
 // emitTunnelReady 在 frpc 报告代理启动成功后，补上「现在可以用这个地址了」。

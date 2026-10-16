@@ -30,6 +30,8 @@ const emptyState = {
   // 自动同步状态：客户端每 20 秒拉取一次隧道清单与 frpc 配置
   last_sync_at: null,
   sync_err: '',
+  // config_error 非空表示本地配置文件损坏（已备份，需要重新填 API Key）
+  config_error: '',
   group: null,
   payment_enabled: false,
   balance_cents: 0
@@ -59,6 +61,8 @@ const mockConnectedState = {
       online: true,
       // running 表示本机是否已为这条隧道拉起 frpc 进程
       running: true,
+      last_error: '',
+      last_error_at: null,
       traffic_used: 1073741824,
       bandwidth_limit_str: '不限速'
     },
@@ -72,6 +76,8 @@ const mockConnectedState = {
       status: 'active',
       online: false,
       running: false,
+      last_error: '',
+      last_error_at: null,
       traffic_used: 52428800,
       bandwidth_limit_str: '5 MB/s'
     }

@@ -59,6 +59,9 @@
     </div>
 
     <div v-if="message" class="banner" :class="messageType">{{ message }}</div>
+    <!-- 本地配置损坏：客户端会以「未登录」启动，必须说清原因，
+         否则用户只会以为凭据莫名其妙丢了。 -->
+    <div v-if="state.config_error" class="banner warn">{{ state.config_error }}</div>
     <div v-if="!state.frpc_found" class="banner warn">
       未找到 frpc 可执行文件。请将 <b>frpc.exe</b> 放到程序同目录后重新打开客户端。
     </div>
@@ -101,6 +104,12 @@
               ·
               {{ t.type.toUpperCase() }}
               <template v-if="t.bandwidth_limit_str"> · 限速 {{ t.bandwidth_limit_str }}</template>
+            </div>
+            <!-- frpc 自己报的错。没有它的话，隧道一直停在「连接中」，
+                 而用户无从判断是凭据失效、地址写错还是网络不通。 -->
+            <div v-if="t.last_error" class="tunnel-err">
+              {{ t.last_error }}
+              <template v-if="t.last_error_at"> · {{ fmtTime(t.last_error_at) }}</template>
             </div>
           </div>
 
@@ -781,12 +790,25 @@ function tagText(t) {
   // running 是本机视角（进程在不在），online 是服务端视角（frps 有没有
   // 收到这条代理）。两者分开说，用户才能区分「我没开」和「开了还没通」。
   if (!t.running) return '未连接'
-  return t.online ? '运行中' : '连接中'
+  if (t.online) return '运行中'
+  // 有错误就不是「还在连」，而是「连不上」。这两者要给不同的提示：
+  // 前者让用户等，后者让用户去查（凭据、地址、网络）。
+  return t.last_error ? '连接失败' : '连接中'
 }
 
 function tagClass(t) {
   if (t.status !== 'active' || !t.running) return 'tag-info'
-  return t.online ? 'tag-success' : 'tag-warn'
+  if (t.online) return 'tag-success'
+  return t.last_error ? 'tag-err' : 'tag-warn'
+}
+
+/** 把时间戳格式化成 HH:MM:SS，用于「最后一次失败发生在什么时候」。 */
+function fmtTime(value) {
+  if (!value) return ''
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 function fmtBytes(bytes) {
@@ -995,6 +1017,19 @@ watch(
   align-items: center;
   gap: 8px;
   margin-bottom: 4px;
+}
+
+/* frpc 的报错原文。用等宽字体并允许换行：里面常常是英文错误串，
+   截断掉关键部分（比如状态码）反而没用。 */
+.tunnel-err {
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #b91c1c;
+  word-break: break-all;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .tunnel-addr {

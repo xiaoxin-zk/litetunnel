@@ -816,6 +816,13 @@ jobs:
           # 带地址的正式安装包由 release.yml 产出。
           wails build -clean -platform windows/amd64
 
+      # main 包的测试只能放在构建之后：它依赖 //go:embed frontend/dist，
+      # 前端没构建出来就编译不过。本地配置的原子写入与损坏处理都在这个包里，
+      # 而这两条路径只在异常情况下才会走到——没有测试就没人守得住。
+      - name: Unit tests (main package)
+        working-directory: client/windows
+        run: go test .
+
       - name: Upload client
         uses: actions/upload-artifact@v4
         with:

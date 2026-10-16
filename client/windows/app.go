@@ -760,9 +760,8 @@ func (a *App) StartTunnel(id uint) (State, error) {
 		a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
 		return a.GetState(), err
 	}
-	// 用户主动点开：把退避清掉。否则他刚修好问题再点一次，
-	// 可能还要等上一次失败留下的退避时间。
-	a.clearRetry(id)
+	// 退避由 startTunnelProcess → writeAndStart 在**启动之前**清掉。
+	// 用户主动点开当然要立刻重试，而不是等上一次失败留下的退避时间。
 	return a.syncAndState(), nil
 }
 
@@ -1097,7 +1096,8 @@ func (a *App) applySync() (changed bool, err error) {
 				failStart(t, "启动失败："+err.Error())
 				continue
 			}
-			a.clearRetry(t.ID)
+			// 退避已在 writeAndStart 里、启动之前清掉。这里**不能**再清一次：
+			// 进程秒退时退出回调可能已经登记了新退避，这一下会把它抹掉。
 			changed = true
 		case cfgChanged:
 			// 只重启这一条：其他隧道的连接不受影响。
@@ -1151,6 +1151,20 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
 		return err
 	}
+	// 清退避要放在**启动之前**，不能等启动成功之后再清。
+	//
+	// 进程退出回调是异步的：frpc 因为凭据失效之类的原因秒退时，回调可能
+	// 在 Start 返回之后、我们清退避之前就把新退避登记好了——随后那次清理
+	// 会把它抹掉，下一轮同步立刻又拉起进程，退避形同不存在。
+	// 放在启动前，最坏情况也只是「刚失败过一次又立刻重试一次」。
+	// 清退避要放在**启动之前**，不能等启动成功之后再清。
+	//
+	// 进程退出回调是异步的：frpc 因为凭据失效之类的原因秒退时，回调可能
+	// 在 Start 返回之后、我们清退避之前就把新退避登记好了——随后那次清理
+	// 会把它抹掉，下一轮同步立刻又拉起进程，退避形同不存在。
+	// 放在启动前，最坏情况也只是「刚失败过一次又立刻重试一次」。
+	a.clearRetry(t.ID)
+
 	// 把配置路径一起打出来：隧道起不来时，第一件要确认的就是
 	// 「客户端到底用了哪份配置」，而这份配置是每条隧道一份的。
 	a.emitTunnelLog(t.Name, "开始加载隧道配置："+path)

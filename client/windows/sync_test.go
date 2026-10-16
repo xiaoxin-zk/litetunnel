@@ -131,6 +131,46 @@ func TestApplySyncDistinguishesFetchAndStartFailures(t *testing.T) {
 	}
 }
 
+// TestWriteAndStartClearsBackoffBeforeStarting 覆盖「退避清除的时机」。
+//
+// 清退避必须在启动**之前**：进程退出回调是异步的，frpc 秒退时回调可能已经
+// 登记了新退避，启动之后再清会把它抹掉——下一轮同步立刻又拉起进程，
+// 退避形同不存在，日志被同样的失败刷屏。
+//
+// 这条用例把「清除发生在启动之前」变成可观察的行为：已经累计失败 3 次之后
+// 再走一次启动（必然失败），失败计数应当重新从 1 开始，而不是继续累加到 4。
+func TestWriteAndStartClearsBackoffBeforeStarting(t *testing.T) {
+	if defaultServerURL() != "" {
+		t.Skip("当前构建注入了服务端地址，本用例需要自己控制服务端")
+	}
+	withTempConfigDir(t)
+
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	// 先制造 3 次连续失败。
+	for i := 0; i < 3; i++ {
+		a.noteStartFailure(1, "mc", "启动失败")
+	}
+	if got := a.retries[1].attempts; got != 3 {
+		t.Fatalf("前置条件：失败计数应为 3，实际 %d", got)
+	}
+
+	tun := TunnelVO{
+		ID: 1, Name: "mc", Type: "tcp", Status: tunnelStatusActive,
+		LocalIP: "127.0.0.1", LocalPort: 25565,
+	}
+	if err := a.writeAndStart(tun, "serverAddr = \"127.0.0.1\"\n"); err == nil {
+		t.Fatal("前置条件：frpc 不存在，启动应失败")
+	}
+
+	// 调用方（StartTunnel / applySync）在启动失败后会登记一次失败。
+	a.noteStartFailure(1, "mc", "启动失败")
+	if got := a.retries[1].attempts; got != 1 {
+		t.Fatalf("失败计数 = %d，期望 1：说明清退避发生在启动**之前**（旧代码在启动之后，计数会继续累加到 4）", got)
+	}
+}
+
 // TestApplySyncTreatsEmptyConfigAsFailure 覆盖「空配置被当成成功」。
 //
 // 静默跳过的话这一轮会被记成完全成功（SyncErr 清空、LastSyncAt 更新），

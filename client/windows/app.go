@@ -1253,10 +1253,14 @@ func (a *App) clearRetry(id uint) {
 	delete(a.retries, id)
 }
 
-// pruneTunnelState 丢弃「服务端已经没有」的隧道留下的错误与退避记录。
+// pruneTunnelState 丢弃「服务端已经没有」的隧道留下的各种记录。
 //
 // 不按运行中的进程来清，是因为一条隧道可能因为启动失败而没有进程：
-// 之后它被服务端删掉，那两个 map 里的记录就再也没有机会被访问或清理。
+// 之后它被服务端删掉，这些记录就再也没有机会被访问或清理。
+//
+// 三张表都要清，包括 applied：它存的是「最近一次写入磁盘的配置原文」，
+// 每条几百字节到几 KB。反复「建了、删掉」会让它一直占着内存，
+// 而它的用途（判断配置有没有变）只对还存在的隧道有意义。
 func (a *App) pruneTunnelState(alive map[uint]bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1268,6 +1272,11 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 	for id := range a.retries {
 		if !alive[id] {
 			delete(a.retries, id)
+		}
+	}
+	for id := range a.applied {
+		if !alive[id] {
+			delete(a.applied, id)
 		}
 	}
 }

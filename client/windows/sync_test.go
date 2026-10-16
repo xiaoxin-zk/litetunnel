@@ -106,11 +106,16 @@ func TestApplySyncDistinguishesFetchAndStartFailures(t *testing.T) {
 		t.Fatalf("退避期间不应再请求配置（%d → %d）", before, got)
 	}
 
-	// 4) 隧道被服务端删掉后，它的失败记录与退避状态都要清掉。
+	// 4) 隧道被服务端删掉后，它的各种记录都要清掉。
 	//
 	// 只按「运行中的进程」清理是不够的：这条隧道恰恰是因为启动失败而没有
 	// 进程，它的记录再也不会被访问到。反复「建了、失败、删掉」会让
-	// 这两个 map 一直长下去。
+	// 这几张表一直长下去。
+	//
+	// applied 也要一起清：它存的是配置原文（每条几 KB），
+	// 只在「判断配置有没有变」时用得上，对已删除的隧道没有任何意义。
+	a.applied[1] = "serverAddr = \"127.0.0.1\"\n" // 模拟它曾经成功启动过
+
 	noTunnels.Store(true)
 	if _, err := a.applySync(); err != nil {
 		t.Fatalf("隧道被删掉后不该再有失败：%v", err)
@@ -120,6 +125,9 @@ func TestApplySyncDistinguishesFetchAndStartFailures(t *testing.T) {
 	}
 	if len(a.retries) != 0 {
 		t.Fatalf("已删除隧道的退避状态应被清掉，实际 %v", a.retries)
+	}
+	if len(a.applied) != 0 {
+		t.Fatalf("已删除隧道的已应用配置文本应被清掉，实际 %v", a.applied)
 	}
 }
 

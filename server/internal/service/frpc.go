@@ -67,7 +67,34 @@ func (s *Services) ResetClientSecret(u *model.User) (string, error) {
 		return "", err
 	}
 	u.ClientSecret = secret
+
+	// 光换凭据不够：已经登录的 frpc 手里那份旧配置里的凭据虽然失效了，
+	// 但它的**会话**还在，插件热路径只看会话与配额，会继续放行新连接。
+	// 必须把会话一起吊销，逼它下次回调走凭据复核。
+	if err := s.RevokeClientSessions(u.ID); err != nil {
+		return "", err
+	}
 	return secret, nil
+}
+
+// RevokeClientSessions 让某用户已建立的客户端会话立即失效。
+//
+// 两处都要清，缺一不可：
+//
+//   - 数据库会话表：插件在内存未命中时回落查它（run_id + online=true）；
+//   - 内存会话：插件热路径（onNewUserConn，每次新建用户连接都经过）
+//     只查内存，命中后只校验配额就放行——凭据轮换后它照样放行。
+//
+// 说明清楚边界：已经建立的数据连接断不掉（那是 frps 与 frpc 之间的事，
+// 插件无权插手），但此后**新建**的连接会走凭据复核并被拒绝。
+func (s *Services) RevokeClientSessions(userID uint) error {
+	if err := s.DB.Model(&model.ClientSession{}).
+		Where("user_id = ?", userID).
+		Update("online", false).Error; err != nil {
+		return err
+	}
+	s.Runtime.DropUserSessions(userID)
+	return nil
 }
 
 // VerifyClientSecret 常量时间比较，抵御时序侧信道。

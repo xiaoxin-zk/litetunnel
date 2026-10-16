@@ -208,6 +208,25 @@ func (r *Runtime) DropSession(runID string) {
 	delete(r.sessions, runID)
 }
 
+// DropUserSessions 注销某用户的全部会话，返回清理掉的条数。
+//
+// 用途：凭据被轮换、密码被重置、账号被删除时，已经登录的 frpc 必须立刻
+// 失去放行资格。只清数据库会话是不够的——插件热路径（onNewUserConn，
+// 每次新建用户连接都经过）先查内存会话，命中后只看配额就放行，
+// 根本不会去读数据库。于是「已吊销」的客户端还能继续接受新连接。
+func (r *Runtime) DropUserSessions(userID uint) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for runID, s := range r.sessions {
+		if s.UserID == userID {
+			delete(r.sessions, runID)
+			n++
+		}
+	}
+	return n
+}
+
 // IsQuotaExceeded 查询用户是否超额。
 func (r *Runtime) IsQuotaExceeded(userID uint) bool {
 	r.mu.RLock()
@@ -325,10 +344,19 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	tunnelDeltas := make(map[uint]*tunnelDelta, len(tunnels))
 	userDeltas := make(map[uint]int64)
 	onlineNow := make(map[uint]bool, len(tunnels))
-	seen := make(map[string]struct{}, len(proxies))
 
 	s.Runtime.mu.Lock()
 	lastStat := s.Runtime.lastStat
+	// 本轮的新基线先攒在一边，落库成功之后再提交。
+	//
+	// 曾经是直接改 lastStat：事务失败时基线已经被推进了，那一轮的增量
+	// 就**永久丢失**——下一轮从新基线算增量，中间这段流量再也不会被记上。
+	// 用户看到的已用量比实际少（等于配额被悄悄放宽），统计也缺一块，
+	// 而且没有任何地方报错。
+	//
+	// 攒在一边之后，失败只是「这一轮不提交」：下一轮仍用旧基线算增量，
+	// 期间的流量会在下次成功时一起补记。
+	nextStat := make(map[string]trafficPair, len(proxies))
 	for _, p := range proxies {
 		frpUser, tunnelName, ok := ParseProxyName(p.Name)
 		if !ok {
@@ -347,7 +375,6 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			continue
 		}
 
-		seen[p.Name] = struct{}{}
 		cur := trafficPair{in: p.Status.TodayTrafficIn, out: p.Status.TodayTrafficOut}
 		prev := lastStat[p.Name]
 		din, dout := cur.in-prev.in, cur.out-prev.out
@@ -358,7 +385,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		if dout < 0 {
 			dout = cur.out
 		}
-		lastStat[p.Name] = cur
+		nextStat[p.Name] = cur
 
 		d := tunnelDeltas[t.ID]
 		if d == nil {
@@ -374,21 +401,29 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		}
 		userDeltas[u.ID] += din + dout
 	}
-	// 清理已消失的代理采样，防止内存随历史代理无限增长。
-	for name := range lastStat {
-		if _, ok := seen[name]; !ok {
-			delete(lastStat, name)
-		}
-	}
+	// 未匹配到隧道的代理不进新基线，等于顺手清掉了历史残留，
+	// 防止内存随历史代理无限增长。
 	s.Runtime.mu.Unlock()
 
 	s.Runtime.setOnlineTunnels(onlineNow)
-	s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner)
+
+	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner); err != nil {
+		log.Printf("[traffic] 流量落库失败，本轮不推进采样基线（增量下轮补记）: %v", err)
+	} else {
+		s.Runtime.mu.Lock()
+		s.Runtime.lastStat = nextStat
+		s.Runtime.mu.Unlock()
+	}
+	// 配额标记无论落库成败都要重算：它读的是库里**已有**的用量，
+	// 与这一次写入是否成功无关。跳过它只会让超额状态更久不收敛。
 	s.refreshQuotaFlags()
 }
 
 // flushTraffic 将本轮增量写库。
-func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas map[uint]int64, tunnelOwner map[uint]uint) {
+//
+// 返回错误而不是只记日志：调用方要靠它决定**要不要推进采样基线**。
+// 失败时推进基线等于把这一轮的流量永久丢掉。
+func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas map[uint]int64, tunnelOwner map[uint]uint) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
@@ -451,9 +486,7 @@ func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas m
 		}
 		return nil
 	})
-	if err != nil {
-		log.Printf("[traffic] 流量落库失败: %v", err)
-	}
+	return err
 }
 
 // refreshQuotaFlags 刷新内存中的超额标记，供 frps 插件实时拦截。

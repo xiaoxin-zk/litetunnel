@@ -274,6 +274,12 @@ func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error
 		return err
 	}
 
+	// 数据库会话置为离线还不够：插件热路径查的是**内存**会话表，
+	// 命中后只校验配额就放行，不会去读数据库。不一起清掉的话，
+	// 重置密码后已登录的 frpc 仍能继续接受新连接——而重置密码的前提
+	// 恰恰是「账号可能已被他人控制」。
+	s.Runtime.DropUserSessions(userID)
+
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
 	log.Printf("[reset] 用户 %d 已重置密码（来源 %s）", userID, ip)
 	return nil

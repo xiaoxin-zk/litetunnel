@@ -327,6 +327,9 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 		updates["nickname"] = truncate(strings.TrimSpace(*in.Nickname), 64)
 	}
 
+	roleChanged := in.Role != nil && *in.Role != target.Role
+	statusChanged := in.Status != nil && *in.Status != target.Status
+
 	if in.Role != nil || in.Status != nil {
 		if id == operatorID {
 			return fmt.Errorf("%w: 不能修改自己的角色或状态", ErrInvalidParam)
@@ -354,6 +357,19 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 			}
 			updates["status"] = *in.Status
 		}
+	}
+
+	// 角色或状态真的变了，就必须让已签发的令牌立即失效。
+	//
+	// 只清身份缓存是不够的：AdminAuth 的授权读的是**令牌里的角色**
+	// （claims.Role），缓存只影响「账号是否启用 / 令牌版本是否一致」这两项。
+	// 不动版本号的话，被降级的超级管理员手里那枚旧令牌在过期前依然能走
+	// super 路由——降级形同没做。
+	//
+	// 只在值真的变化时递增：把角色重复设置成同一个值也踢人下线，
+	// 会让管理员在无意义的操作里被莫名登出。
+	if roleChanged || statusChanged {
+		updates["token_version"] = gorm.Expr("token_version + 1")
 	}
 
 	if len(updates) == 0 {
@@ -557,6 +573,10 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		// 内存态同步清理，避免已删除用户仍占用超额标记或身份缓存。
 		s.Runtime.SetQuotaExceeded(id, false)
 		s.Runtime.InvalidateIdentity(IdentityKindUser, id)
+		// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
+		// 查的是内存会话表，残留的话已登录的 frpc 仍会被放行新连接——
+		// 账号都删了还在跑，这是最不该出现的一种。
+		s.Runtime.DropUserSessions(id)
 		return nil
 	})
 }
@@ -577,9 +597,25 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	}
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
-	// 被封禁的用户需要立刻停止放行流量。
 	if status != model.UserStatusActive {
+		// 被封禁的用户需要立刻停止放行流量。
 		s.Runtime.SetQuotaExceeded(id, true)
+		return nil
+	}
+
+	// 重新启用时**立即**按真实配额重算，而不是等下一轮流量采集。
+	//
+	// 禁用期间这个标记被强制置成了 true（上一步）。启用后如果只是放着
+	// 不管，就要等到下一次采集成功才会恢复；而采集依赖 frps 管理接口，
+	// 它恰好不可用（或采集持续报错）时，用户会看到「账号已启用，但新建
+	// 连接一律被拒」，且没有任何地方说明原因。
+	if u, err := s.LoadUser(id); err == nil {
+		s.Runtime.SetQuotaExceeded(id, s.QuotaExceeded(u))
+	} else {
+		// 取不到用户（理论上不会走到）时保守放行：
+		// 账号状态已经是 active，宁可让下一轮采集再纠正，
+		// 也不要因为一次读取失败把用户挡在门外。
+		s.Runtime.SetQuotaExceeded(id, false)
 	}
 	return nil
 }

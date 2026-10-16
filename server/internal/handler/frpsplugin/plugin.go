@@ -219,7 +219,17 @@ func (h *Handler) Handle(c *gin.Context) {
 	case OpNewUserConn:
 		res = h.onNewUserConn(&req)
 	default:
-		res = allow()
+		// 未知操作一律拒绝，与本函数开头写的 fail-closed 策略保持一致。
+		//
+		// 这里曾经是 allow()：一个空 op、或 frps 升级后新增的操作，都会
+		// 静默走放行分支。而「放行」在插件语义里等于**跳过鉴权**——
+		// 攻击者只要构造出我们不认识的操作名，就能拿到与「凭据校验通过」
+		// 相同的效果。
+		//
+		// 代价是 frp 协议新增操作时会出现显式故障（登录/建代理被拒），
+		// 但那正是我们想要的：显式故障立刻暴露，静默放行没人会知道。
+		log.Printf("[plugin] 未知操作 %q，已拒绝（fail-closed）", req.Op)
+		res = deny("插件不支持的操作")
 	}
 
 	c.JSON(http.StatusOK, res)

@@ -101,6 +101,14 @@ type State struct {
 type App struct {
 	ctx context.Context
 
+	// startedAt 是进程内记录下来的启动时刻。
+	//
+	// 用途只有一个：把「打开客户端很慢」拆成两段——我们这段（拉清单、
+	// 取配置、起进程）和框架这段（窗口与 WebView 初始化，直到前端能收
+	// 事件）。不拆开的话，用户说「慢」，日志里只有我们这段的数字，
+	// 看不出慢在谁身上。
+	startedAt time.Time
+
 	mu   sync.RWMutex
 	cfg  *Config
 	mgr  *frpc.Manager
@@ -174,9 +182,10 @@ func NewApp() *App {
 	}
 
 	return &App{
-		cfg:     cfg,
-		mgr:     frpc.New(exePath),
-		applied: map[uint]string{},
+		cfg:       cfg,
+		mgr:       frpc.New(exePath),
+		applied:   map[uint]string{},
+		startedAt: time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -252,13 +261,20 @@ func (a *App) startOnce(ctx context.Context) {
 		if _, err := a.syncLocked(); err != nil {
 			a.emitLog("启动同步失败：" + err.Error())
 		} else {
-			// 报「几条隧道起来了」以及用时。
+			// 报「几条在跑、几条是关着的、各花了多久」。
 			//
-			// 没有这一行的话，用户打开客户端只看到一堆隧道日志，
-			// 不知道到底同步完了没有；而用时能直接暴露「哪一步变慢了」
-			// ——之前启动要好几秒，日志里完全看不出来。
-			a.emitLog(fmt.Sprintf("启动同步完成：%d 条隧道运行中（用时 %s）",
-				len(a.mgr.RunningIDs()), time.Since(start).Round(time.Millisecond)))
+			// 这几项缺一不可：
+			//   - 运行数让人知道同步完了；
+			//   - 停用数解释了「为什么一条都没起来」——曾经只有运行数，
+			//     用户看到「0 条隧道运行中」只会以为客户端坏了，
+			//     实际只是那条隧道的开关是关的；
+			//   - 两个用时把「客户端慢」拆成两段：我们这段（拉清单、取配置、
+			//     起进程）和框架这段（窗口与 WebView 初始化，直到前端能收事件）。
+			//     混在一起就永远说不清慢在谁身上。
+			a.emitLog(fmt.Sprintf("启动同步完成：%d 条隧道运行中（%d 条已停用，用时 %s，自客户端启动 %s）",
+				len(a.mgr.RunningIDs()), a.countDisabledTunnels(),
+				time.Since(start).Round(time.Millisecond),
+				time.Since(a.startedAt).Round(100*time.Millisecond)))
 		}
 		a.emitState()
 	}()
@@ -991,6 +1007,22 @@ func (a *App) startTunnelProcess(t TunnelVO) error {
 func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
 	return a.mgr.Stop(t.ID)
+}
+
+// countDisabledTunnels 统计当前处于停用状态的隧道。
+//
+// 停用的隧道不会拉起进程，也不该拉起——但如果日志里只说「0 条隧道运行中」，
+// 用户会以为客户端坏了。这个数字用来把「没连」和「不该连」区分开。
+func (a *App) countDisabledTunnels() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	n := 0
+	for i := range a.tunnels {
+		if a.tunnels[i].Status != tunnelStatusActive {
+			n++
+		}
+	}
+	return n
 }
 
 // appliedConfigOf 返回某条隧道最近一次写入磁盘的配置原文。

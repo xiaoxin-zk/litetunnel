@@ -488,7 +488,18 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 接口突发容量需为 1-10000 的整数", ErrInvalidParam)
 	}
 
-	return s.Settings.SetMany(in)
+	// 记下改动前的防火墙开关：如果这次把它打开了，要立刻唤醒协调器，
+	// 让它马上做一次规则对齐并开始重试待办，而不是等下一个轮询周期。
+	firewallWasOn := s.Settings.Bool(KeyFirewallEnabled)
+
+	if err := s.Settings.SetMany(in); err != nil {
+		return err
+	}
+
+	if _, changed := in[KeyFirewallEnabled]; changed && !firewallWasOn && s.Settings.Bool(KeyFirewallEnabled) {
+		s.KickFirewall()
+	}
+	return nil
 }
 
 // ParsePortList 解析 "22,80,443,10000-10100" 形式的端口列表。

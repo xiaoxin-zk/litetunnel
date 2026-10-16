@@ -109,6 +109,53 @@ type Services struct {
 
 	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
 	userLocks [userLockShards]sync.Mutex
+
+	// portLocks 按端口分片，串行化「端口归属发生变化」与「重试关闭该端口」。
+	//
+	// 防的是这个交错：重试任务查到「该端口没有活跃隧道」（此时创建事务还没
+	// 提交）→ 创建事务提交并放行 → 重试任务把它关掉。两边都持有同一把端口锁
+	// 之后，只可能是先后关系（见 portLock）。
+	portLocks [portLockShards]sync.Mutex
+
+	// fwKick 用于在设置里打开防火墙时**立刻**触发一次对齐与重试，
+	// 而不是等下一个轮询周期。
+	fwKick chan struct{}
+}
+
+// portLockShards 是端口锁的分片数。
+//
+// 分片而不是给每个端口一把锁：固定 64 把没有清理问题，碰撞只是让两个端口
+// 的操作多串行化一点，而这类操作本身很稀疏。
+const portLockShards = 64
+
+// portLock 返回某个端口的锁。
+//
+// 覆盖三段临界区，缺一段窗口就还在：
+//   - 建隧道：**提交事务之前**取锁，持有到端口放行完成；
+//   - 启停隧道：取锁后执行放行/收回；
+//   - 待办重试：取锁后再校验意图并执行。
+//
+// 锁序固定为「用户锁 → 端口锁」（建隧道与删用户两条路径都按这个顺序取），
+// 不存在反向获取，因此不会死锁。
+func (s *Services) portLock(port int) *sync.Mutex {
+	if port < 0 {
+		port = -port
+	}
+	return &s.portLocks[port%portLockShards]
+}
+
+// KickFirewall 请求立刻做一次防火墙对齐与待办重试。
+//
+// 非阻塞：调用方是设置更新这类请求路径，不该因为后台协程正忙而卡住。
+func (s *Services) KickFirewall() {
+	if s.fwKick == nil {
+		return
+	}
+	select {
+	case s.fwKick <- struct{}{}:
+	default:
+		// 已有待处理的触发，合并成一次即可。
+	}
 }
 
 // userLockShards 是用户锁的分片数。
@@ -142,6 +189,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
 		fwPending:  map[int]pendingFW{},
+		fwKick:     make(chan struct{}, 1),
 	}
 }
 

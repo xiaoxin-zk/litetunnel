@@ -350,6 +350,35 @@ type PasswordResetToken struct {
 // TableName 固定表名。
 func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens" }
 
+// FirewallPending 是一条待重试的防火墙端口操作。
+//
+// # 为什么必须落库
+//
+// 这个队列原先只在内存里：helper 不可用时关闭失败，待办记在内存，进程一重启
+// 就没了。而启动时的规则对齐**只补放行活跃隧道的端口、不回收任何规则**，
+// 于是那条本该关掉的规则会长期留在宿主机防火墙上——端口对外开着，
+// 而面板上那条隧道早已停用或删除，没有任何地方能看出来。
+//
+// 落库之后，重启只是「换个人继续重试」，意图不会丢。
+//
+// 注意 Port 是唯一键：一个端口同时只可能有一个意图，后来的覆盖先前的。
+type FirewallPending struct {
+	Port int `gorm:"primarykey" json:"port"`
+	// Proto 是 tcp / udp。
+	Proto string `gorm:"size:8;not null" json:"proto"`
+	// Open 为 true 表示待放行，false 表示待收回。
+	Open bool `gorm:"not null" json:"open"`
+	// Attempts 已重试次数，达到上限后放弃并记录日志。
+	Attempts int `gorm:"not null;default:0" json:"attempts"`
+	// LastErr 最后一次失败原因，供排查用。
+	LastErr   string    `gorm:"size:255" json:"last_err"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (FirewallPending) TableName() string { return "lt_firewall_pending" }
+
 // Setting 运行期可调的键值配置。
 type Setting struct {
 	Key       string    `gorm:"primarykey;size:64" json:"key"`

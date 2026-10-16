@@ -1029,6 +1029,268 @@ func TestCreateTunnelWaitsForUserLock(t *testing.T) {
 	}
 }
 
+// TestDeleteTunnelQueuesFirewallClose 覆盖「用户删除单条隧道时忽略收回失败」。
+//
+// 这条路径原先直接调 FirewallClosePort 并丢掉返回值：helper 恰好不可用时，
+// 记录已经删了、端口号再也查不回来，规则就永久留在宿主机防火墙上，
+// 而且没有任何地方会再尝试收回。
+func TestDeleteTunnelQueuesFirewallClose(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	u := &model.User{Username: "deltun", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20021,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	if err := svc.DeleteTunnel(u.ID, tun.ID); err != nil {
+		t.Fatalf("删除隧道失败: %v", err)
+	}
+
+	pending := svc.PendingFirewallOps()
+	if len(pending) != 1 || pending[0] != "20021/tcp 待收回" {
+		t.Fatalf("收回失败应进入待重试队列，实际 %v", pending)
+	}
+}
+
+// TestPendingFirewallSurvivesRestart 覆盖「待办只存在内存里」。
+//
+// 关闭失败后若服务重启，那条意图就没了；而启动时的规则对齐**只补放行、
+// 不回收**，于是旧规则会长期残留——端口对外开着，面板上那条隧道却早已
+// 停用或删除，看不出任何异常。所以待办必须落库并在启动时恢复。
+func TestPendingFirewallSurvivesRestart(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	u := &model.User{Username: "restart", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20023,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+	if err := svc.DeleteTunnel(u.ID, tun.ID); err != nil {
+		t.Fatalf("删除隧道失败: %v", err)
+	}
+
+	var stored int64
+	if err := svc.DB.Model(&model.FirewallPending{}).Where("port = ?", 20023).
+		Count(&stored).Error; err != nil {
+		t.Fatalf("统计待办失败: %v", err)
+	}
+	if stored != 1 {
+		t.Fatalf("待办必须落库，实际库里 %d 条", stored)
+	}
+
+	// 模拟重启：同一个数据库上新建一套 Services（内存态是空的）。
+	restarted := New(svc.DB, svc.Cfg)
+	if len(restarted.PendingFirewallOps()) != 0 {
+		t.Fatal("前置条件：新实例的内存队列应当是空的")
+	}
+	restarted.loadPendingFirewall()
+
+	pending := restarted.PendingFirewallOps()
+	if len(pending) != 1 || pending[0] != "20023/tcp 待收回" {
+		t.Fatalf("重启后应恢复待办，实际 %v", pending)
+	}
+
+	// helper 恢复后，重启后的实例应当能把它真正收回。
+	helper.failCloses.Store(false)
+	if n := restarted.retryPendingFirewall(); n != 0 {
+		t.Fatalf("重试后不应还有待办，实际 %d 条", n)
+	}
+	closed := helper.closedPorts()
+	if len(closed) != 1 || closed[0] != "20023/tcp" {
+		t.Fatalf("重启恢复的待办应真的收回端口，实际 %v", closed)
+	}
+}
+
+// TestEnablingFirewallAtRuntimeAlignsRules 覆盖「运行中开启防火墙不生效」。
+//
+// 协调器原先在启动时读一次设置，关着就整个协程都不启动——管理员中途在面板
+// 上打开防火墙后，既没有规则对齐、也没有 worker 重试待办，已有的活跃隧道
+// 不会被放行，要重启服务才生效，而界面完全不提示。
+func TestEnablingFirewallAtRuntimeAlignsRules(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+
+	svc := newTestServices(t, nil)
+	// 注意：这里**不**打开防火墙，模拟「启动时是关着的」。
+	u := &model.User{Username: "runtimeon", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20031,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	svc.StartFirewallReconciler()
+	// 协调器先睡 3 秒等 frps 与数据库就绪（见实现）。
+	time.Sleep(3*time.Second + 300*time.Millisecond)
+
+	// 运行中打开防火墙，并立刻唤醒协调器（设置页会这么做）。
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallAutoOpen:    "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("打开防火墙失败: %v", err)
+	}
+	svc.KickFirewall()
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range helper.openedPorts() {
+			if p == "20031/tcp" {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("运行中打开防火墙后应对齐已有活跃隧道（放行 20031/tcp），实际已放行 %v",
+		helper.openedPorts())
+}
+
+// TestRetryWaitsForPortLock 覆盖「校验意图与执行关闭之间的并发窗口」。
+//
+// 只校验不互斥的话仍有窗口：校验通过（此刻确实该关）→ 新隧道拿到这个端口
+// 并放行 → 我们按旧意图把它关掉，新隧道刚建好就连不上。
+// 竞态本身无法稳定复现，所以这里验证的是结构前提：重试会先取端口锁。
+func TestRetryWaitsForPortLock(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	u := &model.User{Username: "portlock", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20041,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用失败: %v", err)
+	}
+
+	pl := svc.portLock(20041)
+	pl.Lock() // 模拟「该端口的归属正在变化」
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.retryPendingFirewall()
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("重试必须先取端口锁：否则校验与执行之间会插进新隧道的分配")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	pl.Unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("释放端口锁后重试应立即继续")
+	}
+}
+
+// TestCreateTunnelTakesPortLock 覆盖建隧道侧的结构前提。
+//
+// 取锁必须发生在**提交之前**：待办重试会先查数据库确认这个端口确实不该开着，
+// 若此时创建事务尚未提交，它查不到这条新隧道就会认为可以关——随后我们提交、
+// 放行，它紧接着把端口关掉。
+func TestCreateTunnelTakesPortLock(t *testing.T) {
+	// 指定端口必须落在配置的端口池范围内，所以这里给一个覆盖测试端口的区间。
+	svc := newTestServices(t, &config.Config{PortRangeStart: 20000, PortRangeEnd: 20100})
+
+	u := &model.User{Username: "createlock", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	g := &model.Group{
+		Name: "锁测试组", MaxTunnels: 5, MaxPorts: 5,
+		TrafficQuota: 1 << 30, BandwidthLimit: 1 << 20,
+		AllowProtocols: "tcp", IsDefault: true,
+	}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+	u.GroupID = g.ID
+
+	pl := svc.portLock(20043)
+	pl.Lock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.CreateTunnel(u, TunnelInput{
+			Name: "mc", Type: model.ProxyTypeTCP,
+			LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20043,
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("建隧道应等待该端口的锁（实际立即返回，err=%v）", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	pl.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("释放端口锁后建隧道应成功，实际 %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("释放端口锁后建隧道应立即继续")
+	}
+}
+
+// enableTestFirewall 打开测试用的防火墙配置并指向假 helper。
+func enableTestFirewall(t *testing.T, svc *Services, helper *fakeFirewallHelper) {
+	t.Helper()
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallAutoOpen:    "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+}
+
 // TestRedeemWritesAuditRecords 覆盖兑换流水的两种丢失。
 //
 //  1. 无效兑换码的审计原先写在业务事务里，紧接着事务回滚——等于从来没记录过。

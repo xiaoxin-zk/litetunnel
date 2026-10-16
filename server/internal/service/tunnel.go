@@ -81,6 +81,16 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 	}
 
 	var created model.Tunnel
+
+	// portUnlock 在事务内取到端口锁之后赋值，事务结束（无论成败）后释放。
+	// 之所以要在**提交之前**取锁，见下面取锁处的说明。
+	var portUnlock func()
+	defer func() {
+		if portUnlock != nil {
+			portUnlock()
+		}
+	}()
+
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
 		// 数量上限校验放在事务内，避免并发绕过限制。
 		var count int64
@@ -117,6 +127,20 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 			normalized.RemotePort = 0
 		}
 
+		// 拿到该端口的锁，并持有到下面的放行完成。
+		//
+		// 必须在**提交之前**取：一条「收回 20001」的待办重试时，会先查数据库
+		// 确认这个端口确实不该开着。如果本事务还没提交，它查不到这条新隧道，
+		// 于是认为可以关——然后我们提交、放行，它紧接着把端口关掉。
+		// 新隧道的规则就这样被一条过时任务关掉了，用户看到「刚建好就连不上」。
+		//
+		// 取锁顺序是「用户锁 → 端口锁」，与删除路径一致，不会死锁。
+		if normalized.RemotePort > 0 {
+			pl := s.portLock(normalized.RemotePort)
+			pl.Lock()
+			portUnlock = pl.Unlock
+		}
+
 		normalized.UserID = u.ID
 		normalized.BandwidthLimit = g.BandwidthLimit
 		if err := tx.Create(&normalized).Error; err != nil {
@@ -139,8 +163,11 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 	// 隧道建好后按需在主机防火墙上放行端口。
 	// 失败不影响隧道本身——管理员仍可去云安全组手工放行，
 	// 而把建隧道整体失败掉会让用户完全无从下手。
+	//
+	// 用 Locked 版本：该端口的锁已经在事务里拿到了（见上面取锁处），
+	// 这里再调一次会重复加锁、直接死锁。
 	if created.RemotePort > 0 {
-		s.applyPortIntent(created.RemotePort, ProtoOfTunnel(created.Type), true)
+		s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true)
 	}
 	return &created, nil
 }
@@ -209,9 +236,13 @@ func (s *Services) DeleteTunnel(userID, id uint) error {
 	}
 
 	// 隧道已删除，收回防火墙上的放行规则。
-	// 若该端口在保护列表中，FirewallClosePort 会拒绝并记日志，属预期行为。
+	//
+	// 走 applyPortIntent 而不是直接调 FirewallClosePort：后者失败时只写一行
+	// 日志，而记录已经删了、端口号再也查不回来——helper 恰好不可用的话，
+	// 这条规则就永久留在宿主机上，且没有任何地方会再尝试收回。
+	// 若该端口在保护列表中，护栏会拒绝并记日志，属预期行为。
 	if t.RemotePort > 0 {
-		_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+		s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
 	}
 	return nil
 }

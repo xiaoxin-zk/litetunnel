@@ -83,6 +83,9 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.PasswordResetToken{},
 		&model.EmailCode{},
 		&model.Setting{},
+		// 待重试的防火墙端口操作：必须落库，否则进程重启后丢失，
+		// 那条本该收回的规则会一直留在宿主机上。
+		&model.FirewallPending{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}

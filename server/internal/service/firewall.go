@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -177,24 +178,87 @@ const (
 	pendingFWLimit = 512
 )
 
-// markFirewallPending 记下一条待重试的端口操作。
+// markFirewallPending 记下一条待重试的端口操作（内存 + 落库）。
 func (s *Services) markFirewallPending(port int, proto string, open bool) {
 	s.fwMu.Lock()
-	defer s.fwMu.Unlock()
 	if s.fwPending == nil {
 		s.fwPending = map[int]pendingFW{}
 	}
-	if _, ok := s.fwPending[port]; ok {
-		// 已有记录时**覆盖**为最新意图（而不是保留旧的）：见 pendingFW 的注释。
-		s.fwPending[port] = pendingFW{open: open, proto: proto}
-		return
-	}
-	if len(s.fwPending) >= pendingFWLimit {
+	_, exists := s.fwPending[port]
+	// 已有记录时**覆盖**为最新意图（而不是保留旧的）：见 pendingFW 的注释。
+	// 覆盖时保留已累计的重试次数，避免「意图反复变化」把上限重置掉。
+	attempts := 0
+	if exists {
+		attempts = s.fwPending[port].attempts
+	} else if len(s.fwPending) >= pendingFWLimit {
+		s.fwMu.Unlock()
 		log.Printf("[firewall] 待处理端口操作已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
 			pendingFWLimit, port)
 		return
 	}
-	s.fwPending[port] = pendingFW{open: open, proto: proto}
+	item := pendingFW{open: open, proto: proto, attempts: attempts}
+	s.fwPending[port] = item
+	s.fwMu.Unlock()
+
+	// 落库放在锁外：这是 IO，不该让建/删隧道的请求排在它后面。
+	s.persistPending(port, item)
+}
+
+// persistPending 把一条待办写入数据库（写失败只记日志：内存里那份仍然有效，
+// 只是这次重启后会丢——比让整个防火墙操作失败要好）。
+func (s *Services) persistPending(port int, item pendingFW) {
+	rec := model.FirewallPending{
+		Port:     port,
+		Proto:    item.proto,
+		Open:     item.open,
+		Attempts: item.attempts,
+		LastErr:  truncate(item.lastErr, 255),
+	}
+	if err := s.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "port"}},
+		DoUpdates: clause.AssignmentColumns([]string{"proto", "open", "attempts", "last_err"}),
+	}).Create(&rec).Error; err != nil {
+		log.Printf("[firewall] 待办落库失败（端口 %d，重启后会丢失这条意图）: %v", port, err)
+	}
+}
+
+// dropPending 从内存与数据库里同时移除一条待办。
+func (s *Services) dropPending(port int) {
+	s.fwMu.Lock()
+	delete(s.fwPending, port)
+	s.fwMu.Unlock()
+
+	if err := s.DB.Where("port = ?", port).Delete(&model.FirewallPending{}).Error; err != nil {
+		log.Printf("[firewall] 清除待办记录失败（端口 %d）: %v", port, err)
+	}
+}
+
+// loadPendingFirewall 把落库的待办读回内存。启动时调用一次。
+//
+// 读回来的意图仍然要经过 portIntentValid 校验才会执行——重启期间端口可能
+// 已经被新隧道复用，照着旧意图关掉它就是把新隧道的规则关掉了。
+func (s *Services) loadPendingFirewall() {
+	var recs []model.FirewallPending
+	if err := s.DB.Find(&recs).Error; err != nil {
+		log.Printf("[firewall] 读取待办记录失败（本轮不恢复重试队列）: %v", err)
+		return
+	}
+	if len(recs) == 0 {
+		return
+	}
+
+	s.fwMu.Lock()
+	if s.fwPending == nil {
+		s.fwPending = map[int]pendingFW{}
+	}
+	for _, r := range recs {
+		s.fwPending[r.Port] = pendingFW{
+			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
+		}
+	}
+	n := len(s.fwPending)
+	s.fwMu.Unlock()
+	log.Printf("[firewall] 从数据库恢复了 %d 条待处理的端口操作，将继续重试", n)
 }
 
 // applyPortIntent 执行一次端口操作；失败时记入待重试队列。
@@ -203,6 +267,21 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) {
 // 启动时的规则对齐只补开不收回，放行失败更是没有任何地方会再尝试，
 // 所以两种失败都必须排队重试。
 func (s *Services) applyPortIntent(port int, proto string, open bool) {
+	if port <= 0 {
+		return
+	}
+	// 与「重试关闭该端口」互斥：否则可能刚放行就被一条过时的重试任务关掉。
+	pl := s.portLock(port)
+	pl.Lock()
+	defer pl.Unlock()
+	s.applyPortIntentLocked(port, proto, open)
+}
+
+// applyPortIntentLocked 在**已持有该端口锁**的前提下执行端口操作。
+//
+// 单独拆出来是给「事务提交前就已取锁」的调用方用（建隧道那条路径）：
+// 在那里再调一次 applyPortIntent 会重复加锁，直接死锁。
+func (s *Services) applyPortIntentLocked(port int, proto string, open bool) {
 	if port <= 0 {
 		return
 	}
@@ -278,19 +357,28 @@ func (s *Services) retryPendingFirewall() int {
 	s.fwMu.Unlock()
 
 	for _, port := range ports {
+		// 校验与执行必须在同一段临界区里，且与「端口归属发生变化」互斥。
+		//
+		// 否则仍有窗口：校验通过（此刻确实该关）→ 新隧道拿到这个端口并放行
+		// → 我们按旧意图把它关掉。持有端口锁之后，两者只可能是先后关系：
+		// 要么我们在新隧道出现前就关掉了它（此时它还没被打开，等于空操作），
+		// 要么校验时已经能看到那条活跃隧道，从而作废自己的任务。
+		pl := s.portLock(port)
+		pl.Lock()
+
 		s.fwMu.Lock()
 		item, ok := s.fwPending[port]
 		s.fwMu.Unlock()
 		if !ok {
+			pl.Unlock()
 			continue
 		}
 
 		// 意图过时（端口被新隧道复用、或隧道已经删掉）就直接作废，
 		// 绝不动手——这正是「旧任务关掉新隧道端口」的防线。
 		if !s.portIntentValid(port, item.open) {
-			s.fwMu.Lock()
-			delete(s.fwPending, port)
-			s.fwMu.Unlock()
+			pl.Unlock()
+			s.dropPending(port)
 			log.Printf("[firewall] 端口 %d 的待办已过时（当前状态与意图不符），已作废，未做任何操作", port)
 			continue
 		}
@@ -301,25 +389,28 @@ func (s *Services) retryPendingFirewall() int {
 		} else {
 			err = s.FirewallClosePort(port, item.proto)
 		}
+		pl.Unlock()
+
 		if err != nil {
 			s.fwMu.Lock()
 			item.attempts++
 			item.lastErr = err.Error()
 			if item.attempts >= pendingFWMaxAttempts {
-				delete(s.fwPending, port)
 				s.fwMu.Unlock()
+				s.dropPending(port)
 				log.Printf("[firewall] 端口 %d 连续 %d 次处理失败，放弃自动重试，需要人工清理（最后错误: %v）",
 					port, item.attempts, err)
 				continue
 			}
 			s.fwPending[port] = item
 			s.fwMu.Unlock()
+			// 重试次数也要落库：否则重启后计数归零，永久失败的端口
+			// 会重新走满一轮上限，日志反复出现。
+			s.persistPending(port, item)
 			continue
 		}
 
-		s.fwMu.Lock()
-		delete(s.fwPending, port)
-		s.fwMu.Unlock()
+		s.dropPending(port)
 		action := "收回"
 		if item.open {
 			action = "放行"
@@ -397,21 +488,25 @@ func (s *Services) requireWritableBackend() (firewall.Backend, error) {
 // 第 2 点是有意为之：如果对齐时顺手收回，一旦读取隧道列表出错或
 // 保护端口配置有误，就可能把管理员自己的连接也关掉。
 // 少收回一条规则的代价远小于被锁在服务器外。
-func (s *Services) ReconcileFirewall() {
+//
+// 返回是否真的做了一次对齐：helper 不可用、读库失败等情况下返回 false，
+// 调用方据此**下一轮再试**，而不是把它当成「已经对齐过了」——
+// 否则 helper 恢复之后，那些端口要等到重启服务才会被放行。
+func (s *Services) ReconcileFirewall() bool {
 	if !s.Settings.Bool(KeyFirewallEnabled) {
-		return
+		return false
 	}
 	be := s.FirewallBackend()
 	if _, isNone := be.(*firewall.None); isNone {
 		log.Printf("[firewall] 未检测到可用的防火墙后端，跳过规则对齐")
-		return
+		return false
 	}
 
 	var tunnels []model.Tunnel
 	if err := s.DB.Where("status = ? AND remote_port > 0", model.TunnelStatusActive).
 		Find(&tunnels).Error; err != nil {
 		log.Printf("[firewall] 读取隧道列表失败，跳过规则对齐: %v", err)
-		return
+		return false
 	}
 
 	ok, failed := 0, 0
@@ -427,6 +522,7 @@ func (s *Services) ReconcileFirewall() {
 		ok++
 	}
 	log.Printf("[firewall] 规则对齐完成：%d 个端口已放行，%d 个失败（失败项已进入重试队列，后端 %s）", ok, failed, be.Name())
+	return true
 }
 
 // FirewallStatus 是管理页需要的防火墙运行态。
@@ -617,25 +713,52 @@ func (s *Services) diagnosePortRange(u *PortPoolUsage) {
 	}
 }
 
-// StartFirewallReconciler 在启动时对齐一次规则，之后持续重试失败的端口收回。
+// StartFirewallReconciler 常驻：对齐规则并持续重试失败的端口操作。
 //
-// 延迟几秒执行：等待 frps 与数据库就绪，避免启动瞬间的误判。
+// # 为什么不能「启动时没开就直接返回」
+//
+// 防火墙开关是运行期可改的。以前这里在启动时读一次设置，关着就整个协程都不
+// 启动——于是管理员中途在面板上打开防火墙后，既没有规则对齐，也没有任何
+// worker 去重试失败的端口操作：已有的活跃隧道不会立刻放行，失败的任务也
+// 一直躺着。要重启服务才生效，而这一点界面完全不会提示。
+//
+// 所以协程总是启动，开关在**每一轮循环里**重新判断：
+//   - 关着 → 什么都不做（也不该动规则）；
+//   - 刚打开 → 先做一次完整对齐，再进入常规重试。
+//
+// 除了定时轮询，设置页打开防火墙时会通过 KickFirewall 立刻唤醒一次，
+// 不必等下一个周期。
 func (s *Services) StartFirewallReconciler() {
-	if !s.Settings.Bool(KeyFirewallEnabled) {
-		return
-	}
 	go func() {
+		// 延迟几秒执行：等待 frps 与数据库就绪，避免启动瞬间的误判。
 		time.Sleep(3 * time.Second)
-		s.ReconcileFirewall()
 
-		// 之后只重试「失败的收回」，不再周期性做整表对齐：
-		// 对齐会给每条活跃隧道都发一次 helper 请求，没必要反复做，
-		// 而失败的收回才是会一直悬着的那件事。
-		ticker := time.NewTicker(firewallRetryInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			if n := s.retryPendingFirewall(); n > 0 {
-				log.Printf("[firewall] 仍有 %d 个端口操作待处理，将在下个周期继续重试", n)
+		// 恢复上次进程遗留的待办：它们在内存里丢了，但意图还在库里。
+		s.loadPendingFirewall()
+
+		aligned := false
+		for {
+			enabled := s.Settings.Bool(KeyFirewallEnabled)
+			if !enabled {
+				// 关着的时候不碰规则；同时把「已对齐」标记清掉，
+				// 这样下次打开时会重新对齐一次。
+				aligned = false
+			} else {
+				if !aligned {
+					// 只有**真的对齐成功**才记下：helper 不可用时返回 false，
+					// 下一轮会再试——否则 helper 恢复后要等重启服务才生效。
+					aligned = s.ReconcileFirewall()
+				}
+				if n := s.retryPendingFirewall(); n > 0 {
+					log.Printf("[firewall] 仍有 %d 个端口操作待处理，将在下个周期继续重试", n)
+				}
+			}
+
+			select {
+			case <-time.After(firewallRetryInterval):
+			case <-s.fwKick:
+				// 被设置变更唤醒：立刻重新判断（对齐标记为 false 时会做整表对齐）。
+				aligned = false
 			}
 		}
 	}()

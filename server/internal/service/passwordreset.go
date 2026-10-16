@@ -246,10 +246,33 @@ func (s *Services) ResetPasswordByEmailCode(account, emailCode, newPassword, ip 
 	if u.Email == "" {
 		return fmt.Errorf("%w: 该账号未绑定邮箱，无法通过邮箱重置，请联系管理员", ErrInvalidParam)
 	}
-	if err := s.VerifyEmailCode(u.Email, EmailSceneReset, emailCode); err != nil {
+	hashed, newSecret, err := s.preparePasswordReset(newPassword)
+	if err != nil {
 		return err
 	}
-	return s.applyPasswordReset(u.ID, newPassword, ip)
+
+	// 先只校验（不消费），再把「消费验证码 + 更新密码」放进**同一个事务**。
+	//
+	// 顺序不能是「先消费、再另起一个事务改密码」：那样密码更新失败时，
+	// 验证码已经被标记为已使用——用户手里的码废了、密码却没改，只能等冷却后
+	// 重新申请。放进同一事务后，失败会一并回滚，验证码仍然可用。
+	rec, err := s.checkEmailCode(s.DB, u.Email, EmailSceneReset, emailCode)
+	if err != nil {
+		return err
+	}
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := s.consumeEmailCode(tx, rec.ID); err != nil {
+			return err
+		}
+		return s.applyPasswordResetTx(tx, u.ID, hashed, newSecret)
+	})
+	if err != nil {
+		return err
+	}
+
+	s.finishPasswordReset(u.ID, ip)
+	return nil
 }
 
 // validateNewPassword 统一新密码的强度校验。
@@ -273,29 +296,54 @@ func validateNewPassword(p string) error {
 // 注意这里**不动** API Key：它与登录会话是两套独立的吊销通道，
 // 需要用户在控制台显式重置。这与 GitHub PAT / AWS Access Key 的语义一致。
 func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error {
-	hashed, err := auth.HashPassword(newPassword)
+	hashed, newSecret, err := s.preparePasswordReset(newPassword)
 	if err != nil {
 		return err
 	}
-	newSecret, err := randomHex(32)
-	if err != nil {
-		return err
-	}
-
-	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
-			"password":      hashed,
-			"token_version": gorm.Expr("token_version + 1"),
-			"client_secret": newSecret,
-		}).Error; err != nil {
-			return err
-		}
-		return revokeClientSessionsTx(tx, userID)
-	})
-	if err != nil {
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		return s.applyPasswordResetTx(tx, userID, hashed, newSecret)
+	}); err != nil {
 		return err
 	}
 
+	s.finishPasswordReset(userID, ip)
+	return nil
+}
+
+// preparePasswordReset 在事务**之外**完成哈希与密钥生成。
+//
+// 放外面是有意的：HashPassword 是 CPU 密集操作，占着事务会拉长写锁持有时间。
+func (s *Services) preparePasswordReset(newPassword string) (hashed, newSecret string, err error) {
+	hashed, err = auth.HashPassword(newPassword)
+	if err != nil {
+		return "", "", err
+	}
+	newSecret, err = randomHex(32)
+	if err != nil {
+		return "", "", err
+	}
+	return hashed, newSecret, nil
+}
+
+// applyPasswordResetTx 在给定事务内完成重置的数据库部分。
+//
+// 拆出来是为了让调用方能把它和别的操作（例如消费验证码）放进同一个事务。
+func (s *Services) applyPasswordResetTx(tx *gorm.DB, userID uint, hashed, newSecret string) error {
+	if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+		"password":      hashed,
+		"token_version": gorm.Expr("token_version + 1"),
+		"client_secret": newSecret,
+	}).Error; err != nil {
+		return err
+	}
+	return revokeClientSessionsTx(tx, userID)
+}
+
+// finishPasswordReset 做提交之后的收尾：内存态同步与日志。
+//
+// 必须在事务**提交之后**调用：提交前清会话的话，事务一旦回滚，
+// 内存里的会话已经没了而密码没变——用户会莫名其妙掉线。
+func (s *Services) finishPasswordReset(userID uint, ip string) {
 	// 数据库会话置为离线还不够：插件热路径查的是**内存**会话表，
 	// 命中后只校验配额就放行，不会去读数据库。不一起清掉的话，
 	// 重置密码后已登录的 frpc 仍能继续接受新连接——而重置密码的前提
@@ -304,7 +352,6 @@ func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error
 
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
 	log.Printf("[reset] 用户 %d 已重置密码（来源 %s）", userID, ip)
-	return nil
 }
 
 // findUserByAccount 支持用用户名或邮箱定位账号。

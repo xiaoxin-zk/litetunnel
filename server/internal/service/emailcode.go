@@ -151,26 +151,42 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 // 一次性：校验通过即标记 used_at。失败累计到上限则整条作废，
 // 防止 6 位码被暴力枚举。
 func (s *Services) VerifyEmailCode(email, scene, code string) error {
-	email = strings.ToLower(strings.TrimSpace(email))
-	code = strings.TrimSpace(code)
-	if email == "" || code == "" {
-		return ErrEmailCodeWrong
-	}
-
-	var rec model.EmailCode
-	err := s.DB.Where("email = ? AND scene = ? AND used_at IS NULL", email, scene).
-		Order("id desc").First(&rec).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return ErrEmailCodeWrong
-	}
+	rec, err := s.checkEmailCode(s.DB, email, scene, code)
 	if err != nil {
 		return err
 	}
+	return s.consumeEmailCode(s.DB, rec.ID)
+}
+
+// checkEmailCode **只校验、不消费**，返回命中的验证码记录。
+//
+// 拆成「校验」与「消费」两步，是为了让调用方能自己决定消费发生在哪个事务里：
+// 密码重置要把「消费验证码」和「更新密码」放进同一个事务，失败时一起回滚
+// （否则验证码被标记已用、密码却没改，用户只能等冷却后重新申请）。
+//
+// 校验失败的计数（attempts）在这里就地累加，且**刻意不放进调用方的事务**：
+// 它是防暴力枚举的关键，必须在校验失败后立即生效，不能跟着回滚。
+func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*model.EmailCode, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	code = strings.TrimSpace(code)
+	if email == "" || code == "" {
+		return nil, ErrEmailCodeWrong
+	}
+
+	var rec model.EmailCode
+	err := db.Where("email = ? AND scene = ? AND used_at IS NULL", email, scene).
+		Order("id desc").First(&rec).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrEmailCodeWrong
+	}
+	if err != nil {
+		return nil, err
+	}
 	if time.Now().After(rec.ExpireAt) {
-		return ErrEmailCodeWrong
+		return nil, ErrEmailCodeWrong
 	}
 	if rec.Attempts >= emailCodeMaxAttempts {
-		return ErrEmailCodeAttempts
+		return nil, ErrEmailCodeAttempts
 	}
 
 	sum := sha256.Sum256([]byte(code))
@@ -178,16 +194,24 @@ func (s *Services) VerifyEmailCode(email, scene, code string) error {
 		[]byte(hex.EncodeToString(sum[:])), []byte(rec.CodeHash)) == 1
 	if !ok {
 		// 失败计数用数据库侧自增，避免并发下绕过次数上限。
+		// 用 s.DB 而不是传入的 db：即使调用方的事务随后回滚，这次失败也要留下。
 		if err := s.DB.Model(&model.EmailCode{}).Where("id = ?", rec.ID).
 			Update("attempts", gorm.Expr("attempts + 1")).Error; err != nil {
 			log.Printf("[emailcode] 更新失败次数出错: %v", err)
 		}
-		return ErrEmailCodeWrong
+		return nil, ErrEmailCodeWrong
 	}
+	return &rec, nil
+}
 
-	// 条件更新消费：并发下只有一个请求能把 used_at 从 NULL 改成功。
-	res := s.DB.Model(&model.EmailCode{}).
-		Where("id = ? AND used_at IS NULL", rec.ID).
+// consumeEmailCode 消费一条验证码（标记已使用）。
+//
+// 条件更新：并发下只有一个请求能把 used_at 从 NULL 改成功，
+// 另一个会拿到 0 行并得到「验证码不正确」——这正是我们要的语义
+// （同一个码不能被用两次）。
+func (s *Services) consumeEmailCode(db *gorm.DB, id uint) error {
+	res := db.Model(&model.EmailCode{}).
+		Where("id = ? AND used_at IS NULL", id).
 		Update("used_at", time.Now())
 	if res.Error != nil {
 		return res.Error

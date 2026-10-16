@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1288,6 +1290,112 @@ func TestTrafficCollectorRestoresBaselineOnStart(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("采集器启动时应先恢复采样基线，否则重启后会重复计入当天流量")
+}
+
+// TestResetByEmailCodeKeepsCodeWhenPasswordUpdateFails 覆盖
+// 「验证码被消费了、密码却没改成」。
+//
+// 消费验证码与更新密码如果分属两个事务，后者失败时会留下这个状态：
+// 用户手里的码已经失效、密码还是旧的，只能等冷却后重新申请。
+// 放进同一事务后，失败会一并回滚，验证码仍然可用。
+func TestResetByEmailCodeKeepsCodeWhenPasswordUpdateFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const email = "resetcode@example.com"
+	u := &model.User{
+		Username: "resetcodework", Password: "not-used",
+		Email: email, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 造一个已知明文的验证码（存的是 SHA-256 摘要）。
+	const plain = "123456"
+	sum := sha256.Sum256([]byte(plain))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneReset,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	// 制造「密码更新失败」：删掉客户端会话表，事务里的 revokeClientSessionsTx 会失败。
+	if err := svc.DB.Migrator().DropTable(&model.ClientSession{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+
+	err := svc.ResetPasswordByEmailCode(u.Username, plain, "NewPassw0rd!", "127.0.0.1")
+	if err == nil {
+		t.Fatal("密码更新失败时应返回错误")
+	}
+
+	var got model.EmailCode
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.UsedAt != nil {
+		t.Error("密码没改成时验证码不该被消费：否则用户只能等冷却后重新申请")
+	}
+
+	// 恢复后重试：同一个验证码应当仍然可用。
+	if err := svc.DB.AutoMigrate(&model.ClientSession{}); err != nil {
+		t.Fatalf("重建表失败: %v", err)
+	}
+	if err := svc.ResetPasswordByEmailCode(u.Username, plain, "NewPassw0rd!", "127.0.0.1"); err != nil {
+		t.Fatalf("恢复后应能用同一个验证码完成重置: %v", err)
+	}
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.UsedAt == nil {
+		t.Error("成功重置后验证码必须被消费（一次性）")
+	}
+
+	// 已用过的码不能再被使用。
+	if err := svc.ResetPasswordByEmailCode(u.Username, plain, "AnotherPassw0rd!", "127.0.0.1"); err == nil {
+		t.Error("同一个验证码不能重复使用")
+	}
+}
+
+// TestWrongEmailCodeStillCountsAttempts 覆盖反面：校验失败的计数不能被回滚掉。
+//
+// 失败次数是防 6 位码被暴力枚举的关键，必须在校验失败后立即生效；
+// 如果把它塞进「消费 + 改密」那个事务里，事务一回滚计数就没了。
+func TestWrongEmailCodeStillCountsAttempts(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const email = "attempts@example.com"
+	u := &model.User{
+		Username: "attemptsuser", Password: "not-used",
+		Email: email, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	sum := sha256.Sum256([]byte("123456"))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneReset,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	// 故意用错码：失败次数必须被记下。
+	if err := svc.ResetPasswordByEmailCode(u.Username, "000000", "NewPassw0rd!", "127.0.0.1"); err == nil {
+		t.Fatal("错误的验证码应被拒绝")
+	}
+	var got model.EmailCode
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.Attempts != 1 {
+		t.Fatalf("校验失败应累加次数（防暴力枚举），实际 %d", got.Attempts)
+	}
 }
 
 // TestRunMaintenancePrunesExpiredCredentials 覆盖「短期数据没有任何清理路径」。

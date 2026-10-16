@@ -36,6 +36,33 @@ async function loadLogs() {
   logs.value = await api.logs()
 }
 
+// 日志先攒进缓冲，每 200 毫秒合并成一次更新。
+//
+// frpc 的日志现在输出到 console，一次连接失败可能瞬间刷出上千行。原先每行都
+// 执行一次 `logs.value = [...logs.value.slice(-499), line]`——把整个数组重建
+// 一遍并触发一次渲染，上千行就是上千次，界面会明显卡住（鼠标划过列表都在卡）。
+//
+// 合并之后每 200 毫秒只重建一次，日志一条不少，只是显示晚一点点。
+const pendingLogs = []
+// 缓冲上限：200 毫秒内涌入的极端量（例如日志被反复重试刷屏）也不至于把
+// 内存撑起来。界面本来就只保留最近 500 行，丢掉更早的那部分没有损失。
+const maxPendingLogs = 2000
+let logTimer = null
+
+function pushLog(line) {
+  pendingLogs.push(line)
+  if (pendingLogs.length > maxPendingLogs) {
+    pendingLogs.splice(0, pendingLogs.length - maxPendingLogs)
+  }
+  if (logTimer) return
+  logTimer = setTimeout(() => {
+    logTimer = null
+    const batch = pendingLogs.splice(0, pendingLogs.length)
+    if (!batch.length) return
+    logs.value = [...logs.value, ...batch].slice(-500)
+  }, 200)
+}
+
 function onConnected(next) {
   state.value = next
   loadLogs()
@@ -54,9 +81,7 @@ onMounted(async () => {
   onEvent('state', (payload) => {
     state.value = payload
   })
-  onEvent('log', (line) => {
-    logs.value = [...logs.value.slice(-499), line]
-  })
+  onEvent('log', pushLog)
   onEvent('notice', (msg) => {
     notice.value = { text: msg, at: Date.now() }
   })

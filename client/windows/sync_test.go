@@ -65,6 +65,50 @@ func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
 	}
 }
 
+// TestRegisteredFlagFlowsIntoState 覆盖「frpc 已连上，界面却还停在连接中」。
+//
+// 服务端的 online 要等采集（30 秒一轮）+ 客户端同步（20 秒一轮）才更新，
+// 用户点完连接会盯着「连接中」等一整轮，误以为连不上。registered 由 frpc 的
+// start proxy success 直接置位，界面据此立刻显示「运行中」；服务端采集值
+// 继续用于后续校准（掉线、被停用仍以它为准）。
+func TestRegisteredFlagFlowsIntoState(t *testing.T) {
+	withTempConfigDir(t)
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	// GetState 只读 a.tunnels（服务端清单由同步填充），这里直接放一条即可。
+	a.tunnels = []TunnelVO{{
+		ID: 7, Name: "mc", Type: "tcp", Status: tunnelStatusActive,
+		LocalIP: "127.0.0.1", LocalPort: 25565,
+	}}
+
+	if got := stateTunnel(t, a.GetState(), 7); got.Registered {
+		t.Fatal("前置条件：默认不该是「已注册」")
+	}
+
+	a.setTunnelRegistered(7, true)
+	if got := stateTunnel(t, a.GetState(), 7); !got.Registered {
+		t.Error("frpc 报告成功后状态里必须带上 registered，界面才能立刻切成「运行中」")
+	}
+
+	a.setTunnelRegistered(7, false)
+	if got := stateTunnel(t, a.GetState(), 7); got.Registered {
+		t.Error("进程退出或主动停止后必须清掉，否则界面会一直显示「运行中」")
+	}
+}
+
+// stateTunnel 从状态快照里取出某条隧道。
+func stateTunnel(t *testing.T, st State, id uint) TunnelVO {
+	t.Helper()
+	for _, tv := range st.Tunnels {
+		if tv.ID == id {
+			return tv
+		}
+	}
+	t.Fatalf("状态里没有隧道 %d", id)
+	return TunnelVO{}
+}
+
 // TestSyncCleansConfigOfTunnelDeletedElsewhere 覆盖「网页端删除后本地配置残留」。
 //
 // 隧道可能是在网页端删掉的，或客户端的删除请求在服务端完成之后遇到网络错误：

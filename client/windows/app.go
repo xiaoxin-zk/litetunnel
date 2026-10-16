@@ -50,6 +50,17 @@ type TunnelVO struct {
 	// Running——用户点的是「我这台机器上要不要连出去」。
 	Running bool `json:"running"`
 
+	// Registered 表示 frpc 已报告这条代理注册成功（本机视角，立即生效）。
+	//
+	// 为什么需要它：Online 来自服务端采集（默认 30 秒一轮），客户端同步又是
+	// 20 秒一轮，所以「frps 已经收到这条代理」要过最多约 50 秒才反映到界面上
+	// ——用户点完连接会盯着「连接中」等一整轮，误以为连不上。
+	//
+	// 而 frpc 自己会在 200 毫秒内报出 `start proxy success`，客户端解析到这行
+	// 就能立刻把标签切成「运行中」。服务端采集值继续用于后续校准（代理掉线、
+	// 隧道被服务端停用等情况仍以它为准）。
+	Registered bool `json:"registered"`
+
 	// LastError 是最近一次从该隧道的 frpc 输出里识别到的错误原文。
 	//
 	// 为什么需要它：「连接中」这个状态本身不说明任何原因——凭据失效、
@@ -177,6 +188,17 @@ type App struct {
 	// 避免每轮同步（20 秒）都重复弹同一条提示。
 	cleanupWarned map[uint]bool
 
+	// registered 记录 frpc 已报告注册成功的隧道（见 TunnelVO.Registered）。
+	// 由 start proxy success 置位，进程退出/主动停止/重新拉起时清掉。
+	registered map[uint]bool
+
+	// errEmitAt 是「上一次因错误推送状态」的时间，用于限频。
+	//
+	// frpc 的日志现在走 console，一次连接失败可能瞬间刷出上千行错误；每行都
+	// 推一次状态意味着反复序列化整个状态再发给前端。这里对同一隧道限到 1 秒
+	// 一次，重复的错误对用户没有新信息。
+	errEmitAt map[uint]time.Time
+
 	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。
 	//
 	// 没有它的话：frpc 因凭据失效、地址写错等原因立刻退出，下一轮同步
@@ -238,6 +260,8 @@ func NewApp() *App {
 		applied:    map[uint]string{},
 		tunnelErrs: map[uint]tunnelErr{},
 		retries:    map[uint]*retryState{},
+		registered: map[uint]bool{},
+		errEmitAt:  map[uint]time.Time{},
 		startedAt:  time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
@@ -266,14 +290,29 @@ func (a *App) startup(ctx context.Context) {
 			// 连上了就把退避清掉：下次断开时应当立即重试，
 			// 而不是继承上一次失败的等待时间。
 			a.clearRetry(id)
+			// 立刻把这条隧道标成「已注册」并推一次状态。
+			//
+			// 服务端的 Online 要等采集（30 秒一轮）+ 客户端同步（20 秒一轮），
+			// 用户会盯着「连接中」等一整轮，误以为连不上；而 frpc 此刻已经
+			// 报告成功了，没有理由让他等。服务端采集值仍用于后续校准。
+			a.setTunnelRegistered(id, true)
 			a.emitTunnelReady(id, name)
+			a.emitState()
 		case frpc.IsErrorLine(line):
 			// 记下错误原文并刷新状态，让界面能显示「为什么一直连不上」，
 			// 而不是永远停在一句「连接中」上。
-			a.recordTunnelErr(id, line)
-			a.emitState()
+			//
+			// 但只在错误原文**变化**时刷新，并对同一隧道限频：一次连接失败
+			// 可能瞬间刷出上千行同样的错误，逐行推状态纯属浪费（每推一次都
+			// 要序列化整个状态），而重复的错误对用户没有新信息。
+			if a.recordTunnelErr(id, line) {
+				a.emitStateThrottled(id)
+			}
 		}
 	}, func(id uint, name string, err error, requested bool) {
+		// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
+		// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
+		a.setTunnelRegistered(id, false)
 		switch {
 		case requested:
 			// 我们自己停的（用户关开关、退出登录、配置变更重连）：
@@ -400,6 +439,7 @@ func (a *App) GetState() State {
 	copy(tunnels, a.tunnels)
 	for i := range tunnels {
 		tunnels[i].Running = a.mgr.Running(tunnels[i].ID)
+		tunnels[i].Registered = a.registered[tunnels[i].ID]
 		// 连上之后错误记录已被清掉，这里取不到就表示当前没有已知错误。
 		if e, ok := a.tunnelErrs[tunnels[i].ID]; ok {
 			at := e.at
@@ -819,7 +859,25 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	}
 	// 退避由 startTunnelProcess → writeAndStart 在**启动之前**清掉。
 	// 用户主动点开当然要立刻重试，而不是等上一次失败留下的退避时间。
-	return a.syncAndState(), nil
+
+	// 进程已经拉起来了，先返回，同步放后台。
+	//
+	// 同步会逐条拉取活动隧道的配置（每条一次 HTTP，超时 15 秒），隧道一多
+	// 或网络一慢，按钮就要转很久——而用户此刻关心的是「这条隧道起没起来」。
+	// frpc 一报 start proxy success，界面就会通过 registered 立刻变成
+	// 「运行中」，完全不必等这次同步。
+	//
+	// 后台同步照常执行（拿最新的隧道清单与状态），只是不再挡着返回。
+	state := a.GetState()
+	a.emitState()
+	go func() {
+		// syncMu 此刻还被本函数持有（defer 解锁），所以这个协程会先等一下，
+		// 等 StartTunnel 返回后再同步——不会与它重叠。
+		a.syncMu.Lock()
+		defer a.syncMu.Unlock()
+		a.syncAndState()
+	}()
+	return state, nil
 }
 
 // StopTunnel 断开一条隧道并停用它。
@@ -1228,6 +1286,9 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	// 会把它抹掉，下一轮同步立刻又拉起进程，退避形同不存在。
 	// 放在启动前，最坏情况也只是「刚失败过一次又立刻重试一次」。
 	a.clearRetry(t.ID)
+	// 重新拉起之前先清掉「已注册」：旧进程的注册已经作废，新的要等 frpc
+	// 再报一次 start proxy success。不清的话重连期间界面会一直显示「运行中」。
+	a.setTunnelRegistered(t.ID, false)
 
 	// 把配置路径一起打出来：隧道起不来时，第一件要确认的就是
 	// 「客户端到底用了哪份配置」，而这份配置是每条隧道一份的。
@@ -1269,6 +1330,8 @@ func (a *App) startTunnelProcess(t TunnelVO) error {
 // stopTunnelProcess 停掉某条隧道的进程。
 func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
+	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
+	a.setTunnelRegistered(t.ID, false)
 	return a.mgr.Stop(t.ID)
 }
 
@@ -1572,8 +1635,47 @@ func (a *App) emitTunnelLog(name, msg string) {
 }
 
 // recordTunnelErr 记下一条隧道的 frpc 错误（从原始输出行里取）。
-func (a *App) recordTunnelErr(id uint, line string) {
-	a.recordTunnelErrMsg(id, frpc.StripLogPrefix(line))
+// recordTunnelErr 记下一条隧道的错误说明，返回**错误原文是否变化**。
+//
+// 返回值给调用方决定要不要推状态：同样的错误重复刷屏时，状态里显示的东西
+// 一个字都没变，推了只是白白让前端重建一次视图。
+func (a *App) recordTunnelErr(id uint, line string) bool {
+	return a.recordTunnelErrMsg(id, frpc.StripLogPrefix(line))
+}
+
+// setTunnelRegistered 标记某条隧道的代理是否已注册成功。
+func (a *App) setTunnelRegistered(id uint, up bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.registered == nil {
+		a.registered = map[uint]bool{}
+	}
+	if up {
+		a.registered[id] = true
+		return
+	}
+	delete(a.registered, id)
+}
+
+// emitStateThrottled 推一次状态，但同一隧道 1 秒内只推一次。
+//
+// 限频只在**错误洪峰**这条路径上用：正常的开关、同步、注册成功都必须立即
+// 反映到界面。丢掉的那一次不会让界面停在错误状态上——错误原文变化时必然会
+// 推（那是用户要看的信息），后续同步（≤20 秒）也会带上最新状态。
+func (a *App) emitStateThrottled(id uint) {
+	a.mu.Lock()
+	if a.errEmitAt == nil {
+		a.errEmitAt = map[uint]time.Time{}
+	}
+	now := time.Now()
+	if last, ok := a.errEmitAt[id]; ok && now.Sub(last) < time.Second {
+		a.mu.Unlock()
+		return
+	}
+	a.errEmitAt[id] = now
+	a.mu.Unlock()
+
+	a.emitState()
 }
 
 // recordTunnelErrMsg 记下一条隧道的错误说明。
@@ -1581,17 +1683,20 @@ func (a *App) recordTunnelErr(id uint, line string) {
 // 除了 frpc 自己打印的错误，客户端**自己**发现的失败也要记（拉配置失败、
 // 进程起不来）：那些失败同样让这条隧道连不上，只写进日志的话，
 // 界面上的隧道行仍然什么原因都不显示。
-func (a *App) recordTunnelErrMsg(id uint, msg string) {
+func (a *App) recordTunnelErrMsg(id uint, msg string) bool {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
-		return
+		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.tunnelErrs == nil {
 		a.tunnelErrs = map[uint]tunnelErr{}
 	}
+	prev, ok := a.tunnelErrs[id]
+	// 时间戳每次都更新（它表示「最近一次出现」），但只有原文变化才算变化。
 	a.tunnelErrs[id] = tunnelErr{msg: msg, at: time.Now()}
+	return !ok || prev.msg != msg
 }
 
 // clearTunnelErr 清掉一条隧道的错误记录。

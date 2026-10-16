@@ -97,7 +97,7 @@
           <div class="tunnel-main">
             <div class="tunnel-name">
               {{ t.name }}
-              <span class="tag" :class="tagClass(t)">{{ tagText(t) }}</span>
+              <span class="tag" :class="tagClass(t)" :title="tagHint(t)">{{ tagText(t) }}</span>
             </div>
             <div class="muted">
               本地 <span class="mono">{{ t.local_ip }}:{{ t.local_port }}</span>
@@ -788,9 +788,14 @@ const dotClass = computed(() => {
 function tagText(t) {
   if (t.status !== 'active') return '已停用'
   // running 是本机视角（进程在不在），online 是服务端视角（frps 有没有
-  // 收到这条代理）。两者分开说，用户才能区分「我没开」和「开了还没通」。
+  // 收到这条代理），registered 是本机从 frpc 输出里读到的「代理已注册」。
+  // 三者分开说，用户才能区分「我没开」「开了还没通」「已经通了」。
   if (!t.running) return '未连接'
-  if (t.online) return '运行中'
+  // registered 与 online 等效，但它**先到**：服务端的 online 要等采集
+  // （30 秒一轮）加客户端同步（20 秒一轮），等它的话用户会盯着「连接中」
+  // 等一整轮，误以为连不上。frpc 报告成功后标签立即翻转，服务端采集值
+  // 继续用于后续校准（掉线、被停用等情况仍以它为准）。
+  if (t.registered || t.online) return '运行中'
   // 有错误就不是「还在连」，而是「连不上」。这两者要给不同的提示：
   // 前者让用户等，后者让用户去查（凭据、地址、网络）。
   return t.last_error ? '连接失败' : '连接中'
@@ -798,8 +803,25 @@ function tagText(t) {
 
 function tagClass(t) {
   if (t.status !== 'active' || !t.running) return 'tag-info'
-  if (t.online) return 'tag-success'
+  if (t.registered || t.online) return 'tag-success'
   return t.last_error ? 'tag-err' : 'tag-warn'
+}
+
+/**
+ * 状态标签的悬停说明。
+ *
+ * 主要是解释「本机已注册、服务端状态还没跟上」这一种：标签已经是
+ * 「运行中」，而服务端采集值可能还是上一轮的 false，管理员在后台看到
+ * 的会略滞后。说清楚就不必去猜哪个才准。
+ */
+function tagHint(t) {
+  if (t.status !== 'active') return '这条隧道已在控制台停用'
+  if (!t.running) return '本机没有为这条隧道运行 frpc'
+  if (t.registered && !t.online) {
+    return '本机 frpc 已报告代理注册成功；服务端状态按采集周期（约 30 秒）更新，可能略滞后'
+  }
+  if (t.online) return '服务端已确认这条代理在线'
+  return t.last_error ? '最近一次错误：' + t.last_error : '正在连接'
 }
 
 /** 把时间戳格式化成 HH:MM:SS，用于「最后一次失败发生在什么时候」。 */

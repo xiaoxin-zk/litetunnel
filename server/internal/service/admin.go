@@ -166,6 +166,10 @@ func (s *Services) AdminTOTPEnable(id uint, code string) error {
 		//
 		// 水位线一并置为本次验证的步进：旧密钥的水位线对新密钥没有意义，
 		// 而且这样这个刚用过的口令也不会被重放。
+		//
+		// token_version 也在同一个 UPDATE 里递增（换绑即撤销既有会话，
+		// 见 updateAdminSecurity）：换绑的前提往往是设备丢失或疑似泄露，
+		// 此刻最该停止信任的就是既有会话。
 		res := s.DB.Model(&model.Admin{}).
 			Where("id = ? AND totp_pending_secret = ?", id, pending).
 			Updates(map[string]any{
@@ -174,6 +178,7 @@ func (s *Services) AdminTOTPEnable(id uint, code string) error {
 				"totp_enabled":        true,
 				"totp_last_step":      step,
 				"totp_verified_at":    now,
+				"token_version":       gorm.Expr("token_version + 1"),
 			})
 		if res.Error != nil {
 			return res.Error
@@ -181,6 +186,7 @@ func (s *Services) AdminTOTPEnable(id uint, code string) error {
 		if res.RowsAffected == 0 {
 			return ErrTOTPReplay
 		}
+		s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
 		return nil
 	}
 
@@ -188,16 +194,42 @@ func (s *Services) AdminTOTPEnable(id uint, code string) error {
 	if !s.ClaimTOTPStep(a.ID, step) {
 		return ErrTOTPReplay
 	}
-	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+	return s.updateAdminSecurity(id, map[string]any{
 		"totp_enabled":     true,
 		"totp_verified_at": now,
-	}).Error
+	})
+}
+
+// updateAdminSecurity 写入一次安全相关的管理员状态变更，并撤销其既有会话。
+//
+// # 会话策略
+//
+// **任何改变动态口令绑定的操作**——启用、换绑、关闭、超管救援重置——都会让该
+// 管理员已签发的令牌立即失效：递增 token_version（校验时会比对），并清掉身份
+// 缓存（令牌只验签、不查库，缓存不清的话已登录会话在缓存过期前仍会被放行）。
+//
+// 为什么这类操作要踢人下线：它们的前提往往是「设备丢失或疑似泄露」，而此刻最该
+// 停止信任的恰恰是既有会话——一个被盗的令牌可能正是这次操作要处理的东西。
+// 这与改密码、改角色/状态采用同一套语义。
+//
+// 注意**只在状态真的改变时**才调用：把已经关闭的双因素再关一次也把人踢下线，
+// 只会让管理员在无意义的操作里莫名被登出（改角色那处也是这么处理的）。
+func (s *Services) updateAdminSecurity(id uint, updates map[string]any) error {
+	updates["token_version"] = gorm.Expr("token_version + 1")
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		return err
+	}
+	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	return nil
 }
 
 // AdminTOTPDisable 关闭双因素认证。
 //
 // 关闭是降级安全等级的操作，必须重新验证登录口令，
 // 避免令牌被盗后攻击者直接关掉第二因素。
+//
+// 关闭同样撤销既有会话（见 updateAdminSecurity）：这是一次「第二因素没了」的
+// 状态变化，此刻继续沿用旧会话等于让降级前的信任无限延续下去。
 func (s *Services) AdminTOTPDisable(id uint, password string) error {
 	a, err := s.LoadAdmin(id)
 	if err != nil {
@@ -206,13 +238,17 @@ func (s *Services) AdminTOTPDisable(id uint, password string) error {
 	if !auth.VerifyPassword(a.Password, password) {
 		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 	}
-	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+	if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
+		// 本来就没绑定：什么都没变，不该因为一次空操作把人踢下线。
+		return nil
+	}
+	return s.updateAdminSecurity(id, map[string]any{
 		"totp_enabled": false,
 		"totp_secret":  "",
 		// 待确认的密钥一并清掉：关闭之后它没有意义，留着只会在下次绑定时
 		// 被当成「正在换绑」。
 		"totp_pending_secret": "",
-	}).Error
+	})
 }
 
 // LoadAdmin 载入管理员。
@@ -512,20 +548,25 @@ func (s *Services) AdminSetPassword(id uint, newPassword string) error {
 }
 
 // AdminClearTOTP 清除指定管理员的双因素绑定，用于认证器丢失的救援场景。
+//
+// 这是最该撤销既有会话的一处：走到这里说明账号很可能已经出过问题
+// （设备丢失、疑似泄露），而执行救援的超级管理员无法判断目标账号当前
+// 还有哪些会话在活动——全部作废，让持有人重新登录并绑定新设备。
 func (s *Services) AdminClearTOTP(id uint) error {
-	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+	a, err := s.LoadAdmin(id)
+	if err != nil {
+		return err
+	}
+	if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
+		// 没有可清除的绑定：不改变任何状态，也不该把人踢下线。
+		return nil
+	}
+	return s.updateAdminSecurity(id, map[string]any{
 		"totp_enabled":        false,
 		"totp_secret":         "",
 		"totp_pending_secret": "",
 		"totp_verified_at":    nil,
 	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // assertNotLastSuperAdmin 确保系统里始终至少保留一个可用的超级管理员，

@@ -251,6 +251,194 @@ func TestTOTPSetupWithoutTOTPRequiresNoCode(t *testing.T) {
 	}
 }
 
+// adminTokenVersion 读某管理员当前的令牌版本。
+func adminTokenVersion(t *testing.T, svc *Services, id uint) int {
+	t.Helper()
+	var a model.Admin
+	if err := svc.DB.First(&a, id).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	return a.TokenVersion
+}
+
+// adminIdentityCached 判断某管理员的身份缓存是否还在。
+func adminIdentityCached(svc *Services, id uint) bool {
+	svc.Runtime.mu.RLock()
+	defer svc.Runtime.mu.RUnlock()
+	_, ok := svc.Runtime.identities[identityKey{kind: IdentityKindAdmin, id: id}]
+	return ok
+}
+
+// seedIdentityCache 预置一条身份缓存，模拟「已经登录过一次」。
+func seedIdentityCache(svc *Services, id uint) {
+	svc.Runtime.SetCachedIdentity(IdentityKindAdmin, id, true, 1)
+}
+
+// setAdminPassword 把管理员的登录口令设为一个已知明文（库里存哈希）。
+//
+// 关闭双因素要校验登录口令，而 newAdminForTOTP 建号时写的是占位字符串
+// （不是哈希），直接拿它去校验必然失败。
+func setAdminPassword(t *testing.T, svc *Services, id uint, plain string) {
+	t.Helper()
+	hashed, err := auth.HashPassword(plain)
+	if err != nil {
+		t.Fatalf("哈希口令失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.Admin{}).Where("id = ?", id).
+		Update("password", hashed).Error; err != nil {
+		t.Fatalf("设置口令失败: %v", err)
+	}
+}
+
+// TestTOTPEnableRevokesExistingSessions 覆盖「改了第二因素但旧会话照旧有效」。
+//
+// 启用 / 换绑 / 关闭 / 救援重置都属于「改变动态口令绑定」的操作，前提往往是
+// 设备丢失或疑似泄露——此刻最该停止信任的就是既有会话。不撤销的话，一个被盗的
+// 令牌可以一直用到过期，而管理员以为「我处理过了」。
+func TestTOTPEnableRevokesExistingSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newAdminForTOTP(t, svc, "totp-revoke-enable")
+	before := adminTokenVersion(t, svc, a.ID)
+	seedIdentityCache(svc, a.ID)
+
+	secret, _, err := svc.AdminTOTPSetup(a.ID, "")
+	if err != nil {
+		t.Fatalf("生成密钥失败: %v", err)
+	}
+	code, err := auth.GenerateTOTP(secret, time.Now())
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
+	}
+	if err := svc.AdminTOTPEnable(a.ID, code); err != nil {
+		t.Fatalf("启用失败: %v", err)
+	}
+
+	if got := adminTokenVersion(t, svc, a.ID); got != before+1 {
+		t.Errorf("启用双因素后应递增令牌版本（旧会话立即失效），实际 %d → %d", before, got)
+	}
+	if adminIdentityCached(svc, a.ID) {
+		t.Error("身份缓存必须一并清掉：令牌只验签不查库，缓存还在的话旧会话仍会被放行")
+	}
+}
+
+// TestTOTPRebindRevokesExistingSessions 覆盖换绑路径（走的是另一段提升语句）。
+func TestTOTPRebindRevokesExistingSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newAdminForTOTP(t, svc, "totp-revoke-rebind")
+	oldSecret := enableTOTPDirectly(t, svc, a)
+	before := adminTokenVersion(t, svc, a.ID)
+	seedIdentityCache(svc, a.ID)
+
+	code, err := auth.GenerateTOTP(oldSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
+	}
+	newSecret, _, err := svc.AdminTOTPSetup(a.ID, code)
+	if err != nil {
+		t.Fatalf("换绑第一步应成功: %v", err)
+	}
+	// 只是暂存，还没切换：这一步不该踢人下线。
+	if got := adminTokenVersion(t, svc, a.ID); got != before {
+		t.Errorf("暂存新密钥不该改变令牌版本，实际 %d → %d", before, got)
+	}
+
+	newCode, err := auth.GenerateTOTP(newSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算新口令失败: %v", err)
+	}
+	if err := svc.AdminTOTPEnable(a.ID, newCode); err != nil {
+		t.Fatalf("确认换绑失败: %v", err)
+	}
+
+	if got := adminTokenVersion(t, svc, a.ID); got != before+1 {
+		t.Errorf("换绑完成后应递增令牌版本，实际 %d → %d", before, got)
+	}
+	if adminIdentityCached(svc, a.ID) {
+		t.Error("换绑后身份缓存必须清掉")
+	}
+}
+
+// TestTOTPDisableRevokesExistingSessions 覆盖关闭路径。
+func TestTOTPDisableRevokesExistingSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newAdminForTOTP(t, svc, "totp-revoke-disable")
+	enableTOTPDirectly(t, svc, a)
+	before := adminTokenVersion(t, svc, a.ID)
+	seedIdentityCache(svc, a.ID)
+
+	// 关闭双因素要校验登录口令。
+	const plain = "Passw0rd!2345"
+	setAdminPassword(t, svc, a.ID, plain)
+
+	if err := svc.AdminTOTPDisable(a.ID, plain); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if got := adminTokenVersion(t, svc, a.ID); got != before+1 {
+		t.Errorf("关闭双因素后应递增令牌版本，实际 %d → %d", before, got)
+	}
+	if adminIdentityCached(svc, a.ID) {
+		t.Error("关闭后身份缓存必须清掉")
+	}
+}
+
+// TestTOTPNoopDoesNotRevokeSessions 覆盖反面：什么都没变时不该把人踢下线。
+//
+// 把已经关闭的双因素再关一次、或对没有绑定的账号做救援重置，都只是空操作；
+// 因此被莫名登出属于「无意义操作带来的惩罚」（改角色那处也是这么处理的）。
+func TestTOTPNoopDoesNotRevokeSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newAdminForTOTP(t, svc, "totp-noop")
+	const plain = "Passw0rd!2345"
+	setAdminPassword(t, svc, a.ID, plain)
+	before := adminTokenVersion(t, svc, a.ID)
+	seedIdentityCache(svc, a.ID)
+
+	if err := svc.AdminTOTPDisable(a.ID, plain); err != nil {
+		t.Fatalf("对未绑定的账号关闭双因素不该报错: %v", err)
+	}
+	if err := svc.AdminClearTOTP(a.ID); err != nil {
+		t.Fatalf("对未绑定的账号做救援重置不该报错: %v", err)
+	}
+
+	if got := adminTokenVersion(t, svc, a.ID); got != before {
+		t.Errorf("空操作不该改变令牌版本，实际 %d → %d", before, got)
+	}
+	if !adminIdentityCached(svc, a.ID) {
+		t.Error("空操作不该清掉身份缓存（否则管理员会被莫名登出）")
+	}
+}
+
+// TestClearTOTPRevokesTargetOnly 覆盖救援重置：只踢目标账号，且只踢有绑定的。
+func TestClearTOTPRevokesTargetOnly(t *testing.T) {
+	svc := newTestServices(t, nil)
+	target := newAdminForTOTP(t, svc, "totp-clear-target")
+	other := newAdminForTOTP(t, svc, "totp-clear-other")
+	enableTOTPDirectly(t, svc, target)
+	enableTOTPDirectly(t, svc, other)
+
+	targetBefore := adminTokenVersion(t, svc, target.ID)
+	otherBefore := adminTokenVersion(t, svc, other.ID)
+	seedIdentityCache(svc, target.ID)
+	seedIdentityCache(svc, other.ID)
+
+	if err := svc.AdminClearTOTP(target.ID); err != nil {
+		t.Fatalf("救援重置失败: %v", err)
+	}
+
+	if got := adminTokenVersion(t, svc, target.ID); got != targetBefore+1 {
+		t.Errorf("被重置的账号应递增令牌版本，实际 %d → %d", targetBefore, got)
+	}
+	if adminIdentityCached(svc, target.ID) {
+		t.Error("被重置的账号身份缓存必须清掉")
+	}
+	if got := adminTokenVersion(t, svc, other.ID); got != otherBefore {
+		t.Errorf("不该影响其他管理员，实际 %d → %d", otherBefore, got)
+	}
+	if !adminIdentityCached(svc, other.ID) {
+		t.Error("不该清掉其他管理员的身份缓存")
+	}
+}
+
 // TestClaimTOTPStepRejectsReplay 验证同一口令不能被重复占用。
 func TestClaimTOTPStepRejectsReplay(t *testing.T) {
 	svc := newTestServices(t, nil)

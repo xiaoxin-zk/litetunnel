@@ -285,7 +285,12 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	proxies, err := s.Frps.ListProxies(ctx)
 	if err != nil {
 		// 采集失败不致命：frps 可能正在重启，下一轮会自动恢复。
-		log.Printf("[traffic] 拉取 frps 代理状态失败: %v", err)
+		//
+		// 但**必须在这里就返回**：下面会把本轮的在线集合整体替换掉，
+		// 拿不到可信数据却照常替换，等于把所有隧道一次性判成离线——
+		// 客户端集体显示「连接中」，而真实原因只是采集出了问题。
+		// 保留上一次的在线状态，直到拿到可信结果为止。
+		log.Printf("[traffic] 拉取 frps 代理状态失败（保留上次在线状态）: %v", err)
 		return
 	}
 

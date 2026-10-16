@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,7 +70,31 @@ type frpsPage[T any] struct {
 	Items    []T `json:"items"`
 }
 
+// frpsEnvelope 是 frps 管理 API 的统一响应包装。
+//
+// frps v0.71 的所有管理接口都返回 {code, msg, data}，分页对象在 data 里：
+//
+//	{"code":0,"msg":"","data":{"total":1,"page":1,"pageSize":200,"items":[...]}}
+//
+// 这里必须显式解包。曾经是把整个响应体直接反序列化成 frpsPage：json 对
+// 多余的字段是宽容的，**不会报错**，只是 Items 恒为空。采集器于是拿到一份
+// 「空代理列表」，把所有隧道判成离线，客户端一直显示「连接中」，
+// 而面板日志里没有任何异常。静默失败比报错难查得多。
+type frpsEnvelope struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data json.RawMessage `json:"data"`
+}
+
 // ListProxies 拉取全部代理。分页抓取，避免代理数量增长后被截断。
+//
+// 「返回错误」与「返回空列表」是两件完全不同的事，调用方必须区分：
+//
+//   - 返回错误：没拿到可信数据，应当保留上一次的在线状态；
+//   - 返回空列表且无错误：frps 明确告诉我们当前没有任何代理，
+//     此时把隧道判为离线才是对的。
+//
+// 任何格式不符都走第一条，绝不退化成空列表。
 func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 	const pageSize = 200
 	var all []FrpsProxy
@@ -87,6 +112,11 @@ func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 	return all, nil
 }
 
+// getJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。
+//
+// 每一步不对都返回错误：状态码非 200、响应不是合法 JSON、业务错误码非 0、
+// 缺少 data、data 解不出来。**绝不返回「零值 + nil」**——那等于告诉调用方
+// 「代理列表是空的」，而真实情况是我们根本没读懂响应。
 func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) error {
 	if _, err := url.Parse(endpoint); err != nil {
 		return err
@@ -112,7 +142,26 @@ func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) erro
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(body, out)
+
+	var env frpsEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return fmt.Errorf("frps 管理接口响应不是合法 JSON: %w", err)
+	}
+	// frps 用 code 表达业务错误，此时 HTTP 状态码仍然是 200。
+	if env.Code != 0 {
+		msg := strings.TrimSpace(env.Msg)
+		if msg == "" {
+			msg = "未提供原因"
+		}
+		return fmt.Errorf("frps 管理接口返回错误码 %d: %s", env.Code, msg)
+	}
+	if len(env.Data) == 0 || string(env.Data) == "null" {
+		return errors.New("frps 管理接口响应缺少 data 字段")
+	}
+	if err := json.Unmarshal(env.Data, out); err != nil {
+		return fmt.Errorf("解析 frps 管理接口 data 失败: %w", err)
+	}
+	return nil
 }
 
 // ParseProxyName 拆分 frp 代理名。

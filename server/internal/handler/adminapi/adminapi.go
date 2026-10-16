@@ -94,13 +94,25 @@ func (h *Handler) UpdateProfile(c *gin.Context) {
 // ---- 双因素认证 ----
 
 // TOTPSetup 生成新的 TOTP 密钥（此时尚未启用）。
+//
+// 已启用双因素时属于「换绑」，需要提供**当前生效的动态口令**（见 service 层
+// 的说明）。因此这里接受一个可选字段：未启用时前端不带任何参数，空 body
+// 也要能正常处理。
 func (h *Handler) TOTPSetup(c *gin.Context) {
+	var req struct {
+		Code string `json:"code"`
+	}
+	// 空 body 不是错误：首次绑定时前端不会传任何参数。
+	_ = c.ShouldBindJSON(&req)
+
 	adminID, _, _ := middleware.CurrentAdminID(c)
-	secret, otpauth, err := h.svc.AdminTOTPSetup(adminID)
+	secret, otpauth, err := h.svc.AdminTOTPSetup(adminID, req.Code)
 	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
+	// 换绑是安全相关的操作，记一条审计（首次绑定也会记，代价可以忽略）。
+	h.audit(c, "admin.totp_setup", "admin", strconv.Itoa(int(adminID)), "生成动态口令密钥")
 	httpx.OK(c, gin.H{
 		"secret":      secret,
 		"otpauth_url": otpauth,

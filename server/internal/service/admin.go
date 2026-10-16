@@ -73,11 +73,43 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 //
 // 两步式设计（先生成、再用一次正确口令确认）是为了避免用户扫码失败后
 // 就把自己锁在门外。
-func (s *Services) AdminTOTPSetup(id uint) (secret, otpauthURL string, err error) {
+//
+// # 已启用时不能凭会话令牌直接换绑
+//
+// 本接口会替换密钥并把 totp_enabled 置回 false。如果不加约束，一个**被盗的
+// 管理员会话令牌**就足以把第二因素整个换掉：攻击者调用它、绑上自己控制的
+// 密钥，第二因素从此形同虚设——而「关闭双因素」那个接口反倒要求重新验证
+// 口令，成了两者中更严格的一个，这明显不对。
+//
+// 所以已启用时要求提供**当前生效的动态口令**：换绑的正当场景是「换了手机」，
+// 此时旧设备还在手上。旧设备也丢了的话，由超级管理员在管理员列表里重置
+// （POST /admins/:id/totp-reset，权限更高且会记审计）。
+//
+// 校验发生在生成新密钥**之前**，因此不存在「新密钥已写入、校验却没过」的
+// 中间状态，也就不需要额外的暂存字段。
+func (s *Services) AdminTOTPSetup(id uint, code string) (secret, otpauthURL string, err error) {
 	a, err := s.LoadAdmin(id)
 	if err != nil {
 		return "", "", err
 	}
+
+	if a.TOTPEnabled {
+		if strings.TrimSpace(code) == "" {
+			return "", "", fmt.Errorf(
+				"%w: 双因素认证已启用，换绑需要输入当前动态口令（设备已丢失请联系超级管理员重置）",
+				ErrInvalidParam)
+		}
+		step, ok := auth.VerifyTOTPStep(a.TOTPSecret, code, time.Now())
+		if !ok {
+			return "", "", ErrTOTPInvalid
+		}
+		// 与登录、绑定一致，这一步的口令也要登记：否则同一个口令可以被拿去
+		// 连续做两次操作（换绑 + 登录），防重放就出现了一个缺口。
+		if !s.ClaimTOTPStep(a.ID, step) {
+			return "", "", ErrTOTPReplay
+		}
+	}
+
 	secret, err = auth.GenerateTOTPSecret()
 	if err != nil {
 		return "", "", err

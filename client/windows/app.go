@@ -1015,10 +1015,14 @@ func (a *App) applySync() (changed bool, err error) {
 		}
 		// 隧道都没了，它的失败记录与退避状态一并清掉：
 		// 留着只会让这两个 map 随着「建了又删」的隧道缓慢增长。
-		a.clearTunnelErr(id)
-		a.clearRetry(id)
 		changed = true
 	}
+	// 按「服务端当前有哪些隧道」清一遍记录，而不是只看运行中的进程。
+	//
+	// 只看进程会漏掉一类：隧道因为启动失败而没有进程，随后被服务端删掉——
+	// 它的错误与退避记录再也不会被访问到。反复「建了、失败、删掉」
+	// 会让这两个 map 一直长下去。
+	a.pruneTunnelState(alive)
 
 	// 单条隧道的失败要攒起来，最后作为**部分失败**返回。
 	//
@@ -1247,6 +1251,25 @@ func (a *App) clearRetry(id uint) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.retries, id)
+}
+
+// pruneTunnelState 丢弃「服务端已经没有」的隧道留下的错误与退避记录。
+//
+// 不按运行中的进程来清，是因为一条隧道可能因为启动失败而没有进程：
+// 之后它被服务端删掉，那两个 map 里的记录就再也没有机会被访问或清理。
+func (a *App) pruneTunnelState(alive map[uint]bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id := range a.tunnelErrs {
+		if !alive[id] {
+			delete(a.tunnelErrs, id)
+		}
+	}
+	for id := range a.retries {
+		if !alive[id] {
+			delete(a.retries, id)
+		}
+	}
 }
 
 // countDisabledTunnels 统计当前处于停用状态的隧道。

@@ -18,13 +18,14 @@ import (
 // 每 20 秒重试一次就多推一次退避——配置接口恢复之后，客户端还要白白多等
 // 最长 5 分钟才把隧道拉起来。而用户看到的现象是「网络早就好了，还是连不上」。
 
-// fakePanel 起一个假面板：/info 固定返回一条启用中的隧道，
+// fakePanel 起一个假面板：/info 返回一条启用中的隧道（可切换成空列表），
 // /config 的响应由调用方控制，并统计被请求的次数。
-func fakePanel(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32) {
+func fakePanel(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32, *atomic.Bool) {
 	t.Helper()
 
 	var cfgStatus atomic.Int32
 	var cfgRequests atomic.Int32
+	var noTunnels atomic.Bool
 	cfgStatus.Store(http.StatusInternalServerError)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,12 +40,16 @@ func fakePanel(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if noTunnels.Load() {
+			_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[]}}`))
+			return
+		}
 		_, _ = w.Write([]byte(
 			`{"code":0,"message":"ok","data":{"username":"u","tunnels":[{"id":1,"name":"mc","type":"tcp","status":"active"}]}}`))
 	}))
 	t.Cleanup(srv.Close)
 
-	return srv, &cfgStatus, &cfgRequests
+	return srv, &cfgStatus, &cfgRequests, &noTunnels
 }
 
 func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
@@ -66,7 +71,7 @@ func TestApplySyncDistinguishesFetchAndStartFailures(t *testing.T) {
 	// 配置会写到 dataDir 下，指向临时目录以免碰真实用户目录。
 	withTempConfigDir(t)
 
-	srv, cfgStatus, cfgRequests := fakePanel(t)
+	srv, cfgStatus, cfgRequests, noTunnels := fakePanel(t)
 	a := newSyncTestApp(t, srv)
 
 	// 1) 配置拉取失败：算同步失败，但**不**推进进程退避。
@@ -99,6 +104,22 @@ func TestApplySyncDistinguishesFetchAndStartFailures(t *testing.T) {
 	}
 	if got := cfgRequests.Load(); got != before {
 		t.Fatalf("退避期间不应再请求配置（%d → %d）", before, got)
+	}
+
+	// 4) 隧道被服务端删掉后，它的失败记录与退避状态都要清掉。
+	//
+	// 只按「运行中的进程」清理是不够的：这条隧道恰恰是因为启动失败而没有
+	// 进程，它的记录再也不会被访问到。反复「建了、失败、删掉」会让
+	// 这两个 map 一直长下去。
+	noTunnels.Store(true)
+	if _, err := a.applySync(); err != nil {
+		t.Fatalf("隧道被删掉后不该再有失败：%v", err)
+	}
+	if len(a.tunnelErrs) != 0 {
+		t.Fatalf("已删除隧道的错误记录应被清掉，实际 %v", a.tunnelErrs)
+	}
+	if len(a.retries) != 0 {
+		t.Fatalf("已删除隧道的退避状态应被清掉，实际 %v", a.retries)
 	}
 }
 

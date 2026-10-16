@@ -546,21 +546,88 @@ func enableTestMail(t *testing.T, svc *Services) {
 	}
 }
 
-// fillMailQueue 把发信队列灌满，用于制造「投递失败」。
-func fillMailQueue(svc *Services) {
-	for i := 0; i < mailQueueSize; i++ {
-		svc.mailCh <- outboundMail{}
+// fakeMailer 是可控的发信替身：用它把「投递成功」与「投递失败」变成确定性的。
+type fakeMailer struct {
+	mu   sync.Mutex
+	fail bool
+	sent []string
+}
+
+func (f *fakeMailer) Send(to, subject, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("smtp 不可用")
+	}
+	f.sent = append(f.sent, to)
+	return nil
+}
+
+func (f *fakeMailer) setFail(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail = v
+}
+
+func (f *fakeMailer) sentCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
+}
+
+// newMailTestServices 构造一个邮件已启用、发信器可替换的服务集合。
+func newMailTestServices(t *testing.T) (*Services, *fakeMailer) {
+	t.Helper()
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+	fm := &fakeMailer{}
+	svc.mailerOverride = fm
+	return svc, fm
+}
+
+// deliverAll 驱动一次发件箱处理（正常路径由后台协程做，这里直接调用以便断言）。
+func deliverAll(svc *Services) {
+	svc.processMailOutbox(context.Background())
+}
+
+// TestEmailCodeNotActivatedBeforeDelivery 覆盖「信没送到、新码却已生效」。
+//
+// 验证码记录必须等邮件真的送达才创建：否则一旦这封信发不出去，
+// 用户手上的旧码已经作废、新码又永远收不到——账号就此找不回来。
+func TestEmailCodeNotActivatedBeforeDelivery(t *testing.T) {
+	svc, _ := newMailTestServices(t)
+
+	const email = "notyet@example.com"
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("入队应成功: %v", err)
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).
+		Count(&n).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("送达之前不该创建验证码记录，实际 %d 条", n)
+	}
+
+	var out int64
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("to_addr = ?", email).
+		Count(&out).Error; err != nil {
+		t.Fatalf("统计发件箱失败: %v", err)
+	}
+	if out != 1 {
+		t.Fatalf("应留下一封待发邮件，实际 %d 封", out)
 	}
 }
 
 // TestEmailCodeKeepsOldCodeWhenDeliveryFails 覆盖「投递失败却把旧码作废了」。
 //
-// 作废旧码与投递新邮件如果顺序反了，失败时会留下一个很坑的状态：
-// 旧码已作废、新码又被撤掉，用户手里**一个可用的验证码都没有**，
-// 而接口（找回场景）还告诉他「已发送」。
+// 信发不出去时，用户原有的验证码必须仍然可用——否则他每点一次
+// 「重新发送」都会把上一次的码也作废掉，越试越回不去。
 func TestEmailCodeKeepsOldCodeWhenDeliveryFails(t *testing.T) {
-	svc := newTestServices(t, nil)
-	enableTestMail(t, svc)
+	svc, fm := newMailTestServices(t)
+	fm.setFail(true)
 
 	const email = "keepold@example.com"
 	old := model.EmailCode{
@@ -573,9 +640,19 @@ func TestEmailCodeKeepsOldCodeWhenDeliveryFails(t *testing.T) {
 		t.Fatalf("建旧验证码失败: %v", err)
 	}
 
-	fillMailQueue(svc)
-	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); !errors.Is(err, ErrMailQueueFull) {
-		t.Fatalf("队列满应如实反馈，实际 %v", err)
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("入队应成功（投递是后台的事）: %v", err)
+	}
+
+	// 反复尝试直到重试次数耗尽：全程都不该动到旧码。
+	for i := 0; i < mailMaxAttempts+1; i++ {
+		deliverAll(svc)
+		// 让退避到期，下一轮才会继续尝试。
+		if err := svc.DB.Model(&model.MailOutbox{}).
+			Where("to_addr = ?", email).
+			Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
+			t.Fatalf("调整重试时间失败: %v", err)
+		}
 	}
 
 	var got model.EmailCode
@@ -591,18 +668,30 @@ func TestEmailCodeKeepsOldCodeWhenDeliveryFails(t *testing.T) {
 		t.Fatalf("统计验证码失败: %v", err)
 	}
 	if n != 1 {
-		t.Errorf("失败的那条记录应被撤掉，实际共 %d 条", n)
+		t.Errorf("投递失败不该产生新验证码，实际共 %d 条", n)
+	}
+
+	// 最终状态要能被看见，而不是永远挂着 pending。
+	var out model.MailOutbox
+	if err := svc.DB.Where("to_addr = ?", email).First(&out).Error; err != nil {
+		t.Fatalf("读发件箱失败: %v", err)
+	}
+	if out.Status != model.MailFailed {
+		t.Errorf("重试耗尽后应标为 failed（便于排查），实际 %q", out.Status)
+	}
+	if out.Attempts < mailMaxAttempts {
+		t.Errorf("应记录重试次数，实际 %d", out.Attempts)
 	}
 }
 
-// TestEmailCodeInvalidatesOldCodeOnSuccess 覆盖反面：投递成功后旧码必须失效。
+// TestEmailCodeActivatesOnDelivery 覆盖送达之后的行为：新码生效、旧码作废。
 //
-// 否则用户连点几次，前面几封邮件里的码也都还能用，等于扩大了攻击面。
-func TestEmailCodeInvalidatesOldCodeOnSuccess(t *testing.T) {
-	svc := newTestServices(t, nil)
-	enableTestMail(t, svc)
+// 两者必须是同一件事：只建新码不作废旧码，前面几封邮件里的码就都还能用，
+// 等于扩大了攻击面。
+func TestEmailCodeActivatesOnDelivery(t *testing.T) {
+	svc, fm := newMailTestServices(t)
 
-	const email = "invalidate@example.com"
+	const email = "activate@example.com"
 	old := model.EmailCode{
 		Email: email, Scene: EmailSceneRegister,
 		CodeHash: "old-hash", ExpireAt: time.Now().Add(10 * time.Minute),
@@ -613,7 +702,12 @@ func TestEmailCodeInvalidatesOldCodeOnSuccess(t *testing.T) {
 	}
 
 	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
-		t.Fatalf("投递应成功: %v", err)
+		t.Fatalf("入队应成功: %v", err)
+	}
+	deliverAll(svc)
+
+	if fm.sentCount() != 1 {
+		t.Fatalf("应发出一封信，实际 %d 封", fm.sentCount())
 	}
 
 	var got model.EmailCode
@@ -621,24 +715,31 @@ func TestEmailCodeInvalidatesOldCodeOnSuccess(t *testing.T) {
 		t.Fatalf("读旧验证码失败: %v", err)
 	}
 	if got.UsedAt == nil {
-		t.Error("投递成功后旧码必须作废，否则多封邮件里的码同时可用")
+		t.Error("送达后旧码必须作废，否则多封邮件里的码同时可用")
 	}
 
-	// 新码必须仍然可用（作废时不能把它自己也算进去）。
 	var fresh model.EmailCode
 	if err := svc.DB.Where("email = ? AND used_at IS NULL", email).
 		Order("id desc").First(&fresh).Error; err != nil {
-		t.Fatalf("应留下一条未使用的新验证码: %v", err)
+		t.Fatalf("应创建一条未使用的新验证码: %v", err)
 	}
 	if fresh.ID == old.ID {
-		t.Fatal("留下的应当是刚发的那条，而不是旧的")
+		t.Fatal("留下的应当是刚送达的那条，而不是旧的")
+	}
+
+	var out model.MailOutbox
+	if err := svc.DB.Where("to_addr = ?", email).First(&out).Error; err != nil {
+		t.Fatalf("读发件箱失败: %v", err)
+	}
+	if out.Status != model.MailSent {
+		t.Errorf("送达后应标为 sent，实际 %q", out.Status)
 	}
 }
 
 // TestPasswordResetKeepsOldTokenWhenDeliveryFails 覆盖同类的令牌版本。
 func TestPasswordResetKeepsOldTokenWhenDeliveryFails(t *testing.T) {
-	svc := newTestServices(t, nil)
-	enableTestMail(t, svc)
+	svc, fm := newMailTestServices(t)
+	fm.setFail(true)
 
 	const email = "resetkeep@example.com"
 	u := &model.User{
@@ -657,9 +758,17 @@ func TestPasswordResetKeepsOldTokenWhenDeliveryFails(t *testing.T) {
 		t.Fatalf("建旧令牌失败: %v", err)
 	}
 
-	fillMailQueue(svc)
 	if err := svc.RequestPasswordReset(u.Username, "127.0.0.1", "https://example.com"); err != nil {
 		t.Fatalf("找回密码必须保持静默（否则可用于枚举账号），实际返回 %v", err)
+	}
+
+	for i := 0; i < mailMaxAttempts+1; i++ {
+		deliverAll(svc)
+		if err := svc.DB.Model(&model.MailOutbox{}).
+			Where("to_addr = ?", email).
+			Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
+			t.Fatalf("调整重试时间失败: %v", err)
+		}
 	}
 
 	var got model.PasswordResetToken
@@ -676,7 +785,7 @@ func TestPasswordResetKeepsOldTokenWhenDeliveryFails(t *testing.T) {
 		t.Fatalf("统计令牌失败: %v", err)
 	}
 	if n != 1 {
-		t.Errorf("失败的那条令牌应被撤掉，实际共 %d 条", n)
+		t.Errorf("投递失败不该产生新令牌，实际共 %d 条", n)
 	}
 }
 
@@ -896,89 +1005,280 @@ func TestPendingOpenIsDroppedWhenTunnelDisabled(t *testing.T) {
 	}
 }
 
-// TestMailQueueFullIsReported 覆盖「队列满仍报告已发送」。
+// TestMailOutboxSurvivesRestart 覆盖「重启丢信」。
 //
-// 队列满时以前只记日志：验证码记录已经写库并占着 60 秒冷却，用户却收不到
-// 邮件，接口还说「验证码已发送」——他只能反复重试，而每次都被冷却挡住。
-func TestMailQueueFullIsReported(t *testing.T) {
-	svc := newTestServices(t, nil)
-	if err := svc.Settings.SetMany(map[SettingKey]string{
-		KeySMTPEnabled:  "true",
-		KeySMTPHost:     "smtp.example.com",
-		KeySMTPPort:     "587",
-		KeySMTPUser:     "noreply@example.com",
-		KeySMTPPassword: "secret",
-		KeySMTPFrom:     "noreply@example.com",
-	}); err != nil {
-		t.Fatalf("设置邮件配置失败: %v", err)
-	}
-	if !svc.MailEnabled() {
-		t.Fatal("前置条件：邮件应已启用")
+// 发信原先走内存 channel：进程一重启，队列里的信就没了。而验证码与重置链接
+// 会在「信进队列」时就作废旧凭据——用户既收不到新凭据、旧凭据也失效，
+// 账号彻底找不回来。所以待发的信必须落库。
+func TestMailOutboxSurvivesRestart(t *testing.T) {
+	svc, _ := newMailTestServices(t)
+
+	const email = "survive@example.com"
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("入队应成功: %v", err)
 	}
 
-	// 把队列灌满。
-	for i := 0; i < mailQueueSize; i++ {
-		svc.mailCh <- outboundMail{}
+	// 模拟重启：同一个数据库上新建一套 Services（内存态是空的），
+	// 它启动后应当把遗留的信发出去。
+	restarted := New(svc.DB, svc.Cfg)
+	fm := &fakeMailer{}
+	restarted.mailerOverride = fm
+
+	deliverAll(restarted)
+
+	if fm.sentCount() != 1 {
+		t.Fatalf("重启后应把遗留的邮件发出去，实际发出 %d 封", fm.sentCount())
 	}
 
-	const email = "queue@example.com"
-	err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1")
-	if !errors.Is(err, ErrMailQueueFull) {
-		t.Fatalf("队列满必须如实反馈，实际 %v", err)
-	}
-
-	// 验证码记录必须被撤掉：留着会占住冷却，让用户重试时被「发送过于频繁」挡住。
 	var n int64
-	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).Count(&n).Error; err != nil {
+	if err := restarted.DB.Model(&model.EmailCode{}).Where("email = ?", email).
+		Count(&n).Error; err != nil {
 		t.Fatalf("统计验证码失败: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("投递失败后应撤掉验证码记录，实际还剩 %d 条", n)
+	if n != 1 {
+		t.Fatalf("送达后应创建验证码记录，实际 %d 条", n)
 	}
 }
 
-// TestMailQueueFullStaysSilentForResetScene 覆盖反面：找回密码不能因此暴露账号。
+// TestSendEmailCodeCooldownCountsOutbox 覆盖「改了凭据创建时机后限流失效」。
 //
-// 找回场景已经走完了「账号存在 + 有效」的判断，此时返回错误会让
-// 「已注册 + 队列满」与「未注册」产生可区分的响应，接口就变成账号枚举工具。
-func TestMailQueueFullStaysSilentForResetScene(t *testing.T) {
-	svc := newTestServices(t, nil)
-	if err := svc.Settings.SetMany(map[SettingKey]string{
-		KeySMTPEnabled:  "true",
-		KeySMTPHost:     "smtp.example.com",
-		KeySMTPPort:     "587",
-		KeySMTPUser:     "noreply@example.com",
-		KeySMTPPassword: "secret",
-		KeySMTPFrom:     "noreply@example.com",
-	}); err != nil {
-		t.Fatalf("设置邮件配置失败: %v", err)
-	}
+// 限流原先数的是验证码记录，而记录现在要等送达才创建——继续数它的话，
+// 反复触发发送就能绕过 60 秒冷却（每次都还没送达）。所以限流必须改数发件箱。
+func TestSendEmailCodeCooldownCountsOutbox(t *testing.T) {
+	svc, _ := newMailTestServices(t)
 
-	const email = "reset@example.com"
-	u := &model.User{
-		Username: "resetuser", Password: "not-used",
-		Email: email, Status: model.UserStatusActive,
+	const email = "cooldown@example.com"
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("首次发送应成功: %v", err)
 	}
+	// 故意不投递：此时库里没有任何验证码记录。
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); !errors.Is(err, ErrEmailCodeTooSoon) {
+		t.Fatalf("短时间内重发应被冷却拦住，实际 %v", err)
+	}
+}
+
+// TestApplyPortIntentSkipsStaleClose 覆盖「立即路径不过时校验就动手」。
+//
+// 启停与删除都是「先改数据库、再动防火墙」，两步之间可能插进别的请求：
+// 端口刚被新隧道占用，那条删除/停用的收回就会把新隧道的规则关掉。
+// 动手前必须按当前状态确认意图仍然成立。
+func TestApplyPortIntentSkipsStaleClose(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	u := &model.User{Username: "staleclose", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
-
-	for i := 0; i < mailQueueSize; i++ {
-		svc.mailCh <- outboundMail{}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20081,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
 	}
 
-	if err := svc.SendEmailCode(email, EmailSceneReset, "127.0.0.1"); err != nil {
-		t.Fatalf("找回场景必须保持静默（否则可用于枚举账号），实际返回 %v", err)
+	// 端口正被活跃隧道占用，此时「收回」的意图已经过时。
+	acted, err := svc.applyPortIntent(20081, "tcp", false)
+	if err != nil {
+		t.Fatalf("不该有错误: %v", err)
+	}
+	if acted {
+		t.Error("端口仍被活跃隧道占用，不该真的收回")
+	}
+	if got := helper.closedPorts(); len(got) != 0 {
+		t.Fatalf("绝不能关掉活跃隧道的端口，实际关掉了 %v", got)
+	}
+	if got := svc.PendingFirewallOps(); len(got) != 0 {
+		t.Errorf("过时的意图不该留下待办（否则会被反复重试），实际 %v", got)
+	}
+}
+
+// TestApplyPortIntentSkipsStaleOpen 覆盖反面：没有隧道占用时不该放行。
+//
+// 对账拿的是某一刻的活跃隧道快照，逐条放行的过程中隧道可能已被停用或删除
+// ——照着快照放行等于把一条已经不该开着的端口重新打开。
+func TestApplyPortIntentSkipsStaleOpen(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	// 该端口没有任何隧道占用。
+	acted, err := svc.applyPortIntent(20083, "tcp", true)
+	if err != nil {
+		t.Fatalf("不该有错误: %v", err)
+	}
+	if acted {
+		t.Error("端口没有隧道占用，不该放行")
+	}
+	if got := helper.openedPorts(); len(got) != 0 {
+		t.Fatalf("不该放行无归属的端口，实际 %v", got)
+	}
+}
+
+// TestRetryKeepsNewIntentWrittenDuringOperation 覆盖「旧重试覆盖新意图」。
+//
+// 重试曾经在执行完 helper 操作后就释放端口锁，再回头更新/删除待办。这段间隙里
+// 同一端口可能被写入**新意图**（刚停用的隧道又被启用），旧重试随后把新意图删掉
+// ——那条真正需要的放行再也不会被重试，规则与数据库状态长期不一致。
+//
+// 现在「执行结果 + 待办状态提交」在同一段端口锁内，新意图只可能排在它之后写入。
+func TestRetryKeepsNewIntentWrittenDuringOperation(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	u := &model.User{Username: "intentrace", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20061,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
 	}
 
-	// 但记录仍要撤掉，否则用户重试会被冷却挡住。
-	var n int64
-	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).Count(&n).Error; err != nil {
-		t.Fatalf("统计验证码失败: %v", err)
+	// 停用（helper 坏的）→ 产生「待收回」。
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用失败: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("投递失败后应撤掉验证码记录，实际还剩 %d 条", n)
+	if len(svc.PendingFirewallOps()) != 1 {
+		t.Fatalf("前置条件：应有一条待收回，实际 %v", svc.PendingFirewallOps())
 	}
+
+	// 让重试的关端口卡在 helper 里，好在这期间插入新意图。
+	helper.failCloses.Store(false)
+	helper.failOpens.Store(true) // 新意图的放行会失败 → 必须留下待办
+	helper.closeEntered = make(chan struct{}, 1)
+	helper.closeGate = make(chan struct{})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.retryPendingFirewall()
+	}()
+
+	select {
+	case <-helper.closeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("重试没有进入 helper 调用")
+	}
+
+	// 隧道被重新启用：产生新意图「待放行」。
+	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
+		Update("status", model.TunnelStatusActive).Error; err != nil {
+		t.Fatalf("改状态失败: %v", err)
+	}
+	intentDone := make(chan struct{})
+	go func() {
+		defer close(intentDone)
+		svc.applyPortIntent(20061, "tcp", true)
+	}()
+
+	close(helper.closeGate) // 放行重试继续
+	<-done
+	<-intentDone
+
+	// 新意图必须还在：否则那条真正需要的放行不会再被重试。
+	pending := svc.PendingFirewallOps()
+	if len(pending) != 1 || pending[0] != "20061/tcp 待放行" {
+		t.Fatalf("新意图被旧重试覆盖或删除，实际 %v", pending)
+	}
+}
+
+// TestTrafficBaselineSurvivesRestart 覆盖「控制面重启后重复计入当天流量」。
+//
+// 采样基线原先只在内存里。只重启控制面（frps 没重启、当天累计值还在）时，
+// 第一次采集会把当天全部流量当成新增量记一遍——用户配额被凭空扣掉一大截，
+// 统计也翻倍。滚动升级恰好就是这个形态。
+func TestTrafficBaselineSurvivesRestart(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	u := &model.User{Username: "restarttraffic", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20071,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+
+	// frps 今天已经累计了 5000 字节（在我们启动之前它就在跑了）。
+	frps.total.Store(5000)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 5000 {
+		t.Fatalf("首轮应记 5000，实际 %d", got)
+	}
+
+	// 模拟「只重启控制面、frps 没重启」：同一个库上新建一套 Services。
+	restarted := New(svc.DB, cfg)
+	restarted.Frps = NewFrpsClient(cfg)
+	restarted.loadTrafficBaseline()
+
+	// frps 的当天累计值没变，重启后的这一轮不该再记一遍。
+	restarted.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, restarted, tun.ID); got != 5000 {
+		t.Fatalf("重启后不该重复计入当天已有流量，实际 %d，期望 5000", got)
+	}
+
+	// 之后新增的流量仍要正常记上（基线恢复不能把采集算坏）。
+	frps.total.Store(5200)
+	restarted.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, restarted, tun.ID); got != 5200 {
+		t.Fatalf("重启后新增流量应正常记入，实际 %d，期望 5200", got)
+	}
+}
+
+// TestTrafficCollectorRestoresBaselineOnStart 覆盖上面那条修复的**接线**：
+// 采集器必须在第一次采集之前恢复基线，否则修复形同没做。
+func TestTrafficCollectorRestoresBaselineOnStart(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	if err := svc.DB.Create(&model.TrafficBaseline{
+		ProxyName: "lt_u1.mc", Date: time.Now().Format("2006-01-02"),
+		InBytes: 123, OutBytes: 456,
+	}).Error; err != nil {
+		t.Fatalf("写入基线失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartTrafficCollector(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		svc.Runtime.mu.RLock()
+		cur, ok := svc.Runtime.lastStat["lt_u1.mc"]
+		svc.Runtime.mu.RUnlock()
+		if ok {
+			if cur.in != 123 || cur.out != 456 {
+				t.Fatalf("恢复的基线不对: %+v", cur)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("采集器启动时应先恢复采样基线，否则重启后会重复计入当天流量")
 }
 
 // TestCreateTunnelWaitsForUserLock 覆盖「建隧道与删除用户互斥」。
@@ -1350,6 +1650,12 @@ type fakeFirewallHelper struct {
 	failCloses atomic.Bool
 	failOpens  atomic.Bool
 
+	// closeEntered / closeGate 用于把「关端口」这一步卡住：
+	// 进入处理时向 closeEntered 发信号，然后等 closeGate 才返回。
+	// 用来在「重试执行到一半」时插入别的操作，验证临界区。
+	closeEntered chan struct{}
+	closeGate    chan struct{}
+
 	mu     sync.Mutex
 	opened []string
 	closed []string
@@ -1368,6 +1674,15 @@ func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
 				Proto string `json:"proto"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if f.closeEntered != nil {
+				select {
+				case f.closeEntered <- struct{}{}:
+				default:
+				}
+			}
+			if f.closeGate != nil {
+				<-f.closeGate
+			}
 			if f.failCloses.Load() {
 				// 模拟 helper 暂时不可用：面板必须把这次失败记下来重试，
 				// 而不是只写一行日志就当成关掉了。

@@ -93,10 +93,15 @@ type Services struct {
 	// 增长问题：采样点满了就覆盖最旧的一条，磁盘占用恒为零。
 	Monitor *monitor.Collector
 
-	// loginLogCh 与 mailCh 都是异步队列：
-	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
+	// loginLogCh 是登录日志的异步队列：
+	// 登录日志不能阻塞登录判定。
 	loginLogCh chan model.LoginLog
-	mailCh     chan outboundMail
+
+	// mailWake 用于唤醒发信协程（邮件本身存在发件箱表里，不走内存队列：
+	// 内存队列重启即丢，而验证码/重置链接一旦丢了，用户就找不回账号）。
+	mailWake chan struct{}
+	// mailerOverride 仅供测试注入发信替身，非 nil 时优先于真实 SMTP 配置。
+	mailerOverride mailSender
 
 	// fwMu 保护 fwPending：本该放行/收回、但宿主机 helper 当时失败的端口。
 	//
@@ -187,10 +192,23 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		TOTPReplay: NewTOTPReplayGuard(),
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
-		mailCh:     make(chan outboundMail, mailQueueSize),
+		mailWake:   make(chan struct{}, 1),
 		fwPending:  map[int]pendingFW{},
 		fwKick:     make(chan struct{}, 1),
 	}
+}
+
+// mailSender 是发信器的最小接口，便于测试注入替身。
+type mailSender interface {
+	Send(to, subject, body string) error
+}
+
+// mailSender 返回实际用于发信的对象。
+func (s *Services) mailSender() mailSender {
+	if s.mailerOverride != nil {
+		return s.mailerOverride
+	}
+	return s.Mailer()
 }
 
 // SMTPConfig 按当前运行期配置组装邮件参数。

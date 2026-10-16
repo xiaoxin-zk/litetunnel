@@ -2,42 +2,94 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log"
 	"time"
-)
 
-// mailQueueSize 是待发邮件队列长度。
-//
-// 找回密码接口对外表现必须与「账号是否存在」无关，因此发信必须异步：
-// 若同步等待 SMTP 往返，账号存在时响应会明显变慢，形成账号枚举侧信道。
-// 队列同时起到限流作用——满时直接丢弃，不会无限堆积协程。
-const mailQueueSize = 128
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+)
 
 // mailSendTimeout 是单封邮件的发送超时。
 const mailSendTimeout = 30 * time.Second
 
-type outboundMail struct {
-	To      string
-	Subject string
-	Body    string
+// mailRetryInterval 是发件箱的轮询间隔：等待重试的信与启动时遗留的信都靠它。
+const mailRetryInterval = 30 * time.Second
+
+// mailBatchSize 是单轮最多处理的邮件数。
+//
+// 限批而不是一次全取：SMTP 串行发送，一次几百封会把这一轮拖得很长，
+// 期间新来的信也一直排在后面。
+const mailBatchSize = 20
+
+// mailMaxAttempts 是同一封邮件的最多重试次数。
+//
+// 到上限后标为 failed 并留下明确的日志：SMTP 配置错了的话，重试一万次
+// 也不会成功，而日志会被同样的失败刷满。注意此时**凭据还没有生效**，
+// 用户手里的旧凭据依然可用，所以这不是「账号找不回来」，只是「这封信没发出去」。
+const mailMaxAttempts = 5
+
+// mailSentRetention 是已送达记录的保留时长。
+//
+// Body 里含明文验证码/重置链接，发出去之后就没有保留价值了，留着只是扩大
+// 泄露面（数据库被读到时能拿到还没过期的验证码）。
+const mailSentRetention = 24 * time.Hour
+
+// mailRetryDelay 计算第 n 次失败后的重试间隔。
+func mailRetryDelay(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	d := time.Minute
+	for i := 1; i < attempts; i++ {
+		d *= 2
+		if d >= 30*time.Minute {
+			return 30 * time.Minute
+		}
+	}
+	return d
 }
 
-// enqueueMail 投递一封邮件到异步队列。
+// queueMail 把一封邮件写进发件箱并唤醒发送协程。
 //
-// 返回错误，而不是队列满时静默丢弃：队列满意味着这封信永远不会发出去，
-// 而调用方（验证码、找回密码）随后会告诉用户「已发送」——用户收不到信，
-// 却要等到超时或反复重试才发现，而验证码记录还占着 60 秒冷却。
-// 失败必须让调用方知道，由它决定是回滚还是换一种说法。
-func (s *Services) enqueueMail(to, subject, body string) error {
-	if !s.MailEnabled() {
-		return ErrMailDisabled
+// 返回错误意味着**没写进去**，调用方必须据此回滚已经做的准备（例如撤掉刚建的
+// 凭据记录）：否则用户既收不到信、旧凭据又已经失效。
+//
+// 注意「写进发件箱」不等于「已送达」：送达由后台协程负责并带重试，
+// 凭据动作（激活新凭据、作废旧凭据）在**确认送达之后**才执行。
+func (s *Services) queueMail(to, subject, body, kind string, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	rec := model.MailOutbox{
+		To:      to,
+		Subject: subject,
+		Body:    body,
+		Kind:    kind,
+		Payload: string(raw),
+		Status:  model.MailPending,
+		NextAt:  time.Now(),
+	}
+	if err := s.DB.Create(&rec).Error; err != nil {
+		// 用「稍后重试」的口径对外：对用户来说这与队列繁忙是一回事，
+		// 而真正的原因（数据库写不进去）已经在日志里。
+		log.Printf("[mail] 写入发件箱失败（收件人 %s）: %v", maskEmail(to), err)
+		return ErrMailQueueFull
+	}
+	s.kickMailWorker()
+	return nil
+}
+
+// kickMailWorker 唤醒发送协程，不必等下一个轮询周期。
+func (s *Services) kickMailWorker() {
+	if s.mailWake == nil {
+		return
 	}
 	select {
-	case s.mailCh <- outboundMail{To: to, Subject: subject, Body: body}:
-		return nil
+	case s.mailWake <- struct{}{}:
 	default:
-		log.Printf("[mail] 发信队列已满，丢弃一封发往 %s 的邮件", maskEmail(to))
-		return ErrMailQueueFull
+		// 已有待处理的唤醒，合并成一次即可。
 	}
 }
 
@@ -48,6 +100,7 @@ func (s *Services) enqueueMail(to, subject, body string) error {
 //
 // 协程始终启动，而不是在未配置邮件时跳过：
 // 邮件配置可以在管理端随时开启，启动时禁用不代表之后一直禁用。
+// 未启用时只是不发信（待发的信留在发件箱里，配置好之后自然会被发出去）。
 func (s *Services) StartMailWorker(ctx context.Context) {
 	if s.MailEnabled() {
 		log.Printf("[mail] 邮件发送已启用，发件人 %s", s.SMTPConfig().From)
@@ -56,28 +109,136 @@ func (s *Services) StartMailWorker(ctx context.Context) {
 	}
 
 	go func() {
+		ticker := time.NewTicker(mailRetryInterval)
+		defer ticker.Stop()
+
+		// 启动即处理一次：把上次进程遗留的待发邮件发出去。
+		s.processMailOutbox(ctx)
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case m := <-s.mailCh:
-				sender := s.Mailer()
-				done := make(chan error, 1)
-				go func() { done <- sender.Send(m.To, m.Subject, m.Body) }()
-
-				select {
-				case err := <-done:
-					if err != nil {
-						log.Printf("[mail] 发送失败（收件人 %s）: %v", maskEmail(m.To), err)
-					}
-				case <-time.After(mailSendTimeout):
-					log.Printf("[mail] 发送超时（收件人 %s）", maskEmail(m.To))
-				case <-ctx.Done():
-					return
-				}
+			case <-s.mailWake:
+			case <-ticker.C:
 			}
+			s.processMailOutbox(ctx)
 		}
 	}()
+}
+
+// processMailOutbox 处理一批到期的待发邮件。
+func (s *Services) processMailOutbox(ctx context.Context) {
+	if !s.MailEnabled() {
+		// 没配 SMTP 就什么都不做：这些信留在发件箱里等配置好，
+		// 不算失败、也不累计重试次数。
+		return
+	}
+
+	s.pruneMailOutbox()
+
+	var rows []model.MailOutbox
+	if err := s.DB.Where("status = ? AND next_at <= ?", model.MailPending, time.Now()).
+		Order("id asc").Limit(mailBatchSize).Find(&rows).Error; err != nil {
+		log.Printf("[mail] 读取发件箱失败: %v", err)
+		return
+	}
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		s.deliverMail(ctx, row)
+	}
+}
+
+// deliverMail 发送一封邮件；成功后才执行凭据动作。
+func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
+	sender := s.mailSender()
+	done := make(chan error, 1)
+	go func() { done <- sender.Send(row.To, row.Subject, row.Body) }()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(mailSendTimeout):
+		err = errors.New("发送超时")
+	case <-ctx.Done():
+		return
+	}
+
+	if err != nil {
+		s.failMail(row, err)
+		return
+	}
+
+	// 送达之后才让新凭据生效（并作废旧凭据）。
+	//
+	// 顺序不能反：先作废旧凭据再发信的话，一旦这封信最终发不出去，
+	// 用户手上一个可用的凭据都没有——而他本来只是想重新收一封。
+	if aerr := s.applyMailAction(row); aerr != nil {
+		log.Printf("[mail] 邮件已送达但凭据生效失败（收件人 %s，id=%d）: %v",
+			maskEmail(row.To), row.ID, aerr)
+		// 不重发：重发会让用户收到第二封内容不同的信，而问题在数据库这边。
+		// 标为 failed 并留下明确日志，由人工处理。
+		s.markMail(row.ID, model.MailFailed, row.Attempts+1, "凭据生效失败: "+aerr.Error())
+		return
+	}
+
+	log.Printf("[mail] 已送达（收件人 %s，类型 %s，第 %d 次尝试）",
+		maskEmail(row.To), row.Kind, row.Attempts+1)
+	s.markMail(row.ID, model.MailSent, row.Attempts+1, "")
+}
+
+// failMail 记录一次发送失败并按需安排重试。
+func (s *Services) failMail(row model.MailOutbox, err error) {
+	attempts := row.Attempts + 1
+	if attempts >= mailMaxAttempts {
+		log.Printf("[mail] 发送失败且已达重试上限（收件人 %s，类型 %s，共 %d 次）: %v"+
+			"；该凭据未生效，用户原有凭据仍然可用",
+			maskEmail(row.To), row.Kind, attempts, err)
+		s.markMail(row.ID, model.MailFailed, attempts, err.Error())
+		return
+	}
+
+	delay := mailRetryDelay(attempts)
+	log.Printf("[mail] 发送失败（收件人 %s，第 %d 次），%s 后重试: %v",
+		maskEmail(row.To), attempts, delay.Round(time.Second), err)
+
+	updates := map[string]any{
+		"attempts": attempts,
+		"next_at":  time.Now().Add(delay),
+		"last_err": truncate(err.Error(), 255),
+		"status":   model.MailPending,
+	}
+	if uerr := s.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).Updates(updates).Error; uerr != nil {
+		log.Printf("[mail] 更新发件箱失败（id=%d）: %v", row.ID, uerr)
+	}
+}
+
+// markMail 更新一封邮件的终态。
+//
+// attempts 一并写回：最后那一次尝试也要算进去，否则「重试了几次才放弃」
+// 在库里会少一次，排查时对不上账。
+func (s *Services) markMail(id uint, status string, attempts int, lastErr string) {
+	updates := map[string]any{
+		"status":   status,
+		"last_err": truncate(lastErr, 255),
+		"attempts": attempts,
+	}
+	if err := s.DB.Model(&model.MailOutbox{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", id, err)
+	}
+}
+
+// pruneMailOutbox 清理已经发出去的记录。
+//
+// Body 里是明文验证码/重置链接，发出去之后就没有保留价值了。
+func (s *Services) pruneMailOutbox() {
+	cutoff := time.Now().Add(-mailSentRetention)
+	if err := s.DB.Where("status = ? AND updated_at < ?", model.MailSent, cutoff).
+		Delete(&model.MailOutbox{}).Error; err != nil {
+		log.Printf("[mail] 清理已发送记录失败: %v", err)
+	}
 }
 
 // maskEmail 对日志中的邮箱做脱敏，避免日志成为邮箱收集来源。

@@ -74,17 +74,6 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 		return nil
 	}
 
-	tok := model.PasswordResetToken{
-		UserID:    u.ID,
-		TokenHash: hash,
-		ExpireAt:  time.Now().Add(resetTokenTTL),
-		IP:        truncate(ip, 64),
-	}
-	if err := s.DB.Create(&tok).Error; err != nil {
-		log.Printf("[reset] 保存令牌失败: %v", err)
-		return nil
-	}
-
 	siteName := s.Settings.Get(KeySiteName)
 	if siteName == "" {
 		siteName = "LiteTunnel"
@@ -93,35 +82,27 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	subject := fmt.Sprintf("【%s】重置登录密码", siteName)
 	body := resetMailBody(siteName, u.Username, link, int(resetTokenTTL.Minutes()))
 
+	// 只写发件箱，**不建令牌记录**：令牌等这封信真的送达之后再创建
+	// （见 applyMailAction）。
+	//
+	// 这样「旧链接失效」与「新链接到手」是同一件事的两个面：投递失败时
+	// 用户手上的旧链接依然可用，而不是旧的全废、新的又没收到。
+	//
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 若同步发送会让「账号存在」的响应明显变慢，从而泄露账号是否存在。
 	//
-	// 投递失败只记日志、对外仍然返回成功：这里已经走完了「账号存在 + 有效」
-	// 的判断，此时返回错误会让「已注册 + 队列满」与「未注册」产生可区分的
+	// 入队失败只记日志、对外仍然返回成功：这里已经走完了「账号存在 + 有效」
+	// 的判断，此时返回错误会让「已注册 + 入队失败」与「未注册」产生可区分的
 	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
 	// 「重新发送」，也不给枚举留口子。
-	if err := s.enqueueMail(u.Email, subject, body); err != nil {
-		// 投递失败要**撤掉刚建的令牌**，并保留旧令牌可用。
-		//
-		// 顺序反过来（先作废旧令牌再投递）会留下一个很坑的状态：旧链接
-		// 全部失效、新邮件又没发出去，用户手上一个能用的链接都没有，
-		// 而接口还告诉他「已发送」——他只能反复点重新发送，每次都在
-		// 同一个地方失败，且没有任何线索。
-		if derr := s.DB.Delete(&model.PasswordResetToken{}, tok.ID).Error; derr != nil {
-			log.Printf("[reset] 回滚重置令牌失败（id=%d）: %v", tok.ID, derr)
-		}
-		log.Printf("[reset] 重置邮件投递失败（账号 %d），已保留原令牌: %v", u.ID, err)
+	if err := s.queueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
+		UserID:    u.ID,
+		TokenHash: hash,
+		ExpireAt:  time.Now().Add(resetTokenTTL),
+		IP:        truncate(ip, 64),
+	}); err != nil {
+		log.Printf("[reset] 重置邮件入队失败（账号 %d），原有令牌未受影响: %v", u.ID, err)
 		return nil
-	}
-
-	// 确认新邮件已进队列，才作废旧令牌：同一账号只保留一个有效令牌，
-	// 避免多封邮件里的链接同时可用。
-	//
-	// 排除刚建的这条——它正是我们要留下的那个。
-	if err := s.DB.Model(&model.PasswordResetToken{}).
-		Where("user_id = ? AND used_at IS NULL AND id <> ?", u.ID, tok.ID).
-		Update("used_at", time.Now()).Error; err != nil {
-		log.Printf("[reset] 作废旧令牌失败: %v", err)
 	}
 	return nil
 }

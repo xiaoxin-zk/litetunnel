@@ -66,42 +66,34 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return ErrEmailTaken
 	}
 
-	// 限流 1：同邮箱重发冷却
-	var recent model.EmailCode
-	err := s.DB.Where("email = ? AND scene = ?", email, scene).
+	kind := model.MailKindEmailCodeRegister
+	if scene == EmailSceneReset {
+		kind = model.MailKindEmailCodeReset
+	}
+
+	// 限流 1：同邮箱同用途的重发冷却。
+	//
+	// 计数改为看**发件箱**而不是验证码表：验证码记录现在要等送达才创建，
+	// 拿它做限流的话，反复触发发送就能绕过冷却（每次都还没送达）。
+	// 用发件箱计数也更贴合限流的本意——拦的是「发送行为」，不是「可用验证码」。
+	var recent model.MailOutbox
+	err := s.DB.Where("to_addr = ? AND kind = ?", email, kind).
 		Order("id desc").First(&recent).Error
 	if err == nil && time.Since(recent.CreatedAt) < emailCodeResendCooldown {
 		return ErrEmailCodeTooSoon
 	}
 
-	// 限流 2：同邮箱每日上限
+	// 限流 2：同邮箱每日上限（不限用途，与原先按邮箱统计一致）。
 	now := time.Now()
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	var sent int64
-	if err := s.DB.Model(&model.EmailCode{}).
-		Where("email = ? AND created_at >= ?", email, dayStart).
+	if err := s.DB.Model(&model.MailOutbox{}).
+		Where("to_addr = ? AND created_at >= ?", email, dayStart).
 		Count(&sent).Error; err != nil {
 		return err
 	}
 	if sent >= emailCodeDailyPerEmail {
 		return ErrEmailCodeTooMany
-	}
-
-	code, err := newNumericCode(6)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256([]byte(code))
-
-	rec := model.EmailCode{
-		Email:    email,
-		Scene:    scene,
-		CodeHash: hex.EncodeToString(sum[:]),
-		ExpireAt: now.Add(emailCodeTTL),
-		IP:       truncate(ip, 64),
-	}
-	if err := s.DB.Create(&rec).Error; err != nil {
-		return err
 	}
 
 	// 找回场景且邮箱不存在：不真的发信，但仍返回成功。
@@ -111,46 +103,41 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return nil
 	}
 
+	code, err := newNumericCode(6)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(code))
+
 	siteName := s.Settings.Get(KeySiteName)
 	if siteName == "" {
 		siteName = "LiteTunnel"
 	}
 	subject := fmt.Sprintf("【%s】邮箱验证码", siteName)
+
+	// 只写发件箱，**不建验证码记录**：记录等这封信真的送达之后再创建
+	// （见 applyMailAction）。这样投递失败时用户手上的旧码依然可用，
+	// 而不是「新码没到、旧码已废」。
+	//
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 同步发送会让「邮箱是否存在」通过响应时间泄露出去。
-	if err := s.enqueueMail(email, subject, emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes()))); err != nil {
-		// 投递失败要**撤掉刚写入的验证码记录**。
-		//
-		// 留着它有两个后果：占着 60 秒重发冷却，用户重试时会被
-		// 「发送过于频繁」挡住；以及库里多一条永远用不到的验证码。
-		// 而他实际上从没收到过任何邮件。
-		if derr := s.DB.Where("id = ?", rec.ID).Delete(&model.EmailCode{}).Error; derr != nil {
-			log.Printf("[emailcode] 回滚验证码记录失败（id=%d）: %v", rec.ID, derr)
-		}
-
+	if err := s.queueMail(email, subject,
+		emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())),
+		kind, emailCodePayload{
+			Email:    email,
+			Scene:    scene,
+			CodeHash: hex.EncodeToString(sum[:]),
+			ExpireAt: now.Add(emailCodeTTL),
+			IP:       truncate(ip, 64),
+		}); err != nil {
 		// 找回场景必须保持「不暴露账号是否存在」：这里已经走完了账号判断，
-		// 返回错误会让「已注册 + 投递失败」与「未注册」变得可区分。
+		// 返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
 		if scene == EmailSceneReset {
-			log.Printf("[emailcode] 找回密码的验证码投递失败（邮箱 %s）: %v", maskEmail(email), err)
+			log.Printf("[emailcode] 找回密码的验证码入队失败（邮箱 %s）: %v", maskEmail(email), err)
 			return nil
 		}
 		// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
-		log.Printf("[emailcode] 验证码投递失败（邮箱 %s）: %v", maskEmail(email), err)
 		return err
-	}
-
-	// 确认新邮件已经进队列之后，才作废旧码。
-	//
-	// 顺序不能反：先作废旧码、投递又失败的话，用户手里**一个可用的码都没有**
-	// ——旧码已作废、新码被撤掉，而接口（找回场景）还告诉他「已发送」，
-	// 他只能反复点「重新发送」，每次都在同一个地方失败。
-	//
-	// 排除刚建的这条：VerifyEmailCode 取的是最新未使用的记录，
-	// 把新的也标成已用会让用户永远验不过。
-	if err := s.DB.Model(&model.EmailCode{}).
-		Where("email = ? AND scene = ? AND used_at IS NULL AND id <> ?", email, scene, rec.ID).
-		Update("used_at", time.Now()).Error; err != nil {
-		log.Printf("[emailcode] 作废旧验证码失败（邮箱 %s）: %v", maskEmail(email), err)
 	}
 	return nil
 }

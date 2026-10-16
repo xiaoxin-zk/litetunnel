@@ -350,6 +350,90 @@ type PasswordResetToken struct {
 // TableName 固定表名。
 func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens" }
 
+// 发件箱状态。
+const (
+	// MailPending 待发送（含等待重试）。
+	MailPending = "pending"
+	// MailSent 已送达（并已执行凭据动作）。
+	MailSent = "sent"
+	// MailFailed 重试次数耗尽，已放弃。需要人工介入。
+	MailFailed = "failed"
+)
+
+// 邮件类型，决定送达后要执行什么凭据动作。
+const (
+	// MailKindEmailCodeRegister 注册邮箱验证码。
+	MailKindEmailCodeRegister = "email_code_register"
+	// MailKindEmailCodeReset 找回密码的邮箱验证码。
+	MailKindEmailCodeReset = "email_code_reset"
+	// MailKindResetLink 找回密码的重置链接。
+	MailKindResetLink = "reset_link"
+)
+
+// MailOutbox 是持久化的发件箱。
+//
+// # 为什么必须是持久化的
+//
+// 发信原先走内存 channel：进程一重启，队列里的信就没了；SMTP 报错也只是记一行
+// 日志然后把信丢掉。而验证码与重置链接的流程会在「信进队列」时就作废旧凭据，
+// 于是用户既收不到新凭据、旧凭据也失效了——账号彻底找不回来。
+//
+// 落库之后：重启不丢信、失败可重试，并且**凭据只在送达之后才生效**
+// （见 Payload 与 service 里的 applyMailAction）。
+//
+// 注意 Body 里含有明文验证码/重置链接，这是「可重发」的前提。发出去之后
+// 由清理逻辑删除记录，不长期保留。
+type MailOutbox struct {
+	ID uint `gorm:"primarykey" json:"id"`
+	// To 收件人。列名用 to_addr：to 在部分数据库里是保留字。
+	To      string `gorm:"column:to_addr;size:255;not null;index" json:"to"`
+	Subject string `gorm:"size:255;not null" json:"subject"`
+	Body    string `gorm:"type:text;not null" json:"-"`
+
+	// Kind 决定送达后执行哪个凭据动作。
+	Kind string `gorm:"size:32;not null;index" json:"kind"`
+	// Payload 是凭据动作所需的参数（JSON）。
+	Payload string `gorm:"type:text" json:"-"`
+
+	Attempts int    `gorm:"not null;default:0" json:"attempts"`
+	Status   string `gorm:"size:16;not null;index;default:pending" json:"status"`
+	// NextAt 下次尝试时间，用于退避。
+	NextAt  time.Time `gorm:"not null;index" json:"next_at"`
+	LastErr string    `gorm:"size:255" json:"last_err"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (MailOutbox) TableName() string { return "lt_mail_outbox" }
+
+// TrafficBaseline 是流量采集的采样基线。
+//
+// # 为什么必须落库
+//
+// 采集器算的是「frps 当前累计值 − 上次采样值」。这个上次采样值原先只在内存
+// 里，控制面一重启就没了，而 frps 的**当日累计值还在**——第一次采集于是把
+// 当天全部流量当成新增量记一遍：用户配额被凭空扣掉一大截，统计也跟着翻倍。
+//
+// 只在「只重启控制面、frps 没重启」时暴露，而滚动升级恰好就是这个形态，
+// 所以它属于「上线时才炸」的那类问题。
+//
+// 按代理全名（"lt_u1.mc"）保存，并记下日期：跨零点后 frps 的当日计数归零，
+// 昨天的基线不能再拿来相减。
+type TrafficBaseline struct {
+	ProxyName string `gorm:"primarykey;size:191" json:"proxy_name"`
+	// Date 是基线所属日期（本地时区 YYYY-MM-DD）。
+	Date string `gorm:"size:10;not null;index" json:"date"`
+	// InBytes / OutBytes 是采样时刻 frps 上报的当日累计值。
+	InBytes  int64     `gorm:"not null;default:0" json:"in_bytes"`
+	OutBytes int64     `gorm:"not null;default:0" json:"out_bytes"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (TrafficBaseline) TableName() string { return "lt_traffic_baseline" }
+
 // FirewallPending 是一条待重试的防火墙端口操作。
 //
 // # 为什么必须落库

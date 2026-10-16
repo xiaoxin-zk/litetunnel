@@ -326,6 +326,12 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 		gcTicker := time.NewTicker(10 * time.Minute)
 		defer gcTicker.Stop()
 
+		// 先把当天的采样基线读回来，再跑第一次采集。
+		//
+		// 顺序不能反：第一次采集如果先跑，就会拿空基线去算增量，把 frps 的
+		// 当天累计值整个记成新增量（用户配额被凭空扣掉一大截）。
+		s.loadTrafficBaseline()
+
 		// 启动即跑一次，避免控制台首屏空白。
 		s.collectTraffic(ctx)
 
@@ -451,7 +457,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 
 	s.Runtime.setOnlineTunnels(onlineNow)
 
-	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner); err != nil {
+	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat); err != nil {
 		log.Printf("[traffic] 流量落库失败，本轮不推进采样基线（增量下轮补记）: %v", err)
 	} else {
 		s.Runtime.mu.Lock()
@@ -463,11 +469,23 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	s.refreshQuotaFlags()
 }
 
-// flushTraffic 将本轮增量写库。
+// flushTraffic 将本轮增量与采样基线一并写库。
 //
-// 返回错误而不是只记日志：调用方要靠它决定**要不要推进采样基线**。
+// 返回错误而不是只记日志：调用方要靠它决定**要不要推进内存里的采样基线**。
 // 失败时推进基线等于把这一轮的流量永久丢掉。
-func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas map[uint]int64, tunnelOwner map[uint]uint) error {
+//
+// nextStat 是本轮采样到的新基线，必须与增量在同一个事务里提交：
+//
+//   - 增量记上了、基线没推进 → 下一轮会把同一批流量再算一遍（重复计入）；
+//   - 基线推进了、增量没记上 → 这批流量永久漏记。
+//
+// 两种失真都会直接影响用户配额，且事后很难发现，所以它们必须同生共死。
+func (s *Services) flushTraffic(
+	tunnelDeltas map[uint]*tunnelDelta,
+	userDeltas map[uint]int64,
+	tunnelOwner map[uint]uint,
+	nextStat map[string]trafficPair,
+) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
@@ -528,9 +546,71 @@ func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas m
 				return err
 			}
 		}
+
+		// ---- 采样基线 ----
+		//
+		// 昨天的基线直接删掉：frps 的当日累计值跨零点归零，拿昨天的基线
+		// 相减会得到负数（调用方会把负数当「当天全部流量」处理，等于把
+		// 新一天的流量重复算一遍）。
+		if err := tx.Where("date <> ?", today).Delete(&model.TrafficBaseline{}).Error; err != nil {
+			return err
+		}
+
+		names := make([]string, 0, len(nextStat))
+		for name, cur := range nextStat {
+			names = append(names, name)
+			row := model.TrafficBaseline{
+				ProxyName: name,
+				Date:      today,
+				InBytes:   cur.in,
+				OutBytes:  cur.out,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "proxy_name"}},
+				DoUpdates: clause.AssignmentColumns([]string{"date", "in_bytes", "out_bytes"}),
+			}).Create(&row).Error; err != nil {
+				return err
+			}
+		}
+		// 已经消失的代理要把基线删掉，否则这张表会随历史代理一直长。
+		if len(names) == 0 {
+			if err := tx.Where("1 = 1").Delete(&model.TrafficBaseline{}).Error; err != nil {
+				return err
+			}
+		} else if err := tx.Where("proxy_name NOT IN ?", names).
+			Delete(&model.TrafficBaseline{}).Error; err != nil {
+			return err
+		}
 		return nil
 	})
 	return err
+}
+
+// loadTrafficBaseline 把当天的采样基线读回内存。采集器启动时调用一次。
+//
+// 不恢复的话，控制面重启后第一次采集会把 frps 的**当天累计值**整个当成
+// 新增量记一遍——用户配额被凭空扣掉一大截，统计翻倍。这只在「只重启控制面、
+// frps 没重启」时出现，而滚动升级恰好就是这个形态。
+func (s *Services) loadTrafficBaseline() {
+	today := time.Now().Format("2006-01-02")
+	var rows []model.TrafficBaseline
+	if err := s.DB.Where("date = ?", today).Find(&rows).Error; err != nil {
+		log.Printf("[traffic] 读取采样基线失败，本轮可能重复计入当天流量: %v", err)
+		return
+	}
+
+	m := make(map[string]trafficPair, len(rows))
+	for _, r := range rows {
+		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes}
+	}
+
+	s.Runtime.mu.Lock()
+	s.Runtime.lastStat = m
+	s.Runtime.mu.Unlock()
+
+	if len(m) > 0 {
+		log.Printf("[traffic] 已恢复 %d 条采样基线（避免重启后重复计入当天流量）", len(m))
+	}
 }
 
 // refreshQuotaFlags 刷新内存中的超额与禁用标记，供 frps 插件实时拦截。

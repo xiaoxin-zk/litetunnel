@@ -266,65 +266,101 @@ func (s *Services) loadPendingFirewall() {
 // 失败不能只写日志：数据库状态已经改了、接口也返回了成功，而规则没变。
 // 启动时的规则对齐只补开不收回，放行失败更是没有任何地方会再尝试，
 // 所以两种失败都必须排队重试。
-func (s *Services) applyPortIntent(port int, proto string, open bool) {
+//
+// 返回值 acted 表示这次确实动了手，err 是动手时的错误（acted 为 false 时
+// err 恒为 nil）——对账需要区分「放行成功」「放行失败」「按现状不该放行」。
+func (s *Services) applyPortIntent(port int, proto string, open bool) (acted bool, err error) {
 	if port <= 0 {
-		return
+		return false, nil
 	}
-	// 与「重试关闭该端口」互斥：否则可能刚放行就被一条过时的重试任务关掉。
+	// 与「重试该端口」互斥：否则可能刚放行就被一条过时的重试任务关掉。
 	pl := s.portLock(port)
 	pl.Lock()
 	defer pl.Unlock()
-	s.applyPortIntentLocked(port, proto, open)
+	return s.applyPortIntentLocked(port, proto, open)
 }
 
 // applyPortIntentLocked 在**已持有该端口锁**的前提下执行端口操作。
 //
 // 单独拆出来是给「事务提交前就已取锁」的调用方用（建隧道那条路径）：
 // 在那里再调一次 applyPortIntent 会重复加锁，直接死锁。
-func (s *Services) applyPortIntentLocked(port int, proto string, open bool) {
+//
+// # 动手之前先按数据库现状校验意图
+//
+// 立即路径（启停隧道、删除隧道）同样是「先改数据库、再动防火墙」，
+// 两步之间可能插进别的请求：
+//
+//   - 两个相反的状态切换并发时，较早那个可能最后才执行防火墙操作，
+//     把规则改成与最终数据库状态相反的样子（用户看到「已启用但连不上」）；
+//   - 删除隧道后端口立刻被新隧道复用，那条删除的收回会把新隧道的规则关掉。
+//
+// 校验放在端口锁内，于是「读状态 + 动手」是原子的：最后执行的那次一定
+// 与数据库的最终状态一致，不一致的那次会主动跳过。
+//
+// 注意这里**不需要**把数据库变更也包进锁里：每个请求都在自己的数据库
+// 变更之后才动手，而校验读的就是当下最新的状态。多端口批量删除时逐端口
+// 取锁、不同时持有，也就不存在锁序问题。
+func (s *Services) applyPortIntentLocked(port int, proto string, open bool) (acted bool, err error) {
 	if port <= 0 {
-		return
+		return false, nil
 	}
-	var err error
+
+	valid, verr := s.portIntentValid(port, open)
+	if verr != nil {
+		// 读不出状态：不动手，但记住意图等下一轮。
+		s.markFirewallPending(port, proto, open)
+		log.Printf("[firewall] 无法确认端口 %d 的当前状态，本次不动手、已加入重试队列: %v", port, verr)
+		return false, nil
+	}
+	if !valid {
+		log.Printf("[firewall] 端口 %d 的意图已过时（当前状态与%s不符），本次跳过", port, actionName(open))
+		return false, nil
+	}
+
 	if open {
 		err = s.FirewallOpenPort(port, proto)
 	} else {
 		err = s.FirewallClosePort(port, proto)
 	}
 	if err == nil {
-		return
+		return true, nil
 	}
 	s.markFirewallPending(port, proto, open)
-	action := "收回"
+	log.Printf("[firewall] 端口 %d/%s %s失败，已加入重试队列: %v", port, proto, actionName(open), err)
+	return true, err
+}
+
+// actionName 把意图转成日志用的动作名。
+func actionName(open bool) string {
 	if open {
-		action = "放行"
+		return "放行"
 	}
-	log.Printf("[firewall] 端口 %d/%s %s失败，已加入重试队列: %v", port, proto, action, err)
+	return "收回"
 }
 
 // portIntentValid 判断某端口的意图按数据库现状是否仍然成立。
 //
-// 这是重试前的必查项，防的是「旧任务关掉新隧道的端口」：
+// 这是每次动手前的必查项，防的是「旧意图关掉新隧道的端口」：
 // 旧隧道删除后端口被新隧道复用，此时那条「收回 20001」的待办还在队列里，
 // 照着执行就会把新隧道的规则一起关掉——用户看到的是「隧道莫名连不上」。
 //
-// 判定规则：端口当前应当处于什么状态，与待办记录的意图一致才动手。
-//   - 有活跃隧道占用 → 应当放行；待办是「收回」就作废。
-//   - 没有活跃隧道占用 → 应当收回；待办是「放行」就作废。
+// 判定规则：端口当前应当处于什么状态，与本次意图一致才动手。
+//   - 有活跃隧道占用 → 应当放行；意图是「收回」就作废。
+//   - 没有活跃隧道占用 → 应当收回；意图是「放行」就作废。
 //
-// 读不出隧道时返回 false（不动手）：宁可留着一条规则，也不要误关
-// 一条活跃隧道的端口。
-func (s *Services) portIntentValid(port int, open bool) bool {
+// 第二个返回值是「读不出来」：这时**不动手也不作废**，由调用方排队重试。
+// 宁可留着一条规则，也不要误关一条活跃隧道的端口。
+func (s *Services) portIntentValid(port int, open bool) (bool, error) {
 	var t model.Tunnel
 	err := s.DB.Where("remote_port = ?", port).First(&t).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// 没有任何隧道占用这个端口：该关，不该开。
-		return !open
+		return !open, nil
 	}
 	if err != nil {
-		return false
+		return false, err
 	}
-	return (t.Status == model.TunnelStatusActive) == open
+	return (t.Status == model.TunnelStatusActive) == open, nil
 }
 
 // PendingFirewallOps 返回待处理的端口操作（形如 "20001/tcp 待收回"），供管理页展示。
@@ -357,12 +393,17 @@ func (s *Services) retryPendingFirewall() int {
 	s.fwMu.Unlock()
 
 	for _, port := range ports {
-		// 校验与执行必须在同一段临界区里，且与「端口归属发生变化」互斥。
+		// 整段临界区都在端口锁内：读意图 → 校验 → 执行 → 提交待办状态。
 		//
-		// 否则仍有窗口：校验通过（此刻确实该关）→ 新隧道拿到这个端口并放行
-		// → 我们按旧意图把它关掉。持有端口锁之后，两者只可能是先后关系：
-		// 要么我们在新隧道出现前就关掉了它（此时它还没被打开，等于空操作），
-		// 要么校验时已经能看到那条活跃隧道，从而作废自己的任务。
+		// # 为什么「提交待办状态」也必须在锁内
+		//
+		// 曾经是执行完就释放锁，再回头更新/删除待办。这段间隙里同一端口
+		// 可能被写入**新意图**（例如刚被停用的隧道又被启用），旧重试随后
+		// 把新意图覆盖掉或直接删掉——那条真正需要执行的放行就再也不会被
+		// 重试了，规则与数据库状态长期不一致。
+		//
+		// 锁序固定为「端口锁 → fwMu」，与 applyPortIntent 一侧一致，
+		// 不存在反向获取。
 		pl := s.portLock(port)
 		pl.Lock()
 
@@ -376,10 +417,17 @@ func (s *Services) retryPendingFirewall() int {
 
 		// 意图过时（端口被新隧道复用、或隧道已经删掉）就直接作废，
 		// 绝不动手——这正是「旧任务关掉新隧道端口」的防线。
-		if !s.portIntentValid(port, item.open) {
+		valid, verr := s.portIntentValid(port, item.open)
+		if verr != nil {
+			// 读不出来：保留待办，下轮再试。
 			pl.Unlock()
+			continue
+		}
+		if !valid {
 			s.dropPending(port)
-			log.Printf("[firewall] 端口 %d 的待办已过时（当前状态与意图不符），已作废，未做任何操作", port)
+			pl.Unlock()
+			log.Printf("[firewall] 端口 %d 的待办已过时（当前状态与%s不符），已作废，未做任何操作",
+				port, actionName(item.open))
 			continue
 		}
 
@@ -389,33 +437,31 @@ func (s *Services) retryPendingFirewall() int {
 		} else {
 			err = s.FirewallClosePort(port, item.proto)
 		}
-		pl.Unlock()
 
 		if err != nil {
-			s.fwMu.Lock()
 			item.attempts++
 			item.lastErr = err.Error()
 			if item.attempts >= pendingFWMaxAttempts {
-				s.fwMu.Unlock()
 				s.dropPending(port)
+				pl.Unlock()
 				log.Printf("[firewall] 端口 %d 连续 %d 次处理失败，放弃自动重试，需要人工清理（最后错误: %v）",
 					port, item.attempts, err)
 				continue
 			}
+			s.fwMu.Lock()
 			s.fwPending[port] = item
 			s.fwMu.Unlock()
 			// 重试次数也要落库：否则重启后计数归零，永久失败的端口
 			// 会重新走满一轮上限，日志反复出现。
 			s.persistPending(port, item)
+			pl.Unlock()
 			continue
 		}
 
 		s.dropPending(port)
-		action := "收回"
-		if item.open {
-			action = "放行"
-		}
-		log.Printf("[firewall] 端口 %d/%s 已补%s（此前失败 %d 次）", port, item.proto, action, item.attempts)
+		pl.Unlock()
+		log.Printf("[firewall] 端口 %d/%s 已补%s（此前失败 %d 次）",
+			port, item.proto, actionName(item.open), item.attempts)
 	}
 
 	s.fwMu.Lock()
@@ -509,14 +555,22 @@ func (s *Services) ReconcileFirewall() bool {
 		return false
 	}
 
+	// 逐端口走 applyPortIntent，而不是直接 FirewallOpenPort：
+	//
+	//   - 它会取端口锁，并在锁内**重新确认该端口当前确实该放行**。这里拿到的
+	//     活跃隧道列表只是某一刻的快照，逐条放行的过程中隧道可能已被停用或
+	//     删除——照着快照放行，等于把一条已经不该开着的端口重新打开。
+	//   - 放行失败的端口会进重试队列，不必等到下次重启。
 	ok, failed := 0, 0
 	for i := range tunnels {
-		// 走 applyPortIntent 而不是直接 FirewallOpenPort：对齐时失败的端口
-		// 同样要进重试队列。否则 helper 恰好在这一刻不可用，所有端口都要
-		// 等到下次重启才可能被放行。
-		if err := s.FirewallOpenPort(tunnels[i].RemotePort, ProtoOfTunnel(tunnels[i].Type)); err != nil {
+		// acted 表示这次确实动了手（false 表示快照已过时或状态读不出来，
+		// 两种情况都不该计入「已放行」）。
+		acted, err := s.applyPortIntent(tunnels[i].RemotePort, ProtoOfTunnel(tunnels[i].Type), true)
+		if !acted {
+			continue
+		}
+		if err != nil {
 			failed++
-			s.markFirewallPending(tunnels[i].RemotePort, ProtoOfTunnel(tunnels[i].Type), true)
 			continue
 		}
 		ok++

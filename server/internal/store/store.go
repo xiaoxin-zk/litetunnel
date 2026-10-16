@@ -86,6 +86,12 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		// 待重试的防火墙端口操作：必须落库，否则进程重启后丢失，
 		// 那条本该收回的规则会一直留在宿主机上。
 		&model.FirewallPending{},
+		// 流量采样基线：必须落库，否则控制面重启后会把当天已有流量
+		// 重复计入一遍（frps 没重启时它的当日累计值还在）。
+		&model.TrafficBaseline{},
+		// 发件箱：必须落库，否则重启丢信、失败即弃，而验证码与重置链接
+		// 会在「信进队列」时就作废旧凭据——用户就再也找不回账号了。
+		&model.MailOutbox{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}

@@ -47,7 +47,12 @@
     <el-row :gutter="16" style="margin-top: 16px">
       <el-col :xs="24" :md="12">
         <div class="lt-card">
-          <div class="lt-card-title">网络吞吐</div>
+          <div class="lt-card-title">
+            <span>网络吞吐</span>
+            <span class="lt-muted" style="font-size: 12.5px; font-weight: 400">
+              累计 下行 {{ fmtBytes(latest?.net_rx_total) }} · 上行 {{ fmtBytes(latest?.net_tx_total) }}
+            </span>
+          </div>
           <div ref="netRef" class="chart"></div>
         </div>
       </el-col>

@@ -493,15 +493,31 @@ type AdminCreateUserInput struct {
 }
 
 // AdminCreateUser 管理员创建用户。
+//
+// 刻意**不复用 Register**：那是公开注册入口，带着注册开关、条款勾选、
+// 人机验证、邮箱域名黑白名单与每日频率限制——那些是「防陌生人滥用」的策略，
+// 管理员建号是受信操作，不该受它们约束。
+//
+// 曾经直接调 Register 并且没传 AgreedTerms，结果是管理员建号**永远失败**，
+// 报「请先阅读并同意服务条款」；即便补上这个字段，只要站点关掉了注册
+// 或开了人机验证，管理员照样建不了号。
+//
+// 共用的是数据本身那部分（格式校验、唯一性、密码哈希、初始 API Key）。
 func (s *Services) AdminCreateUser(in AdminCreateUserInput) (*model.User, error) {
-	u, err := s.Register(RegisterInput{
-		Username: in.Username,
-		Password: in.Password,
-		Email:    in.Email,
-	})
+	username, email, err := validateNewUser(in.Username, in.Email, in.Password)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkUserUnique(username, email); err != nil {
+		return nil, err
+	}
+	// 邮箱标记为「未验证」：管理员填的邮箱没有走过验证码，
+	// 标成已验证会在「邮箱即身份凭证」的场景下造成误判。
+	u, err := s.insertUser(username, email, in.Password, "", false)
+	if err != nil {
+		return nil, err
+	}
+
 	updates := map[string]any{"remark": truncate(in.Remark, 200)}
 	if in.GroupID > 0 {
 		updates["group_id"] = in.GroupID
@@ -553,11 +569,17 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 
 // AdminDeleteUser 删除用户及其全部隧道与流量记录。
 func (s *Services) AdminDeleteUser(id uint) error {
-	// 端口在**事务内**读取，删完之后再用（见下面 closePorts 的位置）。
+	// 与「给该用户建隧道」互斥（见 userLock）。
 	//
-	// 事务外先读、再开事务删，中间有个竞态窗口：用户此刻并发创建一条隧道，
-	// 它会在读完之后才出现，随后被事务删掉——端口却不在回收清单里，
-	// 规则永久残留在宿主机防火墙上。
+	// 只把端口读取放进事务还不够：PostgreSQL 的 READ COMMITTED 下，
+	// 一条在端口查询之后、删除语句之前提交的新隧道，仍可能被 DELETE 删掉
+	// 而没进回收清单。持有用户锁后，建隧道要么先完成（端口已在清单里），
+	// 要么等删除结束——后者会因为账号已不存在而失败。
+	lock := s.userLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 端口在**事务内**读取，删完之后再用（见下面 closePorts 的位置）。
 	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
@@ -970,7 +992,8 @@ func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 		if status == model.TunnelStatusActive {
 			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
 		} else {
-			_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+			// 与用户侧一致：收回失败要进重试队列，而不是只写一行日志。
+			s.closePortAndTrack(t.RemotePort, ProtoOfTunnel(t.Type))
 		}
 	}
 	return nil

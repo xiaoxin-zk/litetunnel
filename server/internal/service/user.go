@@ -47,20 +47,11 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		}
 	}
 
-	in.Username = strings.TrimSpace(in.Username)
-	in.Email = strings.TrimSpace(in.Email)
-	if len(in.Username) < 3 || len(in.Username) > 32 {
-		return nil, fmt.Errorf("%w: 用户名长度需为 3-32 个字符", ErrInvalidParam)
+	username, email, err := validateNewUser(in.Username, in.Email, in.Password)
+	if err != nil {
+		return nil, err
 	}
-	if !isSafeName(in.Username) {
-		return nil, fmt.Errorf("%w: 用户名仅允许字母、数字、下划线", ErrInvalidParam)
-	}
-	if len(in.Password) < 8 {
-		return nil, fmt.Errorf("%w: 密码长度不得少于 8 位", ErrInvalidParam)
-	}
-	if in.Email != "" && !IsValidEmail(in.Email) {
-		return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
-	}
+	in.Username, in.Email = username, email
 
 	// 邮箱验证：站点启用邮件后，注册必须提供邮箱并通过一次性验证码。
 	//
@@ -97,23 +88,8 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		}
 	}
 
-	var exists int64
-	if err := s.DB.Model(&model.User{}).Where("username = ?", in.Username).Count(&exists).Error; err != nil {
+	if err := s.checkUserUnique(in.Username, in.Email); err != nil {
 		return nil, err
-	}
-	if exists > 0 {
-		return nil, ErrUsernameTaken
-	}
-
-	// 邮箱唯一性：找回密码要靠邮箱定位账号，重复邮箱会让整个流程产生歧义。
-	if in.Email != "" {
-		var emailExists int64
-		if err := s.DB.Model(&model.User{}).Where("email = ?", in.Email).Count(&emailExists).Error; err != nil {
-			return nil, err
-		}
-		if emailExists > 0 {
-			return nil, ErrEmailTaken
-		}
 	}
 
 	// 邮箱验证码放在最后校验：它会**消费掉**验证码。
@@ -125,12 +101,66 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		}
 	}
 
-	hashed, err := auth.HashPassword(in.Password)
+	return s.insertUser(in.Username, in.Email, in.Password, in.IP, requireEmail)
+}
+
+// validateNewUser 校验并清洗新账号资料。只读、无副作用。
+//
+// 抽出来是因为它有两个调用方（公开注册与管理端建号），而两者的**准入策略**
+// 完全不同：注册要过注册开关、条款勾选、验证码、域名黑白名单与每日频率限制；
+// 管理员建号是受信操作，不该受这些约束。校验与写入共用，准入各自处理。
+func validateNewUser(username, email, password string) (string, string, error) {
+	username = strings.TrimSpace(username)
+	email = strings.TrimSpace(email)
+	if len(username) < 3 || len(username) > 32 {
+		return "", "", fmt.Errorf("%w: 用户名长度需为 3-32 个字符", ErrInvalidParam)
+	}
+	if !isSafeName(username) {
+		return "", "", fmt.Errorf("%w: 用户名仅允许字母、数字、下划线", ErrInvalidParam)
+	}
+	if len(password) < 8 {
+		return "", "", fmt.Errorf("%w: 密码长度不得少于 8 位", ErrInvalidParam)
+	}
+	if email != "" && !IsValidEmail(email) {
+		return "", "", fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
+	}
+	return username, email, nil
+}
+
+// checkUserUnique 校验用户名与邮箱未被占用。
+func (s *Services) checkUserUnique(username, email string) error {
+	var exists int64
+	if err := s.DB.Model(&model.User{}).Where("username = ?", username).Count(&exists).Error; err != nil {
+		return err
+	}
+	if exists > 0 {
+		return ErrUsernameTaken
+	}
+	if email == "" {
+		return nil
+	}
+	// 邮箱唯一性：找回密码要靠邮箱定位账号，重复邮箱会让整个流程产生歧义。
+	var emailExists int64
+	if err := s.DB.Model(&model.User{}).Where("email = ?", email).Count(&emailExists).Error; err != nil {
+		return err
+	}
+	if emailExists > 0 {
+		return ErrEmailTaken
+	}
+	return nil
+}
+
+// insertUser 写入用户记录：密码哈希、初始 API Key、默认分组。
+//
+// ip 与 emailVerified 由调用方决定：公开注册会带上来源 IP 与「邮箱已验证」，
+// 管理端建号两者都没有（管理员填的邮箱没有经过验证码校验，不该标成已验证）。
+func (s *Services) insertUser(username, email, password, ip string, emailVerified bool) (*model.User, error) {
+	hashed, err := auth.HashPassword(password)
 	if err != nil {
 		return nil, err
 	}
 
-	// 注册即生成 API Key：桌面客户端只用这一把凭据登录，
+	// 建号即生成 API Key：桌面客户端只用这一把凭据登录，
 	// 用户不必再去控制台点一次「生成」，省掉一个容易卡住的步骤。
 	apiKey, apiPrefix, apiHash, err := auth.GenerateAPIKey()
 	if err != nil {
@@ -144,19 +174,19 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 
 	group := s.defaultGroup()
 	user := &model.User{
-		Username:        in.Username,
-		Email:           in.Email,
+		Username:        username,
+		Email:           email,
 		Password:        hashed,
-		Nickname:        in.Username,
+		Nickname:        username,
 		Status:          model.UserStatusActive,
 		TrafficResetAt:  time.Now().AddDate(0, 1, 0),
 		APIKeyHash:      apiHash,
 		APIKeyPrefix:    apiPrefix,
 		APIKeyEnc:       apiEnc,
 		APIKeyCreatedAt: &now,
-		RegisterIP:      truncate(in.IP, 64),
-		EmailDomain:     truncate(domain, 128),
-		EmailVerified:   requireEmail,
+		RegisterIP:      truncate(ip, 64),
+		EmailDomain:     truncate(emailDomain(email), 128),
+		EmailVerified:   emailVerified,
 	}
 	if group != nil {
 		user.GroupID = group.ID
@@ -514,11 +544,13 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 	}
 
+	// 与「给自己建隧道」互斥（见 userLock）：只把端口读取放进事务还不够，
+	// READ COMMITTED 下在端口查询之后提交的新隧道仍可能被删掉而漏出回收清单。
+	lock := s.userLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	// 端口在**事务内**读取，删完之后再用（见下面 closePorts 的位置）。
-	//
-	// 事务外先读、再开事务删，中间有个竞态窗口：此刻并发创建一条隧道，
-	// 它会在读完之后才出现，随后被事务删掉——端口却不在回收清单里，
-	// 规则永久残留在宿主机防火墙上。
 	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {

@@ -106,7 +106,9 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrEmailCodeTooMany),
 		errors.Is(err, service.ErrEmailCodeAttempts),
 		errors.Is(err, service.ErrRegisterLimited),
-		errors.Is(err, service.ErrDomainRegisterLimited):
+		errors.Is(err, service.ErrDomainRegisterLimited),
+		// 队列满属于「过一会儿再来」，不是用户填错了。
+		errors.Is(err, service.ErrMailQueueFull):
 		httpx.Fail(c, http.StatusTooManyRequests, err.Error())
 
 	case errors.Is(err, service.ErrQuotaExceeded),

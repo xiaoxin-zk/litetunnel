@@ -27,6 +27,12 @@ const (
 // 这是配置问题，与账号是否存在无关，因此可以安全地对外暴露。
 var ErrMailDisabled = errors.New("站点未配置邮件服务，请联系管理员重置密码")
 
+// ErrMailQueueFull 表示发信队列已满，这封信没有投出去。
+//
+// 与 ErrMailDisabled 一样属于「与账号是否存在无关」的故障，
+// 可以安全地对外暴露：它由服务端负载决定，不携带任何账号信息。
+var ErrMailQueueFull = errors.New("邮件发送队列繁忙，请稍后重试")
+
 // 重置令牌相关错误。
 var (
 	ErrResetTokenInvalid = errors.New("重置链接无效，请重新申请")
@@ -90,7 +96,14 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 若同步发送会让「账号存在」的响应明显变慢，从而泄露账号是否存在。
-	s.enqueueMail(u.Email, subject, body)
+	//
+	// 投递失败只记日志、对外仍然返回成功：这里已经走完了「账号存在 + 有效」
+	// 的判断，此时返回错误会让「已注册 + 队列满」与「未注册」产生可区分的
+	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
+	// 「重新发送」，也不给枚举留口子。
+	if err := s.enqueueMail(u.Email, subject, body); err != nil {
+		log.Printf("[reset] 重置邮件投递失败（账号 %d）: %v", u.ID, err)
+	}
 	return nil
 }
 

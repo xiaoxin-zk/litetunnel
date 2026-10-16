@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -404,6 +405,262 @@ func TestRedeemRefreshesQuotaFlag(t *testing.T) {
 	}
 }
 
+// TestAdminCreateUserBypassesPublicRegistration 覆盖「管理员建号永远失败」。
+//
+// AdminCreateUser 曾经直接调 Register，而 Register 是**公开注册**入口：
+// 它要求勾选条款（管理员建号没这个字段，于是 100% 失败，报「请先阅读并同意
+// 服务条款」），还受注册开关、人机验证、邮箱域名黑白名单与每日频率限制约束。
+// 站点一关注册，管理员就再也建不了号。
+func TestAdminCreateUserBypassesPublicRegistration(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 关掉公开注册，并打开人机验证：两者都只该影响公开注册。
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyRegisterEnabled: "false",
+		KeyRegisterCaptcha: "true",
+	}); err != nil {
+		t.Fatalf("设置注册开关失败: %v", err)
+	}
+
+	// 前置条件：公开注册此时确实不可用。
+	if _, err := svc.Register(RegisterInput{
+		Username: "publicuser", Password: "Passw0rd123", AgreedTerms: true,
+	}); err == nil {
+		t.Fatal("前置条件：关闭注册后公开注册应被拒绝")
+	}
+
+	u, err := svc.AdminCreateUser(AdminCreateUserInput{
+		Username: "adminmade", Password: "Passw0rd123", Email: "made@example.com",
+		Remark: "管理员建号",
+	})
+	if err != nil {
+		t.Fatalf("管理员建号不应受公开注册准入约束，实际失败: %v", err)
+	}
+	if u.Username != "adminmade" || u.Status != model.UserStatusActive {
+		t.Fatalf("建出来的账号不对: %+v", u)
+	}
+	if u.APIKeyHash == "" {
+		t.Error("建号应同时生成 API Key（客户端只用它登录）")
+	}
+	if u.EmailVerified {
+		t.Error("管理员填的邮箱没走过验证码，不该标成已验证")
+	}
+}
+
+// TestAdminCreateUserValidatesData 覆盖反面：绕过的是准入，不是数据校验。
+func TestAdminCreateUserValidatesData(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	if _, err := svc.AdminCreateUser(AdminCreateUserInput{
+		Username: "ok_name", Password: "short",
+	}); err == nil {
+		t.Error("密码过短仍应被拒绝")
+	}
+	if _, err := svc.AdminCreateUser(AdminCreateUserInput{
+		Username: "bad name!", Password: "Passw0rd123",
+	}); err == nil {
+		t.Error("用户名非法字符仍应被拒绝")
+	}
+
+	if _, err := svc.AdminCreateUser(AdminCreateUserInput{
+		Username: "dupuser", Password: "Passw0rd123",
+	}); err != nil {
+		t.Fatalf("首次建号失败: %v", err)
+	}
+	if _, err := svc.AdminCreateUser(AdminCreateUserInput{
+		Username: "dupuser", Password: "Passw0rd123",
+	}); !errors.Is(err, ErrUsernameTaken) {
+		t.Errorf("重名应返回 ErrUsernameTaken，实际 %v", err)
+	}
+}
+
+// TestFirewallCloseFailureIsRetried 覆盖「收回失败被吞掉」。
+//
+// 隧道停用/删除时数据库已经改了、接口也返回成功，而防火墙操作可能因为
+// helper 暂时不可达而失败。以前只写一行日志：规则一直开着，而启动时的
+// 规则对齐只补开、不收回，所以没有任何地方会再尝试。
+func TestFirewallCloseFailureIsRetried(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "fwretry", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20007,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	// 停用：helper 此刻是坏的，操作仍然成功（数据库已改），但端口要进重试队列。
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用失败: %v", err)
+	}
+	pending := svc.PendingPortCloses()
+	if len(pending) != 1 || pending[0] != "20007/tcp" {
+		t.Fatalf("收回失败应进入待重试队列，实际 %v", pending)
+	}
+
+	// helper 恢复后重试应当成功，并且真的调到了 helper。
+	helper.failCloses.Store(false)
+	if n := svc.retryPendingPortCloses(); n != 0 {
+		t.Fatalf("重试后不应还有待收回端口，实际 %d 个", n)
+	}
+	closed := helper.closedPorts()
+	if len(closed) != 1 || closed[0] != "20007/tcp" {
+		t.Fatalf("重试应真的收回端口，实际 %v", closed)
+	}
+	if len(svc.PendingPortCloses()) != 0 {
+		t.Error("成功后应从待重试队列移除")
+	}
+}
+
+// TestMailQueueFullIsReported 覆盖「队列满仍报告已发送」。
+//
+// 队列满时以前只记日志：验证码记录已经写库并占着 60 秒冷却，用户却收不到
+// 邮件，接口还说「验证码已发送」——他只能反复重试，而每次都被冷却挡住。
+func TestMailQueueFullIsReported(t *testing.T) {
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeySMTPEnabled:  "true",
+		KeySMTPHost:     "smtp.example.com",
+		KeySMTPPort:     "587",
+		KeySMTPUser:     "noreply@example.com",
+		KeySMTPPassword: "secret",
+		KeySMTPFrom:     "noreply@example.com",
+	}); err != nil {
+		t.Fatalf("设置邮件配置失败: %v", err)
+	}
+	if !svc.MailEnabled() {
+		t.Fatal("前置条件：邮件应已启用")
+	}
+
+	// 把队列灌满。
+	for i := 0; i < mailQueueSize; i++ {
+		svc.mailCh <- outboundMail{}
+	}
+
+	const email = "queue@example.com"
+	err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1")
+	if !errors.Is(err, ErrMailQueueFull) {
+		t.Fatalf("队列满必须如实反馈，实际 %v", err)
+	}
+
+	// 验证码记录必须被撤掉：留着会占住冷却，让用户重试时被「发送过于频繁」挡住。
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).Count(&n).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("投递失败后应撤掉验证码记录，实际还剩 %d 条", n)
+	}
+}
+
+// TestMailQueueFullStaysSilentForResetScene 覆盖反面：找回密码不能因此暴露账号。
+//
+// 找回场景已经走完了「账号存在 + 有效」的判断，此时返回错误会让
+// 「已注册 + 队列满」与「未注册」产生可区分的响应，接口就变成账号枚举工具。
+func TestMailQueueFullStaysSilentForResetScene(t *testing.T) {
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeySMTPEnabled:  "true",
+		KeySMTPHost:     "smtp.example.com",
+		KeySMTPPort:     "587",
+		KeySMTPUser:     "noreply@example.com",
+		KeySMTPPassword: "secret",
+		KeySMTPFrom:     "noreply@example.com",
+	}); err != nil {
+		t.Fatalf("设置邮件配置失败: %v", err)
+	}
+
+	const email = "reset@example.com"
+	u := &model.User{
+		Username: "resetuser", Password: "not-used",
+		Email: email, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	for i := 0; i < mailQueueSize; i++ {
+		svc.mailCh <- outboundMail{}
+	}
+
+	if err := svc.SendEmailCode(email, EmailSceneReset, "127.0.0.1"); err != nil {
+		t.Fatalf("找回场景必须保持静默（否则可用于枚举账号），实际返回 %v", err)
+	}
+
+	// 但记录仍要撤掉，否则用户重试会被冷却挡住。
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).Count(&n).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("投递失败后应撤掉验证码记录，实际还剩 %d 条", n)
+	}
+}
+
+// TestCreateTunnelWaitsForUserLock 覆盖「建隧道与删除用户互斥」。
+//
+// 不互斥的话有个窄窗口：删除流程先读端口清单、再删记录，中间并发建出来的
+// 隧道会被删掉而端口不在回收清单里，防火墙规则永久残留。
+// 竞态本身无法稳定复现（SQLite 单连接会天然串行化），所以这里直接验证
+// 「建隧道确实会先取用户锁」这个结构前提。
+func TestCreateTunnelWaitsForUserLock(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "lockuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	g := &model.Group{
+		Name: "测试分组", MaxTunnels: 5, MaxPorts: 5,
+		TrafficQuota: 1 << 30, BandwidthLimit: 1 << 20,
+		AllowProtocols: "tcp", IsDefault: true,
+	}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+
+	lock := svc.userLock(u.ID)
+	lock.Lock() // 模拟「正在删除该用户」
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = svc.CreateTunnel(u, TunnelInput{
+			Name: "mc", Type: model.ProxyTypeTCP,
+			LocalIP: "127.0.0.1", LocalPort: 25565,
+		})
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("删除用户持锁期间，建隧道必须先等待——否则会建给一个正在被删除的账号")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	lock.Unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("释放锁之后建隧道应立即继续")
+	}
+}
+
 // TestRedeemWritesAuditRecords 覆盖兑换流水的两种丢失。
 //
 //  1. 无效兑换码的审计原先写在业务事务里，紧接着事务回滚——等于从来没记录过。
@@ -459,6 +716,9 @@ func TestRedeemWritesAuditRecords(t *testing.T) {
 type fakeFirewallHelper struct {
 	*httptest.Server
 
+	// failCloses 为 true 时关端口一律失败，用于模拟 helper 暂时不可用。
+	failCloses atomic.Bool
+
 	mu     sync.Mutex
 	opened []string
 	closed []string
@@ -477,6 +737,12 @@ func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
 				Proto string `json:"proto"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if f.failCloses.Load() {
+				// 模拟 helper 暂时不可用：面板必须把这次失败记下来重试，
+				// 而不是只写一行日志就当成关掉了。
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			f.mu.Lock()
 			f.closed = append(f.closed, fmt.Sprintf("%d/%s", body.Port, body.Proto))
 			f.mu.Unlock()

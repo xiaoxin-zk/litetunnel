@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -142,16 +143,125 @@ func portsOfTunnels(tunnels []model.Tunnel) []portProto {
 	return out
 }
 
+// pendingClose 是一个「本该收回、但上次失败」的端口。
+type pendingClose struct {
+	proto    string
+	attempts int
+	lastErr  string
+}
+
+const (
+	// firewallRetryInterval 是重试待收回端口的间隔。
+	firewallRetryInterval = 2 * time.Minute
+	// pendingCloseMaxAttempts 是同一端口的最大重试次数。
+	//
+	// 必须有上限：有些失败是**永久性**的（端口在保护列表里、不在端口池内），
+	// 无限重试只会每两分钟刷一次同样的日志。到上限后放弃并明确要求人工清理。
+	pendingCloseMaxAttempts = 5
+	// pendingCloseLimit 是待重试队列的长度上限，防止异常情况下无限增长。
+	pendingCloseLimit = 512
+)
+
+// markPortClosePending 记下一个失败的端口收回，等待后台重试。
+func (s *Services) markPortClosePending(port int, proto string) {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	if s.fwPending == nil {
+		s.fwPending = map[int]pendingClose{}
+	}
+	if _, ok := s.fwPending[port]; ok {
+		return
+	}
+	if len(s.fwPending) >= pendingCloseLimit {
+		log.Printf("[firewall] 待收回端口已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
+			pendingCloseLimit, port)
+		return
+	}
+	s.fwPending[port] = pendingClose{proto: proto}
+}
+
+// closePortAndTrack 收回端口；失败时记入待重试队列。
+//
+// 失败不能只写日志：数据库状态已经改了、接口也返回了成功，而规则还开着；
+// 启动时的规则对齐只补开不收回，所以这个失败**没有任何地方会再尝试**。
+func (s *Services) closePortAndTrack(port int, proto string) {
+	if port <= 0 {
+		return
+	}
+	if err := s.FirewallClosePort(port, proto); err != nil {
+		s.markPortClosePending(port, proto)
+		log.Printf("[firewall] 端口 %d/%s 收回失败，已加入重试队列: %v", port, proto, err)
+	}
+}
+
+// PendingPortCloses 返回待收回的端口（形如 "20001/tcp"），供管理页展示。
+func (s *Services) PendingPortCloses() []string {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	out := make([]string, 0, len(s.fwPending))
+	for port, item := range s.fwPending {
+		out = append(out, fmt.Sprintf("%d/%s", port, item.proto))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// retryPendingPortCloses 重试所有待收回的端口，返回仍在等待的数量。
+//
+// 只处理「我们自己记下来的、确实该关的」端口，不做全表扫描：
+// 收回比放行危险得多，扫全表去猜哪些规则是多余的，很容易把管理员
+// 自己的连接也关掉（这也是 ReconcileFirewall 刻意不收回端口的原因）。
+func (s *Services) retryPendingPortCloses() int {
+	s.fwMu.Lock()
+	ports := make([]int, 0, len(s.fwPending))
+	for port := range s.fwPending {
+		ports = append(ports, port)
+	}
+	s.fwMu.Unlock()
+
+	for _, port := range ports {
+		s.fwMu.Lock()
+		item, ok := s.fwPending[port]
+		s.fwMu.Unlock()
+		if !ok {
+			continue
+		}
+
+		if err := s.FirewallClosePort(port, item.proto); err != nil {
+			s.fwMu.Lock()
+			item.attempts++
+			item.lastErr = err.Error()
+			if item.attempts >= pendingCloseMaxAttempts {
+				delete(s.fwPending, port)
+				s.fwMu.Unlock()
+				log.Printf("[firewall] 端口 %d 连续 %d 次收回失败，放弃自动重试，需要人工清理（最后错误: %v）",
+					port, item.attempts, err)
+				continue
+			}
+			s.fwPending[port] = item
+			s.fwMu.Unlock()
+			continue
+		}
+
+		s.fwMu.Lock()
+		delete(s.fwPending, port)
+		s.fwMu.Unlock()
+		log.Printf("[firewall] 端口 %d/%s 已补收回（此前失败 %d 次）", port, item.proto, item.attempts)
+	}
+
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	return len(s.fwPending)
+}
+
 // closePorts 逐个回收端口。
 //
-// 只记日志、不返回错误：调用方此刻已经删完数据了，让回收失败把
-// 「删除成功」变成错误返回，只会让管理员以为没删掉而重复操作。
-// 失败必须留痕，因为这类残留规则只能靠人工清理。
+// 不返回错误：调用方此刻已经删完数据了，让回收失败把「删除成功」
+// 变成错误返回，只会让管理员以为没删掉而重复操作。
+// 但失败不能只留一行日志——会进待重试队列，由后台反复尝试。
 func (s *Services) closePorts(ports []portProto) {
 	for _, p := range ports {
-		if err := s.FirewallClosePort(p.port, p.proto); err != nil {
-			log.Printf("[firewall] 回收端口 %d/%s 失败，需要人工清理: %v", p.port, p.proto, err)
-		}
+		s.closePortAndTrack(p.port, p.proto)
 	}
 }
 
@@ -255,17 +365,25 @@ type FirewallStatus struct {
 	// Listening 是当前主机实际监听的端口，用于识别哪些端口已被占用
 	Listening []firewall.ListeningPort `json:"listening"`
 
+	// PendingCloses 是「本该收回、但 helper 当时失败」的端口，正在后台重试。
+	//
+	// 必须显示出来：这些端口对应的隧道已经停用或删除，界面上一片正常，
+	// 但规则仍然放行。不暴露这个列表的话，管理员没有任何线索知道
+	// 「后台说关了，其实还开着」。
+	PendingCloses []string `json:"pending_closes,omitempty"`
+
 	Error string `json:"error,omitempty"`
 }
 
 // FirewallStatusOf 采集防火墙运行态。
 func (s *Services) FirewallStatusOf() *FirewallStatus {
 	st := &FirewallStatus{
-		Enabled:   s.Settings.Bool(KeyFirewallEnabled),
-		AutoOpen:  s.Settings.Bool(KeyFirewallAutoOpen),
-		Protected: s.FirewallGuard().Protected(),
-		PoolStart: s.Cfg.PortRangeStart,
-		PoolEnd:   s.Cfg.PortRangeEnd,
+		Enabled:       s.Settings.Bool(KeyFirewallEnabled),
+		AutoOpen:      s.Settings.Bool(KeyFirewallAutoOpen),
+		Protected:     s.FirewallGuard().Protected(),
+		PoolStart:     s.Cfg.PortRangeStart,
+		PoolEnd:       s.Cfg.PortRangeEnd,
+		PendingCloses: s.PendingPortCloses(),
 	}
 
 	be := s.FirewallBackend()
@@ -417,7 +535,7 @@ func (s *Services) diagnosePortRange(u *PortPoolUsage) {
 	}
 }
 
-// StartFirewallReconciler 在启动时对齐一次规则。
+// StartFirewallReconciler 在启动时对齐一次规则，之后持续重试失败的端口收回。
 //
 // 延迟几秒执行：等待 frps 与数据库就绪，避免启动瞬间的误判。
 func (s *Services) StartFirewallReconciler() {
@@ -427,5 +545,16 @@ func (s *Services) StartFirewallReconciler() {
 	go func() {
 		time.Sleep(3 * time.Second)
 		s.ReconcileFirewall()
+
+		// 之后只重试「失败的收回」，不再周期性做整表对齐：
+		// 对齐会给每条活跃隧道都发一次 helper 请求，没必要反复做，
+		// 而失败的收回才是会一直悬着的那件事。
+		ticker := time.NewTicker(firewallRetryInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if n := s.retryPendingPortCloses(); n > 0 {
+				log.Printf("[firewall] 仍有 %d 个端口待收回，将在下个周期继续重试", n)
+			}
+		}
 	}()
 }

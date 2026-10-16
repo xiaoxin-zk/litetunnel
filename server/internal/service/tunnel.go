@@ -59,7 +59,17 @@ func (s *Services) FindTunnelByName(userID uint, name string) (*model.Tunnel, er
 }
 
 // CreateTunnel 校验分组权限并创建隧道。
+//
+// 全程持有该用户的锁：与「删除该用户」互斥（见 userLock）。
 func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, error) {
+	lock := s.userLock(u.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.createTunnelLocked(u, in)
+}
+
+// createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。
+func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tunnel, error) {
 	g := s.EffectiveGroup(u)
 	if g == nil {
 		return nil, errors.New("当前账号未绑定任何分组，请联系管理员")
@@ -233,7 +243,9 @@ func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 		if status == model.TunnelStatusActive {
 			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
 		} else {
-			_ = s.FirewallClosePort(t.RemotePort, ProtoOfTunnel(t.Type))
+			// 收回失败要进重试队列：数据库状态已经改了、接口也返回成功，
+			// 只写一行日志的话规则会一直开着，而且没有任何地方会再尝试。
+			s.closePortAndTrack(t.RemotePort, ProtoOfTunnel(t.Type))
 		}
 	}
 	return nil
@@ -305,12 +317,19 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 		Failures: make([]BatchFailure, 0),
 	}
 
+	// 整批持有该用户的锁，而不是每条各自去抢：
+	// 后者会让「删除该用户」插在两条之间，剩下的隧道就建给一个已经
+	// 不存在的账号了（记录与防火墙规则都留着，而账号没了）。
+	lock := s.userLock(u.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	for _, port := range ports {
 		// 分隔符用下划线而不是连字符：隧道名沿用 IsSafeName 的字符集
 		// （字母数字下划线），连字符会被拒绝。
 		name := fmt.Sprintf("%s_%d", prefix, port)
 
-		t, err := s.CreateTunnel(u, TunnelInput{
+		t, err := s.createTunnelLocked(u, TunnelInput{
 			Name:      name,
 			Type:      in.Type,
 			LocalIP:   in.LocalIP,

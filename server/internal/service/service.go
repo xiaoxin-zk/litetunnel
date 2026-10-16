@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -96,6 +97,35 @@ type Services struct {
 	// 登录日志不能阻塞登录判定，邮件投递不能因为 SMTP 往返而暴露账号是否存在。
 	loginLogCh chan model.LoginLog
 	mailCh     chan outboundMail
+
+	// fwMu 保护 fwPending：本该收回、但宿主机 helper 当时失败了的端口。
+	//
+	// 为什么需要它：隧道停用/删除时数据库已经改了，而防火墙操作可能因为
+	// helper 暂时不可达而失败。以前这个失败只写一行日志就没了——接口返回
+	// 成功，规则却仍然放行；而启动时的规则对齐**只补开、不收回**，
+	// 所以这条规则不会再有第二次机会被处理。
+	fwMu      sync.Mutex
+	fwPending map[int]pendingClose
+
+	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
+	userLocks [userLockShards]sync.Mutex
+}
+
+// userLockShards 是用户锁的分片数。
+//
+// 分片而不是给每个用户建一把锁（配 map + 清理）：固定 64 把不会有
+// 「锁表随用户数增长」的问题，碰撞只是让两个用户的操作多串行化一点，
+// 而这两件事本来就不频繁。
+const userLockShards = 64
+
+// userLock 返回某个用户的锁。
+//
+// 用途只有一个：串行化「给该用户建隧道」与「删除该用户」。
+// 删除流程要先读端口清单、再删记录，中间若插进一条并发创建的隧道，
+// 它会被删掉而端口不在回收清单里——防火墙规则永久残留，且没有任何
+// 地方会再尝试清理（启动时的规则对齐只补开、不收回）。
+func (s *Services) userLock(userID uint) *sync.Mutex {
+	return &s.userLocks[userID%userLockShards]
 }
 
 // New 构造服务集合。
@@ -111,6 +141,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
+		fwPending:  map[int]pendingClose{},
 	}
 }
 

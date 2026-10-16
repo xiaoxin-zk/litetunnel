@@ -22,15 +22,22 @@ type outboundMail struct {
 	Body    string
 }
 
-// enqueueMail 投递一封邮件到异步队列。队列满时丢弃并记录告警。
-func (s *Services) enqueueMail(to, subject, body string) {
+// enqueueMail 投递一封邮件到异步队列。
+//
+// 返回错误，而不是队列满时静默丢弃：队列满意味着这封信永远不会发出去，
+// 而调用方（验证码、找回密码）随后会告诉用户「已发送」——用户收不到信，
+// 却要等到超时或反复重试才发现，而验证码记录还占着 60 秒冷却。
+// 失败必须让调用方知道，由它决定是回滚还是换一种说法。
+func (s *Services) enqueueMail(to, subject, body string) error {
 	if !s.MailEnabled() {
-		return
+		return ErrMailDisabled
 	}
 	select {
 	case s.mailCh <- outboundMail{To: to, Subject: subject, Body: body}:
+		return nil
 	default:
 		log.Printf("[mail] 发信队列已满，丢弃一封发往 %s 的邮件", maskEmail(to))
+		return ErrMailQueueFull
 	}
 }
 

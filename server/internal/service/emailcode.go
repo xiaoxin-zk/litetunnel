@@ -126,7 +126,26 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	subject := fmt.Sprintf("【%s】邮箱验证码", siteName)
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 同步发送会让「邮箱是否存在」通过响应时间泄露出去。
-	s.enqueueMail(email, subject, emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())))
+	if err := s.enqueueMail(email, subject, emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes()))); err != nil {
+		// 投递失败要**撤掉刚写入的验证码记录**。
+		//
+		// 留着它有两个后果：占着 60 秒重发冷却，用户重试时会被
+		// 「发送过于频繁」挡住；以及库里多一条永远用不到的验证码。
+		// 而他实际上从没收到过任何邮件。
+		if derr := s.DB.Where("id = ?", rec.ID).Delete(&model.EmailCode{}).Error; derr != nil {
+			log.Printf("[emailcode] 回滚验证码记录失败（id=%d）: %v", rec.ID, derr)
+		}
+
+		// 找回场景必须保持「不暴露账号是否存在」：这里已经走完了账号判断，
+		// 返回错误会让「已注册 + 投递失败」与「未注册」变得可区分。
+		if scene == EmailSceneReset {
+			log.Printf("[emailcode] 找回密码的验证码投递失败（邮箱 %s）: %v", maskEmail(email), err)
+			return nil
+		}
+		// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
+		log.Printf("[emailcode] 验证码投递失败（邮箱 %s）: %v", maskEmail(email), err)
+		return err
+	}
 	return nil
 }
 

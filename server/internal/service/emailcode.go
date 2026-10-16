@@ -193,11 +193,21 @@ func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*mode
 	ok := subtle.ConstantTimeCompare(
 		[]byte(hex.EncodeToString(sum[:])), []byte(rec.CodeHash)) == 1
 	if !ok {
-		// 失败计数用数据库侧自增，避免并发下绕过次数上限。
+		// 失败计数用**带条件的**自增，而不是「先读上限、再无条件 +1」。
+		//
+		// 后者在并发下会漏：多个请求同时读到「还没到上限」的旧值，各自继续
+		// 校验，同一个 6 位码就能被猜超过规定的次数。带条件时数据库保证只有
+		// 一个能把它从「未达上限」推到下一格，推不动就说明已经到顶了。
+		//
 		// 用 s.DB 而不是传入的 db：即使调用方的事务随后回滚，这次失败也要留下。
-		if err := s.DB.Model(&model.EmailCode{}).Where("id = ?", rec.ID).
-			Update("attempts", gorm.Expr("attempts + 1")).Error; err != nil {
-			log.Printf("[emailcode] 更新失败次数出错: %v", err)
+		res := s.DB.Model(&model.EmailCode{}).
+			Where("id = ? AND attempts < ?", rec.ID, emailCodeMaxAttempts).
+			Update("attempts", gorm.Expr("attempts + 1"))
+		if res.Error != nil {
+			log.Printf("[emailcode] 更新失败次数出错: %v", res.Error)
+		} else if res.RowsAffected == 0 {
+			// 条件没命中：并发请求已经把它顶到上限了。
+			return nil, ErrEmailCodeAttempts
 		}
 		return nil, ErrEmailCodeWrong
 	}
@@ -206,12 +216,16 @@ func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*mode
 
 // consumeEmailCode 消费一条验证码（标记已使用）。
 //
-// 条件更新：并发下只有一个请求能把 used_at 从 NULL 改成功，
-// 另一个会拿到 0 行并得到「验证码不正确」——这正是我们要的语义
-// （同一个码不能被用两次）。
+// 条件里带上「未使用 + 未过期 + 未达尝试上限」：校验与消费之间可能插进别的
+// 请求（并发猜测、或恰好跨过过期时刻），只按 id 更新会把这些检查绕过去
+// ——一个已经该作废的验证码仍然能被用掉。
+//
+// 并发下也只有一个请求能把 used_at 从 NULL 改成功，另一个拿到 0 行并得到
+// 「验证码不正确」：同一个码不能被用两次。
 func (s *Services) consumeEmailCode(db *gorm.DB, id uint) error {
 	res := db.Model(&model.EmailCode{}).
-		Where("id = ? AND used_at IS NULL", id).
+		Where("id = ? AND used_at IS NULL AND expire_at > ? AND attempts < ?",
+			id, time.Now(), emailCodeMaxAttempts).
 		Update("used_at", time.Now())
 	if res.Error != nil {
 		return res.Error

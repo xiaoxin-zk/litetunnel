@@ -246,21 +246,29 @@ func (s *Services) ResetPasswordByEmailCode(account, emailCode, newPassword, ip 
 	if u.Email == "" {
 		return fmt.Errorf("%w: 该账号未绑定邮箱，无法通过邮箱重置，请联系管理员", ErrInvalidParam)
 	}
-	hashed, newSecret, err := s.preparePasswordReset(newPassword)
-	if err != nil {
-		return err
-	}
-
-	// 先只校验（不消费），再把「消费验证码 + 更新密码」放进**同一个事务**。
+	// 先校验验证码，**再**做哈希与密钥生成。
 	//
-	// 顺序不能是「先消费、再另起一个事务改密码」：那样密码更新失败时，
-	// 验证码已经被标记为已使用——用户手里的码废了、密码却没改，只能等冷却后
-	// 重新申请。放进同一事务后，失败会一并回滚，验证码仍然可用。
+	// 顺序很重要：preparePasswordReset 里的 bcrypt 是刻意设计成慢的（防离线
+	// 爆破），放在校验之前的话，任何一个错误验证码的请求都会消耗这段 CPU
+	// ——接口虽有按 IP 限流，但分布式来源仍能把它放大成 CPU 耗尽。
+	//
+	// 校验本身是只读的（失败计数除外），把它的结果先拿到手，下面的哈希与
+	// 事务都只在验证码正确时才发生。
 	rec, err := s.checkEmailCode(s.DB, u.Email, EmailSceneReset, emailCode)
 	if err != nil {
 		return err
 	}
 
+	hashed, newSecret, err := s.preparePasswordReset(newPassword)
+	if err != nil {
+		return err
+	}
+
+	// 再把「消费验证码 + 更新密码」放进**同一个事务**。
+	//
+	// 顺序不能是「先消费、再另起一个事务改密码」：那样密码更新失败时，
+	// 验证码已经被标记为已使用——用户手里的码废了、密码却没改，只能等冷却后
+	// 重新申请。放进同一事务后，失败会一并回滚，验证码仍然可用。
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
 		if err := s.consumeEmailCode(tx, rec.ID); err != nil {
 			return err

@@ -1292,6 +1292,199 @@ func TestTrafficCollectorRestoresBaselineOnStart(t *testing.T) {
 	t.Fatal("采集器启动时应先恢复采样基线，否则重启后会重复计入当天流量")
 }
 
+// TestInvalidEmailCodeSkipsBcrypt 覆盖「无效验证码也触发 bcrypt」。
+//
+// preparePasswordReset 里的 bcrypt 是刻意设计成慢的（防离线爆破）。若放在
+// 校验验证码之前，任何一个错误验证码的请求都会消耗这段 CPU——接口虽有按 IP
+// 限流，但分布式来源仍能把它放大成 CPU 耗尽。
+func TestInvalidEmailCodeSkipsBcrypt(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const email = "bcryptskip@example.com"
+	u := &model.User{
+		Username: "bcryptskip", Password: "not-used",
+		Email: email, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	sum := sha256.Sum256([]byte("123456"))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneReset,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	// 先量一次真实 bcrypt 的耗时作为基线。
+	start := time.Now()
+	if _, err := auth.HashPassword("NewPassw0rd!"); err != nil {
+		t.Fatalf("哈希失败: %v", err)
+	}
+	baseline := time.Since(start)
+
+	start = time.Now()
+	err := svc.ResetPasswordByEmailCode(u.Username, "000000", "NewPassw0rd!", "127.0.0.1")
+	wrongDur := time.Since(start)
+	if err == nil {
+		t.Fatal("错误的验证码应被拒绝")
+	}
+
+	// 用**比值**而不是绝对阈值：CI 负载高时两边一起变慢，比值仍然成立。
+	if wrongDur > baseline/2 {
+		t.Fatalf("验证码错误时不该做 bcrypt：耗时 %v，而一次哈希只要 %v",
+			wrongDur.Round(time.Millisecond), baseline.Round(time.Millisecond))
+	}
+}
+
+// TestEmailCodeAttemptsNeverExceedLimit 覆盖「失败计数不是原子的」。
+//
+// 「先读上限、再无条件 +1」在并发下会漏：多个请求同时读到「还没到上限」的
+// 旧值，各自继续校验，同一个 6 位码就能被猜超过规定的次数。
+// 带条件的自增由数据库保证只有一次能生效，计数最终**恰好**停在上限。
+func TestEmailCodeAttemptsNeverExceedLimit(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const email = "attemptsrace@example.com"
+	sum := sha256.Sum256([]byte("123456"))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneReset,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	const workers = 20
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = svc.checkEmailCode(svc.DB, email, EmailSceneReset, "000000")
+		}()
+	}
+	wg.Wait()
+
+	var got model.EmailCode
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.Attempts != emailCodeMaxAttempts {
+		t.Fatalf("%d 次并发错误尝试后计数应恰好停在上限 %d，实际 %d",
+			workers, emailCodeMaxAttempts, got.Attempts)
+	}
+}
+
+// TestConsumeEmailCodeRejectsExhaustedOrExpired 覆盖消费时的条件校验。
+//
+// 校验与消费之间可能插进别的请求（并发猜测、或恰好跨过过期时刻），
+// 只按 id 更新会把这些检查绕过去——一个已经该作废的验证码仍然能被用掉。
+func TestConsumeEmailCodeRejectsExhaustedOrExpired(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	mk := func(name string, attempts int, expireAt time.Time) model.EmailCode {
+		rec := model.EmailCode{
+			Email: name + "@example.com", Scene: EmailSceneReset,
+			CodeHash: "h", Attempts: attempts, ExpireAt: expireAt,
+		}
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建验证码失败: %v", err)
+		}
+		return rec
+	}
+
+	exhausted := mk("exhausted", emailCodeMaxAttempts, time.Now().Add(10*time.Minute))
+	expired := mk("expired", 0, time.Now().Add(-time.Minute))
+	fresh := mk("fresh", 0, time.Now().Add(10*time.Minute))
+
+	if err := svc.consumeEmailCode(svc.DB, exhausted.ID); !errors.Is(err, ErrEmailCodeWrong) {
+		t.Errorf("已达尝试上限的验证码不该能被消费，实际 %v", err)
+	}
+	if err := svc.consumeEmailCode(svc.DB, expired.ID); !errors.Is(err, ErrEmailCodeWrong) {
+		t.Errorf("已过期的验证码不该能被消费，实际 %v", err)
+	}
+	if err := svc.consumeEmailCode(svc.DB, fresh.ID); err != nil {
+		t.Fatalf("正常验证码应能消费: %v", err)
+	}
+	if err := svc.consumeEmailCode(svc.DB, fresh.ID); !errors.Is(err, ErrEmailCodeWrong) {
+		t.Errorf("同一个验证码不能被消费两次，实际 %v", err)
+	}
+}
+
+// TestRegisterKeepsEmailCodeWhenInsertFails 覆盖「注册没成功、验证码却已失效」。
+//
+// 消费验证码与写入用户如果分属两步，写库失败（或并发注册撞唯一索引）时，
+// 用户得重新收信才能再试一次。
+func TestRegisterKeepsEmailCodeWhenInsertFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyRegisterEnabled:      "true",
+		KeyRegisterRequireEmail: "true",
+		// 人机验证默认是开的，这里关掉：本用例只关心验证码与写用户的先后。
+		KeyRegisterCaptcha: "false",
+	}); err != nil {
+		t.Fatalf("设置注册开关失败: %v", err)
+	}
+
+	const email = "registerfail@example.com"
+	const plain = "654321"
+	sum := sha256.Sum256([]byte(plain))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneRegister,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	// 制造「写用户失败」：给用户表装一个拒绝插入的触发器。
+	// 比「并发撞唯一索引」更确定，走的仍是真实注册路径。
+	if err := svc.DB.Exec(
+		`CREATE TRIGGER lt_users_block_insert BEFORE INSERT ON lt_users
+		 BEGIN SELECT RAISE(ABORT, 'blocked for test'); END`).Error; err != nil {
+		t.Fatalf("装触发器失败: %v", err)
+	}
+
+	_, err := svc.Register(RegisterInput{
+		Username: "registerfail", Password: "Passw0rd123",
+		Email: email, EmailCode: plain, AgreedTerms: true, IP: "127.0.0.1",
+	})
+	if err == nil {
+		t.Fatal("写用户失败时注册应返回错误")
+	}
+
+	var got model.EmailCode
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.UsedAt != nil {
+		t.Error("注册没成功时验证码不该被消费：否则用户只能重新收信")
+	}
+
+	// 去掉触发器后重试：同一个验证码应当仍然可用。
+	if err := svc.DB.Exec(`DROP TRIGGER lt_users_block_insert`).Error; err != nil {
+		t.Fatalf("删触发器失败: %v", err)
+	}
+	if _, err := svc.Register(RegisterInput{
+		Username: "registerfail", Password: "Passw0rd123",
+		Email: email, EmailCode: plain, AgreedTerms: true, IP: "127.0.0.1",
+	}); err != nil {
+		t.Fatalf("恢复后应能用同一个验证码完成注册: %v", err)
+	}
+	if err := svc.DB.First(&got, rec.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if got.UsedAt == nil {
+		t.Error("注册成功后验证码必须被消费（一次性）")
+	}
+}
+
 // TestResetByEmailCodeKeepsCodeWhenPasswordUpdateFails 覆盖
 // 「验证码被消费了、密码却没改成」。
 //

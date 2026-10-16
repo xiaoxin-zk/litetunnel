@@ -92,16 +92,40 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, err
 	}
 
-	// 邮箱验证码放在最后校验：它会**消费掉**验证码。
-	// 必须等所有无副作用的校验都通过后再执行，否则一次「用户名已占用」
-	// 就会白白浪费用户一个验证码，用户得重新收信。
+	// 邮箱验证码放在最后校验，而且这里**只校验、不消费**。
+	//
+	// 必须等所有无副作用的校验都通过后再做，否则一次「用户名已占用」就会
+	// 白白浪费用户一个验证码。消费则要和写用户放进同一个事务（见下）：
+	// 分开做的话，写库失败或并发注册撞唯一索引时，注册没成功、验证码却已经
+	// 失效了，用户只能重新收信。
+	var codeRec *model.EmailCode
 	if requireEmail {
-		if err := s.VerifyEmailCode(in.Email, EmailSceneRegister, in.EmailCode); err != nil {
-			return nil, err
+		var cerr error
+		codeRec, cerr = s.checkEmailCode(s.DB, in.Email, EmailSceneRegister, in.EmailCode)
+		if cerr != nil {
+			return nil, cerr
 		}
 	}
 
-	return s.insertUser(in.Username, in.Email, in.Password, in.IP, requireEmail)
+	// 哈希与密钥生成放在事务**之外**：bcrypt 是刻意设计成慢的，
+	// 占着事务会拉长写锁持有时间。
+	user, err := s.prepareNewUser(in.Username, in.Email, in.Password, in.IP, requireEmail)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if codeRec != nil {
+			if cerr := s.consumeEmailCode(tx, codeRec.ID); cerr != nil {
+				return cerr
+			}
+		}
+		return s.insertUserTx(tx, user)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.LoadUser(user.ID)
 }
 
 // validateNewUser 校验并清洗新账号资料。只读、无副作用。
@@ -155,6 +179,21 @@ func (s *Services) checkUserUnique(username, email string) error {
 // ip 与 emailVerified 由调用方决定：公开注册会带上来源 IP 与「邮箱已验证」，
 // 管理端建号两者都没有（管理员填的邮箱没有经过验证码校验，不该标成已验证）。
 func (s *Services) insertUser(username, email, password, ip string, emailVerified bool) (*model.User, error) {
+	user, err := s.prepareNewUser(username, email, password, ip, emailVerified)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.insertUserTx(s.DB, user); err != nil {
+		return nil, err
+	}
+	return s.LoadUser(user.ID)
+}
+
+// prepareNewUser 在事务**之外**完成哈希与密钥生成，返回待写入的用户对象。
+//
+// 拆出来是为了让调用方能把「写入用户」和别的操作（例如消费邮箱验证码）
+// 放进同一个事务，而把 CPU 密集的哈希留在事务外。
+func (s *Services) prepareNewUser(username, email, password, ip string, emailVerified bool) (*model.User, error) {
 	hashed, err := auth.HashPassword(password)
 	if err != nil {
 		return nil, err
@@ -191,11 +230,18 @@ func (s *Services) insertUser(username, email, password, ip string, emailVerifie
 	if group != nil {
 		user.GroupID = group.ID
 	}
-	if err := s.DB.Create(user).Error; err != nil {
-		// 并发注册时可能撞唯一索引，转为友好错误。
-		return nil, ErrUsernameTaken
+	return user, nil
+}
+
+// insertUserTx 在给定事务内写入用户记录。
+//
+// 唯一索引冲突在这里转成友好错误：并发注册时两个请求可能同时通过了
+// 「用户名未占用」的检查，最终由数据库裁决。
+func (s *Services) insertUserTx(db *gorm.DB, user *model.User) error {
+	if err := db.Create(user).Error; err != nil {
+		return ErrUsernameTaken
 	}
-	return s.LoadUser(user.ID)
+	return nil
 }
 
 // emailDomainBlocked 判断邮箱域名是否命中黑名单。

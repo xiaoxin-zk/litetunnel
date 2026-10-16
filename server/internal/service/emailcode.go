@@ -87,14 +87,6 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return ErrEmailCodeTooMany
 	}
 
-	// 作废旧码：同一邮箱同一场景只保留最新一个可用验证码。
-	// 否则用户连点几次后，前面几封邮件里的码也都还能用，等于扩大了攻击面。
-	if err := s.DB.Model(&model.EmailCode{}).
-		Where("email = ? AND scene = ? AND used_at IS NULL", email, scene).
-		Update("used_at", now).Error; err != nil {
-		return err
-	}
-
 	code, err := newNumericCode(6)
 	if err != nil {
 		return err
@@ -145,6 +137,20 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
 		log.Printf("[emailcode] 验证码投递失败（邮箱 %s）: %v", maskEmail(email), err)
 		return err
+	}
+
+	// 确认新邮件已经进队列之后，才作废旧码。
+	//
+	// 顺序不能反：先作废旧码、投递又失败的话，用户手里**一个可用的码都没有**
+	// ——旧码已作废、新码被撤掉，而接口（找回场景）还告诉他「已发送」，
+	// 他只能反复点「重新发送」，每次都在同一个地方失败。
+	//
+	// 排除刚建的这条：VerifyEmailCode 取的是最新未使用的记录，
+	// 把新的也标成已用会让用户永远验不过。
+	if err := s.DB.Model(&model.EmailCode{}).
+		Where("email = ? AND scene = ? AND used_at IS NULL AND id <> ?", email, scene, rec.ID).
+		Update("used_at", time.Now()).Error; err != nil {
+		log.Printf("[emailcode] 作废旧验证码失败（邮箱 %s）: %v", maskEmail(email), err)
 	}
 	return nil
 }

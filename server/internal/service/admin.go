@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -911,7 +912,31 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 	if err := s.DB.First(&g, id).Error; err != nil {
 		return nil, err
 	}
+
+	// 事务提交后刷新该组用户的超额标记。
+	//
+	// 配额可能被调低（原本没超额的变成超额）或调高（原本超额的可以放行了），
+	// 而 Runtime.exceeded 是插件实时拦截的依据。不刷新的话要等下一轮成功
+	// 采集才生效——frps 管理接口恰好不可用时，这个标记会一直停在旧值上：
+	// 调低配额后用户还能继续建连接，调高配额后用户仍然被拒。
+	s.refreshQuotaForGroup(id)
 	return &g, nil
+}
+
+// refreshQuotaForGroup 刷新某分组下所有用户的超额标记。
+//
+// 一次查询取出该组全部用户（带分组），而不是逐个 LoadUser：
+// 一个分组可能有成百上千个用户，逐个查会把一次管理操作变成一串查询。
+func (s *Services) refreshQuotaForGroup(groupID uint) {
+	var users []model.User
+	if err := s.DB.Preload("Group").Where("group_id = ?", groupID).Find(&users).Error; err != nil {
+		log.Printf("[quota] 刷新分组 %d 的配额标记失败: %v", groupID, err)
+		return
+	}
+	for i := range users {
+		s.EnsureTrafficPeriod(&users[i])
+		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
+	}
 }
 
 // DeleteGroup 删除分组。默认分组与仍被占用的分组不允许删除。
@@ -990,10 +1015,10 @@ func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 
 	if t.RemotePort > 0 {
 		if status == model.TunnelStatusActive {
-			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
+			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true)
 		} else {
 			// 与用户侧一致：收回失败要进重试队列，而不是只写一行日志。
-			s.closePortAndTrack(t.RemotePort, ProtoOfTunnel(t.Type))
+			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
 		}
 	}
 	return nil

@@ -98,14 +98,14 @@ type Services struct {
 	loginLogCh chan model.LoginLog
 	mailCh     chan outboundMail
 
-	// fwMu 保护 fwPending：本该收回、但宿主机 helper 当时失败了的端口。
+	// fwMu 保护 fwPending：本该放行/收回、但宿主机 helper 当时失败的端口。
 	//
-	// 为什么需要它：隧道停用/删除时数据库已经改了，而防火墙操作可能因为
-	// helper 暂时不可达而失败。以前这个失败只写一行日志就没了——接口返回
-	// 成功，规则却仍然放行；而启动时的规则对齐**只补开、不收回**，
-	// 所以这条规则不会再有第二次机会被处理。
+	// 为什么需要它：隧道建好/停用/删除时数据库已经改了，而防火墙操作可能
+	// 因为 helper 暂时不可达而失败。以前这个失败只写一行日志就没了——
+	// 接口返回成功，规则却没变；而启动时的规则对齐只补开、不收回，
+	// 放行失败更是没有任何地方会再尝试。
 	fwMu      sync.Mutex
-	fwPending map[int]pendingClose
+	fwPending map[int]pendingFW
 
 	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
 	userLocks [userLockShards]sync.Mutex
@@ -141,7 +141,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailCh:     make(chan outboundMail, mailQueueSize),
-		fwPending:  map[int]pendingClose{},
+		fwPending:  map[int]pendingFW{},
 	}
 }
 

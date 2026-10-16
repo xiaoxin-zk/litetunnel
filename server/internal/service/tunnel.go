@@ -140,7 +140,7 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 	// 失败不影响隧道本身——管理员仍可去云安全组手工放行，
 	// 而把建隧道整体失败掉会让用户完全无从下手。
 	if created.RemotePort > 0 {
-		_ = s.FirewallOpenPort(created.RemotePort, ProtoOfTunnel(created.Type))
+		s.applyPortIntent(created.RemotePort, ProtoOfTunnel(created.Type), true)
 	}
 	return &created, nil
 }
@@ -241,11 +241,11 @@ func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 
 	if t.RemotePort > 0 {
 		if status == model.TunnelStatusActive {
-			_ = s.FirewallOpenPort(t.RemotePort, ProtoOfTunnel(t.Type))
+			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true)
 		} else {
 			// 收回失败要进重试队列：数据库状态已经改了、接口也返回成功，
 			// 只写一行日志的话规则会一直开着，而且没有任何地方会再尝试。
-			s.closePortAndTrack(t.RemotePort, ProtoOfTunnel(t.Type))
+			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
 		}
 	}
 	return nil

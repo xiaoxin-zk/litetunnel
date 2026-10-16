@@ -33,6 +33,13 @@ var ErrMailDisabled = errors.New("站点未配置邮件服务，请联系管理�
 // 可以安全地对外暴露：它由服务端负载决定，不携带任何账号信息。
 var ErrMailQueueFull = errors.New("邮件发送队列繁忙，请稍后重试")
 
+// ErrFirewallUnavailable 表示防火墙总开关开着，但宿主机 helper 不可用。
+//
+// 与「防火墙未启用」必须区分：后者是「本来就不该动规则」，返回 nil 是对的；
+// 前者是「该动但动不了」，必须作为失败上报，否则这次操作既没生效、
+// 也不会进入重试队列。
+var ErrFirewallUnavailable = errors.New("宿主机防火墙 helper 不可用")
+
 // 重置令牌相关错误。
 var (
 	ErrResetTokenInvalid = errors.New("重置链接无效，请重新申请")
@@ -67,14 +74,6 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 		return nil
 	}
 
-	// 同一账号只保留一个有效令牌：作废旧令牌，避免多封邮件同时可用。
-	if err := s.DB.Model(&model.PasswordResetToken{}).
-		Where("user_id = ? AND used_at IS NULL", u.ID).
-		Update("used_at", time.Now()).Error; err != nil {
-		log.Printf("[reset] 作废旧令牌失败: %v", err)
-		return nil
-	}
-
 	tok := model.PasswordResetToken{
 		UserID:    u.ID,
 		TokenHash: hash,
@@ -102,7 +101,27 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
 	// 「重新发送」，也不给枚举留口子。
 	if err := s.enqueueMail(u.Email, subject, body); err != nil {
-		log.Printf("[reset] 重置邮件投递失败（账号 %d）: %v", u.ID, err)
+		// 投递失败要**撤掉刚建的令牌**，并保留旧令牌可用。
+		//
+		// 顺序反过来（先作废旧令牌再投递）会留下一个很坑的状态：旧链接
+		// 全部失效、新邮件又没发出去，用户手上一个能用的链接都没有，
+		// 而接口还告诉他「已发送」——他只能反复点重新发送，每次都在
+		// 同一个地方失败，且没有任何线索。
+		if derr := s.DB.Delete(&model.PasswordResetToken{}, tok.ID).Error; derr != nil {
+			log.Printf("[reset] 回滚重置令牌失败（id=%d）: %v", tok.ID, derr)
+		}
+		log.Printf("[reset] 重置邮件投递失败（账号 %d），已保留原令牌: %v", u.ID, err)
+		return nil
+	}
+
+	// 确认新邮件已进队列，才作废旧令牌：同一账号只保留一个有效令牌，
+	// 避免多封邮件里的链接同时可用。
+	//
+	// 排除刚建的这条——它正是我们要留下的那个。
+	if err := s.DB.Model(&model.PasswordResetToken{}).
+		Where("user_id = ? AND used_at IS NULL AND id <> ?", u.ID, tok.ID).
+		Update("used_at", time.Now()).Error; err != nil {
+		log.Printf("[reset] 作废旧令牌失败: %v", err)
 	}
 	return nil
 }

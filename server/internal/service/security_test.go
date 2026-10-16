@@ -509,22 +509,390 @@ func TestFirewallCloseFailureIsRetried(t *testing.T) {
 	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
 		t.Fatalf("停用失败: %v", err)
 	}
-	pending := svc.PendingPortCloses()
-	if len(pending) != 1 || pending[0] != "20007/tcp" {
+	pending := svc.PendingFirewallOps()
+	if len(pending) != 1 || pending[0] != "20007/tcp 待收回" {
 		t.Fatalf("收回失败应进入待重试队列，实际 %v", pending)
 	}
 
 	// helper 恢复后重试应当成功，并且真的调到了 helper。
 	helper.failCloses.Store(false)
-	if n := svc.retryPendingPortCloses(); n != 0 {
+	if n := svc.retryPendingFirewall(); n != 0 {
 		t.Fatalf("重试后不应还有待收回端口，实际 %d 个", n)
 	}
 	closed := helper.closedPorts()
 	if len(closed) != 1 || closed[0] != "20007/tcp" {
 		t.Fatalf("重试应真的收回端口，实际 %v", closed)
 	}
-	if len(svc.PendingPortCloses()) != 0 {
+	if len(svc.PendingFirewallOps()) != 0 {
 		t.Error("成功后应从待重试队列移除")
+	}
+}
+
+// enableTestMail 打开测试用的邮件配置，并确认 MailEnabled 成立。
+func enableTestMail(t *testing.T, svc *Services) {
+	t.Helper()
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeySMTPEnabled:  "true",
+		KeySMTPHost:     "smtp.example.com",
+		KeySMTPPort:     "587",
+		KeySMTPUser:     "noreply@example.com",
+		KeySMTPPassword: "secret",
+		KeySMTPFrom:     "noreply@example.com",
+	}); err != nil {
+		t.Fatalf("设置邮件配置失败: %v", err)
+	}
+	if !svc.MailEnabled() {
+		t.Fatal("前置条件：邮件应已启用")
+	}
+}
+
+// fillMailQueue 把发信队列灌满，用于制造「投递失败」。
+func fillMailQueue(svc *Services) {
+	for i := 0; i < mailQueueSize; i++ {
+		svc.mailCh <- outboundMail{}
+	}
+}
+
+// TestEmailCodeKeepsOldCodeWhenDeliveryFails 覆盖「投递失败却把旧码作废了」。
+//
+// 作废旧码与投递新邮件如果顺序反了，失败时会留下一个很坑的状态：
+// 旧码已作废、新码又被撤掉，用户手里**一个可用的验证码都没有**，
+// 而接口（找回场景）还告诉他「已发送」。
+func TestEmailCodeKeepsOldCodeWhenDeliveryFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+
+	const email = "keepold@example.com"
+	old := model.EmailCode{
+		Email: email, Scene: EmailSceneRegister,
+		CodeHash: "old-hash", ExpireAt: time.Now().Add(10 * time.Minute),
+		// 越过 60 秒重发冷却，否则请求会被 ErrEmailCodeTooSoon 挡在前面。
+		CreatedAt: time.Now().Add(-2 * time.Minute),
+	}
+	if err := svc.DB.Create(&old).Error; err != nil {
+		t.Fatalf("建旧验证码失败: %v", err)
+	}
+
+	fillMailQueue(svc)
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); !errors.Is(err, ErrMailQueueFull) {
+		t.Fatalf("队列满应如实反馈，实际 %v", err)
+	}
+
+	var got model.EmailCode
+	if err := svc.DB.First(&got, old.ID).Error; err != nil {
+		t.Fatalf("读旧验证码失败: %v", err)
+	}
+	if got.UsedAt != nil {
+		t.Error("投递失败不该作废旧验证码：用户会一个可用的码都没有")
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", email).Count(&n).Error; err != nil {
+		t.Fatalf("统计验证码失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("失败的那条记录应被撤掉，实际共 %d 条", n)
+	}
+}
+
+// TestEmailCodeInvalidatesOldCodeOnSuccess 覆盖反面：投递成功后旧码必须失效。
+//
+// 否则用户连点几次，前面几封邮件里的码也都还能用，等于扩大了攻击面。
+func TestEmailCodeInvalidatesOldCodeOnSuccess(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+
+	const email = "invalidate@example.com"
+	old := model.EmailCode{
+		Email: email, Scene: EmailSceneRegister,
+		CodeHash: "old-hash", ExpireAt: time.Now().Add(10 * time.Minute),
+		CreatedAt: time.Now().Add(-2 * time.Minute),
+	}
+	if err := svc.DB.Create(&old).Error; err != nil {
+		t.Fatalf("建旧验证码失败: %v", err)
+	}
+
+	if err := svc.SendEmailCode(email, EmailSceneRegister, "127.0.0.1"); err != nil {
+		t.Fatalf("投递应成功: %v", err)
+	}
+
+	var got model.EmailCode
+	if err := svc.DB.First(&got, old.ID).Error; err != nil {
+		t.Fatalf("读旧验证码失败: %v", err)
+	}
+	if got.UsedAt == nil {
+		t.Error("投递成功后旧码必须作废，否则多封邮件里的码同时可用")
+	}
+
+	// 新码必须仍然可用（作废时不能把它自己也算进去）。
+	var fresh model.EmailCode
+	if err := svc.DB.Where("email = ? AND used_at IS NULL", email).
+		Order("id desc").First(&fresh).Error; err != nil {
+		t.Fatalf("应留下一条未使用的新验证码: %v", err)
+	}
+	if fresh.ID == old.ID {
+		t.Fatal("留下的应当是刚发的那条，而不是旧的")
+	}
+}
+
+// TestPasswordResetKeepsOldTokenWhenDeliveryFails 覆盖同类的令牌版本。
+func TestPasswordResetKeepsOldTokenWhenDeliveryFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+
+	const email = "resetkeep@example.com"
+	u := &model.User{
+		Username: "resetkeep", Password: "not-used",
+		Email: email, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	old := model.PasswordResetToken{
+		UserID: u.ID, TokenHash: "old-token-hash",
+		ExpireAt: time.Now().Add(30 * time.Minute),
+	}
+	if err := svc.DB.Create(&old).Error; err != nil {
+		t.Fatalf("建旧令牌失败: %v", err)
+	}
+
+	fillMailQueue(svc)
+	if err := svc.RequestPasswordReset(u.Username, "127.0.0.1", "https://example.com"); err != nil {
+		t.Fatalf("找回密码必须保持静默（否则可用于枚举账号），实际返回 %v", err)
+	}
+
+	var got model.PasswordResetToken
+	if err := svc.DB.First(&got, old.ID).Error; err != nil {
+		t.Fatalf("读旧令牌失败: %v", err)
+	}
+	if got.UsedAt != nil {
+		t.Error("投递失败不该作废旧令牌：用户手上的链接全部失效，而接口说「已发送」")
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.PasswordResetToken{}).
+		Where("user_id = ?", u.ID).Count(&n).Error; err != nil {
+		t.Fatalf("统计令牌失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("失败的那条令牌应被撤掉，实际共 %d 条", n)
+	}
+}
+
+// TestUpdateGroupRefreshesQuotaFlags 覆盖「改了分组配额但标记没跟着变」。
+//
+// Runtime.exceeded 是插件实时拦截的依据，平时靠流量采集刷新。管理员调低
+// 配额时用户可能继续建连接，调高配额时已超额用户仍被拒——而 frps 管理接口
+// 恰好不可用时，这个标记会一直停在旧值上，等多久都不会恢复。
+func TestUpdateGroupRefreshesQuotaFlags(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	g := &model.Group{
+		Name: "配额组", MaxTunnels: 5, MaxPorts: 5,
+		TrafficQuota: 100, BandwidthLimit: 1 << 20, AllowProtocols: "tcp",
+	}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+	u := &model.User{
+		Username: "groupquota", Password: "not-used",
+		Status: model.UserStatusActive, GroupID: g.ID, TrafficUsed: 200,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	svc.refreshQuotaFor(u.ID)
+	if !svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("前置条件：已用 200 > 配额 100，应处于超额状态")
+	}
+
+	// 调高配额：该用户应当立刻可以重新建连接。
+	if _, err := svc.UpdateGroup(g.ID, GroupInput{
+		Name: "配额组", MaxTunnels: 5, MaxPorts: 5,
+		TrafficQuota: 1 << 30, BandwidthLimit: 1 << 20, AllowProtocols: "tcp",
+	}); err != nil {
+		t.Fatalf("更新分组失败: %v", err)
+	}
+	if svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Error("调高配额后应立即解除超额，而不是等下一轮采集")
+	}
+
+	// 再调低：应当立刻恢复拦截。
+	if _, err := svc.UpdateGroup(g.ID, GroupInput{
+		Name: "配额组", MaxTunnels: 5, MaxPorts: 5,
+		TrafficQuota: 10, BandwidthLimit: 1 << 20, AllowProtocols: "tcp",
+	}); err != nil {
+		t.Fatalf("再次更新分组失败: %v", err)
+	}
+	if !svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Error("调低配额后应立即开始拦截，而不是等下一轮采集")
+	}
+}
+
+// TestPendingCloseIsDroppedWhenPortIsReused 覆盖「旧任务关掉新隧道的端口」。
+//
+// 待办按端口保存，而端口会被复用：旧隧道删除后该端口分给了新隧道，
+// 此时那条「收回 20001」的待办还在队列里——照着执行就会把新隧道的规则
+// 一起关掉，用户看到的是「隧道莫名连不上」，而日志里只有一条「已补收回」。
+func TestPendingCloseIsDroppedWhenPortIsReused(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failCloses.Store(true)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "reuseuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 旧隧道：停用时收回失败，进入待办队列。
+	old := &model.Tunnel{
+		UserID: u.ID, Name: "old", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20011,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(old).Error; err != nil {
+		t.Fatalf("建旧隧道失败: %v", err)
+	}
+	if err := svc.AdminSetTunnelStatus(old.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用失败: %v", err)
+	}
+	if len(svc.PendingFirewallOps()) != 1 {
+		t.Fatalf("前置条件：应有一条待收回记录，实际 %v", svc.PendingFirewallOps())
+	}
+
+	// 旧隧道被删除，端口 20011 分给了新隧道（且是启用状态）。
+	if err := svc.AdminDeleteTunnel(old.ID); err != nil {
+		t.Fatalf("删除旧隧道失败: %v", err)
+	}
+	fresh := &model.Tunnel{
+		UserID: u.ID, Name: "new", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25566, RemotePort: 20011,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(fresh).Error; err != nil {
+		t.Fatalf("建新隧道失败: %v", err)
+	}
+
+	// helper 恢复，重试——此时那条待办已经过时，必须作废而不是执行。
+	helper.failCloses.Store(false)
+	if n := svc.retryPendingFirewall(); n != 0 {
+		t.Fatalf("过时的待办应被作废，实际还剩 %d 条", n)
+	}
+	if got := helper.closedPorts(); len(got) != 0 {
+		t.Fatalf("绝不能关掉已被新隧道复用的端口，实际关掉了 %v", got)
+	}
+}
+
+// TestFirewallOpenFailureIsRetried 覆盖「放行失败没人重试」。
+//
+// 新建或启用隧道时会忽略 FirewallOpenPort 的错误，而防火墙协调器只在启动时
+// 补开一次、之后只重试收回——helper 暂时不可用时，隧道一直处于启用状态但
+// 端口没放行，只能靠人工重扫或重启服务。
+func TestFirewallOpenFailureIsRetried(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failOpens.Store(true)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "openretry", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20013,
+		Status: model.TunnelStatusDisabled,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	// 启用：helper 坏的，数据库改了、放行失败，必须进入待办队列。
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusActive); err != nil {
+		t.Fatalf("启用失败: %v", err)
+	}
+	pending := svc.PendingFirewallOps()
+	if len(pending) != 1 || pending[0] != "20013/tcp 待放行" {
+		t.Fatalf("放行失败应进入待重试队列，实际 %v", pending)
+	}
+
+	// helper 恢复后重试应当真的放行。
+	helper.failOpens.Store(false)
+	if n := svc.retryPendingFirewall(); n != 0 {
+		t.Fatalf("重试后不应还有待办，实际 %d 条", n)
+	}
+	opened := helper.openedPorts()
+	if len(opened) != 1 || opened[0] != "20013/tcp" {
+		t.Fatalf("重试应真的放行端口，实际 %v", opened)
+	}
+}
+
+// TestPendingOpenIsDroppedWhenTunnelDisabled 覆盖反面：
+// 待放行的端口若隧道又被停用，重试不能把端口开回来。
+func TestPendingOpenIsDroppedWhenTunnelDisabled(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	helper.failOpens.Store(true)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "staleopen", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20015,
+		Status: model.TunnelStatusDisabled,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusActive); err != nil {
+		t.Fatalf("启用失败: %v", err)
+	}
+	if len(svc.PendingFirewallOps()) != 1 {
+		t.Fatalf("前置条件：应有一条待放行记录，实际 %v", svc.PendingFirewallOps())
+	}
+
+	// 用户又把它停用了（收回成功），此时那条待放行已经过时。
+	helper.failOpens.Store(false)
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用失败: %v", err)
+	}
+	helper.mu.Lock()
+	helper.opened = nil
+	helper.mu.Unlock()
+
+	if n := svc.retryPendingFirewall(); n != 0 {
+		t.Fatalf("过时的待放行应被作废，实际还剩 %d 条", n)
+	}
+	if got := helper.openedPorts(); len(got) != 0 {
+		t.Fatalf("隧道已停用，绝不能把端口再开回来，实际 %v", got)
 	}
 }
 
@@ -716,8 +1084,9 @@ func TestRedeemWritesAuditRecords(t *testing.T) {
 type fakeFirewallHelper struct {
 	*httptest.Server
 
-	// failCloses 为 true 时关端口一律失败，用于模拟 helper 暂时不可用。
+	// failCloses / failOpens 为 true 时对应操作一律失败，用于模拟 helper 暂时不可用。
 	failCloses atomic.Bool
+	failOpens  atomic.Bool
 
 	mu     sync.Mutex
 	opened []string
@@ -753,6 +1122,10 @@ func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
 				Proto string `json:"proto"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if f.failOpens.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			f.mu.Lock()
 			f.opened = append(f.opened, fmt.Sprintf("%d/%s", body.Port, body.Proto))
 			f.mu.Unlock()

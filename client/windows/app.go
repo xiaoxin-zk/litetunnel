@@ -176,7 +176,10 @@ func NewApp() *App {
 	}
 }
 
-// startup 由 Wails 在窗口就绪后调用。
+// startup 由 Wails 在应用启动时调用（早于窗口加载完成）。
+//
+// 这里只做准备：注册回调、记下 ctx。真正的「打开即连」放在 domReady，
+// 原因见那里。
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.mgr.SetCallbacks(func(id uint, name, line string) {
@@ -193,7 +196,21 @@ func (a *App) startup(ctx context.Context) {
 		_ = err
 		a.emitState()
 	})
+}
 
+// domReady 在 WebView 加载完成、前端脚本就绪后调用，负责「打开即连」。
+//
+// # 为什么不能挂在 startup 上
+//
+// 日志与状态是通过 Wails 事件推给前端的，而在 Windows 上这条推送最终落到
+// mainWindow.Invoke —— 它是**同步**的，会一直等到 UI 线程空闲才返回。
+//
+// 窗口和 WebView 还在初始化时（Chromium 起来要好几秒），从后台协程发出
+// 第一条日志，就会把整个启动同步卡在那一刻：frpc 明明只要几毫秒就能拉起来
+// （实测 cmd.Start 2-5ms），用户却要等好几秒，而且日志上只看到两条时间
+// 相差几秒的记录，完全看不出卡在哪。之前这里用的是「启动后等 800ms」，
+// 恰好落在窗口初始化窗口期里，所以每台机器都会中招。
+func (a *App) domReady(ctx context.Context) {
 	// 自动同步常驻运行：即使一条隧道都没连也要同步，
 	// 因为用户在网页端改了隧道后，客户端列表应当自己跟上。
 	a.startAutoSync(ctx)
@@ -206,9 +223,10 @@ func (a *App) startup(ctx context.Context) {
 	// 客户端只要在跑就应该跟上。留着它们只会制造「开关是开的，但还得再点
 	// 一次才连上」这种状态不一致。
 	go func() {
-		// 稍等一下再同步：窗口刚起来时界面还没渲染，这时候推状态与日志
-		// 没有地方显示，用户会觉得「打开了什么都没发生」。
-		time.Sleep(800 * time.Millisecond)
+		// 再等一小会儿：OnDomReady 只保证页面加载完成，而前端注册事件
+		// 监听是在 Vue 挂载之后，早于它发出的事件会被丢掉（日志第一行
+		// 凭空消失，看起来像客户端没干活）。
+		time.Sleep(300 * time.Millisecond)
 
 		a.mu.RLock()
 		hasKey := a.cfg.APIKey != ""
@@ -217,8 +235,18 @@ func (a *App) startup(ctx context.Context) {
 			// 还没接入过，没有可同步的东西。
 			return
 		}
+
+		start := time.Now()
 		if _, err := a.syncLocked(); err != nil {
-			log.Printf("[client] 启动同步失败: %v", err)
+			a.emitLog("启动同步失败：" + err.Error())
+		} else {
+			// 报「几条隧道起来了」以及用时。
+			//
+			// 没有这一行的话，用户打开客户端只看到一堆隧道日志，
+			// 不知道到底同步完了没有；而用时能直接暴露「哪一步变慢了」
+			// ——之前启动要好几秒，日志里完全看不出来。
+			a.emitLog(fmt.Sprintf("启动同步完成：%d 条隧道运行中（用时 %s）",
+				len(a.mgr.RunningIDs()), time.Since(start).Round(time.Millisecond)))
 		}
 		a.emitState()
 	}()
@@ -910,7 +938,9 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
 		return err
 	}
-	a.emitTunnelLog(t.Name, "开始加载隧道配置")
+	// 把配置路径一起打出来：隧道起不来时，第一件要确认的就是
+	// 「客户端到底用了哪份配置」，而这份配置是每条隧道一份的。
+	a.emitTunnelLog(t.Name, "开始加载隧道配置："+path)
 	if err := a.mgr.Start(t.ID, t.Name, path); err != nil {
 		return err
 	}
@@ -1033,6 +1063,18 @@ func (a *App) Refresh() (State, error) {
 }
 
 // ---- 日志 ----
+
+// emitLog 往运行日志里追加一行客户端自身的说明（不带隧道前缀）。
+//
+// 与 emitTunnelLog 分开：带前缀的行是「某条隧道发生了什么」，
+// 不带前缀的行是「客户端整体在做什么」（启动同步、用时统计）。
+// 混在一起会让用户以为启动统计也属于某条隧道。
+func (a *App) emitLog(msg string) {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.EventsEmit(a.ctx, "log", time.Now().Format("15:04:05")+"  "+msg)
+}
 
 // emitTunnelLog 往运行日志里追加一行带隧道前缀的说明。
 //

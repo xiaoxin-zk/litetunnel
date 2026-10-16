@@ -137,6 +137,13 @@ type App struct {
 	// 两者都会写配置文件、起停进程；重叠执行会让同一时刻出现
 	// 「刚停掉又被拉起来」的反复闪断。
 	syncMu sync.Mutex
+
+	// domReadyOnce 保证「打开即连」只跑一次。
+	//
+	// Wails 的 OnDomReady 挂在 navigationCompleted 上，页面重载（开发时的
+	// HMR、或任何一次导航）都会再触发一遍。不挡的话会起出第二个自动同步
+	// 协程，表现为「同步频率翻倍」这种很难解释的现象。
+	domReadyOnce sync.Once
 }
 
 // syncInterval 是后台自动同步的间隔。
@@ -211,6 +218,11 @@ func (a *App) startup(ctx context.Context) {
 // 相差几秒的记录，完全看不出卡在哪。之前这里用的是「启动后等 800ms」，
 // 恰好落在窗口初始化窗口期里，所以每台机器都会中招。
 func (a *App) domReady(ctx context.Context) {
+	a.domReadyOnce.Do(func() { a.startOnce(ctx) })
+}
+
+// startOnce 是 domReady 的实际内容，只允许执行一次（见 domReadyOnce）。
+func (a *App) startOnce(ctx context.Context) {
 	// 自动同步常驻运行：即使一条隧道都没连也要同步，
 	// 因为用户在网页端改了隧道后，客户端列表应当自己跟上。
 	a.startAutoSync(ctx)

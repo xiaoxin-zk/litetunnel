@@ -2,6 +2,9 @@
 package middleware
 
 import (
+	"container/list"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -112,7 +115,21 @@ func CORSDevOnly(isProd bool) gin.HandlerFunc {
 type bucket struct {
 	tokens   float64
 	lastSeen time.Time
+	// elem 是桶在 LRU 链表中的位置，用于容量满时定位最久未用的桶。
+	elem *list.Element
 }
+
+// maxBuckets 是**单个**限流器保留的令牌桶数量上限。
+//
+// 没有上限时，攻击者用大量分散来源的请求就能让这张表无限增长：GC 只清理
+// 30 分钟无活动的桶，而攻击者只要持续换 IP 就能一直制造新桶。
+//
+// 取值说明：每个桶连同 map 与键的开销约两三百字节，5 万个桶约十几 MB。
+// 取 maxLoginRecords 的一半，是因为路由里同时存在四个限流器实例
+// （登录、用户接口、管理接口、用户认证各一个），这样「所有实例加起来」
+// 的总量级仍与 LoginGuard 单表相当。分散来源的正常流量远达不到这个规模，
+// 达到就说明该在入口反代再加一层限流了。
+const maxBuckets = 50000
 
 // RateSource 返回当前的「每秒补充令牌数」与「桶容量」。
 // 由上层注入，使限流阈值可以在管理端热调整而无需重启。
@@ -120,8 +137,19 @@ type RateSource func() (rate, capacity float64)
 
 // RateLimiter 基于令牌桶的内存限流器，按 IP + 分组键隔离。
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	// lru 按「最近使用」排序，Front 是最久未用的桶。
+	//
+	// 存在的意义只有一个：容量满时能 O(1) 找到该淘汰谁。用扫描找最久未用
+	// 的桶是不行的——容量满恰恰只在攻击期间发生，那时每次插入都扫一遍，
+	// 等于把内存问题换成了 CPU 问题。
+	lru     *list.List
+	maxSize int
+
+	evicted  uint64    // 累计淘汰数，用于告警
+	lastWarn time.Time // 上次告警时间，避免日志被洪水放大
+
 	rate     float64 // 每秒补充令牌数
 	capacity float64
 	// source 非空时改用实时读取的阈值，用于支持管理端热调整。
@@ -130,13 +158,7 @@ type RateLimiter struct {
 
 // NewRateLimiter 创建限流器：每秒补充 rate 个令牌，桶容量 capacity。
 func NewRateLimiter(rate, capacity float64) *RateLimiter {
-	rl := &RateLimiter{
-		buckets:  make(map[string]*bucket),
-		rate:     rate,
-		capacity: capacity,
-	}
-	go rl.gc()
-	return rl
+	return newRateLimiter(maxBuckets, nil, rate, capacity)
 }
 
 // NewDynamicRateLimiter 创建阈值可热调整的限流器。
@@ -145,9 +167,20 @@ func NewRateLimiter(rate, capacity float64) *RateLimiter {
 // 攻击者只要设法让管理员改一次配置，就能顺带重置自己的配额。
 // 这里保持桶本身不变，仅在补充令牌时采用最新速率。
 func NewDynamicRateLimiter(source RateSource) *RateLimiter {
+	return newRateLimiter(maxBuckets, source, 0, 0)
+}
+
+func newRateLimiter(maxSize int, source RateSource, rate, capacity float64) *RateLimiter {
+	if maxSize <= 0 {
+		maxSize = maxBuckets
+	}
 	rl := &RateLimiter{
-		buckets: make(map[string]*bucket),
-		source:  source,
+		buckets:  make(map[string]*bucket),
+		lru:      list.New(),
+		maxSize:  maxSize,
+		rate:     rate,
+		capacity: capacity,
+		source:   source,
 	}
 	go rl.gc()
 	return rl
@@ -172,19 +205,40 @@ func (rl *RateLimiter) gc() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoff := time.Now().Add(-30 * time.Minute)
-		rl.mu.Lock()
-		for k, b := range rl.buckets {
-			if b.lastSeen.Before(cutoff) {
-				delete(rl.buckets, k)
+		rl.dropIdle(time.Now().Add(-30 * time.Minute))
+	}
+}
+
+// dropIdle 清理超过 cutoff 未活动的桶。
+//
+// 摘链与删表必须成对：只删 map 不摘链，链表会残留已不存在的键，
+// 容量满时淘汰到的是一个空壳——表现为「桶数没到上限却一直在淘汰」。
+func (rl *RateLimiter) dropIdle(cutoff time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for k, b := range rl.buckets {
+		if b.lastSeen.Before(cutoff) {
+			if b.elem != nil {
+				rl.lru.Remove(b.elem)
 			}
+			delete(rl.buckets, k)
 		}
-		rl.mu.Unlock()
 	}
 }
 
 // Allow 判断某键是否放行。
 func (rl *RateLimiter) Allow(key string) bool {
+	allowed, warn := rl.allow(key)
+	// 告警在锁外打印：日志写入可能阻塞（管道、慢盘），
+	// 不该让所有请求排在它后面。
+	if warn != "" {
+		log.Print(warn)
+	}
+	return allowed
+}
+
+// allow 是 Allow 的主体，返回「是否放行」与「需要打印的告警」。
+func (rl *RateLimiter) allow(key string) (allowed bool, warn string) {
 	rate, capacity := rl.limits()
 
 	now := time.Now()
@@ -193,17 +247,55 @@ func (rl *RateLimiter) Allow(key string) bool {
 
 	b, ok := rl.buckets[key]
 	if !ok {
-		rl.buckets[key] = &bucket{tokens: capacity - 1, lastSeen: now}
-		return true
+		b = &bucket{tokens: capacity - 1, lastSeen: now}
+		b.elem = rl.lru.PushBack(key)
+		rl.buckets[key] = b
+		return true, rl.evictLocked()
 	}
 	elapsed := now.Sub(b.lastSeen).Seconds()
 	b.tokens = min(capacity, b.tokens+elapsed*rate)
 	b.lastSeen = now
+	// 空判是防御性的：elem 为 nil 说明这个桶不是经由本方法建的
+	// （目前没有这种路径）。真出现时也只是一次位置更新被跳过，
+	// 而不是在这里 panic —— 限流器 panic 等于每个请求都 500。
+	if b.elem != nil {
+		rl.lru.MoveToBack(b.elem)
+	}
 	if b.tokens < 1 {
-		return false
+		return false, ""
 	}
 	b.tokens--
-	return true
+	return true, ""
+}
+
+// evictLocked 在超出容量上限时淘汰最久未用的桶，返回需要打印的告警（无则空串）。
+//
+// # 为什么淘汰最久未用的，而不是像 LoginGuard 那样整表清空
+//
+// 限流器的桶里装的是**剩余配额**。整表清空等于给所有来源一次性发满令牌，
+// 而触发清空的恰恰是攻击流量——也就是在攻击者最需要额度的时候把闸门打开。
+// 只淘汰最久未用的，活跃来源的配额不受影响；被淘汰的那部分来源会重新开始
+// 计数，这是容量受限下必然要付出的代价，但不会变成一次集体放行。
+func (rl *RateLimiter) evictLocked() string {
+	for len(rl.buckets) > rl.maxSize {
+		oldest := rl.lru.Front()
+		if oldest == nil {
+			break
+		}
+		key, _ := oldest.Value.(string)
+		rl.lru.Remove(oldest)
+		delete(rl.buckets, key)
+		rl.evicted++
+	}
+	// 限频告警：淘汰一开始就意味着「有大量分散来源」，
+	// 但洪水期间每次插入都会触发，不加限频日志本身会成为放大器。
+	if rl.evicted == 0 || time.Since(rl.lastWarn) < time.Minute {
+		return ""
+	}
+	rl.lastWarn = time.Now()
+	return fmt.Sprintf(
+		"[limit] 令牌桶已达上限 %d，累计淘汰 %d 个最久未用的桶：可能存在大量分散来源的请求，建议在入口反代再加一层限流",
+		rl.maxSize, rl.evicted)
 }
 
 // Limit 返回限流中间件。

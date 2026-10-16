@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -78,6 +79,29 @@ func TestAllocatePortIsRandom(t *testing.T) {
 
 	if len(seen) < 2 {
 		t.Fatalf("端口分配必须随机（否则外部可预测）：%d 次全部落在同一个端口", draws)
+	}
+}
+
+// TestIsPortConflict 覆盖「端口撞车后不重试」的判定依据。
+//
+// 两个驱动的报错文本不同，而重试与否全看这个判定：漏判会让一次本来重试就能
+// 成功的创建直接失败（用户看到「创建失败」）；误判则会把真正的错误也重试
+// 几遍（无害，最终仍返回原始错误）。
+func TestIsPortConflict(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("UNIQUE constraint failed: lt_tunnels.remote_port"), true},
+		{errors.New("ERROR: duplicate key value violates unique constraint \"idx_tunnels_remote_port\""), true},
+		{errors.New("connection refused"), false},
+		{errors.New("context deadline exceeded"), false},
+	}
+	for _, tc := range cases {
+		if got := isPortConflict(tc.err); got != tc.want {
+			t.Errorf("isPortConflict(%v) = %v，期望 %v", tc.err, got, tc.want)
+		}
 	}
 }
 

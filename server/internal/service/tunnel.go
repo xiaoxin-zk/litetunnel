@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"strings"
@@ -67,7 +68,60 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 	lock := s.userLock(u.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	return s.createTunnelLocked(u, in)
+
+	// 自动分配端口时，唯一索引仍可能在并发下拒绝其中一个：两个请求恰好
+	// 随机到同一个端口（概率很低，但会发生）。这是可重试的——换一个随机
+	// 端口，把整条建隧道流程重来一次即可。
+	//
+	// 重试放在**这里**而不是事务内部，是为了让每次尝试都是一次完整的
+	// createTunnelLocked：它拿到的端口锁会随这次调用返回而释放，重试时
+	// 重新取新端口的锁。放在事务内部的话，上一把锁只能靠 defer 释放最后
+	// 那一把，旧端口上的防火墙操作会从此卡死。
+	//
+	// 用户自己指定端口时不重试：那是他明确要的端口，冲突应当如实报错，
+	// 而不是悄悄换一个给他。
+	attempts := 1
+	if in.RemotePort == 0 {
+		attempts = portAllocAttempts
+	}
+
+	var (
+		created *model.Tunnel
+		err     error
+	)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		created, err = s.createTunnelLocked(u, in)
+		if err == nil {
+			return created, nil
+		}
+		if !isPortConflict(err) {
+			return nil, err
+		}
+		log.Printf("[tunnel] 端口分配撞车（第 %d/%d 次尝试），重新随机分配后重试", attempt, attempts)
+	}
+	return nil, err
+}
+
+// portAllocAttempts 是自动分配端口撞车后的最大尝试次数。
+//
+// 取 5 是权衡：随机撞车的概率本身很低（池子越大越低），5 次几乎不可能全部
+// 撞上；而真撞上 5 次说明池子已经接近占满，继续重试也没意义。
+const portAllocAttempts = 5
+
+// isPortConflict 判断错误是否来自「端口唯一索引冲突」。
+//
+// 两个驱动的报错文本不同（SQLite 是 "UNIQUE constraint failed"，PostgreSQL
+// 是 "duplicate key value violates unique constraint"），这里按关键字匹配。
+//
+// 注意它只用来决定**要不要重试**：匹配不上最多退化为「不重试」，原始错误
+// 照样返回给调用方，不会被吞掉。名字冲突（user_id + name 的唯一索引）也会
+// 命中这里，但那种情况重试几次后依旧失败，最终返回的还是原始错误。
+func isPortConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate key")
 }
 
 // createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。

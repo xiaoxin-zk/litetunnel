@@ -131,3 +131,24 @@ func ParseProxyName(name string) (frpUser, proxyName string, ok bool) {
 
 // 说明：从 frp user 字段还原身份的解析逻辑已迁移到 frpc.go 的 UserIDFromFrpUser。
 // 早期版本用「用户名」作前缀，导致用户改名会破坏全部已下发配置，现已改为不可变用户 ID。
+
+// proxyPhaseOnline 是 frps 管理接口用来表示「代理已注册并监听」的 phase 取值。
+//
+// 必须同时认多个：frps 不同版本给的字符串不一样——较早的版本用 "running"，
+// v0.71 的管理接口返回的是 "online"。
+//
+// 只认其中一个的后果很隐蔽：代理其实已经注册成功、端口也已经在监听，
+// 但面板把它算成离线，客户端据此一直显示「连接中」，用户反复重启客户端、
+// 检查防火墙都无效。这个错误真实发生过。
+var proxyPhaseOnline = map[string]bool{
+	"online":  true,
+	"running": true,
+}
+
+// IsProxyOnline 判断 frps 返回的代理 phase 是否表示代理在线。
+//
+// 大小写与空白都容忍：这是外部系统给的字符串，不该因为一个空格
+// 就把整条隧道判成离线。
+func IsProxyOnline(phase string) bool {
+	return proxyPhaseOnline[strings.ToLower(strings.TrimSpace(phase))]
+}

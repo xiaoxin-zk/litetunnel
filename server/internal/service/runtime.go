@@ -362,7 +362,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		}
 		d.in += din
 		d.out += dout
-		running := p.Status.Phase == "running"
+		running := IsProxyOnline(p.Status.Phase)
 		d.online = d.online || running
 		if running {
 			onlineNow[t.ID] = true

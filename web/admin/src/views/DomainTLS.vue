@@ -11,6 +11,16 @@
       </div>
 
       <el-alert
+        v-if="status.pending"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        title="已保存的配置还没有在宿主机上生效"
+        :description="pendingText"
+      />
+
+      <el-alert
         v-if="!status.helper_configured"
         type="warning"
         :closable="false"
@@ -56,6 +66,19 @@
           {{ status.helper?.ports?.vhost_https || '-' }}
           <span v-if="form.mode === 'e2e'" class="lt-muted">（需对公网放行）</span>
           <span v-else class="lt-muted">（仅本机）</span>
+        </el-descriptions-item>
+        <!--
+          上面几项是「期望值」（表单里保存的那份），这一项是宿主机上**实际在用**
+          的那份。保存与下发是两步，不做区分的话，「只保存未下发」与「下发失败」
+          在页面上都表现成「已经改了」，而流量还走在旧配置上。
+        -->
+        <el-descriptions-item label="宿主机实际在用" :span="2">
+          <span class="mono">{{ appliedText }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="下发状态">
+          <el-tag size="small" :type="status.pending ? 'warning' : 'success'" effect="plain">
+            {{ status.pending ? '待下发' : '与期望一致' }}
+          </el-tag>
         </el-descriptions-item>
       </el-descriptions>
     </div>
@@ -284,7 +307,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import { domainApi, settingsApi } from '../api'
@@ -317,6 +340,32 @@ const form = reactive({
 
 const secretPlaceholder = (key) =>
   secretLoaded[key] ? '已配置，留空表示不修改' : '尚未配置'
+
+const modeText = (m) => (m === 'e2e' ? '端到端' : '边缘')
+
+// 宿主机上实际在用的配置（由后端记录「已下发」的那一份，不是表单里的值）。
+const appliedText = computed(() => {
+  const a = status.value.applied || {}
+  return `${a.panel || '（未设置面板域名）'} · ${a.tunnel || '（未启用隧道域名）'} · ${modeText(a.https_mode)}`
+})
+
+// 把「期望 → 已生效」的差异写清楚，管理员才知道点一次下发会改掉什么。
+const pendingText = computed(() => {
+  const a = status.value.applied || {}
+  const d = status.value.desired || {}
+  const parts = []
+  if ((d.panel || '') !== (a.panel || '')) {
+    parts.push(`面板域名 ${a.panel || '（空）'} → ${d.panel || '（空）'}`)
+  }
+  if ((d.tunnel || '') !== (a.tunnel || '')) {
+    parts.push(`隧道根域名 ${a.tunnel || '（未启用）'} → ${d.tunnel || '（未启用）'}`)
+  }
+  if ((d.https_mode || '') !== (a.https_mode || '')) {
+    parts.push(`HTTPS 模式 ${modeText(a.https_mode)} → ${modeText(d.https_mode)}`)
+  }
+  const detail = parts.length ? `待切换：${parts.join('；')}。` : ''
+  return `宿主机上仍在用：${appliedText.value}。${detail}配置要等下发出成功（渲染、校验、写盘并重建容器）之后才会切换。`
+})
 
 function applySettings(data) {
   const d = data || {}

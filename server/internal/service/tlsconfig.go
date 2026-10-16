@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,44 @@ import (
 // 两者的处置方式完全不同，混在一起只会让管理员去改本来正确的字段。
 var ErrDomainApply = errors.New("配置下发失败")
 
+// DomainAppliedSet 是「域名与证书」这一组里真正影响运行期的三个值。
+//
+// 只有这三个：其余项（ACME 邮箱、DNS 服务商与凭据）只影响渲染出的文件内容，
+// 不影响面板按什么域名放行、按什么模式拼地址。把它们也纳入比较，只会让
+// 「待下发」在无关改动上也亮起来。
+type DomainAppliedSet struct {
+	Panel     string `json:"panel"`
+	Tunnel    string `json:"tunnel"`
+	HTTPSMode string `json:"https_mode"`
+}
+
+// DomainDesired 返回界面上的**期望值**快照。
+func (s *Services) DomainDesired() DomainAppliedSet {
+	return DomainAppliedSet{
+		Panel:     s.DesiredPanelDomain(),
+		Tunnel:    s.DesiredTunnelDomain(),
+		HTTPSMode: s.DesiredDomainHTTPSMode(),
+	}
+}
+
+// DomainApplied 返回**已生效**的配置快照。
+//
+// 没有任何一次成功下发时回落到环境变量：那正是当前在跑的配置（手工部署
+// 时由 .env 决定），而不是「还没生效的期望值」。
+func (s *Services) DomainApplied() DomainAppliedSet {
+	return DomainAppliedSet{
+		Panel:     normalizeDomainValue(s.Settings.Get(KeyDomainAppliedPanel)),
+		Tunnel:    normalizeDomainValue(s.Settings.Get(KeyDomainAppliedTunnel)),
+		HTTPSMode: s.DomainHTTPSMode(),
+	}
+}
+
+// DomainPending 表示磁盘/容器上跑的还是上一份配置。
+func (s *Services) DomainPending() bool {
+	d, a := s.DomainDesired(), s.DomainApplied()
+	return d.Panel != a.Panel || d.Tunnel != a.Tunnel || d.HTTPSMode != a.HTTPSMode
+}
+
 // DomainStatus 是「域名与证书」页的状态总览。
 type DomainStatus struct {
 	// Helper 是宿主机配置服务的健康状态。
@@ -29,6 +68,16 @@ type DomainStatus struct {
 	HelperConfigured bool `json:"helper_configured"`
 	// Certs 是 Caddy 证书存储里的证书（读不到时为空并有 reason）。
 	Certs tlscfg.CertStatus `json:"certs"`
+	// Desired 是界面上保存的期望配置。
+	Desired DomainAppliedSet `json:"desired"`
+	// Applied 是宿主机上**已经生效**的那一份。
+	//
+	// 与 Desired 分开是这一页存在的意义：保存只写数据库，生效要等 helper
+	// 渲染、校验、写盘并重建容器。只顾着看期望值的话，「只保存未下发」与
+	// 「下发失败」都会表现成「界面说已经改了」，而实际流量还走在旧配置上。
+	Applied DomainAppliedSet `json:"applied"`
+	// Pending 为真表示两者不一致：还需要一次「保存并应用」。
+	Pending bool `json:"pending"`
 }
 
 // DomainConfigVars 组装交给 helper 的模板变量。
@@ -37,7 +86,7 @@ type DomainStatus struct {
 // 一律由 helper 从部署目录的 .env 读取。面板不该、也无法改它们——
 // helper 的白名单会直接拒绝。
 func (s *Services) DomainConfigVars() (map[string]string, error) {
-	panel := normalizeDomainValue(s.Settings.Get(KeyDomainPanel))
+	panel := s.DesiredPanelDomain()
 	if panel == "" {
 		return nil, fmt.Errorf("%w: 请先填写面板域名，Caddy 需要一个域名来签发证书", ErrInvalidParam)
 	}
@@ -46,47 +95,114 @@ func (s *Services) DomainConfigVars() (map[string]string, error) {
 	}
 	// 只发「面板对外地址」而不是站点地址：站点地址（LT_USER_DOMAIN）由 helper
 	// 从它派生，这样「面板域名」在这一套里只有一个来源。
+	//
+	// 这一份是**要下发**的配置，因此取期望值而不是已生效值。
 	vars := map[string]string{
 		tlscfg.VarUserPublicURL: "https://" + panel,
-		tlscfg.VarTunnelDomain:  normalizeDomainValue(s.Settings.Get(KeyDomainTunnel)),
+		tlscfg.VarTunnelDomain:  s.DesiredTunnelDomain(),
 		tlscfg.VarACMEEmail:     strings.TrimSpace(s.Settings.Get(KeyDomainACMEEmail)),
 		tlscfg.VarDNSProvider:   strings.TrimSpace(s.Settings.Get(KeyDomainDNSProvider)),
 		tlscfg.VarDNSArgs:       strings.TrimSpace(s.Settings.Get(KeyDomainDNSArgs)),
 		tlscfg.VarDNSCredential: s.Settings.Get(KeyDomainDNSCredential),
-		tlscfg.VarHTTPSMode:     s.DomainHTTPSMode(),
+		tlscfg.VarHTTPSMode:     s.DesiredDomainHTTPSMode(),
 	}
 	return vars, nil
 }
 
-// DomainHTTPSMode 返回当前生效的 HTTPS 隧道模式，空值按默认模式处理。
-func (s *Services) DomainHTTPSMode() string {
-	switch strings.ToLower(strings.TrimSpace(s.Settings.Get(KeyDomainHTTPSMode))) {
-	case tlscfg.HTTPSModeE2E:
-		return tlscfg.HTTPSModeE2E
-	default:
-		return tlscfg.HTTPSModeEdge
+// DesiredPanelDomain 返回界面上保存的面板域名（期望值，未必已生效）。
+func (s *Services) DesiredPanelDomain() string {
+	if v := normalizeDomainValue(s.Settings.Get(KeyDomainPanel)); v != "" {
+		return v
 	}
+	return normalizeDomainValue(s.Cfg.UserPublicURL)
 }
 
-// TunnelDomain 返回当前生效的隧道根域名。
-//
-// 为什么不能直接用 Cfg.TunnelDomain：它来自面板**启动时**的环境变量，而管理端
-// 在「域名与证书」里改完域名后，helper 只重建 caddy 与 frps，面板容器不会重启。
-// 照 Cfg 取值会让面板继续按旧域名放行子域名、拼出旧域名的访问地址——
-// 界面上明明写着新域名，用户拿到的却是对不上的那个。
-func (s *Services) TunnelDomain() string {
+// DesiredTunnelDomain 返回界面上保存的隧道根域名（期望值，未必已生效）。
+func (s *Services) DesiredTunnelDomain() string {
 	if v := normalizeDomainValue(s.Settings.Get(KeyDomainTunnel)); v != "" {
 		return v
 	}
 	return normalizeDomainValue(s.Cfg.TunnelDomain)
 }
 
-// UserPublicURL 返回面板对外地址（带 scheme）。同样以数据库设置为准，理由同上。
+// DesiredDomainHTTPSMode 返回界面上保存的 HTTPS 隧道模式（期望值）。
+//
+// 与 DomainHTTPSMode 的分工必须分清：这一个用于「要下发什么」，
+// 那一个用于「现在实际跑的是什么」。
+func (s *Services) DesiredDomainHTTPSMode() string {
+	switch strings.ToLower(strings.TrimSpace(s.Settings.Get(KeyDomainHTTPSMode))) {
+	case tlscfg.HTTPSModeE2E:
+		return tlscfg.HTTPSModeE2E
+	case tlscfg.HTTPSModeEdge:
+		return tlscfg.HTTPSModeEdge
+	}
+	return s.envHTTPSMode()
+}
+
+// DomainHTTPSMode 返回**当前生效**的 HTTPS 隧道模式。
+//
+// 以「已下发」的记录为准，没有记录时回落到 .env（那才是实际在跑的配置）。
+// 直接读数据库里的期望值会让「只保存未下发」立刻改变运行期行为——面板开始
+// 按新模式放行或拒绝 HTTPS 隧道，而 frps 还是上一份配置。见 setting.go 里
+// 已生效那一组字段的说明。
+func (s *Services) DomainHTTPSMode() string {
+	switch strings.ToLower(strings.TrimSpace(s.Settings.Get(KeyDomainAppliedMode))) {
+	case tlscfg.HTTPSModeE2E:
+		return tlscfg.HTTPSModeE2E
+	case tlscfg.HTTPSModeEdge:
+		return tlscfg.HTTPSModeEdge
+	}
+	return s.envHTTPSMode()
+}
+
+// envHTTPSMode 是没有任何下发记录时的回落值：面板启动时读到的 .env。
+func (s *Services) envHTTPSMode() string {
+	if strings.EqualFold(strings.TrimSpace(s.Cfg.HTTPSProxyMode), tlscfg.HTTPSModeE2E) {
+		return tlscfg.HTTPSModeE2E
+	}
+	return tlscfg.HTTPSModeEdge
+}
+
+// TunnelDomain 返回**当前生效**的隧道根域名。
+//
+// 两处都不能想当然，各自对应一类事故：
+//
+//	不能用 Cfg.TunnelDomain：它来自面板**启动时**的环境变量，而管理端改完
+//	域名后 helper 只重建 caddy 与 frps，面板容器不会重启。照 Cfg 取值会让
+//	面板按旧域名放行子域名、拼出旧域名的地址。
+//	也不能用数据库里的期望值：保存与下发是两步，「只保存未下发」或「下发
+//	失败」时新域名还没生效，按它放行只会得到一条打不开的隧道。
+//
+// 所以取「已下发」的记录，没有记录时回落到 .env——那才是实际在跑的配置。
+func (s *Services) TunnelDomain() string {
+	if v := normalizeDomainValue(s.Settings.Get(KeyDomainAppliedTunnel)); v != "" {
+		return v
+	}
+	return normalizeDomainValue(s.Cfg.TunnelDomain)
+}
+
+// UserPublicURL 返回面板对外地址（带 scheme），同样以**已下发**的为准。
 func (s *Services) UserPublicURL() string {
-	if v := normalizeDomainValue(s.Settings.Get(KeyDomainPanel)); v != "" {
+	if v := normalizeDomainValue(s.Settings.Get(KeyDomainAppliedPanel)); v != "" {
 		return "https://" + v
 	}
 	return strings.TrimRight(strings.TrimSpace(s.Cfg.UserPublicURL), "/")
+}
+
+// markDomainApplied 记录「刚下发的这一份已经在宿主机上生效」。
+//
+// 用刚下发的 vars 而不是重新读设置：两者之间管理员若又保存了一次，
+// 记下来的就会是那份**没有下发**的值，等于把刚修好的问题重新引入。
+func (s *Services) markDomainApplied(vars map[string]string) error {
+	mode := strings.ToLower(strings.TrimSpace(vars[tlscfg.VarHTTPSMode]))
+	if mode != tlscfg.HTTPSModeE2E {
+		mode = tlscfg.HTTPSModeEdge
+	}
+	return s.Settings.SetInternal(map[SettingKey]string{
+		KeyDomainAppliedPanel:  normalizeDomainValue(vars[tlscfg.VarUserPublicURL]),
+		KeyDomainAppliedTunnel: normalizeDomainValue(vars[tlscfg.VarTunnelDomain]),
+		KeyDomainAppliedMode:   mode,
+	})
 }
 
 // HTTPSProxyEntryEnabled 表示平台当前是否为 HTTPS 隧道提供了公网入口。
@@ -203,6 +319,17 @@ func (s *Services) ApplyDomainConfig(apply bool) (tlscfg.RenderResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("%w: %s", ErrDomainApply, err.Error())
 	}
+
+	// 只有真的重建了容器才更新「已生效」记录：helper 报错、或者本轮只渲染
+	// 不应用（apply=false），磁盘与容器都还是上一份配置。
+	if apply && res.Applied {
+		if err := s.markDomainApplied(vars); err != nil {
+			// 配置本身已经生效，只是没能记下来：此时界面会显示「待下发」，
+			// 再点一次下发即可收敛。为了这个把整次调用判为失败，
+			// 反而会让管理员以为「没生效」而反复重试。
+			log.Printf("[domain] 记录已生效的域名配置失败: %v", err)
+		}
+	}
 	return res, nil
 }
 
@@ -248,10 +375,17 @@ func (s *Services) DomainCerts() (tlscfg.CertStatus, error) {
 	return certs, nil
 }
 
-// DomainStatus 汇总页面需要的状态：helper 健康度 + 证书 + 待检查域名。
+// DomainStatus 汇总页面需要的状态：helper 健康度 + 证书 + 期望/已生效的差异。
 func (s *Services) DomainStatus() DomainStatus {
 	client := s.DomainHelper()
 	st := DomainStatus{HelperConfigured: client.Configured()}
+
+	// 期望与已生效的对比必须**无条件**返回，包括 helper 连不上的时候：
+	// 「配了 helper 但连不上」正是最容易出现「保存了却没生效」的场景。
+	st.Desired = s.DomainDesired()
+	st.Applied = s.DomainApplied()
+	st.Pending = s.DomainPending()
+
 	if !client.Configured() {
 		st.HelperReason = client.Reason()
 		return st

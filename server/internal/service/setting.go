@@ -125,6 +125,22 @@ const (
 	KeyDomainExpectedIP    SettingKey = "domain.expected_ip"
 	KeyDomainHelperAddr    SettingKey = "domain.helper_addr"
 	KeyDomainHelperToken   SettingKey = "domain.helper_token"
+
+	// ---- 已生效的域名配置（系统维护，面板不可写）----
+	//
+	// 上面那一组是**期望值**：管理员点了「保存」就写库了，但 Caddy 与 frps
+	// 未必已经按它重建。而运行期的事（放行哪个域名的子域、拼出什么访问地址、
+	// 有没有 HTTPS 隧道入口）只能按**已经生效**的那一份算：
+	//
+	//	只保存未下发 → 按新域名生成地址、放行新域名隧道，而实际在跑的是旧配置，
+	//	               用户拿到一个打不开的地址，且没有任何地方提示原因；
+	//	下发失败       → 同上，而且失败原因只在当次响应里，刷新页面就没了。
+	//
+	// 所以把「已应用」独立记一份，只有 helper 真的重建了容器才更新它，
+	// 界面上把两者的差异显示成「待下发」。
+	KeyDomainAppliedPanel  SettingKey = "domain.applied_panel"
+	KeyDomainAppliedTunnel SettingKey = "domain.applied_tunnel"
+	KeyDomainAppliedMode   SettingKey = "domain.applied_https_mode"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -137,6 +153,12 @@ const SecretMask = "__UNCHANGED__"
 type settingSpec struct {
 	Key    SettingKey
 	Secret bool
+	// Internal 标记「只由服务内部写入」的项：面板既不能通过设置接口改它，
+	// 管理端也读不到它。
+	//
+	// 用它而不是直接把这类项排除在白名单外：它们需要参与内存缓存
+	// （运行期要高频读取），而缓存是按 settingSpecs 建的。
+	Internal bool
 	// Default 是数据库无记录时的回落值，通常来自环境变量。
 	Default func(cfg *config.Config) string
 }
@@ -237,6 +259,15 @@ var settingSpecs = []settingSpec{
 	{Key: KeyDomainExpectedIP, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainHelperAddr, Default: func(*config.Config) string { return "http://127.0.0.1:7850" }},
 	{Key: KeyDomainHelperToken, Secret: true, Default: func(*config.Config) string { return "" }},
+
+	// 已生效的域名配置。
+	//
+	// 默认值刻意留空而不是取环境变量：空表示「还没有任何一次成功下发」，
+	// 此时运行期回落到 .env（那才是实际在跑的配置）。若默认成期望值，
+	// 「只保存未下发」就会被当成效已生效——正是这一组字段要解决的问题。
+	{Key: KeyDomainAppliedPanel, Internal: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainAppliedTunnel, Internal: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainAppliedMode, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。
@@ -274,6 +305,8 @@ func NewSettingStore(db *gorm.DB, cfg *config.Config) *SettingStore {
 		log.Printf("[setting] 加载运行期配置失败，已回落到默认值: %v", err)
 		s.applyDefaults()
 	}
+	// 升级路径的一次性对齐，之后运行期只认「已生效」的那一份。
+	s.bootstrapAppliedDomain()
 	return s
 }
 
@@ -369,6 +402,11 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 		if !ok {
 			return fmt.Errorf("%w: 未知配置项 %s", ErrInvalidParam, k)
 		}
+		if spec.Internal {
+			// 管理端改不了「已生效」这一组：它只应该由下发流程按实际结果写入。
+			// 允许手工改的话，界面可以显示「已生效」而宿主机上什么都没做。
+			return fmt.Errorf("%w: %s 由系统维护，不能手工修改", ErrInvalidParam, k)
+		}
 		if spec.Secret && v == SecretMask {
 			continue
 		}
@@ -402,10 +440,91 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 	return s.Reload()
 }
 
+// SetInternal 写入系统维护项（Internal 标记的那些值）并刷新缓存。
+//
+// 与 SetMany 分开，是为了让调用方一眼看出「这不是管理员改的配置」：
+// 它只接受 Internal 项，值一律明文（这一组存的是域名与模式，不是密钥）。
+func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
+	if len(in) == 0 {
+		return nil
+	}
+	for k := range in {
+		spec, ok := settingByKey[k]
+		if !ok || !spec.Internal {
+			return fmt.Errorf("%w: %s 不是系统维护项", ErrInvalidParam, k)
+		}
+	}
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		for k, v := range in {
+			key := string(k)
+			row := model.Setting{Key: key}
+			if err := tx.Where("key = ?", key).Assign(model.Setting{Value: v}).
+				FirstOrCreate(&row).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return s.Reload()
+}
+
+// hasRow 判断某个键在数据库里是否有记录（与它的值是否为空无关）。
+func (s *SettingStore) hasRow(k SettingKey) bool {
+	var n int64
+	if err := s.db.Model(&model.Setting{}).Where("key = ?", string(k)).Count(&n).Error; err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// bootstrapAppliedDomain 为「已生效的域名配置」补一次基线。
+//
+// 为什么要它：这一组字段是后加的，而在此之前运行期是按数据库里的期望值算的
+// （已成功下发的部署确实如此，未下发的那些则是个 bug）。升级后如果这一组
+// 一直是空的，运行期会回落到面板容器启动时的环境变量——对于「改过域名、
+// 但面板容器一直没重启」的部署，那是个更旧的域名，子域名隧道会立刻失效。
+//
+// 因此做一次性对齐：某一项为空、且它的期望值**确实存过库**（说明管理员用过
+// 这个页面）时，把期望值记为已生效。
+//
+// 判定用「库里有没有这一行」而不是「值是否为空」：从未用过该页面的部署本来
+// 就没有行，那种情况必须继续以 .env 为准，因为那才是实际在跑的配置。
+func (s *SettingStore) bootstrapAppliedDomain() {
+	pairs := []struct{ applied, desired SettingKey }{
+		{KeyDomainAppliedPanel, KeyDomainPanel},
+		{KeyDomainAppliedTunnel, KeyDomainTunnel},
+		{KeyDomainAppliedMode, KeyDomainHTTPSMode},
+	}
+	updates := map[SettingKey]string{}
+	for _, p := range pairs {
+		if strings.TrimSpace(s.Get(p.applied)) != "" || !s.hasRow(p.desired) {
+			continue
+		}
+		updates[p.applied] = s.Get(p.desired)
+	}
+	if len(updates) == 0 {
+		return
+	}
+	if err := s.SetInternal(updates); err != nil {
+		log.Printf("[setting] 补齐「已生效的域名配置」失败，界面会提示需要重新下发: %v", err)
+		return
+	}
+	log.Printf("[setting] 已按数据库里的域名配置补齐「已生效」基线（升级后的一次性对齐）")
+}
+
 // AllForAdmin 返回给管理端的配置快照：敏感字段以占位符代替，绝不回传明文。
+//
+// Internal 项不返回：它们是下发结果，不是可编辑的配置项，出现在页面上只会
+// 让管理员以为可以改。
 func (s *SettingStore) AllForAdmin() map[string]string {
 	out := make(map[string]string, len(settingSpecs))
 	for _, spec := range settingSpecs {
+		if spec.Internal {
+			continue
+		}
 		v := s.Get(spec.Key)
 		if spec.Secret {
 			if v == "" {

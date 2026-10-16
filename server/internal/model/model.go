@@ -509,6 +509,12 @@ type Admin struct {
 	TOTPEnabled bool `gorm:"default:false" json:"totp_enabled"`
 	// TOTPVerifiedAt 记录最近一次成功校验时间，仅用于展示。
 	TOTPVerifiedAt *time.Time `json:"totp_verified_at"`
+	// TOTPLastStep 记录最近一次被接受的动态口令步进码，用于防重放。
+	//
+	// 必须落库：以前只记在内存里，控制面重启、或请求被负载均衡到另一个实例
+	// 之后记录就没了，而同一个口令在 ±1 步（最长 90 秒）窗口内仍然有效——
+	// 钓鱼反代拿到口令后重放，就能在窗口内二次登录。
+	TOTPLastStep int64 `gorm:"not null;default:0" json:"-"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

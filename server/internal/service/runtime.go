@@ -141,12 +141,36 @@ func (r *Runtime) ShouldTouch(runID string, interval time.Duration) bool {
 }
 
 // TouchClientSession 以节流方式刷新客户端会话的在线时间。
+//
+// # 心跳只能续期，不能复活
+//
+// 更新条件里必须带 online = true。以前是无条件写回 online = true，
+// 于是有一条很隐蔽的提权路径：
+//
+//	凭据轮换 / 重置密码 → 会话被置为离线、内存会话被清掉
+//	→ 旧 frpc 继续心跳 → 会话又被改回在线（last_seen_at 也刷新了）
+//	→ 下一次 NewProxy / NewUserConn 走 FindTrustedClientSession 命中
+//	  这条「在线且刚更新」的记录，于是**跳过新凭据校验**被放行。
+//
+// 会话重新变为在线只能通过一条路：新的 Login，或凭据复核通过后的补登记
+// （UpsertClientSession）——它们都会先验过当前生效的凭据。
 func (s *Services) TouchClientSession(runID string) {
 	if !s.Runtime.ShouldTouch(runID, time.Minute) {
 		return
 	}
-	_ = s.DB.Model(&model.ClientSession{}).Where("run_id = ?", runID).
-		Updates(map[string]any{"online": true, "last_seen_at": time.Now()}).Error
+	res := s.DB.Model(&model.ClientSession{}).
+		Where("run_id = ? AND online = ?", runID, true).
+		Update("last_seen_at", time.Now())
+	if res.Error != nil {
+		log.Printf("[session] 刷新会话心跳失败（run_id=%s）: %v", runID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		// 没有命中在线会话：要么会话已被撤销（凭据轮换、改密、删号），
+		// 要么它从来就不存在。两种情况下心跳都不该产生任何效果，
+		// 但值得记一条日志——这是「旧凭据还在试图续期」的信号。
+		log.Printf("[session] 心跳未命中在线会话（run_id=%s，可能已被撤销），已忽略", runID)
+	}
 }
 
 // sessionTrustWindow 是数据库会话被视为可信的最长时间。

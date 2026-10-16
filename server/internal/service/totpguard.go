@@ -1,24 +1,19 @@
 package service
 
 import (
-	"fmt"
-	"sync"
-	"time"
+	"log"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// totpReplayTTL 是「已用口令」记录的保留时长。
+// ClaimTOTPStep 尝试占用某个管理员的一个动态口令步进码。
 //
-// 必须严格大于口令的最大有效窗口（±1 步 = 90 秒），否则记录一过期，
-// 同一个口令就又能被重放了。这里取 5 分钟，留出充足余量。
-const totpReplayTTL = 5 * time.Minute
-
-// totpReplayMaxEntries 是记录表的容量上限，防止异常输入把内存撑爆。
-const totpReplayMaxEntries = 10000
-
-// TOTPReplayGuard 记录已使用过的动态口令步进码，阻止同一口令被重复使用。
+// 返回 false 表示这一步（或更早的步进）已经被用过，判定为重放。
 //
-// 背景：TOTP 校验本身只回答「这个码在当前窗口内是否有效」，
-// 而窗口是 ±1 步（最长 90 秒）。在这 90 秒里，同一个 6 位口令可以提交任意多次。
+// # 为什么记在数据库而不是内存表
+//
+// TOTP 校验本身只回答「这个码在当前窗口内是否有效」，而窗口是 ±1 步
+// （最长 90 秒）。在这 90 秒里同一个 6 位口令可以提交任意多次。
 //
 // 现实中的攻击路径是**钓鱼反代**：
 //
@@ -26,57 +21,34 @@ const totpReplayMaxEntries = 10000
 //	攻击者在这一刻同时拿到了密码和动态口令，
 //	然后在窗口内用它们登录真站——即使受害者随后立刻改密码也来不及。
 //
-// 登记粒度是「账号 + 步进码」而不是「账号 + 口令值」：
-// 步进码能精确区分窗口内的不同时刻（上一分钟的口令不该挡住这一分钟的），
-// 也不会把口令明文留在内存里。
-type TOTPReplayGuard struct {
-	mu   sync.Mutex
-	used map[string]time.Time
-}
-
-// NewTOTPReplayGuard 构造防重放登记表。
-func NewTOTPReplayGuard() *TOTPReplayGuard {
-	g := &TOTPReplayGuard{used: make(map[string]time.Time)}
-	go g.gc()
-	return g
-}
-
-// Claim 尝试占用一个步进码。返回 false 表示该口令已被使用过（判定为重放）。
+// 以前用内存 map 记录「已用口令」：控制面一重启（或请求被负载均衡到另一个
+// 实例）记录就没了，同一个口令在窗口内又能通过一次。改成数据库条件更新之后，
+// 判定既是**原子**的（只有比已记录的步进更新才能写入成功）又是**持久**的，
+// 重启与多实例都不会丢。
 //
-// 检查与登记必须在同一把锁内完成：拆成「先查再写」两步的话，
-// 并发提交同一个口令会同时通过检查，防重放就失效了。
-func (g *TOTPReplayGuard) Claim(adminID uint, step int64) bool {
-	key := fmt.Sprintf("%d:%d", adminID, step)
-	now := time.Now()
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if at, ok := g.used[key]; ok && now.Sub(at) < totpReplayTTL {
+// 登记粒度是「步进码」而不是「口令值」：步进码能精确区分窗口内的不同时刻
+// （上一分钟的口令不该挡住这一分钟的），也不会把口令明文存下来。
+func (s *Services) ClaimTOTPStep(adminID uint, step int64) bool {
+	res := s.DB.Model(&model.Admin{}).
+		Where("id = ? AND totp_last_step < ?", adminID, step).
+		Update("totp_last_step", step)
+	if res.Error != nil {
+		// 数据库不可用时**拒绝**：防重放失效的后果（口令被重放）比一次
+		// 登录失败严重得多，这里必须 fail-closed。
+		log.Printf("[totp] 更新防重放步进失败（管理员 %d）: %v", adminID, res.Error)
 		return false
 	}
-	// 容量保护：达到上限时整表清空。
-	// 宁可让极少数攻击者重新开始，也不让内存被异常输入撑爆。
-	// 正常情况下这张表最多只有「管理员数 × 窗口内步数」个条目。
-	if len(g.used) >= totpReplayMaxEntries {
-		g.used = make(map[string]time.Time)
-	}
-	g.used[key] = now
-	return true
+	// 条件没命中：这一步不比已记录的更新——重复提交同一个口令，
+	// 或者提交了一个更早窗口的口令。
+	return res.RowsAffected == 1
 }
 
-// gc 定期清理过期记录，避免这张表随着时间无界增长。
-func (g *TOTPReplayGuard) gc() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		cutoff := time.Now().Add(-totpReplayTTL)
-		g.mu.Lock()
-		for k, at := range g.used {
-			if at.Before(cutoff) {
-				delete(g.used, k)
-			}
-		}
-		g.mu.Unlock()
-	}
+// ResetTOTPStep 清空某管理员的防重放水位线。
+//
+// 重新绑定动态口令时调用：换了一把密钥之后，旧的水位线对新密钥没有意义，
+// 留着只会让新密钥的第一批口令被判成重放（新密钥的步进从当前时间算起，
+// 一般高于旧水位线，但换绑前后恰好落在同一秒时就会撞上）。
+func (s *Services) ResetTOTPStep(adminID uint) error {
+	return s.DB.Model(&model.Admin{}).Where("id = ?", adminID).
+		Update("totp_last_step", 0).Error
 }

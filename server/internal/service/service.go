@@ -89,7 +89,9 @@ type Services struct {
 	Captchas *CaptchaStore
 
 	// TOTPReplay 记录已用过的动态口令步进码，阻止窗口内重放。
-	TOTPReplay *TOTPReplayGuard
+	// 动态口令的防重放记录在管理员表上（totp_last_step），不在这里：
+	// 内存记录重启即丢，而口令的有效窗口还在。
+
 
 	// Monitor 采集宿主机与面板自身的运行指标。
 	//
@@ -195,7 +197,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Runtime:    NewRuntime(),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
-		TOTPReplay: NewTOTPReplayGuard(),
+
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		mailWake:   make(chan struct{}, 1),

@@ -1375,8 +1375,20 @@ func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
 			a.warnConfigCleanup(id, "本地配置文件清理失败（其中含接入密钥）："+rerr.Error())
 			continue
 		}
+		// 清理成功：把「已提示过」的标记一并撤掉。
+		//
+		// 不撤的话这张表只增不减——反复遇到「清理失败 → 后来成功」的不同隧道，
+		// 每个 ID 都会永久占一个条目。
+		a.clearCleanupWarn(id)
 		log.Printf("[client] 已清理隧道 %d 的本地配置（该隧道在服务端已不存在）", id)
 	}
+}
+
+// clearCleanupWarn 撤掉「已提示过清理失败」的标记。
+func (a *App) clearCleanupWarn(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.cleanupWarned, id)
 }
 
 // warnConfigCleanup 就「配置清理失败」提示用户，同一隧道只提示一次。
@@ -1403,9 +1415,12 @@ func (a *App) warnConfigCleanup(id uint, msg string) {
 // 不按运行中的进程来清，是因为一条隧道可能因为启动失败而没有进程：
 // 之后它被服务端删掉，这些记录就再也没有机会被访问或清理。
 //
-// 三张表都要清，包括 applied：它存的是「最近一次写入磁盘的配置原文」，
+// 四张表都要清，包括 applied：它存的是「最近一次写入磁盘的配置原文」，
 // 每条几百字节到几 KB。反复「建了、删掉」会让它一直占着内存，
 // 而它的用途（判断配置有没有变）只对还存在的隧道有意义。
+//
+// cleanupWarned 同理：它记的是「这条隧道的清理失败已经提示过了」，
+// 隧道都不存在了，这个标记没有任何意义。
 func (a *App) pruneTunnelState(alive map[uint]bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1422,6 +1437,11 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 	for id := range a.applied {
 		if !alive[id] {
 			delete(a.applied, id)
+		}
+	}
+	for id := range a.cleanupWarned {
+		if !alive[id] {
+			delete(a.cleanupWarned, id)
 		}
 	}
 }

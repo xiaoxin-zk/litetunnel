@@ -96,6 +96,54 @@ func TestSyncCleansConfigOfTunnelDeletedElsewhere(t *testing.T) {
 	}
 }
 
+// TestCleanupWarnedDoesNotGrow 覆盖「提示标记只增不减」。
+//
+// cleanupWarned 记的是「这条隧道的清理失败已经提示过」。清理成功后不撤掉的话，
+// 反复遇到「失败 → 后来成功」的不同隧道，每个 ID 都会永久占一个条目。
+func TestCleanupWarnedDoesNotGrow(t *testing.T) {
+	withTempConfigDir(t)
+	srv, cfgStatus, _, noTunnels := fakePanel(t)
+	cfgStatus.Store(http.StatusOK)
+	a := newSyncTestApp(t, srv)
+	noTunnels.Store(true)
+
+	// 模拟「这条隧道之前提示过清理失败」。
+	a.warnConfigCleanup(9, "之前清理失败过")
+	if len(a.cleanupWarned) != 1 {
+		t.Fatalf("前置条件：应有一条提示标记，实际 %d 条", len(a.cleanupWarned))
+	}
+
+	// 文件还在、进程没在跑 → 本轮同步会把它清掉。
+	if err := writeFrpcConfig(9, "token = \"secret\"\n"); err != nil {
+		t.Fatalf("写隧道配置失败: %v", err)
+	}
+	if _, err := a.applySync(); err != nil {
+		t.Fatalf("同步失败: %v", err)
+	}
+
+	if len(a.cleanupWarned) != 0 {
+		t.Fatalf("清理成功后应撤掉提示标记，实际还剩 %d 条", len(a.cleanupWarned))
+	}
+}
+
+// TestPruneTunnelStateDropsCleanupWarn 覆盖提示标记纳入状态裁剪。
+func TestPruneTunnelStateDropsCleanupWarn(t *testing.T) {
+	withTempConfigDir(t)
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	a.warnConfigCleanup(3, "x")
+	a.warnConfigCleanup(4, "y")
+	a.pruneTunnelState(map[uint]bool{4: true})
+
+	if _, ok := a.cleanupWarned[3]; ok {
+		t.Error("服务端已不存在的隧道，其提示标记应被清掉")
+	}
+	if _, ok := a.cleanupWarned[4]; !ok {
+		t.Error("仍然存在的隧道不该被误清")
+	}
+}
+
 // TestLogoutCleansTunnelConfigsEvenIfMainConfigFails 覆盖「一处失败阻断另一处清理」。
 //
 // 主配置与隧道配置是两份独立的凭据（API Key vs 接入密钥）。主配置删不掉时

@@ -97,16 +97,26 @@
             <el-button type="primary" :loading="totpLoading" @click="startSetup">启用双因素认证</el-button>
           </div>
           <div v-else>
+            <el-button :loading="totpLoading" @click="rebindVisible = true">换绑新设备</el-button>
             <el-button type="danger" plain :loading="totpLoading" @click="disableVisible = true">
               关闭双因素认证
             </el-button>
+            <p class="lt-muted" style="line-height: 1.9; margin: 12px 0 0">
+              换绑需要先用当前设备的口令验证，再用新设备确认。中途放弃（关掉页面、输错）
+              不会影响现有绑定，第二因素始终有效。
+            </p>
           </div>
         </div>
       </el-col>
     </el-row>
 
     <!-- 绑定对话框 -->
-    <el-dialog v-model="setupVisible" title="绑定认证器" width="480px" :close-on-click-modal="false">
+    <el-dialog
+      v-model="setupVisible"
+      :title="rebinding ? '换绑认证器' : '绑定认证器'"
+      width="480px"
+      :close-on-click-modal="false"
+    >
       <el-steps :active="1" align-center style="margin-bottom: 18px">
         <el-step title="扫码" description="用认证器 App 扫描" />
         <el-step title="验证" description="输入一次动态口令" />
@@ -137,6 +147,29 @@
       <template #footer>
         <el-button @click="setupVisible = false">取消</el-button>
         <el-button type="primary" :loading="totpLoading" @click="confirmEnable">完成绑定</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 换绑第一步：先证明持有当前设备 -->
+    <el-dialog v-model="rebindVisible" title="换绑认证器" width="440px">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="先验证当前设备"
+        description="输入当前认证器显示的动态口令，然后扫码绑定新设备。中途放弃不会影响现有绑定。"
+        style="margin-bottom: 16px"
+      />
+      <el-input
+        v-model="rebindCode"
+        maxlength="6"
+        size="large"
+        placeholder="当前设备显示的 6 位口令"
+        @keyup.enter="confirmRebind"
+      />
+      <template #footer>
+        <el-button @click="rebindVisible = false">取消</el-button>
+        <el-button type="primary" :loading="totpLoading" @click="confirmRebind">下一步</el-button>
       </template>
     </el-dialog>
 
@@ -194,6 +227,13 @@ const qrDataUrl = ref('')
 
 const disableVisible = ref(false)
 const disablePassword = ref('')
+
+// 换绑流程：先验证当前设备（rebindCode），再走与首次绑定相同的扫码确认。
+// rebinding 只用于文案区分——服务端两处的语义不同（换绑不动现有绑定，
+// 确认之后才切换），提示语要让用户知道这一点。
+const rebindVisible = ref(false)
+const rebindCode = ref('')
+const rebinding = ref(false)
 
 const roleLabels = { super: '超级管理员', operator: '运营', auditor: '审计只读' }
 const roleLabel = computed(() => roleLabels[admin.value?.role] || admin.value?.role || '-')
@@ -256,10 +296,36 @@ async function startSetup() {
   totpLoading.value = true
   try {
     const data = await authApi.totpSetup()
+    rebinding.value = false
     setupSecret.value = data.secret
     setupCode.value = ''
     // 在本地渲染二维码，密钥不经过任何第三方服务。
     qrDataUrl.value = await QRCode.toDataURL(data.otpauth_url, { width: 220, margin: 1 })
+    setupVisible.value = true
+  } finally {
+    totpLoading.value = false
+  }
+}
+
+// confirmRebind 换绑第一步：用当前设备的口令换取一把新密钥。
+//
+// 服务端此时只把新密钥**暂存**起来，现有绑定不受影响——所以这一步失败、
+// 或者后面扫码那步被放弃，账号仍然处于双因素保护之下。
+async function confirmRebind() {
+  const code = rebindCode.value.trim()
+  if (code.length !== 6) {
+    ElMessage.warning('请输入 6 位动态口令')
+    return
+  }
+  totpLoading.value = true
+  try {
+    const data = await authApi.totpSetup(code)
+    rebinding.value = true
+    setupSecret.value = data.secret
+    setupCode.value = ''
+    qrDataUrl.value = await QRCode.toDataURL(data.otpauth_url, { width: 220, margin: 1 })
+    rebindVisible.value = false
+    rebindCode.value = ''
     setupVisible.value = true
   } finally {
     totpLoading.value = false
@@ -275,8 +341,13 @@ async function confirmEnable() {
   totpLoading.value = true
   try {
     await authApi.totpEnable(code)
-    ElMessage.success('双因素认证已启用，下次登录需要输入动态口令')
+    ElMessage.success(
+      rebinding.value
+        ? '已换绑到新设备，请用新设备的口令登录'
+        : '双因素认证已启用，下次登录需要输入动态口令'
+    )
     setupVisible.value = false
+    rebinding.value = false
     await load()
   } finally {
     totpLoading.value = false

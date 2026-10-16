@@ -49,7 +49,8 @@ export const authApi = {
   profile: () => http.get('/profile'),
   updateProfile: (data) => http.put('/profile', data),
   changePassword: (data) => http.put('/profile/password', data),
-  totpSetup: () => http.post('/profile/totp/setup'),
+  // 已启用双因素时属于「换绑」，需要带上当前设备的动态口令。
+  totpSetup: (code) => http.post('/profile/totp/setup', { code: code || '' }),
   totpEnable: (code) => http.post('/profile/totp/enable', { code }),
   totpDisable: (password) => http.post('/profile/totp/disable', { password })
 }

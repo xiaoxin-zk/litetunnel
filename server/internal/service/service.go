@@ -59,6 +59,12 @@ var (
 	ErrDomainRegisterLimited = errors.New("该邮箱域名今日注册数量已达上限，请改用其他邮箱或明日再试")
 	ErrEmailCodeNeeded = errors.New("请输入邮箱验证码")
 	ErrEmailCodeWrong  = errors.New("邮箱验证码不正确或已过期")
+	// ErrEmailCodeCheckFailed 表示校验本身没法完成（例如失败次数写不进库）。
+	//
+	// 必须与 ErrEmailCodeWrong 分开：后者是「你填错了」，前者是「我们这边暂时
+	// 处理不了」。混为一谈的后果不只是提示不准——失败次数记不上的话，
+	// 猜测次数上限就形同不存在，攻击者可以无限试。
+	ErrEmailCodeCheckFailed = errors.New("验证码校验暂时不可用，请稍后重试")
 
 	// 邮箱验证码相关
 	ErrEmailRequired     = errors.New("请填写有效的邮箱地址")

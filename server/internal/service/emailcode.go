@@ -204,8 +204,17 @@ func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*mode
 			Where("id = ? AND attempts < ?", rec.ID, emailCodeMaxAttempts).
 			Update("attempts", gorm.Expr("attempts + 1"))
 		if res.Error != nil {
-			log.Printf("[emailcode] 更新失败次数出错: %v", res.Error)
-		} else if res.RowsAffected == 0 {
+			// 计数没记上就**不能**当成普通的「验证码错误」返回。
+			//
+			// 否则只要让写库持续失败（打满连接池、把磁盘写满……），攻击者就能
+			// 无限次猜码：每次失败都不计数，上限永远不会到。这里是拒绝继续
+			// 校验、如实报服务错误，让用户稍后重试。
+			//
+			// 不把底层错误拼进对外消息（会泄露实现细节），只写日志。
+			log.Printf("[emailcode] 记录失败次数出错，拒绝继续校验: %v", res.Error)
+			return nil, ErrEmailCodeCheckFailed
+		}
+		if res.RowsAffected == 0 {
 			// 条件没命中：并发请求已经把它顶到上限了。
 			return nil, ErrEmailCodeAttempts
 		}

@@ -1339,6 +1339,64 @@ func TestInvalidEmailCodeSkipsBcrypt(t *testing.T) {
 	}
 }
 
+// TestEmailCodeCheckFailsWhenAttemptsCannotBeRecorded 覆盖
+// 「计数写库失败仍按普通验证码错误返回」。
+//
+// 那样的话只要让写库持续失败（打满连接池、磁盘写满……），攻击者就能无限次
+// 猜码——每次失败都不计数，上限永远不会到。必须拒绝继续校验并如实报服务错误。
+func TestEmailCodeCheckFailsWhenAttemptsCannotBeRecorded(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const email = "countfail@example.com"
+	sum := sha256.Sum256([]byte("123456"))
+	rec := model.EmailCode{
+		Email: email, Scene: EmailSceneReset,
+		CodeHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("建验证码失败: %v", err)
+	}
+
+	// 让「记录失败次数」必然失败：给验证码表装一个拒绝更新的触发器。
+	// 读仍然正常，正是要模拟的场景（读得到、写不进）。
+	if err := svc.DB.Exec(
+		`CREATE TRIGGER lt_email_codes_block_update BEFORE UPDATE ON lt_email_codes
+		 BEGIN SELECT RAISE(ABORT, 'blocked for test'); END`).Error; err != nil {
+		t.Fatalf("装触发器失败: %v", err)
+	}
+
+	_, err := svc.checkEmailCode(svc.DB, email, EmailSceneReset, "000000")
+	if !errors.Is(err, ErrEmailCodeCheckFailed) {
+		t.Fatalf("计数写不进去时必须报服务错误，实际 %v", err)
+	}
+	if errors.Is(err, ErrEmailCodeWrong) {
+		t.Error("不能返回「验证码错误」：那等于让攻击者无限试码")
+	}
+}
+
+// TestWriteAuditReportsFailure 覆盖「审计写入失败被静默忽略」。
+//
+// 以前是 `_ = s.DB.Create(...)`：写失败既没有日志、也没有任何地方能看出来，
+// 于是「操作成功、审计缺失」可以静默存在——出事之后去查审计，只会发现那段时间
+// 什么都没有，而且分不清是「没人操作」还是「记录没写进去」。
+func TestWriteAuditReportsFailure(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 正常写入应当成功。
+	if err := svc.WriteAudit(1, "admin", "user.update", "user", "2", "detail", "127.0.0.1"); err != nil {
+		t.Fatalf("正常写入不该报错: %v", err)
+	}
+
+	// 制造写入失败：删掉审计表。
+	if err := svc.DB.Migrator().DropTable(&model.AuditLog{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+	if err := svc.WriteAudit(1, "admin", "user.update", "user", "2", "detail", "127.0.0.1"); err == nil {
+		t.Fatal("审计写失败必须返回错误，否则调用方无从知道记录丢了")
+	}
+}
+
 // TestEmailCodeAttemptsNeverExceedLimit 覆盖「失败计数不是原子的」。
 //
 // 「先读上限、再无条件 +1」在并发下会漏：多个请求同时读到「还没到上限」的

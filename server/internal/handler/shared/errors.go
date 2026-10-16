@@ -81,6 +81,11 @@ func Fail(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrNotFound):
 		httpx.NotFound(c, err.Error())
 
+	// 校验本身没法完成（例如失败次数写不进库）：这是服务端的问题，不是
+	// 「你填错了」，用 503 让客户端知道可以稍后重试。
+	case errors.Is(err, service.ErrEmailCodeCheckFailed):
+		httpx.Fail(c, http.StatusServiceUnavailable, err.Error())
+
 	case errors.Is(err, service.ErrBadCredentials),
 		errors.Is(err, service.ErrAccountDisabled):
 		httpx.Unauthorized(c, err.Error())

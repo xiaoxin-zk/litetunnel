@@ -7,6 +7,7 @@ package adminapi
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -33,9 +34,13 @@ type Handler struct {
 func New(svc *service.Services) *Handler { return &Handler{svc: svc} }
 
 // audit 记录一次管理操作。所有写操作都必须调用。
-func (h *Handler) audit(c *gin.Context, action, target, targetID, detail string) {
+//
+// 返回写入结果，供「审计是这次操作的必要保障」的调用点判断；多数调用点
+// 忽略它即可——写失败已经由 WriteAudit 记了带上下文的错误日志，
+// 不会像以前那样静默消失。
+func (h *Handler) audit(c *gin.Context, action, target, targetID, detail string) error {
 	adminID, adminName, _ := middleware.CurrentAdminID(c)
-	h.svc.WriteAudit(adminID, adminName, action, target, targetID, detail, httpx.ClientIP(c))
+	return h.svc.WriteAudit(adminID, adminName, action, target, targetID, detail, httpx.ClientIP(c))
 }
 
 // 说明：管理员登录已合并到 /api/auth/login（见 handler/authapi），
@@ -178,19 +183,54 @@ func (h *Handler) StatsOverview(c *gin.Context) {
 		onlineClient int64
 	)
 	db := h.svc.DB
-	if err := db.Model(&model.User{}).Count(&userTotal).Error; err != nil {
-		shared.Fail(c, err)
-		return
-	}
-	_ = db.Model(&model.User{}).Where("status = ?", model.UserStatusActive).Count(&userActive).Error
-	_ = db.Model(&model.Tunnel{}).Count(&tunnelTotal).Error
-	_ = db.Model(&model.Tunnel{}).Where("status = ?", model.TunnelStatusActive).Count(&tunnelActive).Error
-	_ = db.Model(&model.ClientSession{}).Where("online = ?", true).Count(&onlineClient).Error
 
+	// 每一项都要确认成功。
+	//
+	// 以前只检查第一个查询，后面几项忽略错误——查询失败时那几个数字会是 0，
+	// 而 0 在首页上**看起来完全正常**：管理员会以为「真的没有在线客户端」，
+	// 而不是「数据库出了问题」。把失败当成真实的零值，比直接报错更危险。
 	var totalUsed int64
-	var usedRow struct{ Total int64 }
-	_ = db.Model(&model.User{}).Select("COALESCE(SUM(traffic_used),0) AS total").Scan(&usedRow).Error
-	totalUsed = usedRow.Total
+	queries := []struct {
+		name string
+		run  func() error
+	}{
+		{"总用户数", func() error {
+			return db.Model(&model.User{}).Count(&userTotal).Error
+		}},
+		{"活跃用户数", func() error {
+			return db.Model(&model.User{}).
+				Where("status = ?", model.UserStatusActive).Count(&userActive).Error
+		}},
+		{"隧道总数", func() error {
+			return db.Model(&model.Tunnel{}).Count(&tunnelTotal).Error
+		}},
+		{"活跃隧道数", func() error {
+			return db.Model(&model.Tunnel{}).
+				Where("status = ?", model.TunnelStatusActive).Count(&tunnelActive).Error
+		}},
+		{"在线客户端数", func() error {
+			return db.Model(&model.ClientSession{}).
+				Where("online = ?", true).Count(&onlineClient).Error
+		}},
+		{"总流量", func() error {
+			var row struct{ Total int64 }
+			if err := db.Model(&model.User{}).
+				Select("COALESCE(SUM(traffic_used),0) AS total").Scan(&row).Error; err != nil {
+				return err
+			}
+			totalUsed = row.Total
+			return nil
+		}},
+	}
+	for _, q := range queries {
+		if err := q.run(); err != nil {
+			// 带上是哪一项失败：日志里只有一条 SQL 错误时，
+			// 排查的人还得自己猜是哪块统计出了问题。
+			log.Printf("[admin] 首页统计查询失败（%s）: %v", q.name, err)
+			shared.Fail(c, err)
+			return
+		}
+	}
 
 	httpx.OK(c, gin.H{
 		"user_total":         userTotal,

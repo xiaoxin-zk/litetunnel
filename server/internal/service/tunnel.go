@@ -1,8 +1,10 @@
 package service
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"strings"
 
@@ -491,7 +493,15 @@ func (s *Services) normalizeDomain(g *model.Group, in TunnelInput) (domain, sub 
 	return "", sub, nil
 }
 
-// allocatePort 从端口池中分配一个未占用端口。
+// allocatePort 从端口池中**随机**分配一个未占用端口。
+//
+// 起点用随机数，而不是「按用户 ID 派生起点 + 顺序扫描」：
+//
+//   - 顺序分配时端口是**可预测**的。同一用户每次拿到的都是池里靠前的第一个
+//     空位，连续创建几条隧道就能把用到的整段端口推出来；换端口也一样。
+//     端口可预测会明显降低外部扫描/撞库的成本，而端口对外就是服务入口。
+//   - 随机起点同样能避免并发碰撞：两个请求几乎不可能从同一个位置开始扫，
+//     真正撞上时由下面的唯一索引兜底。
 //
 // 依赖 lt_tunnels(remote_port) 上的部分唯一索引做最终兜底：
 // 即使并发分配撞车，也会由数据库拒绝，不会出现端口冲突。
@@ -513,8 +523,12 @@ func (s *Services) allocatePort(tx *gorm.DB, userID uint) (int, error) {
 	if span <= 0 {
 		return 0, ErrNoPortAvailable
 	}
-	// 从用户 ID 派生起点，把不同用户的端口天然分散开，降低并发碰撞概率。
-	offset := int(userID) % span
+	offset, err := randomOffset(span)
+	if err != nil {
+		// 取不到随机数（几乎不可能）：退回按用户分散，至少不会让所有用户
+		// 都从同一个位置开始扫。
+		offset = int(userID) % span
+	}
 	for i := 0; i < span; i++ {
 		p := start + (offset+i)%span
 		if _, ok := set[p]; !ok {
@@ -522,6 +536,19 @@ func (s *Services) allocatePort(tx *gorm.DB, userID uint) (int, error) {
 		}
 	}
 	return 0, ErrNoPortAvailable
+}
+
+// randomOffset 返回 [0, span) 内的一个随机数。
+//
+// 用 crypto/rand 而不是 math/rand：这里要的是「外部猜不到」，而不只是
+// 「分布均匀」——math/rand 的全局序列是可预测的，知道种子就能算出下一条
+// 隧道会拿到哪个端口。
+func randomOffset(span int) (int, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(span)))
+	if err != nil {
+		return 0, err
+	}
+	return int(n.Int64()), nil
 }
 
 // assertPortFree 校验指定端口是否可用。

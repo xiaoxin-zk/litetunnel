@@ -182,9 +182,17 @@ func (s *Services) BuildFrpcConfig(u *model.User, tunnels []model.Tunnel) (strin
 	b.WriteString("transport.tls.enable = true\n")
 	fmt.Fprintf(&b, "transport.tls.serverName = %s\n\n", tomlString(info.ServerAddr))
 
-	b.WriteString("log.to = \"./frpc.log\"\n")
+	// 必须写 console（stdout）：客户端靠解析 frpc 的输出判断「这条隧道到底
+	// 起来没有」——`start proxy success` 会触发界面上的「隧道启动成功 + 可用
+	// 地址」，错误行则用于显示「为什么一直连不上」。
+	//
+	// 这里曾经写的是 ./frpc.log：日志全落到文件里，客户端读到的 stdout 始终
+	// 是空的，于是那两条提示**永远不会出现**——用户只看到「已启动 frpc（PID …）」
+	// 之后就再无下文，分不清是在连、还是已经连上了。
+	//
+	// maxDays 只对文件输出有意义，改成 console 后一并去掉。
+	b.WriteString("log.to = \"console\"\n")
 	b.WriteString("log.level = \"info\"\n")
-	b.WriteString("log.maxDays = 7\n")
 
 	if len(tunnels) == 0 {
 		b.WriteString("\n# 当前账号还没有可用隧道，请先在控制台创建。\n")

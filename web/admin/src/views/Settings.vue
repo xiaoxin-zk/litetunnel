@@ -341,14 +341,20 @@ async function confirmEnable() {
   totpLoading.value = true
   try {
     await authApi.totpEnable(code)
-    ElMessage.success(
-      rebinding.value
-        ? '已换绑到新设备，请用新设备的口令登录'
-        : '双因素认证已启用，下次登录需要输入动态口令'
-    )
+    // 先取下来再重置：重置之后文案会走错分支。
+    const wasRebinding = rebinding.value
     setupVisible.value = false
     rebinding.value = false
-    await load()
+    // 服务端在启用 / 换绑成功后会撤销该账号的既有会话（第二因素变了，旧会话
+    // 不再可信），所以这里直接引导重新登录。不这样的话，用户刚点完「完成绑定」
+    // 就会被下一次请求的 401 甩出去，只会以为是出了故障。
+    ElMessage.success(
+      wasRebinding
+        ? '已换绑到新设备，请用新设备的口令重新登录'
+        : '双因素认证已启用，请重新登录并输入动态口令'
+    )
+    localStorage.removeItem(TOKEN_KEY)
+    router.push('/login')
   } finally {
     totpLoading.value = false
   }
@@ -362,10 +368,12 @@ async function confirmDisable() {
   totpLoading.value = true
   try {
     await authApi.totpDisable(disablePassword.value)
-    ElMessage.success('双因素认证已关闭')
     disableVisible.value = false
     disablePassword.value = ''
-    await load()
+    // 同 confirmEnable：第二因素变了，服务端会撤销既有会话，这里直接引导重登。
+    ElMessage.success('双因素认证已关闭，请重新登录')
+    localStorage.removeItem(TOKEN_KEY)
+    router.push('/login')
   } finally {
     totpLoading.value = false
   }

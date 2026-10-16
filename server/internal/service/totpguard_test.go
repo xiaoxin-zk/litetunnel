@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,8 +102,13 @@ func TestTOTPSetupRefusesRebindWithWrongCode(t *testing.T) {
 	}
 }
 
-// TestTOTPSetupAllowsRebindWithCurrentCode 覆盖正当场景：换了手机，旧设备还在手上。
-func TestTOTPSetupAllowsRebindWithCurrentCode(t *testing.T) {
+// TestTOTPSetupKeepsActiveFactorUntilConfirmed 覆盖
+// 「换绑未完成就把账号降级成仅密码」。
+//
+// 换绑要等用户去扫码、输码，中间只要关掉页面、网络中断或输错，账号就会停在
+// 「只有密码保护」——而用户以为自己正在换绑，多半不会察觉第二因素已经没了。
+// 所以新密钥必须先暂存，生效的那把与启用状态都保持原样。
+func TestTOTPSetupKeepsActiveFactorUntilConfirmed(t *testing.T) {
 	svc := newTestServices(t, nil)
 	a := newAdminForTOTP(t, svc, "totp-rebind-ok")
 	oldSecret := enableTOTPDirectly(t, svc, a)
@@ -122,22 +128,90 @@ func TestTOTPSetupAllowsRebindWithCurrentCode(t *testing.T) {
 		t.Error("应同时返回 otpauth URL 供扫码")
 	}
 
+	// 关键断言：此刻（还没确认）生效的仍是旧密钥，双因素仍然开着。
 	var got model.Admin
 	if err := svc.DB.First(&got, a.ID).Error; err != nil {
 		t.Fatalf("读管理员失败: %v", err)
 	}
-	if got.TOTPSecret != newSecret {
-		t.Error("密钥应已替换为新密钥")
+	if got.TOTPSecret != oldSecret {
+		t.Errorf("确认之前不该替换生效密钥（旧 %q，实际 %q）", oldSecret, got.TOTPSecret)
 	}
-	if got.TOTPEnabled {
-		t.Error("换绑后应处于「待确认」状态：还要用新密钥的口令调 Enable 才算完成")
+	if !got.TOTPEnabled {
+		t.Error("确认之前双因素必须仍然启用：否则中断换绑就等于静默关掉了第二因素")
+	}
+	if got.TOTPPendingSecret != newSecret {
+		t.Error("新密钥应处于待确认状态")
+	}
+
+	// 用新设备的口令确认，才真正切换过去。
+	newCode, err := auth.GenerateTOTP(newSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算新口令失败: %v", err)
+	}
+	if err := svc.AdminTOTPEnable(a.ID, newCode); err != nil {
+		t.Fatalf("用新设备的口令确认应成功: %v", err)
+	}
+
+	if err := svc.DB.First(&got, a.ID).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	if got.TOTPSecret != newSecret {
+		t.Error("确认之后生效密钥应切换为新密钥")
+	}
+	if !got.TOTPEnabled {
+		t.Error("确认之后双因素应处于启用状态")
+	}
+	if got.TOTPPendingSecret != "" {
+		t.Error("确认之后待确认密钥应被清空")
+	}
+
+	// 同一个确认请求再发一次：待确认密钥已经不在，会被防重放挡掉。
+	if err := svc.AdminTOTPEnable(a.ID, newCode); !errors.Is(err, ErrTOTPReplay) {
+		t.Errorf("重复确认应被拒绝（防重放），实际 %v", err)
 	}
 }
 
-// TestTOTPSetupWithoutTOTPRequiresNoCode 覆盖反面：尚未启用时不该多要一道口令。
+// TestTOTPSetupAbandonedRebindChangesNothing 覆盖「换绑中途放弃」。
+//
+// 这是上一条的另一面：放弃之后账号必须与换绑前**完全一致**——旧设备仍然能登录，
+// 第二因素仍然开着。
+func TestTOTPSetupAbandonedRebindChangesNothing(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newAdminForTOTP(t, svc, "totp-abandon")
+	oldSecret := enableTOTPDirectly(t, svc, a)
+
+	code, err := auth.GenerateTOTP(oldSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
+	}
+	if _, _, err := svc.AdminTOTPSetup(a.ID, code); err != nil {
+		t.Fatalf("换绑第一步应成功: %v", err)
+	}
+
+	// 用户关掉页面，再也不回来。旧设备的口令必须照常可用。
+	var got model.Admin
+	if err := svc.DB.First(&got, a.ID).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	if got.TOTPSecret != oldSecret || !got.TOTPEnabled {
+		t.Fatal("放弃换绑后，旧密钥与启用状态都必须保持原样")
+	}
+	// 旧设备的码仍能用于登录校验（这里直接验签，等价于登录时的判断）。
+	// 用一个更晚的步进：刚才那一步已经被 setup 登记过（防重放）。
+	next := time.Now().Add(time.Duration(auth.TOTPPeriodSeconds) * time.Second)
+	oldCode, err := auth.GenerateTOTP(oldSecret, next)
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
+	}
+	if _, ok := auth.VerifyTOTPStep(oldSecret, oldCode, next); !ok {
+		t.Error("放弃换绑后，旧设备的口令应当照常可用")
+	}
+}
+
+// TestTOTPSetupWithoutTOTPRequiresNoCode 覆盖首次绑定：不该多要一道口令。
 //
 // 首次绑定没有「当前因素」可验，要求提供只会把流程卡死；而这里换掉的也不是
-// 任何已有的因素。
+// 任何已有的因素。确认之后走的是同一套「待确认 → 提升」流程。
 func TestTOTPSetupWithoutTOTPRequiresNoCode(t *testing.T) {
 	svc := newTestServices(t, nil)
 	a := newAdminForTOTP(t, svc, "totp-first")
@@ -148,6 +222,32 @@ func TestTOTPSetupWithoutTOTPRequiresNoCode(t *testing.T) {
 	}
 	if secret == "" || otpauth == "" {
 		t.Fatal("应返回密钥与 otpauth URL")
+	}
+
+	var got model.Admin
+	if err := svc.DB.First(&got, a.ID).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	if got.TOTPEnabled {
+		t.Error("尚未确认时不该处于启用状态")
+	}
+	if got.TOTPPendingSecret != secret {
+		t.Error("首次绑定的密钥同样先暂存")
+	}
+
+	code, err := auth.GenerateTOTP(secret, time.Now())
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
+	}
+	if err := svc.AdminTOTPEnable(a.ID, code); err != nil {
+		t.Fatalf("确认绑定应成功: %v", err)
+	}
+	if err := svc.DB.First(&got, a.ID).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	if !got.TOTPEnabled || got.TOTPSecret != secret || got.TOTPPendingSecret != "" {
+		t.Errorf("确认后应正式启用：enabled=%v secret 匹配=%v pending=%q",
+			got.TOTPEnabled, got.TOTPSecret == secret, got.TOTPPendingSecret)
 	}
 }
 
@@ -237,20 +337,54 @@ func TestClaimTOTPStepFailsClosedOnDBError(t *testing.T) {
 	}
 }
 
-// TestResetTOTPStepAllowsReenrollment 覆盖重新绑定密钥时的水位线清理。
+// TestTOTPEnablePromotionIsAtomic 覆盖「并发/重复确认换绑」。
 //
-// 不清的话，在同一时间窗口内重新绑定会被判成「重放」而失败。
-func TestResetTOTPStepAllowsReenrollment(t *testing.T) {
+// 提升条件里带着「待确认密钥仍是刚验证的那把」：并发两次确认只有一个能成功，
+// 另一个会拿到「重放」，而不是两次都把一个已经被消费的密钥提升上去。
+func TestTOTPEnablePromotionIsAtomic(t *testing.T) {
 	svc := newTestServices(t, nil)
-	a := newAdminForTOTP(t, svc, "totp-reset")
+	a := newAdminForTOTP(t, svc, "totp-promote")
+	oldSecret := enableTOTPDirectly(t, svc, a)
 
-	if !svc.ClaimTOTPStep(a.ID, 100) {
-		t.Fatal("首次占用应当成功")
+	code, err := auth.GenerateTOTP(oldSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算动态口令失败: %v", err)
 	}
-	if err := svc.ResetTOTPStep(a.ID); err != nil {
-		t.Fatalf("重置水位线失败: %v", err)
+	newSecret, _, err := svc.AdminTOTPSetup(a.ID, code)
+	if err != nil {
+		t.Fatalf("换绑第一步应成功: %v", err)
 	}
-	if !svc.ClaimTOTPStep(a.ID, 100) {
-		t.Fatal("重置之后同一个步进码应当可以重新占用（换绑新密钥的场景）")
+	newCode, err := auth.GenerateTOTP(newSecret, time.Now())
+	if err != nil {
+		t.Fatalf("计算新口令失败: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	okCount := 0
+	var mu sync.Mutex
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := svc.AdminTOTPEnable(a.ID, newCode); err == nil {
+				mu.Lock()
+				okCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if okCount != 1 {
+		t.Fatalf("并发确认只应有一个成功，实际 %d 个", okCount)
+	}
+
+	var got model.Admin
+	if err := svc.DB.First(&got, a.ID).Error; err != nil {
+		t.Fatalf("读管理员失败: %v", err)
+	}
+	if got.TOTPSecret != newSecret || !got.TOTPEnabled || got.TOTPPendingSecret != "" {
+		t.Errorf("确认后状态不对：enabled=%v secret 匹配=%v pending=%q",
+			got.TOTPEnabled, got.TOTPSecret == newSecret, got.TOTPPendingSecret)
 	}
 }

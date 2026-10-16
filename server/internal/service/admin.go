@@ -69,24 +69,30 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 
 // ---- 双因素认证 ----
 
-// AdminTOTPSetup 生成新的 TOTP 密钥，此时尚未启用。
+// AdminTOTPSetup 生成一把**待确认**的新 TOTP 密钥。
 //
 // 两步式设计（先生成、再用一次正确口令确认）是为了避免用户扫码失败后
 // 就把自己锁在门外。
 //
 // # 已启用时不能凭会话令牌直接换绑
 //
-// 本接口会替换密钥并把 totp_enabled 置回 false。如果不加约束，一个**被盗的
-// 管理员会话令牌**就足以把第二因素整个换掉：攻击者调用它、绑上自己控制的
-// 密钥，第二因素从此形同虚设——而「关闭双因素」那个接口反倒要求重新验证
-// 口令，成了两者中更严格的一个，这明显不对。
+// 如果不加约束，一个**被盗的管理员会话令牌**就足以把第二因素整个换掉：
+// 攻击者调用它、绑上自己控制的密钥，第二因素从此形同虚设——而「关闭双因素」
+// 那个接口反倒要求重新验证口令，成了两者中更严格的一个，这明显不对。
 //
 // 所以已启用时要求提供**当前生效的动态口令**：换绑的正当场景是「换了手机」，
 // 此时旧设备还在手上。旧设备也丢了的话，由超级管理员在管理员列表里重置
 // （POST /admins/:id/totp-reset，权限更高且会记审计）。
 //
-// 校验发生在生成新密钥**之前**，因此不存在「新密钥已写入、校验却没过」的
-// 中间状态，也就不需要额外的暂存字段。
+// # 新密钥只暂存，不动生效的那把
+//
+// 生成之后写进 totp_pending_secret，totp_secret / totp_enabled **保持原样**，
+// 等管理员用新设备的口令调 Enable 验证通过才原子切换。
+//
+// 直接替换（并把 totp_enabled 置回 false）会留下一个危险的中间态：确认这一步
+// 要等用户去扫码、输码，中间只要关掉页面、网络中断或输错，账号就停在
+// 「只有密码保护」——而用户以为自己正在换绑，多半不会察觉第二因素已经没了。
+// 暂存之后，未完成的换绑等于什么都没发生。
 func (s *Services) AdminTOTPSetup(id uint, code string) (secret, otpauthURL string, err error) {
 	a, err := s.LoadAdmin(id)
 	if err != nil {
@@ -114,37 +120,74 @@ func (s *Services) AdminTOTPSetup(id uint, code string) (secret, otpauthURL stri
 	if err != nil {
 		return "", "", err
 	}
-	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
-		"totp_secret":  secret,
-		"totp_enabled": false,
-		// 换了一把密钥，旧的水位线对新密钥没有意义：不清掉的话，
-		// 在同一时间窗口内重新绑定会被判成「重放」而失败。
-		"totp_last_step": 0,
-	}).Error; err != nil {
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).
+		Update("totp_pending_secret", secret).Error; err != nil {
 		return "", "", err
 	}
 	return secret, auth.OtpauthURL("LiteTunnel", a.Username, secret), nil
 }
 
-// AdminTOTPEnable 用一次正确的动态口令确认绑定并启用双因素认证。
+// AdminTOTPEnable 用一次正确的动态口令确认绑定（或完成换绑）。
+//
+// 待确认密钥存在时走**换绑**：验证新设备的口令，然后把它原子地提升为生效密钥
+// ——提升条件里带着「待确认密钥仍是我们刚验证的那把」，因此并发的两次确认
+// 只有一个能成功，另一个会拿到「重放」。
+//
+// 没有待确认密钥时走**首次绑定**：验证的是刚生成的那把密钥本身。
 func (s *Services) AdminTOTPEnable(id uint, code string) error {
 	a, err := s.LoadAdmin(id)
 	if err != nil {
 		return err
 	}
-	if a.TOTPSecret == "" {
+
+	// 换绑期间优先验证待确认的那把；否则验证当前生效的（首次绑定）。
+	pending := a.TOTPPendingSecret
+	target := pending
+	if target == "" {
+		target = a.TOTPSecret
+	}
+	if target == "" {
 		return fmt.Errorf("%w: 请先生成密钥", ErrInvalidParam)
 	}
-	step, ok := auth.VerifyTOTPStep(a.TOTPSecret, code, time.Now())
+
+	step, ok := auth.VerifyTOTPStep(target, code, time.Now())
 	if !ok {
 		return ErrTOTPInvalid
 	}
-	// 绑定用的口令同样登记。不登记的话，「刚绑定完立刻拿同一个口令去登录」
-	// 就成了一条绕过防重放的现成路径。
+	now := time.Now()
+
+	if pending != "" {
+		// 原子切换：把待确认密钥提升为生效密钥，并清掉暂存。
+		//
+		// 条件里带上「待确认密钥仍是刚验证的那把」，于是：
+		//   - 并发两次确认只有一个成功（另一个 RowsAffected=0）；
+		//   - 期间又调了一次 Setup 换了新密钥的话，这次确认作废——否则会用
+		//     一个已经被替换掉的密钥把 2FA 打开。
+		//
+		// 水位线一并置为本次验证的步进：旧密钥的水位线对新密钥没有意义，
+		// 而且这样这个刚用过的口令也不会被重放。
+		res := s.DB.Model(&model.Admin{}).
+			Where("id = ? AND totp_pending_secret = ?", id, pending).
+			Updates(map[string]any{
+				"totp_secret":         pending,
+				"totp_pending_secret": "",
+				"totp_enabled":        true,
+				"totp_last_step":      step,
+				"totp_verified_at":    now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrTOTPReplay
+		}
+		return nil
+	}
+
+	// 首次绑定：登记这一步，避免「刚绑定完立刻拿同一个口令去登录」。
 	if !s.ClaimTOTPStep(a.ID, step) {
 		return ErrTOTPReplay
 	}
-	now := time.Now()
 	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
 		"totp_enabled":     true,
 		"totp_verified_at": now,
@@ -166,6 +209,9 @@ func (s *Services) AdminTOTPDisable(id uint, password string) error {
 	return s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
 		"totp_enabled": false,
 		"totp_secret":  "",
+		// 待确认的密钥一并清掉：关闭之后它没有意义，留着只会在下次绑定时
+		// 被当成「正在换绑」。
+		"totp_pending_secret": "",
 	}).Error
 }
 
@@ -468,9 +514,10 @@ func (s *Services) AdminSetPassword(id uint, newPassword string) error {
 // AdminClearTOTP 清除指定管理员的双因素绑定，用于认证器丢失的救援场景。
 func (s *Services) AdminClearTOTP(id uint) error {
 	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
-		"totp_enabled":     false,
-		"totp_secret":      "",
-		"totp_verified_at": nil,
+		"totp_enabled":        false,
+		"totp_secret":         "",
+		"totp_pending_secret": "",
+		"totp_verified_at":    nil,
 	})
 	if res.Error != nil {
 		return res.Error

@@ -505,6 +505,16 @@ type Admin struct {
 
 	// TOTPSecret 为双因素认证共享密钥（Base32）。json:"-" 保证永不外泄。
 	TOTPSecret string `gorm:"size:64" json:"-"`
+	// TOTPPendingSecret 是**待确认**的新密钥（换绑流程用）。
+	//
+	// 换绑时新密钥先放这里，totp_secret / totp_enabled 保持原样；等管理员用新
+	// 设备生成的口令调 Enable 验证通过，才原子地把它提升为生效密钥。
+	//
+	// 为什么不直接替换：直接替换会把 totp_enabled 置回 false，而确认这一步要等
+	// 用户去扫码、输码——中间只要关掉页面、网络中断或输错，账号就会停在
+	// 「只有密码保护」的状态，而用户以为自己刚换绑成功。暂存之后，未完成换绑
+	// 等于什么都没发生。
+	TOTPPendingSecret string `gorm:"size:64" json:"-"`
 	// TOTPEnabled 为 true 时登录必须携带动态口令。
 	TOTPEnabled bool `gorm:"default:false" json:"totp_enabled"`
 	// TOTPVerifiedAt 记录最近一次成功校验时间，仅用于展示。

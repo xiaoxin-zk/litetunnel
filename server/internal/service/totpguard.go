@@ -42,13 +42,3 @@ func (s *Services) ClaimTOTPStep(adminID uint, step int64) bool {
 	// 或者提交了一个更早窗口的口令。
 	return res.RowsAffected == 1
 }
-
-// ResetTOTPStep 清空某管理员的防重放水位线。
-//
-// 重新绑定动态口令时调用：换了一把密钥之后，旧的水位线对新密钥没有意义，
-// 留着只会让新密钥的第一批口令被判成重放（新密钥的步进从当前时间算起，
-// 一般高于旧水位线，但换绑前后恰好落在同一秒时就会撞上）。
-func (s *Services) ResetTOTPStep(adminID uint) error {
-	return s.DB.Model(&model.Admin{}).Where("id = ?", adminID).
-		Update("totp_last_step", 0).Error
-}

@@ -68,6 +68,85 @@ func TestLoadAcceptsProductionWithPublicURL(t *testing.T) {
 	}
 }
 
+// TestValidateCIDRList 直接覆盖白名单校验本身。
+func TestValidateCIDRList(t *testing.T) {
+	// 空列表合法：含义是「未启用白名单」。
+	if err := validateCIDRList("LT_ADMIN_ALLOW_CIDR", nil); err != nil {
+		t.Fatalf("未配置白名单不该报错: %v", err)
+	}
+	for _, v := range []string{"10.0.0.0/8", "1.2.3.4", "::1", "2001:db8::/32"} {
+		if err := validateCIDRList("X", []string{v}); err != nil {
+			t.Errorf("%s 是合法条目，不该报错: %v", v, err)
+		}
+	}
+
+	cases := []struct{ name, value string }{
+		{"掩码越界", "10.0.0.0/33"},
+		{"多了一段", "1.2.3.4.5"},
+		{"主机名不是网段", "panel.example.com"},
+		{"空项", "  "},
+		{"信任所有", "0.0.0.0/0"},
+		{"信任所有(IPv6)", "::/0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCIDRList("LT_ADMIN_ALLOW_CIDR", []string{tc.value})
+			if err == nil {
+				t.Fatalf("%q 不该被接受", tc.value)
+			}
+			if !strings.Contains(err.Error(), "LT_ADMIN_ALLOW_CIDR") {
+				t.Errorf("错误信息应点名是哪个变量，实际: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadRejectsInvalidAllowCIDR 覆盖「白名单写错」必须在启动时就暴露。
+//
+// 两类后果都必须等到线上才看得出来，而它们的方向完全相反：
+//
+//	管理白名单解析失败 → 集合为空 → 被当成「不限制」→ 公网谁都能进后台；
+//	插件白名单解析失败 → 集合为空 → 所有回调被拒 → 隧道全部无法上线。
+func TestLoadRejectsInvalidAllowCIDR(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"管理白名单拼错", "LT_ADMIN_ALLOW_CIDR", "10.0.0.0/33"},
+		{"管理白名单信任所有", "LT_ADMIN_ALLOW_CIDR", "0.0.0.0/0"},
+		{"插件白名单里混进一项错的", "LT_FRPS_PLUGIN_ALLOW_CIDR", "127.0.0.1/32,oops"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := prodEnv()
+			env[tc.key] = tc.val
+			setEnv(t, env)
+
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("%s=%q 时必须拒绝启动", tc.key, tc.val)
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("错误信息应点名 %s，实际: %v", tc.key, err)
+			}
+		})
+	}
+
+	// 开发环境同样拦住：这类配置错误与运行环境无关，
+	// 而「开发时能启动、上线才静默失效」正是最难查的那种。
+	t.Run("开发环境也不放行", func(t *testing.T) {
+		setEnv(t, map[string]string{
+			"LT_ENV":              "development",
+			"LT_ADMIN_ALLOW_CIDR": "10.0.0.0/33",
+			"LT_USER_PUBLIC_URL":  "",
+		})
+		if _, err := Load(); err == nil {
+			t.Fatal("非法白名单在开发环境也必须拒绝启动")
+		}
+	})
+}
+
 // TestLoadWarnsWhenPublicURLMissingInDev 覆盖开发环境：不阻断启动，但必须提示。
 //
 // 不提示的话，用户点了「忘记密码」什么都不会发生（运行时不再从请求头推断），

@@ -19,6 +19,7 @@ package router
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -80,6 +81,12 @@ func New(
 	r.POST("/api/frps/plugin", plugin.Guard(), plugin.Handle)
 
 	adminAllow := middleware.NewCIDRSet(cfg.AdminAllowCIDRs)
+	if bad := adminAllow.Invalid(); len(bad) > 0 {
+		// 走到这里说明启动校验被绕过了（或有人直接构造了 CIDRSet）。
+		// 这套集合此时会拒绝所有来源——记下来，否则表现只是「后台一律 404」。
+		log.Printf("[router] LT_ADMIN_ALLOW_CIDR 有 %d 项无法解析，管理后台将拒绝所有来源: %v",
+			len(bad), bad)
+	}
 
 	// 登录/注册类接口用更严格的限流，抵御撞库。
 	userAuthLimiter := middleware.NewRateLimiter(0.5, 10)

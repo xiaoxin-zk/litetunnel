@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -549,13 +550,56 @@ type clientInfoData struct {
 }
 
 // serverBase 返回本次运行使用的服务端地址：构建注入的优先。
+//
+// 两条来源都要过 checkServerURL，理由不同但结论一样：
+//
+//	注入地址：CI 里的值填成 http://IP 时，客户端必须拒绝而不是照发凭据；
+//	本地保存：早期版本允许保存 http:// 公网地址，那份配置可能还在磁盘上，
+//	          升级后同样要拒绝，否则明文凭据会一直发下去。
+//
+// 地址不可用时返回空串，由 baseReason 给出原因。
 func (a *App) serverBase() string {
 	if base := defaultServerURL(); base != "" {
-		return base
+		checked, err := checkServerURL(base, true)
+		if err != nil {
+			return ""
+		}
+		return checked
 	}
 	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return strings.TrimRight(a.cfg.ServerURL, "/")
+	raw := a.cfg.ServerURL
+	a.mu.RUnlock()
+	if raw == "" {
+		return ""
+	}
+	checked, err := checkServerURL(raw, false)
+	if err != nil {
+		return ""
+	}
+	return checked
+}
+
+// baseReason 解释当前为什么没有可用的服务端地址。
+//
+// 不区分「还没接入」与「地址本身不可用」的话，用户看到的永远是
+// 「尚未接入，请先连接」——而后者需要退出登录、重填地址才能解决，
+// 照着前者的提示怎么点都没用。
+func (a *App) baseReason() string {
+	if base := defaultServerURL(); base != "" {
+		if _, err := checkServerURL(base, true); err != nil {
+			return "客户端内置的服务器地址不可用：" + err.Error()
+		}
+		return "尚未接入，请先连接"
+	}
+	a.mu.RLock()
+	raw := a.cfg.ServerURL
+	a.mu.RUnlock()
+	if raw != "" {
+		if _, err := checkServerURL(raw, false); err != nil {
+			return "已保存的服务器地址不可用：" + err.Error() + "。请退出登录后重新填写"
+		}
+	}
+	return "尚未接入，请先连接"
 }
 
 // Connect 使用 API Key 接入平台。
@@ -703,7 +747,7 @@ func (a *App) currentCredential() (base, apiKey string, err error) {
 	apiKey = a.cfg.APIKey
 	a.mu.RUnlock()
 	if base == "" || apiKey == "" {
-		return "", "", errors.New("尚未接入，请先连接")
+		return "", "", errors.New(a.baseReason())
 	}
 	return base, apiKey, nil
 }
@@ -1138,7 +1182,7 @@ func (a *App) applySync() (changed bool, err error) {
 	a.mu.RUnlock()
 
 	if base == "" || apiKey == "" {
-		return false, errors.New("尚未接入")
+		return false, errors.New(a.baseReason())
 	}
 
 	var data clientInfoData
@@ -1973,7 +2017,19 @@ type envelope struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-func normalizeServerURL(raw string) (string, error) {
+// checkServerURL 校验并归一化一个服务端地址。
+//
+// 主线只有一条：**凭据只能走 HTTPS**。
+//
+// 接入之后每一轮同步都带着长期 API Key（Authorization: Bearer …），
+// 而 API Key 是「泄露一次、长期可用」的东西：明文 HTTP 的链路上任何一跳
+// （同一个 WiFi、机房上游、运营商）都能把它抄走，然后以该用户的身份接入
+// 隧道、改隧道配置。地址是用户在界面上填的，所以必须在填的时候就拒绝。
+//
+// 唯一的例外是本地调试：开发构建（没有注入地址）面向 127.0.0.1 起面板时
+// 允许 http，因为那条链路不出本机。构建注入的地址一律要求 https——
+// 正式客户端的内置地址如果写成 http://IP，那就等于把 API Key 明文发出去。
+func checkServerURL(raw string, injected bool) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", errors.New("请填写服务器地址")
@@ -1986,7 +2042,18 @@ func normalizeServerURL(raw string) (string, error) {
 	if err != nil {
 		return "", errors.New("服务器地址格式不正确")
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if injected {
+			return "", errors.New("内置地址必须使用 https：明文 HTTP 会把 API Key 暴露在链路上")
+		}
+		if !isLoopbackHost(u.Hostname()) {
+			return "", errors.New(
+				"服务端必须使用 https：明文 HTTP 会把 API Key 暴露给链路上的任何一跳。" +
+					"http 只允许用于本机调试（127.0.0.1 / localhost / ::1）")
+		}
+	default:
 		return "", errors.New("仅支持 http 或 https 协议")
 	}
 	if u.Host == "" {
@@ -1995,15 +2062,28 @@ func normalizeServerURL(raw string) (string, error) {
 	return strings.TrimRight(u.Scheme+"://"+u.Host+u.Path, "/"), nil
 }
 
+// isLoopbackHost 判断主机名是否指向本机。
+func isLoopbackHost(host string) bool {
+	// URL 里的 IPv6 字面量带方括号，如 http://[::1]:8080。
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // resolveBase 统一解析服务端地址。
 //
 // 构建注入的地址优先：正式客户端只认内置地址，用户无从篡改，
 // 也就不会被诱导连到钓鱼服务器。未注入时才用界面上填写的（仅调试构建）。
 func (a *App) resolveBase(serverURL string) (string, error) {
 	if base := defaultServerURL(); base != "" {
-		return base, nil
+		// 注入的地址同样要过校验：地址是 CI 里的 secret，填错时客户端
+		// 应当直接拒绝发送凭据，而不是把长期 API Key 明文发出去。
+		return checkServerURL(base, true)
 	}
-	return normalizeServerURL(serverURL)
+	return checkServerURL(serverURL, false)
 }
 
 // ServerMailEnabled 查询服务端是否启用了邮件功能。

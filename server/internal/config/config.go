@@ -342,10 +342,22 @@ func (c *Config) validate() error {
 			return fmt.Errorf("LT_TRUSTED_PROXIES 中的 %q 不是合法的 IP 或 CIDR", p)
 		}
 	}
-	for _, p := range c.FrpsPluginAllowCIDRs {
-		if isTrustAll(p) {
-			return fmt.Errorf("LT_FRPS_PLUGIN_ALLOW_CIDR 不允许配置 %q：插件回调等同于最高权限接口", p)
-		}
+	// 两份 CIDR 白名单都必须逐项可解析。
+	//
+	// 为什么要在启动时挡住，而不是留给运行期：解析失败的条目会被静默丢弃，
+	// 而这两处的语义恰好都建立在「列表非空」上——
+	//
+	//	管理白名单：解析结果为空会被当成「不限制」，于是「填了白名单但每项
+	//	            都拼错」不是谁都进不来，而是**公网谁都能进后台**；
+	//	插件白名单：解析结果为空会让所有回调被拒，隧道全部无法上线，
+	//	            而报错只是一个 403 日志，看不出是配置写错了。
+	//
+	// 两种后果都必须等到线上才暴露，代价与「启动失败」完全不成比例。
+	if err := validateCIDRList("LT_ADMIN_ALLOW_CIDR", c.AdminAllowCIDRs); err != nil {
+		return err
+	}
+	if err := validateCIDRList("LT_FRPS_PLUGIN_ALLOW_CIDR", c.FrpsPluginAllowCIDRs); err != nil {
+		return err
 	}
 
 	if !c.IsProd() {
@@ -472,6 +484,28 @@ func isPublicBind(addr string) bool {
 		return true
 	}
 	return !ip.IsLoopback()
+}
+
+// validateCIDRList 逐项校验来源白名单：每一项都必须是合法的 IP 或 CIDR，
+// 且不能等价于「信任所有来源」。
+//
+// 空列表是合法的（表示未启用白名单），但列表**里**的空项不是：
+// 它多半来自 "10.0.0.0/8, ,1.2.3.4" 这种手写串，而它同时会让管理员以为
+// 该项已经生效。
+func validateCIDRList(name string, list []string) error {
+	for _, raw := range list {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return fmt.Errorf("%s 中存在空项：白名单里的每一项都必须是 IP 或 CIDR", name)
+		}
+		if isTrustAll(v) {
+			return fmt.Errorf("%s 不允许配置 %q：那等于不限制来源", name, v)
+		}
+		if _, _, err := net.ParseCIDR(v); err != nil && net.ParseIP(v) == nil {
+			return fmt.Errorf("%s 中的 %q 不是合法的 IP 或 CIDR", name, v)
+		}
+	}
+	return nil
 }
 
 // isTrustAll 判断网段是否等价于「信任所有来源」。

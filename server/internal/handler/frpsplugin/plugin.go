@@ -137,8 +137,13 @@ type Handler struct {
 }
 
 // New 构造处理器。allowCIDRs 为允许调用本回调的来源网段。
+//
+// 解析失败的条目与「白名单为空」都会被记下来：前者会被静默丢弃，后者会让
+// Guard 拒绝**所有**回调——表现是「隧道全部起不来」，而单条日志只有一个
+// 403。启动校验（config 包）会在更早的地方拦住非法项，这里是兜底与线索。
 func New(svc *service.Services, cidrs []string) *Handler {
 	h := &Handler{svc: svc}
+	var invalid []string
 	for _, c := range cidrs {
 		if _, n, err := net.ParseCIDR(c); err == nil {
 			h.allowCIDRs = append(h.allowCIDRs, n)
@@ -150,7 +155,16 @@ func New(svc *service.Services, cidrs []string) *Handler {
 				bits = 128
 			}
 			h.allowCIDRs = append(h.allowCIDRs, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
 		}
+		invalid = append(invalid, c)
+	}
+	if len(invalid) > 0 {
+		log.Printf("[plugin] LT_FRPS_PLUGIN_ALLOW_CIDR 中有 %d 项不是合法的 IP 或 CIDR: %v",
+			len(invalid), invalid)
+	}
+	if len(h.allowCIDRs) == 0 {
+		log.Printf("[plugin] 插件回调白名单为空：所有回调都会被拒绝，隧道将无法上线")
 	}
 	return h
 }
@@ -489,17 +503,25 @@ func (h *Handler) onNewProxy(req *request) response {
 	return allow()
 }
 
+// domainMatched 校验客户端声明的域名与数据库里的隧道配置**完全一致**。
+//
+// 为什么不能只要求「包含获准域名」：customDomains 由客户端提交，而 frpc 的
+// 配置文件在用户手上。保留获准域名、再追加几个别的域名，就能通过「包含」
+// 式的检查——frps 会把那些额外域名也路由到这条隧道，等于用别人（或平台
+// 自己的）域名接管流量。所以要求集合一致：该用什么就用什么，多一个都不行。
 func domainMatched(t *model.Tunnel, content *newProxyContent) bool {
 	if t.Domain != "" {
-		for _, d := range content.CustomDomains {
-			if strings.EqualFold(d, t.Domain) {
-				return true
-			}
-		}
-		return false
+		// 平台为自定义域名隧道下发的就是 customDomains = [<域名>]，恰好一项。
+		return len(content.CustomDomains) == 1 &&
+			strings.EqualFold(strings.TrimSpace(content.CustomDomains[0]), t.Domain) &&
+			content.SubDomain == ""
 	}
 	if t.Subdomain != "" {
-		return strings.EqualFold(content.SubDomain, t.Subdomain)
+		// 二级域名隧道只应带 subdomain。两者同时出现时 frps 按 customDomains
+		// 路由，那就绕开了「只能落在平台泛域名之下」这条限制（见 service
+		// 里对自定义域名的校验）。
+		return strings.EqualFold(strings.TrimSpace(content.SubDomain), t.Subdomain) &&
+			len(content.CustomDomains) == 0
 	}
 	return false
 }

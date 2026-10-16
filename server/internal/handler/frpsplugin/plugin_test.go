@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
 // TestHandleRejectsUnknownOp 覆盖插件的 fail-closed 策略。
@@ -94,6 +96,42 @@ func TestHandleRejectsMalformedBody(t *testing.T) {
 	rec := postPlugin(t, r, `{"op":`)
 	if res := decodeResponse(t, rec); !res.Reject {
 		t.Fatalf("解析失败必须拒绝，实际放行: %s", rec.Body.String())
+	}
+}
+
+// TestDomainMatchedRequiresExactSet 覆盖「保留获准域名、再追加别的域名」。
+//
+// customDomains 由客户端提交，而 frpc 的配置文件在用户手上：只检查「是否
+// 包含获准域名」的话，[获准域名, 别人的域名] 也能通过，frps 会把后者一并
+// 路由进这条隧道——等于用平台的（或第三方的）域名接管流量。
+func TestDomainMatchedRequiresExactSet(t *testing.T) {
+	custom := &model.Tunnel{Domain: "shop.tunnel.example.com"}
+	sub := &model.Tunnel{Subdomain: "shop"}
+
+	cases := []struct {
+		name    string
+		tunnel  *model.Tunnel
+		content newProxyContent
+		want    bool
+	}{
+		{"自定义域名恰好一致", custom, newProxyContent{CustomDomains: []string{"shop.tunnel.example.com"}}, true},
+		{"自定义域名大小写不同", custom, newProxyContent{CustomDomains: []string{"SHOP.Tunnel.Example.COM"}}, true},
+		{"追加了未授权域名", custom, newProxyContent{CustomDomains: []string{"shop.tunnel.example.com", "evil.example.com"}}, false},
+		{"只报了别的域名", custom, newProxyContent{CustomDomains: []string{"evil.example.com"}}, false},
+		{"一个域名都没报", custom, newProxyContent{}, false},
+		{"改用子域顶替自定义域名", custom, newProxyContent{SubDomain: "shop"}, false},
+		{"二级域名一致", sub, newProxyContent{SubDomain: "shop"}, true},
+		{"二级域名夹带自定义域名", sub, newProxyContent{SubDomain: "shop", CustomDomains: []string{"evil.example.com"}}, false},
+		{"二级域名不符", sub, newProxyContent{SubDomain: "admin"}, false},
+		{"隧道既无域名也无子域", &model.Tunnel{}, newProxyContent{CustomDomains: []string{"x.example.com"}}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := domainMatched(tc.tunnel, &tc.content); got != tc.want {
+				t.Fatalf("domainMatched = %v，期望 %v", got, tc.want)
+			}
+		})
 	}
 }
 

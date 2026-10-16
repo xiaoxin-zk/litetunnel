@@ -167,11 +167,20 @@ jobs:
 
       - name: Assemble
         run: |
-          mkdir -p bundle/deploy/frps bundle/deploy/caddy bundle/deploy/scripts
+          # 目录结构必须与仓库一致：README 里的命令都按 deploy/xxx 书写，
+          # 包里少一层或换个名字，用户就只能自己猜。
+          mkdir -p bundle/deploy/frps bundle/deploy/caddy bundle/deploy/scripts bundle/deploy/systemd
           cp deploy/docker-compose.yml bundle/deploy/
           cp deploy/frps/frps.toml.template bundle/deploy/frps/
           cp deploy/caddy/Caddyfile.template bundle/deploy/caddy/
+          # Caddyfile 里要配 DNS Challenge 就必须自建镜像（官方镜像不含任何
+          # dns 插件），少了这个 Dockerfile，用户照文档走也构建不出来——
+          # 只会得到一句 unrecognized directive: dns。
+          cp deploy/caddy/Dockerfile bundle/deploy/caddy/
           cp deploy/scripts/render.sh deploy/scripts/render.ps1 bundle/deploy/scripts/
+          # 防火墙 helper 与域名配置服务（lt-config）的 systemd 单元：
+          # 后台「域名与证书」依赖后者，包里没有就得回仓库里翻。
+          cp deploy/systemd/* bundle/deploy/systemd/
           cp .env.example README.md bundle/
           cd bundle && zip -r ../litetunnel-deploy.zip .
 

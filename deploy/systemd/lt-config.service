@@ -1,0 +1,47 @@
+[Unit]
+Description=LiteTunnel 域名与证书配置服务（宿主机侧受限渲染端点）
+Documentation=https://github.com/xiaoxin-zk/litetunnel
+# 它要重建容器，所以等 docker 起来；解析域名也要网络就绪。
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 必须以 root 运行：它要调用 docker 起校验容器、重建 caddy 与 frps，
+# 并写入部署目录。
+#
+# 权限边界不是靠降权保证的，而是靠三重约束：
+#   1. 只监听回环地址（启动时校验，非回环直接拒绝启动）
+#   2. 所有请求必须带 Bearer token（常量时间比较）
+#   3. 只允许覆盖白名单内的域名 / DNS 变量，且只重建 caddy 与 frps 两个容器
+User=root
+
+# 配置从这里读。首次部署请复制 lt-config.env.example 并生成随机 token。
+EnvironmentFile=-/etc/litetunnel/lt-config.env
+
+ExecStart=/usr/local/bin/lt-config
+
+Restart=on-failure
+RestartSec=3
+
+# ---- 加固 ----
+# 目标是「即使本服务自身出问题，也难以横向移动」，
+# 而不是限制它做本职操作（那由白名单与校验器负责）。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+# 部署目录必须可写：Caddyfile、frps.toml 与 .env 都改在这里。
+#
+# ProtectSystem=full 会把 /usr、/boot、/etc 置为只读，所以部署目录放在
+# /opt 或 /srv 下最省事；放在 /etc 里就必须在这里额外放行。
+ReadWritePaths=/opt/litetunnel
+
+[Install]
+WantedBy=multi-user.target

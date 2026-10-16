@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -171,6 +172,10 @@ type App struct {
 	//
 	// 不落盘：它描述的是「这一次运行」的情况，重启后重连一次就有结果了。
 	tunnelErrs map[uint]tunnelErr
+
+	// cleanupWarned 记录已经就「本地配置清理失败」提示过用户的隧道，
+	// 避免每轮同步（20 秒）都重复弹同一条提示。
+	cleanupWarned map[uint]bool
 
 	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。
 	//
@@ -597,15 +602,25 @@ func (a *App) Logout() (State, error) {
 	// 每条隧道的 frpc.toml 里同样是凭据（客户端接入密钥 + frps 全局 token），
 	// 只删 config.json 等于「退出了但钥匙还留在磁盘上」——换个账号登录后，
 	// 上一个账号的接入密钥仍然可以被读出来使用。
-	if err := clearConfig(); err != nil {
-		// 内存里的凭据已经清了，但磁盘上那份还在——下次启动会重新读到它。
+	// 两处都要尝试，最后汇总错误。
+	//
+	// 不能一处失败就返回：主配置与隧道配置是两份独立的凭据（API Key vs
+	// 接入密钥），一处删不掉不该让另一处也留着——能清掉一个是一个。
+	cfgErr := clearConfig()
+	frpcErr := removeAllFrpcConfigs()
+
+	if cfgErr != nil || frpcErr != nil {
+		// 内存里的凭据已经清了，但磁盘上还有残留——下次启动可能重新读到它。
 		// 这必须让用户知道，所以照样推状态、并把错误抛出去。
 		a.emitState()
-		return a.GetState(), fmt.Errorf("已退出，但本地凭据文件删除失败: %w", err)
-	}
-	if err := removeAllFrpcConfigs(); err != nil {
-		a.emitState()
-		return a.GetState(), fmt.Errorf("已退出，但隧道配置文件删除失败（其中含接入密钥）: %w", err)
+		switch {
+		case cfgErr != nil && frpcErr != nil:
+			return a.GetState(), fmt.Errorf("已退出，但本地凭据清理失败：主配置 %v；隧道配置 %v", cfgErr, frpcErr)
+		case cfgErr != nil:
+			return a.GetState(), fmt.Errorf("已退出，但本地主配置删除失败: %w", cfgErr)
+		default:
+			return a.GetState(), fmt.Errorf("已退出，但隧道配置文件删除失败（其中含接入密钥）: %w", frpcErr)
+		}
 	}
 	return a.GetState(), nil
 }
@@ -743,7 +758,16 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 	}
 
 	// 停进程：它已经没有服务端记录，继续跑只会刷重连错误。
-	_ = a.mgr.Stop(id)
+	//
+	// 停止失败时**不能继续删配置**：进程还在跑，配置文件却被删了——用户看到
+	// 「已删除」，而 frpc 仍在后台占着端口转发，且下次排查时连它用的是哪份
+	// 配置都查不到。这种情况必须如实报错，并把清理留给下一轮同步
+	// （cleanupStaleConfigs 会在进程停下之后接手）。
+	if err := a.mgr.Stop(id); err != nil {
+		msg := "隧道已在服务端删除，但本地 frpc 进程停止失败，配置文件暂未清理：" + err.Error()
+		a.emitNotice(msg)
+		return a.GetState(), errors.New(msg)
+	}
 
 	// 状态记录一并清掉：这条隧道不会再回来了。
 	a.clearTunnelErr(id)
@@ -1056,6 +1080,13 @@ func (a *App) applySync() (changed bool, err error) {
 	// 会让这两个 map 一直长下去。
 	a.pruneTunnelState(alive)
 
+	// 再清掉它们在本地留下的配置文件。
+	//
+	// 只清内存是不够的：frpc.toml 里含客户端接入密钥与 frps token，隧道已经在
+	// 服务端删掉（可能是在网页端删的），磁盘上那份却仍然可以被任何能读到该
+	// 目录的进程拿去接入。
+	a.cleanupStaleConfigs(alive)
+
 	// 单条隧道的失败要攒起来，最后作为**部分失败**返回。
 	//
 	// 以前是只写一行日志、然后照常返回 nil：调用方于是把本轮同步当成
@@ -1298,6 +1329,73 @@ func (a *App) clearRetry(id uint) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.retries, id)
+}
+
+// cleanupStaleConfigs 清掉「服务端已经没有」的隧道在本地留下的配置文件。
+//
+// # 为什么以磁盘为准，而不是只看「刚停掉的进程」
+//
+// 隧道可能在**网页端**被删除，或客户端删除请求在服务端完成之后遇到网络错误：
+// 这时客户端这一侧既没有它的进程、也没有内存状态，上面那个「收进程」的循环
+// 根本不会经过它，pruneTunnelState 又只清内存——磁盘上的 frpc.toml 就一直留着。
+//
+// 所以这里扫一遍隧道目录，凡是不在服务端清单里的都清掉。目录名是隧道 ID。
+//
+// 进程还没停下来的**刻意不删**：删了它仍在跑，而配置文件没了意味着下次排查时
+// 什么都看不到；磁盘上的残留本身就是「待重试状态」，下一轮同步会再来一次。
+func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
+	dir, err := frpcTunnelsDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// 目录不存在是正常的（还没建过隧道）。
+		return
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id64, perr := strconv.ParseUint(e.Name(), 10, 32)
+		if perr != nil {
+			// 不是隧道目录（用户自己放的东西），别动它。
+			continue
+		}
+		id := uint(id64)
+		if alive[id] {
+			continue
+		}
+		if a.mgr.Running(id) {
+			a.warnConfigCleanup(id, "本地 frpc 进程尚未停止，配置文件暂未清理")
+			continue
+		}
+		if rerr := removeFrpcConfig(id); rerr != nil {
+			a.warnConfigCleanup(id, "本地配置文件清理失败（其中含接入密钥）："+rerr.Error())
+			continue
+		}
+		log.Printf("[client] 已清理隧道 %d 的本地配置（该隧道在服务端已不存在）", id)
+	}
+}
+
+// warnConfigCleanup 就「配置清理失败」提示用户，同一隧道只提示一次。
+//
+// 不重复提示是因为它会每 20 秒重试一次：每次都弹提示只会把界面刷满，
+// 而结论一直是同一个。真正的重试仍在继续（残留文件还在，下轮会再试）。
+func (a *App) warnConfigCleanup(id uint, msg string) {
+	a.mu.Lock()
+	if a.cleanupWarned == nil {
+		a.cleanupWarned = map[uint]bool{}
+	}
+	first := !a.cleanupWarned[id]
+	a.cleanupWarned[id] = true
+	a.mu.Unlock()
+
+	if first {
+		log.Printf("[client] 隧道 %d：%s", id, msg)
+		a.emitNotice(msg)
+	}
 }
 
 // pruneTunnelState 丢弃「服务端已经没有」的隧道留下的各种记录。

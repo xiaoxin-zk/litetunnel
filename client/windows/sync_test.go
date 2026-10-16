@@ -65,6 +65,71 @@ func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
 	}
 }
 
+// TestSyncCleansConfigOfTunnelDeletedElsewhere 覆盖「网页端删除后本地配置残留」。
+//
+// 隧道可能是在网页端删掉的，或客户端的删除请求在服务端完成之后遇到网络错误：
+// 这时客户端这一侧既没有它的进程、也没有内存状态，只清内存的 pruneTunnelState
+// 根本不会碰它——磁盘上的 frpc.toml（含接入密钥与 frps token）就一直留着。
+func TestSyncCleansConfigOfTunnelDeletedElsewhere(t *testing.T) {
+	withTempConfigDir(t)
+	srv, cfgStatus, _, noTunnels := fakePanel(t)
+	cfgStatus.Store(http.StatusOK)
+	a := newSyncTestApp(t, srv)
+
+	// 本地存在隧道 9 的配置，而服务端清单里没有它。
+	if err := writeFrpcConfig(9, "token = \"secret\"\n"); err != nil {
+		t.Fatalf("写隧道配置失败: %v", err)
+	}
+	tunnelsDir, err := frpcTunnelsDir()
+	if err != nil {
+		t.Fatalf("取隧道目录失败: %v", err)
+	}
+	staleDir := filepath.Join(tunnelsDir, "9")
+	noTunnels.Store(true) // 服务端返回空清单
+
+	if _, err := a.applySync(); err != nil {
+		t.Fatalf("同步失败: %v", err)
+	}
+
+	if _, serr := os.Stat(staleDir); !os.IsNotExist(serr) {
+		t.Error("服务端已不存在的隧道，其本地配置应被同步清理（其中含接入密钥）")
+	}
+}
+
+// TestLogoutCleansTunnelConfigsEvenIfMainConfigFails 覆盖「一处失败阻断另一处清理」。
+//
+// 主配置与隧道配置是两份独立的凭据（API Key vs 接入密钥）。主配置删不掉时
+// 直接返回，会让本来能删掉的隧道配置也留在磁盘上——能清掉一个是一个。
+func TestLogoutCleansTunnelConfigsEvenIfMainConfigFails(t *testing.T) {
+	withTempConfigDir(t)
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	// 把 config.json 造成一个非空目录：os.Remove 必定失败（两个平台都一样）。
+	cfgPath, err := configFilePath()
+	if err != nil {
+		t.Fatalf("取配置路径失败: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfgPath, "sub"), 0o700); err != nil {
+		t.Fatalf("构造失败场景失败: %v", err)
+	}
+	if err := writeFrpcConfig(1, "token = \"secret\"\n"); err != nil {
+		t.Fatalf("写隧道配置失败: %v", err)
+	}
+	tunnelsDir, err := frpcTunnelsDir()
+	if err != nil {
+		t.Fatalf("取隧道目录失败: %v", err)
+	}
+
+	if _, lerr := a.Logout(); lerr == nil {
+		t.Fatal("主配置删不掉时应如实报错，而不是当作已退出")
+	}
+
+	if _, serr := os.Stat(tunnelsDir); !os.IsNotExist(serr) {
+		t.Error("主配置删除失败不该阻断隧道配置清理（其中含接入密钥）")
+	}
+}
+
 // TestLogoutRemovesAllCredentialFiles 覆盖「退出登录后磁盘上仍留着凭据」。
 //
 // 主配置里是 API Key，每条隧道的 frpc.toml 里是客户端接入密钥与 frps 全局

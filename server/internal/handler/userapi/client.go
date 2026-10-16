@@ -21,12 +21,28 @@ import (
 type clientAuthReq struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+	// 账号失败次数较多时要求人机验证（与网页端统一登录同一套策略）。
+	CaptchaTicket string `json:"captcha_ticket"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
+
+// clientCaptchaMessage 是「要求验证码」时给桌面客户端的提示。
+//
+// 不能照搬网页端那句「请输入验证码后重试」：客户端的登录框没有验证码输入框
+// （它现在已经不调这个接口了，老版本才会），照着这句话做，用户只会反复看到
+// 同一个他无法满足的要求。真正可执行的路径有两条，直接写出来。
+const clientCaptchaMessage = "该账号近期登录失败次数较多，为防止爆破已要求人机验证。" +
+	"请改用 API Key 接入，或先在网页端登录成功后再试"
 
 // ClientAuth 供桌面客户端首次登录使用，直接返回可用的接入信息与完整配置。
 //
-// 这是与网页登录等价的密码校验入口，必须套用同样的账号锁定策略，
-// 否则攻击者可以绕过网页端的锁定直接从客户端接口爆破。
+// 这是与网页登录等价的密码校验入口：同一份账号、同一个密码，因此必须套用
+// **同一套**策略，否则它就是绕过网页端限制的旁路。曾经这里只有一份独立的
+// IP 限流与锁定 scope，没有账号级验证码要求——分布式来源改打这个接口就能
+// 继续猜密码，而网页端早已要求验证码。
+//
+// 现在与统一登录共用同一份失败计数（Services.LoginGuard）与同一个 scope，
+// 并同样检查账号级验证码要求。
 func (h *Handler) ClientAuth(c *gin.Context) {
 	var req clientAuthReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -34,31 +50,51 @@ func (h *Handler) ClientAuth(c *gin.Context) {
 		return
 	}
 
+	// 与统一登录使用同一个规范化后的账号作为计数键：验证码要求是按登录日志
+	// 里的失败次数统计的，写入与查询的写法必须一致，否则交替大小写就能把
+	// 失败次数摊薄（见 authapi.Login 里的说明）。
 	account := strings.ToLower(strings.TrimSpace(req.Username))
 	attempt := service.LoginAttempt{
 		Kind:     model.LoginKindUser,
-		Username: req.Username,
+		Username: account,
 		Source:   model.LoginSourceClient,
 	}
 
 	ip := httpx.ClientIP(c)
-	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account, ip) {
+	if !shared.CheckLoginLock(c, h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip) {
 		attempt.Result = model.LoginResultLocked
 		attempt.Detail = "账号在当前网络下处于登录锁定期"
 		h.recordLogin(c, attempt)
 		return
 	}
 
+	switch shared.CheckLoginCaptcha(c, h.svc, account, req.CaptchaTicket, req.CaptchaAnswer, clientCaptchaMessage) {
+	case shared.CaptchaGatePass:
+	case shared.CaptchaGateWrong:
+		shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+		attempt.Result = model.LoginResultBadCred
+		attempt.Detail = "验证码不正确"
+		h.recordLogin(c, attempt)
+		return
+	default:
+		// 客户端拿到的是「需要验证码」而不是密码错误，因此不计入失败次数：
+		// 它还没真正尝试过密码。
+		attempt.Result = model.LoginResultLocked
+		attempt.Detail = "账号累计失败次数较多，要求人机验证"
+		h.recordLogin(c, attempt)
+		return
+	}
+
 	u, err := h.svc.Authenticate(req.Username, req.Password, ip)
 	if err != nil {
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account, ip)
+		shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
 		attempt.Result = shared.LoginResultOf(err)
 		attempt.Detail = err.Error()
 		h.recordLogin(c, attempt)
 		shared.Fail(c, err)
 		return
 	}
-	shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account, ip)
+	shared.LoginSucceeded(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
 	attempt.AccountID = u.ID
 	attempt.Username = u.Username
 	attempt.Result = model.LoginResultSuccess

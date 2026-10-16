@@ -148,8 +148,18 @@ func (s *service) validateCaddy(text, image string, vars map[string]string) (str
 	// 把凭据传进校验容器：{env.LT_CADDY_DNS_CREDENTIAL} 取不到值时，
 	// 部分服务商插件会在 provision 阶段直接报「没有凭据」，
 	// 那样就成了一次与配置无关的误报。
+	//
+	// 但**不能用 `-e KEY=value`**：那种写法的值会出现在 docker 进程的命令行里
+	// （/proc/<pid>/cmdline），宿主机上任何本地用户都能在容器启动的那一瞬读到。
+	// 这是 DNS API 凭据，拿到就能改这个域名的解析记录。改用 env 文件：docker
+	// 从文件读值，命令行上只有文件路径；文件按 0600 建在 0700 的临时目录里，
+	// 校验结束随目录一起删除。
 	if cred := vars[tlscfg.VarDNSCredential]; cred != "" {
-		args = append(args, "-e", tlscfg.VarDNSCredential+"="+cred)
+		envPath := filepath.Join(dir, "caddy.env")
+		if err := os.WriteFile(envPath, []byte(tlscfg.VarDNSCredential+"="+cred+"\n"), 0o600); err != nil {
+			return "", fmt.Errorf("写入校验用 env 文件失败: %w", err)
+		}
+		args = append(args, "--env-file", envPath)
 	}
 	args = append(args, image, "caddy", "validate", "--config", "/w/Caddyfile", "--adapter", "caddyfile")
 
@@ -158,6 +168,28 @@ func (s *service) validateCaddy(text, image string, vars map[string]string) (str
 		return out, fmt.Errorf("Caddy 配置校验未通过：%s", strings.TrimSpace(out))
 	}
 	return "Caddy：" + strings.TrimSpace(out), nil
+}
+
+// validateContainers 用**将要上线的那个镜像**实际跑一遍校验。
+//
+// 两层分工：validateVars 看变量本身（能指出是哪个字段的问题），这里看这份
+// 渲染结果在那个镜像里能不能起来。两者都不通过就不该写盘。
+func (s *service) validateContainers(caddyText, caddyImage, frpsText string, vars map[string]string) (string, error) {
+	if s.validateFn != nil {
+		return s.validateFn(caddyText, caddyImage, frpsText, vars)
+	}
+	out, err := s.validateCaddy(caddyText, caddyImage, vars)
+	if err != nil {
+		return "", err
+	}
+	if !s.validateFrps {
+		return out, nil
+	}
+	frpsOut, err := s.validateFrpsConfig(frpsText)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out + "\n" + frpsOut), nil
 }
 
 // validateFrpsConfig 用 frps 自带的 verify 子命令校验。

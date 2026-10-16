@@ -44,10 +44,16 @@ func (s *Services) DomainDesired() DomainAppliedSet {
 //
 // 没有任何一次成功下发时回落到环境变量：那正是当前在跑的配置（手工部署
 // 时由 .env 决定），而不是「还没生效的期望值」。
+//
+// 必须走与运行期同一套读取器（UserPublicURL / TunnelDomain / DomainHTTPSMode），
+// 而不是直接读 domain.applied_*：后者在「从未用过这个页面」的部署上是空的，
+// 于是 Applied 为空、Desired 是 .env 的值，Pending 会恒为真——页面一直报
+// 「已保存的配置还没有生效」、并把「宿主机实际在用」显示成「未设置面板域名」，
+// 而实际流量正按 .env 正常跑着。那种部署必须继续以 .env 为准。
 func (s *Services) DomainApplied() DomainAppliedSet {
 	return DomainAppliedSet{
-		Panel:     normalizeDomainValue(s.Settings.Get(KeyDomainAppliedPanel)),
-		Tunnel:    normalizeDomainValue(s.Settings.Get(KeyDomainAppliedTunnel)),
+		Panel:     normalizeDomainValue(s.UserPublicURL()),
+		Tunnel:    s.TunnelDomain(),
 		HTTPSMode: s.DomainHTTPSMode(),
 	}
 }

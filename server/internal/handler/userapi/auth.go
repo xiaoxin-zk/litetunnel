@@ -9,6 +9,7 @@ import (
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/shared"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
@@ -108,7 +109,18 @@ type resetPasswordReq struct {
 	OldPassword string `json:"old_password"`
 	// EmailCode 在「站点已启用邮件」时用于验证身份
 	EmailCode string `json:"email_code"`
+	// 旧密码模式同样在校验密码，因此同样可能在账号失败次数过多时被要求
+	// 人机验证（与统一登录共用一份计数）。
+	CaptchaTicket string `json:"captcha_ticket"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
+
+// resetCaptchaMessage 是旧密码重置入口被要求验证码时的提示。
+//
+// 这个入口通常出现在「站点未启用邮件」的部署里，所以不能让人去查邮箱；
+// 网页端的重置表单也没有验证码输入框，因此给出一条真正可执行的路径。
+const resetCaptchaMessage = "该账号近期失败次数较多，为防止爆破已要求人机验证。" +
+	"请等待约 30 分钟后重试；若急需使用，请联系管理员重置密码"
 
 // ResetPassword 重置密码。三种入口，按站点配置与请求内容自动选择：
 //
@@ -145,21 +157,55 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 
 	// 入口 2：旧密码模式（站点未启用邮件）
 	if !h.svc.MailEnabled() {
-		// 复用登录的账号锁定维度。不这么做的话，本接口会立刻变成
-		// 绕过登录锁定的旁路：被锁住的攻击者改打这里继续撞库。
-		if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUser, account, ip) {
+		// 这里同样在**校验密码**（旧密码），所以必须与登录共用同一份计数与
+		// 同一个 scope。否则它就是一个绕过登录限速的旁路：在登录页撞几次、
+		// 再换到这个接口继续撞，两边各自计数都到不了阈值。
+		attempt := service.LoginAttempt{
+			Kind: model.LoginKindUser,
+			// 与登录共用同一个规范化后的账号作为计数键（见 authapi.Login）。
+			Username: account,
+			Source:   model.LoginSourceWeb,
+			Detail:   "通过旧密码重置密码",
+		}
+		if !shared.CheckLoginLock(c, h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip) {
+			attempt.Result = model.LoginResultLocked
+			attempt.Detail = "账号在当前网络下处于登录锁定期"
+			h.recordLogin(c, attempt)
 			return
 		}
+		// 账号级验证码要求同样适用：它是分布式爆破的唯一克星，
+		// 而分布式来源恰好能绕开按 IP 计数的硬锁。
+		switch shared.CheckLoginCaptcha(c, h.svc, account, req.CaptchaTicket, req.CaptchaAnswer, resetCaptchaMessage) {
+		case shared.CaptchaGatePass:
+		case shared.CaptchaGateWrong:
+			shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+			attempt.Result = model.LoginResultBadCred
+			attempt.Detail = "验证码不正确"
+			h.recordLogin(c, attempt)
+			return
+		default:
+			attempt.Result = model.LoginResultLocked
+			attempt.Detail = "账号累计失败次数较多，要求人机验证"
+			h.recordLogin(c, attempt)
+			return
+		}
+
 		err := h.svc.ResetPasswordByOldPassword(req.Account, req.OldPassword, req.Password, ip)
 		if err != nil {
-			// 只有「凭据错误」才计入锁定次数；密码强度不合格之类不该算失败。
+			// 只有「凭据错误」才计入锁定次数与登录日志：密码强度不合格之类
+			// 既不是一次登录尝试，也不该消耗失败额度。
 			if errors.Is(err, service.ErrBadCredentials) {
-				shared.LoginFailed(h.guard, shared.LoginLockScopeUser, account, ip)
+				shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+				attempt.Result = model.LoginResultBadCred
+				attempt.Detail = err.Error()
+				h.recordLogin(c, attempt)
 			}
 			shared.Fail(c, err)
 			return
 		}
-		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUser, account, ip)
+		shared.LoginSucceeded(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+		attempt.Result = model.LoginResultSuccess
+		h.recordLogin(c, attempt)
 		httpx.OK(c, gin.H{"message": okMsg})
 		return
 	}

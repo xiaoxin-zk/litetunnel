@@ -8,29 +8,25 @@ package userapi
 import (
 	"errors"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
-	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
 // Handler 用户控制台处理器。
 type Handler struct {
 	svc *service.Services
-	// guard 按账号维度锁定连续登录失败，抵御代理池对单一账号的慢速爆破。
-	guard *middleware.LoginGuard
 }
 
 // New 构造处理器。
+//
+// 登录锁来自 Services（全站唯一一份），本包不再自建：每个入口各持一份
+// 计数，等于给攻击者多份额度——在网页端撞几次、再换客户端接口撞几次，
+// 两边都不触发锁定。详见 Services.LoginGuard 与 shared.CheckLoginCaptcha。
 func New(svc *service.Services) *Handler {
-	return &Handler{
-		svc: svc,
-		// 连续失败 5 次开始锁定，首次 15 分钟，之后逐次翻倍，上限 24 小时。
-		guard: middleware.NewLoginGuard(5, 15*time.Minute, 24*time.Hour),
-	}
+	return &Handler{svc: svc}
 }
 
 // recordLogin 写入登录日志，自动补齐 IP 与 UA。

@@ -82,18 +82,11 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	//    官方镜像没有 dns 插件，拿它校验「带 DNS Challenge 的自建镜像配置」
 	//    会误报 unrecognized directive: dns。
 	caddyImage := s.effectiveCaddyImage(vars)
-	validateOut, err := s.validateCaddy(caddyText, caddyImage, vars)
+	validateOut, err := s.validateContainers(caddyText, caddyImage, frpsText, vars)
 	if err != nil {
 		return res, err
 	}
 	res.Validate = validateOut
-	if s.validateFrps {
-		frpsOut, err := s.validateFrpsConfig(frpsText)
-		if err != nil {
-			return res, err
-		}
-		res.Validate = strings.TrimSpace(res.Validate + "\n" + frpsOut)
-	}
 
 	// 6) 组装待写产物。走到这里为止，磁盘上的文件一个都没动。
 	writes := []pendingWrite{
@@ -115,7 +108,25 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 		})
 	}
 
-	// 8) 两阶段提交：候选内容全部就绪后才逐个替换。
+	// 8) 「只校验不应用」：到此为止磁盘上一个文件都没动。
+	//
+	// 这不是保守，是必须：这三个文件是**容器直接挂载**的活动配置
+	// （deploy/docker-compose.yml 挂进 caddy 与 frps，restart 策略是
+	// unless-stopped）。校验阶段把它们改掉，之后宿主机或容器只要重启一次，
+	// 这份「还没应用」的新配置就会真的生效——而面板侧记录的状态仍是上一份，
+	// 两边对不上，也没有任何地方会提示。
+	if !req.Apply {
+		res.Changed = pendingChanges(writes)
+		res.Message = "配置已生成并通过校验（未写入、未应用）"
+		return res, nil
+	}
+	if !s.allowApply {
+		// 这个检查必须放在写盘**之前**：放在后面的话，「只渲染模式」同样会
+		// 把活动文件改掉，与上面那段注释说的是同一件事。
+		return res, errors.New("本服务以只渲染模式启动（LT_CFG_APPLY=false），配置未写入、也未重建容器")
+	}
+
+	// 9) 两阶段提交：候选内容全部就绪后才逐个替换。
 	batch, err := prepareWrites(writes)
 	if err != nil {
 		return res, err
@@ -126,24 +137,34 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	}
 	res.Changed = sortedChanged(batch.changed)
 
-	// 9) 应用
-	if req.Apply {
-		if !s.allowApply {
-			return res, errors.New("本服务以只渲染模式启动（LT_CFG_APPLY=false），配置已生成但未重建容器")
-		}
-		// 文件都没有变化时仍然重建：.env 里的 DNS 凭据可能变了，
-		// 而 compose 只有在重建容器时才会把新的环境变量带进容器。
-		out, err := s.composeUp()
-		if err != nil {
-			return res, err
-		}
-		res.Applied = true
-		res.Validate = strings.TrimSpace(res.Validate + "\n" + out)
-		res.Message = "配置已应用，caddy 与 frps 已重建"
-	} else {
-		res.Message = "配置已生成并通过校验（未应用）"
+	// 10) 重建容器。
+	//
+	// 文件都没有变化时仍然重建：.env 里的 DNS 凭据可能变了，
+	// 而 compose 只有在重建容器时才会把新的环境变量带进容器。
+	out, err := s.composeUp()
+	if err != nil {
+		return res, err
 	}
+	res.Applied = true
+	res.Validate = strings.TrimSpace(res.Validate + "\n" + out)
+	res.Message = "配置已应用，caddy 与 frps 已重建"
 	return res, nil
+}
+
+// pendingChanges 列出「如果应用，会变化哪些文件」，全程不碰磁盘。
+//
+// 「保存并校验」也要给出与「应用」一致的反馈（哪些文件会变），但它的语义
+// 是只读的，所以这里只比较内容。
+func pendingChanges(writes []pendingWrite) []string {
+	var names []string
+	for _, w := range writes {
+		old, err := os.ReadFile(w.path)
+		if err == nil && string(old) == w.content {
+			continue
+		}
+		names = append(names, w.name)
+	}
+	return names
 }
 
 // deriveVars 计算由其他变量派生的值，规则与渲染脚本一致。

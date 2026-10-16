@@ -15,14 +15,16 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// LoginLockScope 用于区分不同登录入口的锁定计数，互不影响。
-const (
-	LoginLockScopeUser  = "user"
-	LoginLockScopeAdmin = "admin"
-	// LoginLockScopeUnified 用于统一登录入口：提交时无法预判账号属于哪一侧，
-	// 因此单独计数并采用最严的策略。
-	LoginLockScopeUnified = "unified"
-)
+// LoginLockScopeUnified 是全站唯一的登录锁定维度。
+//
+// 为什么只剩一个：scope 原本用来让不同入口互不影响（用户侧、管理侧各一份
+// 计数），但每个 scope 实质上是给攻击者的**另一份额度**——在 A 入口撞几次、
+// 再去 B 入口撞几次，两边都不会触发锁定。而「账号 + 密码」只有一个，计数
+// 也就只该有一份。合并入口与桌面端接口、旧密码重置现在共用它。
+//
+// 另一个维度见 CheckLoginCaptcha：它按账号累计失败计数，是分布式来源的
+// 唯一克星（硬锁按 IP 计数，分布式来源每个 IP 各拿一份额度）。
+const LoginLockScopeUnified = "unified"
 
 // CheckLoginLock 检查「账号 + 来源 IP」是否处于登录锁定期。
 //

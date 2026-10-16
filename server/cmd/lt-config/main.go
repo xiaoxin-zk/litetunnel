@@ -249,6 +249,11 @@ type service struct {
 	frpsImage    string
 	validateFrps bool
 	allowApply   bool
+
+	// validateFn 是容器校验的替身钩子，正式运行时为 nil（走真实的 caddy / frps
+	// 校验）。测试里起不了 docker，而「校验阶段不许改活动文件」这条性质必须被
+	// 守住——没有这个钩子就只能靠人眼盯着，而那正是它上次被漏掉的原因。
+	validateFn func(caddyText, caddyImage, frpsText string, vars map[string]string) (string, error)
 }
 
 // auth 校验 Bearer token，用常量时间比较避免逐字节试探。

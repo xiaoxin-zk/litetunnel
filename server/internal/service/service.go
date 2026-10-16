@@ -17,8 +17,17 @@ import (
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/mailer"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/monitor"
+)
+
+// 登录取证用的一组常量：合并入口采用最严的一档（无法预判提交的是用户还是
+// 管理员账号），并对所有校验密码的入口共用同一份计数。
+const (
+	loginLockThreshold = 3
+	loginLockBase      = 30 * time.Minute
+	loginLockMax       = 24 * time.Hour
 )
 
 // 业务错误。处理器统一映射为 HTTP 状态码。
@@ -87,6 +96,14 @@ type Services struct {
 
 	// Captchas 是内存中的一次性验证码存储。
 	Captchas *CaptchaStore
+
+	// LoginGuard 是**全站唯一**一份「账号 + 来源 IP」登录失败计数。
+	//
+	// 为什么必须唯一：每个入口各自 new 一个锁，就等于给攻击者多一份额度——
+	// 在 A 入口撞 3 次、B 入口再撞 3 次，两边都不会触发锁定，而账号级
+	// 验证码要求又只在各自入口里检查。放进 Services 是为了让「只有一份」
+	// 成为结构上的事实：新加入口时能拿到的东西只有这一个，写不出第二份。
+	LoginGuard *middleware.LoginGuard
 
 	// TOTPReplay 记录已用过的动态口令步进码，阻止窗口内重放。
 	// 动态口令的防重放记录在管理员表上（totp_last_step），不在这里：
@@ -197,6 +214,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Runtime:    NewRuntime(),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
+		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),
 
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),

@@ -151,6 +151,44 @@ func TestTunnelDomainFollowsApplied(t *testing.T) {
 	}
 }
 
+// TestDomainPendingFalseWhenOnlyEnvConfigured 覆盖「手工部署、没进过后台」这一档。
+//
+// 这类部署只用 .env 配域名，设置表里没有 domain.panel / domain.tunnel 的记录，
+// 也没有任何一次下发。此时运行期本就按 .env 在跑，界面必须显示「与期望一致」；
+// 若 Applied 不回落到 .env，就会得到「空 vs .env」的假差异，页面永久提示
+// 「已保存的配置还没有在宿主机上生效」，把管理员引去点一次根本不需要的下发。
+func TestDomainPendingFalseWhenOnlyEnvConfigured(t *testing.T) {
+	svc := newTestServices(t, &config.Config{
+		TunnelDomain:   "tunnel.example.com",
+		UserPublicURL:  "https://panel.example.com",
+		HTTPSProxyMode: tlscfg.HTTPSModeE2E,
+	})
+
+	got := svc.DomainApplied()
+	want := DomainAppliedSet{
+		Panel:     "panel.example.com",
+		Tunnel:    "tunnel.example.com",
+		HTTPSMode: tlscfg.HTTPSModeE2E,
+	}
+	if got != want {
+		t.Fatalf("没有下发记录时「已生效」应等于 .env 的实际配置，得到 %+v，期望 %+v", got, want)
+	}
+	if svc.DomainPending() {
+		t.Fatal("只用 .env 配好、且从未进过后台的部署不该显示「待下发」")
+	}
+
+	// 只保存未下发：这时才该亮起「待下发」。
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyDomainPanel: "new.example.com"}); err != nil {
+		t.Fatalf("写入设置失败: %v", err)
+	}
+	if !svc.DomainPending() {
+		t.Fatal("保存了新域名但还没下发时应当处于「待下发」状态")
+	}
+	if got := svc.DomainApplied().Panel; got != "panel.example.com" {
+		t.Fatalf("只保存未下发时「已生效」仍应是 .env 的旧值，实际 %q", got)
+	}
+}
+
 // TestBootstrapAppliedDomainAlignsUpgradePath 覆盖升级路径的一次性对齐。
 //
 // 「已生效」是后加的字段。升级前管理员若改过域名（期望值存了库），升级后

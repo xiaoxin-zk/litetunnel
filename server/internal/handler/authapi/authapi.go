@@ -9,35 +9,29 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/shared"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
-	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
 // Handler 公共认证处理器。
 type Handler struct {
-	svc   *service.Services
-	guard *middleware.LoginGuard
+	svc *service.Services
 	// adminPath 是管理员登录成功后的跳转目标，由路由层注入。
 	adminPath string
 }
 
 // New 构造处理器。
+//
+// 登录锁不在这里自建：它来自 Services，全站唯一一份。每个入口各持一份
+// 计数，等于给攻击者多份额度（见 Services.LoginGuard 的说明）。
 func New(svc *service.Services, adminPath string) *Handler {
-	return &Handler{
-		svc:       svc,
-		adminPath: adminPath,
-		// 合并入口采用最严策略：无法预判提交的是用户还是管理员账号，
-		// 因此统一按管理员标准（3 次失败锁 30 分钟起）计数。
-		guard: middleware.NewLoginGuard(3, 30*time.Minute, 24*time.Hour),
-	}
+	return &Handler{svc: svc, adminPath: adminPath}
 }
 
 func (h *Handler) record(c *gin.Context, kind, username, result, detail string) {
@@ -62,22 +56,6 @@ type loginReq struct {
 	CaptchaAnswer string `json:"captcha_answer"`
 }
 
-// respondCaptchaRequired 要求客户端先通过人机验证。
-//
-// 用 401 + 机器可读标记，而不是 429：
-// 429 的语义是「你被限流了，等着」，而这里是「请先证明你是人」。
-// 两者前端处理方式完全不同——前者只能等，后者可以立刻重试。
-func (h *Handler) respondCaptchaRequired(c *gin.Context, message string) {
-	if message == "" {
-		message = "该账号连续登录失败次数较多，请输入验证码后重试"
-	}
-	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-		"code":    http.StatusUnauthorized,
-		"message": message,
-		"data":    gin.H{"captcha_required": true},
-	})
-}
-
 // Login 统一登录入口。
 //
 // 校验顺序与信息暴露控制：
@@ -93,12 +71,17 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// account 是**计数与校验共用**的键：锁定、验证码要求、登录日志都用它。
+	//
+	// 这里不能图省事在记录时用 req.Username（原始大小写）：验证码要求是按
+	// 登录日志里的失败次数统计的，写入用一个写法、查询用另一个写法，脚本只要
+	// 交替大小写就能把失败次数摊薄，账号级防线永远不触发。
 	account := strings.ToLower(strings.TrimSpace(req.Username))
 	ip := httpx.ClientIP(c)
 
 	// 1. 硬锁：按「账号 + 来源 IP」计数，攻击者只能锁住自己。
-	if !shared.CheckLoginLock(c, h.guard, shared.LoginLockScopeUnified, account, ip) {
-		h.record(c, model.LoginKindUser, req.Username, model.LoginResultLocked,
+	if !shared.CheckLoginLock(c, h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip) {
+		h.record(c, model.LoginKindUser, account, model.LoginResultLocked,
 			"账号在当前网络下处于登录锁定期")
 		return
 	}
@@ -108,17 +91,17 @@ func (h *Handler) Login(c *gin.Context) {
 	//    这是「管理员不会被锁死」的关键：验证码由人解答，脚本无法继续爆破，
 	//    而账号真正的所有者随时能登录进来。若改成硬锁，攻击者仅凭知道用户名
 	//    就能把管理员永久挡在门外——这比爆破本身更廉价。
-	if h.svc.CaptchaRequired("login", account) {
-		if strings.TrimSpace(req.CaptchaTicket) == "" {
-			h.respondCaptchaRequired(c, "")
-			return
-		}
-		if !h.svc.CheckCaptcha(req.CaptchaTicket, req.CaptchaAnswer) {
-			shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
-			h.record(c, model.LoginKindUser, req.Username, model.LoginResultBadCred, "验证码不正确")
-			h.respondCaptchaRequired(c, "验证码不正确或已过期，请重新获取")
-			return
-		}
+	switch shared.CheckLoginCaptcha(c, h.svc, account, req.CaptchaTicket, req.CaptchaAnswer, "") {
+	case shared.CaptchaGatePass:
+	case shared.CaptchaGateWrong:
+		// 验证码错误也要计一次失败：验证码是一次性的（用错即作废），
+		// 不计的话攻击者可以拿同一张票反复试，这道防线就变成了免费的密码配额。
+		shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+		h.record(c, model.LoginKindUser, account, model.LoginResultBadCred, "验证码不正确")
+		return
+	default:
+		// 没带验证码：响应已写出，本次不计失败（用户还没真正尝试密码）。
+		return
 	}
 
 	// ---- 1. 普通用户 ----
@@ -131,7 +114,7 @@ func (h *Handler) Login(c *gin.Context) {
 			shared.Fail(c, err)
 			return
 		}
-		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account, ip)
+		shared.LoginSucceeded(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindUser, u.Username, model.LoginResultSuccess, "")
 		httpx.OK(c, gin.H{
 			"role":      "user",
@@ -144,8 +127,8 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	} else if errors.Is(err, service.ErrAccountDisabled) {
 		// 账号被禁用是明确的状态，直接告知比笼统报错更有用。
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
-		h.record(c, model.LoginKindUser, req.Username, model.LoginResultDisabled, err.Error())
+		shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+		h.record(c, model.LoginKindUser, account, model.LoginResultDisabled, err.Error())
 		httpx.Forbidden(c, "账号已被禁用，请联系管理员")
 		return
 	}
@@ -161,7 +144,7 @@ func (h *Handler) Login(c *gin.Context) {
 			shared.Fail(c, err)
 			return
 		}
-		shared.LoginSucceeded(h.guard, shared.LoginLockScopeUnified, account, ip)
+		shared.LoginSucceeded(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
 		h.record(c, model.LoginKindAdmin, a.Username, model.LoginResultSuccess, "")
 		httpx.OK(c, gin.H{
 			"role":          "admin",
@@ -190,14 +173,14 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 	if errors.Is(err, service.ErrAccountDisabled) {
-		shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
-		h.record(c, model.LoginKindAdmin, req.Username, model.LoginResultDisabled, err.Error())
+		shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+		h.record(c, model.LoginKindAdmin, account, model.LoginResultDisabled, err.Error())
 		httpx.Forbidden(c, "账号已被禁用，请联系管理员")
 		return
 	}
 
-	shared.LoginFailed(h.guard, shared.LoginLockScopeUnified, account, ip)
-	h.record(c, model.LoginKindUser, req.Username, model.LoginResultBadCred, "账号或密码不正确")
+	shared.LoginFailed(h.svc.LoginGuard, shared.LoginLockScopeUnified, account, ip)
+	h.record(c, model.LoginKindUser, account, model.LoginResultBadCred, "账号或密码不正确")
 	httpx.Unauthorized(c, "账号或密码不正确")
 }
 

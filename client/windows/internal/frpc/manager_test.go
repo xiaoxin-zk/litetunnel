@@ -30,6 +30,30 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// TestPumpReportsScannerError 覆盖「日志读取静默停摆」。
+//
+// bufio.Scanner 遇到超长行（或底层管道出错）会停止读取并返回错误。
+// 不检查它的话，日志会凭空停在某一行，看起来像「frpc 不再输出了」，
+// 而真实原因是客户端这边的读取端坏了——这类现象最容易被归因到
+// frpc 或服务端上。
+func TestPumpReportsScannerError(t *testing.T) {
+	m := testManager(t)
+
+	// 单行 2 MiB，远超 1 MiB 的单行上限，Scanner 必定报 ErrTooLong。
+	m.pump(1, "mc1", strings.NewReader(strings.Repeat("x", 2<<20)))
+
+	var found bool
+	for _, l := range m.Logs() {
+		if strings.Contains(l, "日志读取中断") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("读取失败必须留下痕迹，实际日志: %v", m.Logs())
+	}
+}
+
 func testManager(t *testing.T) *Manager {
 	t.Helper()
 	exe, err := os.Executable()
@@ -95,7 +119,7 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	cfg := testConfig(t)
 
 	c := &collector{}
-	m.SetCallbacks(c.log, func(uint, string, error) {})
+	m.SetCallbacks(c.log, func(uint, string, error, bool) {})
 
 	if err := m.Start(1, "mc1", cfg); err != nil {
 		t.Fatalf("启动隧道 1 失败: %v", err)
@@ -160,7 +184,7 @@ func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 	cfg := testConfig(t)
 
 	c := &collector{}
-	m.SetCallbacks(c.log, func(uint, string, error) {})
+	m.SetCallbacks(c.log, func(uint, string, error, bool) {})
 
 	if err := m.Start(7, "mc1", cfg); err != nil {
 		t.Fatalf("启动失败: %v", err)

@@ -113,6 +113,43 @@ func TestLoadConfigKeepsCorruptFile(t *testing.T) {
 	}
 }
 
+// TestLoadConfigNeverReturnsNil 覆盖「配置读不出来时返回 nil」。
+//
+// 调用方会直接把这个返回值存进 App，而渲染状态时无条件读它的字段
+// （ServerURL / APIKey…）。返回 nil 等于在启动路径上埋一个 panic：
+// 用户双击之后什么反应都没有，也没有任何可排查的线索。
+func TestLoadConfigNeverReturnsNil(t *testing.T) {
+	// 构造「配置目录取不到」：清掉两个环境变量，os.UserConfigDir 会失败。
+	t.Setenv("APPDATA", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	cfg, err := loadConfig()
+	if cfg == nil {
+		t.Fatal("无论成功与否都必须返回非 nil 配置，否则渲染状态时会 panic")
+	}
+	if err == nil {
+		t.Skip("当前平台未定义配置目录，构造不出这个失败场景")
+	}
+}
+
+// TestLoadConfigNonNotExistErrorStillReturnsConfig 覆盖读取失败
+// （非「文件不存在」）的情况。
+func TestLoadConfigNonNotExistErrorStillReturnsConfig(t *testing.T) {
+	dir := withTempConfigDir(t)
+	// 把 config.json 造成一个目录：os.ReadFile 返回的不是 ErrNotExist。
+	if err := os.Mkdir(filepath.Join(dir, "config.json"), 0o700); err != nil {
+		t.Fatalf("构造失败场景失败: %v", err)
+	}
+
+	cfg, err := loadConfig()
+	if cfg == nil {
+		t.Fatal("读取失败时也必须返回非 nil 配置")
+	}
+	if err == nil {
+		t.Fatal("读取失败应返回错误，界面才能显示原因")
+	}
+}
+
 // TestLoadConfigMissingFileIsNotAnError 断言「首次启动」不算异常。
 func TestLoadConfigMissingFileIsNotAnError(t *testing.T) {
 	withTempConfigDir(t)

@@ -172,8 +172,21 @@ type App struct {
 	// 不落盘：它描述的是「这一次运行」的情况，重启后重连一次就有结果了。
 	tunnelErrs map[uint]tunnelErr
 
+	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。
+	//
+	// 没有它的话：frpc 因凭据失效、地址写错等原因立刻退出，下一轮同步
+	// （20 秒后）发现进程不在就再拉一次——如此循环，日志每 20 秒重复一遍
+	// 同样的错误，而问题一点没变，用户还以为客户端在「努力重连」。
+	retries map[uint]*retryState
+
 	// cfgErr 记录本地配置读取失败的原因，通过 State 呈现给用户。
 	cfgErr string
+}
+
+// retryState 是一条隧道的重试退避状态。
+type retryState struct {
+	attempts int
+	nextAt   time.Time
 }
 
 // tunnelErr 是一次 frpc 错误记录。
@@ -219,6 +232,7 @@ func NewApp() *App {
 		mgr:        frpc.New(exePath),
 		applied:    map[uint]string{},
 		tunnelErrs: map[uint]tunnelErr{},
+		retries:    map[uint]*retryState{},
 		startedAt:  time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
@@ -244,6 +258,9 @@ func (a *App) startup(ctx context.Context) {
 			// 原始输出只有一行 start proxy success，用户看不出这意味着
 			// 「可以把地址发给朋友了」——而那恰恰是他最需要的信息。
 			a.clearTunnelErr(id)
+			// 连上了就把退避清掉：下次断开时应当立即重试，
+			// 而不是继承上一次失败的等待时间。
+			a.clearRetry(id)
 			a.emitTunnelReady(id, name)
 		case frpc.IsErrorLine(line):
 			// 记下错误原文并刷新状态，让界面能显示「为什么一直连不上」，
@@ -251,10 +268,23 @@ func (a *App) startup(ctx context.Context) {
 			a.recordTunnelErr(id, line)
 			a.emitState()
 		}
-	}, func(id uint, name string, err error) {
-		_ = id
-		_ = name
-		_ = err
+	}, func(id uint, name string, err error, requested bool) {
+		switch {
+		case requested:
+			// 我们自己停的（用户关开关、退出登录、配置变更重连）：
+			// 不是失败，不该进入退避——否则用户关掉一条隧道，
+			// 界面反而开始报「启动失败，30 秒后重试」。
+			a.clearRetry(id)
+		default:
+			// 非请求退出都算失败并进入退避，包括 err == nil 的情况：
+			// frpc 自己干净退出同样意味着这条隧道没在跑，不加退避就会
+			// 每 20 秒被重新拉起一次。
+			reason := "frpc 已退出"
+			if err != nil {
+				reason = "frpc 异常退出：" + err.Error()
+			}
+			a.noteStartFailure(id, name, reason)
+		}
 		a.emitState()
 	})
 }
@@ -343,6 +373,14 @@ func (a *App) GetState() State {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
+	// 最后一道保护：这个方法在启动路径与日志回调里都会被调用，
+	// 一旦对 nil 配置取字段就是整个界面白屏（用户只看到「双击没反应」）。
+	// loadConfig 现在保证非 nil，这里再兜一层，让以后的改动也炸不出来。
+	cfg := a.cfg
+	if cfg == nil {
+		cfg = &Config{}
+	}
+
 	// 零值时间序列化成 "0001-01-01T00:00:00Z"，前端没法用它判断
 	// 「还没同步过」，所以未同步时下发 null。
 	var lastSync *time.Time
@@ -369,10 +407,10 @@ func (a *App) GetState() State {
 	}
 
 	state := State{
-		ServerURL:      a.cfg.ServerURL,
+		ServerURL:      cfg.ServerURL,
 		ServerFixed:    serverFixed(),
-		NeedsServerURL: !serverFixed() && a.cfg.ServerURL == "",
-		LoggedIn:       a.cfg.APIKey != "",
+		NeedsServerURL: !serverFixed() && cfg.ServerURL == "",
+		LoggedIn:       cfg.APIKey != "",
 		Username:       a.username,
 		APIKeyMask:     a.apiKeyMask,
 		GatewayHost:    a.gatewayHost,
@@ -548,8 +586,10 @@ func (a *App) Logout() (State, error) {
 	a.balanceCents = 0
 	// 清掉已写入的配置记录：换个账号接入后，旧账号的配置文本不该再参与比对。
 	a.applied = map[uint]string{}
-	// 隧道错误记录也一并清掉：换个账号后，旧账号的失败原因会指向错误的排查方向。
+	// 隧道错误记录与退避状态也一并清掉：换个账号后，旧账号的失败原因会指向
+	// 错误的排查方向，而退避时间会让新账号的隧道白白多等一会儿。
 	a.tunnelErrs = map[uint]tunnelErr{}
+	a.retries = map[uint]*retryState{}
 	a.mu.Unlock()
 
 	if err := clearConfig(); err != nil {
@@ -717,8 +757,12 @@ func (a *App) StartTunnel(id uint) (State, error) {
 		}
 	}
 	if err := a.startTunnelProcess(t); err != nil {
+		a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
 		return a.GetState(), err
 	}
+	// 用户主动点开：把退避清掉。否则他刚修好问题再点一次，
+	// 可能还要等上一次失败留下的退避时间。
+	a.clearRetry(id)
 	return a.syncAndState(), nil
 }
 
@@ -969,7 +1013,26 @@ func (a *App) applySync() (changed bool, err error) {
 		if err := a.mgr.Stop(id); err != nil {
 			return changed, err
 		}
+		// 隧道都没了，它的失败记录与退避状态一并清掉：
+		// 留着只会让这两个 map 随着「建了又删」的隧道缓慢增长。
+		a.clearTunnelErr(id)
+		a.clearRetry(id)
 		changed = true
+	}
+
+	// 单条隧道的失败要攒起来，最后作为**部分失败**返回。
+	//
+	// 以前是只写一行日志、然后照常返回 nil：调用方于是把本轮同步当成
+	// 完全成功——SyncErr 被清空、LastSyncAt 被更新，而那条隧道其实没连上。
+	// 用户看到的是「一切正常」，隧道却一直不工作。
+	var failures []string
+	fail := func(t TunnelVO, msg string) {
+		a.emitTunnelLog(t.Name, msg)
+		// 同时记进该隧道的错误，让隧道行自己把原因显示出来，
+		// 而不是只躺在日志里等着被翻出来。
+		a.recordTunnelErrMsg(t.ID, msg)
+		a.noteStartFailure(t.ID, t.Name, msg)
+		failures = append(failures, t.Name+"："+msg)
 	}
 
 	for _, t := range tunnels {
@@ -985,9 +1048,9 @@ func (a *App) applySync() (changed bool, err error) {
 
 		cfgText, err := a.fetchTunnelConfig(base, apiKey, t.ID)
 		if err != nil {
-			// 单条隧道的配置拉不到，不该让整次同步失败——
+			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
-			a.emitTunnelLog(t.Name, "拉取配置失败："+err.Error())
+			fail(t, "拉取配置失败："+err.Error())
 			continue
 		}
 		if cfgText == "" {
@@ -999,10 +1062,16 @@ func (a *App) applySync() (changed bool, err error) {
 
 		switch {
 		case !a.mgr.Running(t.ID):
-			if err := a.writeAndStart(t, cfgText); err != nil {
-				a.emitTunnelLog(t.Name, "启动失败："+err.Error())
+			// 退避中就不再重复拉起：上次失败的原因已经写在日志和隧道行上，
+			// 每 20 秒重来一次只会把同样的错误刷屏。
+			if !a.retryAllowed(t.ID) {
 				continue
 			}
+			if err := a.writeAndStart(t, cfgText); err != nil {
+				fail(t, "启动失败："+err.Error())
+				continue
+			}
+			a.clearRetry(t.ID)
 			changed = true
 		case cfgChanged:
 			// 只重启这一条：其他隧道的连接不受影响。
@@ -1011,13 +1080,21 @@ func (a *App) applySync() (changed bool, err error) {
 				return changed, err
 			}
 			if err := a.writeAndStart(t, cfgText); err != nil {
-				a.emitTunnelLog(t.Name, "重连失败："+err.Error())
+				fail(t, "重连失败："+err.Error())
 				continue
 			}
 			changed = true
 		}
 	}
 
+	if len(failures) > 0 {
+		// 只列前两条，避免十几条隧道全挂时把这行日志撑成一大段。
+		detail := failures[0]
+		if len(failures) > 1 {
+			detail = fmt.Sprintf("%s 等 %d 条", failures[0], len(failures))
+		}
+		return changed, fmt.Errorf("%d 条隧道同步失败：%s", len(failures), detail)
+	}
 	return changed, nil
 }
 
@@ -1089,6 +1166,65 @@ func (a *App) startTunnelProcess(t TunnelVO) error {
 func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
 	return a.mgr.Stop(t.ID)
+}
+
+// ---- 失败退避 ----
+
+// retryDelay 计算第 n 次失败之后的重试等待。
+//
+// 起点必须**大于**后台同步周期（20 秒）。比它小的话退避等于不存在：
+// 每个同步周期都会重新拉起一次，日志被同样的失败刷屏，而问题一点没变。
+func retryDelay(attempts int) time.Duration {
+	const maxDelay = 5 * time.Minute
+	if attempts < 1 {
+		attempts = 1
+	}
+	d := 30 * time.Second
+	for i := 1; i < attempts; i++ {
+		d *= 2
+		if d >= maxDelay {
+			return maxDelay
+		}
+	}
+	return d
+}
+
+// retryAllowed 判断这条隧道当前是否允许再次拉起。
+func (a *App) retryAllowed(id uint) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	st := a.retries[id]
+	return st == nil || time.Now().After(st.nextAt)
+}
+
+// noteStartFailure 记一次失败并安排下次重试时间。
+func (a *App) noteStartFailure(id uint, name, reason string) {
+	a.mu.Lock()
+	if a.retries == nil {
+		a.retries = map[uint]*retryState{}
+	}
+	st := a.retries[id]
+	if st == nil {
+		st = &retryState{}
+		a.retries[id] = st
+	}
+	st.attempts++
+	delay := retryDelay(st.attempts)
+	st.nextAt = time.Now().Add(delay)
+	attempts := st.attempts
+	a.mu.Unlock()
+
+	// 把「什么时候再试」说清楚。不说的话，用户只看到反复失败，
+	// 分不清客户端是在退避还是已经放弃。
+	a.emitTunnelLog(name, fmt.Sprintf("%s（第 %d 次失败，%s 后重试）",
+		reason, attempts, delay.Round(time.Second)))
+}
+
+// clearRetry 清掉一条隧道的退避状态。
+func (a *App) clearRetry(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.retries, id)
 }
 
 // countDisabledTunnels 统计当前处于停用状态的隧道。
@@ -1216,9 +1352,18 @@ func (a *App) emitTunnelLog(name, msg string) {
 		fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
 }
 
-// recordTunnelErr 记下一条隧道的 frpc 错误。
+// recordTunnelErr 记下一条隧道的 frpc 错误（从原始输出行里取）。
 func (a *App) recordTunnelErr(id uint, line string) {
-	msg := strings.TrimSpace(frpc.StripLogPrefix(line))
+	a.recordTunnelErrMsg(id, frpc.StripLogPrefix(line))
+}
+
+// recordTunnelErrMsg 记下一条隧道的错误说明。
+//
+// 除了 frpc 自己打印的错误，客户端**自己**发现的失败也要记（拉配置失败、
+// 进程起不来）：那些失败同样让这条隧道连不上，只写进日志的话，
+// 界面上的隧道行仍然什么原因都不显示。
+func (a *App) recordTunnelErrMsg(id uint, msg string) {
+	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return
 	}

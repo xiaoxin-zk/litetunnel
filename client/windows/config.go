@@ -78,17 +78,26 @@ func frpcTunnelsDir() (string, error) {
 	return filepath.Join(dir, "tunnels"), nil
 }
 
+// loadConfig 读取本地配置。
+//
+// 无论成功与否都返回**非 nil** 的配置：调用方会直接把它存进 App，
+// 而渲染状态时无条件读它的字段（ServerURL / APIKey…）。
+// 这里返回 nil 出去，等于在客户端的启动路径上埋一个 panic——
+// 用户看到的是「双击没反应」，而不是任何可排查的错误。
+//
+// 出错时第二个返回值仍然有意义：调用方要靠它把原因显示给用户。
 func loadConfig() (*Config, error) {
 	path, err := configFilePath()
 	if err != nil {
-		return nil, err
+		return &Config{}, err
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// 首次启动，不是错误。
 			return &Config{}, nil
 		}
-		return nil, err
+		return &Config{}, err
 	}
 	cfg := &Config{}
 	if err := json.Unmarshal(raw, cfg); err != nil {

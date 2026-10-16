@@ -41,6 +41,13 @@ type process struct {
 	// 没有它就无法保证「Stop 返回时进程一定已经不在」，
 	// 而这恰恰是紧接着调用 Start 的前提条件。
 	exitCh chan struct{}
+
+	// stopping 表示这次退出是 Stop 主动请求的，而不是 frpc 自己崩了。
+	//
+	// 必须区分：Kill 之后 Wait 返回的同样是「非正常退出」的错误，
+	// 上层若据此启动退避重试，用户每关一次开关就会看到一串
+	// 「启动失败，30 秒后重试」——而那正是他自己要求的停止。
+	stopping bool
 }
 
 // Manager 托管多条隧道的 frpc 子进程。
@@ -53,8 +60,13 @@ type Manager struct {
 
 	// onLog 收到的行已经带好「Tunnel/<名字>」前缀。
 	onLog func(tunnelID uint, tunnelName, line string)
-	// onExit 在某个隧道的进程退出时调用（包括被 Stop 主动停掉）。
-	onExit func(tunnelID uint, tunnelName string, err error)
+	// onExit 在某个隧道的进程退出时调用。
+	//
+	// requested 为 true 表示这次退出是 Stop 主动请求的（用户关掉开关、
+	// 退出登录、配置变更重连），而不是 frpc 自己退出——上层据此决定
+	// 要不要进入退避重试。判错的后果很直观：用户关掉一条隧道，
+	// 界面却开始报「启动失败，30 秒后重试」。
+	onExit func(tunnelID uint, tunnelName string, err error, requested bool)
 }
 
 // New 创建管理器。exePath 为空时自动在应用目录与 PATH 中查找 frpc。
@@ -68,7 +80,7 @@ func New(exePath string) *Manager {
 // SetCallbacks 注册日志与退出回调。回调会在后台协程中被调用。
 func (m *Manager) SetCallbacks(
 	onLog func(tunnelID uint, tunnelName, line string),
-	onExit func(tunnelID uint, tunnelName string, err error),
+	onExit func(tunnelID uint, tunnelName string, err error, requested bool),
 ) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -199,7 +211,9 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		// 只清理仍指向本进程的记录：Stop 后紧接着 Start 会放入新的 *process，
 		// 这里无条件删除会把刚起来的那个进程从表里抹掉，
 		// 表现为「界面上显示未运行，实际进程还在」。
+		requested := false
 		if p, ok := m.procs[tunnelID]; ok && p.exitCh == exitCh {
+			requested = p.stopping
 			delete(m.procs, tunnelID)
 		}
 		m.mu.Unlock()
@@ -213,7 +227,7 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.appendLog(tunnelID, tunnelName, "frpc 已正常退出")
 		}
 		if onExit != nil {
-			onExit(tunnelID, tunnelName, err)
+			onExit(tunnelID, tunnelName, err, requested)
 		}
 	}()
 
@@ -224,6 +238,10 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 func (m *Manager) Stop(tunnelID uint) error {
 	m.mu.Lock()
 	p := m.procs[tunnelID]
+	if p != nil {
+		// 先标记再 Kill：Wait 的协程可能在任何时刻读到它。
+		p.stopping = true
+	}
 	m.mu.Unlock()
 	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return nil
@@ -280,9 +298,21 @@ func (m *Manager) ClearLogs() {
 
 func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 	scanner := bufio.NewScanner(r)
+	// 单行上限 1 MiB。frpc 的正常输出远小于它，但真出现超长行时
+	// 不能让读取端**静默**停摆：管道写满之后子进程会跟着阻塞。
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
 	for scanner.Scan() {
 		m.appendLog(tunnelID, tunnelName, scanner.Text())
+	}
+
+	// 读取失败必须留痕。
+	//
+	// 以前这里什么都不做：日志会凭空停在某一行，看起来像「frpc 不再输出了」，
+	// 而真实原因是我们的读取端坏了（超长行、管道错误）。这类现象最容易被
+	// 归因到 frpc 或服务端，实际上问题在客户端自己。
+	if err := scanner.Err(); err != nil {
+		m.appendLog(tunnelID, tunnelName, "日志读取中断："+err.Error())
 	}
 }
 

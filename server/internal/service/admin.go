@@ -553,7 +553,10 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 
 // AdminDeleteUser 删除用户及其全部隧道与流量记录。
 func (s *Services) AdminDeleteUser(id uint) error {
-	return s.DB.Transaction(func(tx *gorm.DB) error {
+	// 端口要在删除前取出来：记录一删就再也查不回来了。
+	ports := s.tunnelPortsOf(id)
+
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		var u model.User
 		if err := tx.First(&u, id).Error; err != nil {
 			return ErrNotFound
@@ -567,18 +570,31 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Where("user_id = ?", id).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Delete(&model.User{}, id).Error; err != nil {
-			return err
-		}
-		// 内存态同步清理，避免已删除用户仍占用超额标记或身份缓存。
-		s.Runtime.SetQuotaExceeded(id, false)
-		s.Runtime.InvalidateIdentity(IdentityKindUser, id)
-		// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
-		// 查的是内存会话表，残留的话已登录的 frpc 仍会被放行新连接——
-		// 账号都删了还在跑，这是最不该出现的一种。
-		s.Runtime.DropUserSessions(id)
-		return nil
+		return tx.Delete(&model.User{}, id).Error
 	})
+	if err != nil {
+		return err
+	}
+
+	// ---- 事务提交之后再做这些 ----
+	//
+	// 放在事务回调里做会有两个问题：
+	//   - 事务可能提交失败，而内存已经被清了（缓存与库不一致）；
+	//   - 在多连接数据库上，并发插件回调可能在这段时间里重新读到旧用户
+	//     并登记会话，事务提交后又留下一条内存会话。
+	//
+	// 内存态清理，避免已删除用户仍占用超额/禁用标记或身份缓存。
+	s.Runtime.SetQuotaExceeded(id, false)
+	s.Runtime.SetUserBlocked(id, false)
+	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
+	// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
+	// 查的是内存会话表，残留的话已登录的 frpc 仍会被放行新连接——
+	// 账号都删了还在跑，这是最不该出现的一种。
+	s.Runtime.DropUserSessions(id)
+
+	// 隧道没了，主机防火墙上的放行规则也要收回，否则会一直留在那里。
+	s.closePorts(ports)
+	return nil
 }
 
 // AdminSetUserStatus 禁用/启用/封禁用户。
@@ -598,10 +614,18 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	if status != model.UserStatusActive {
-		// 被封禁的用户需要立刻停止放行流量。
-		s.Runtime.SetQuotaExceeded(id, true)
+		// 禁用/封禁走独立的标记，而不是借用超额标记。
+		//
+		// 借用的写法有个致命后果：超额标记会被每轮流量采集按配额重算，
+		// 于是「配额没超限的禁用用户」会在下一次成功采集后被重新放行——
+		// 禁用是否生效取决于采集有没有跑过，现象随机且无法复现。
+		s.Runtime.SetUserBlocked(id, true)
+		// 同时撤销其运行时会话：插件热路径命中会话后只看这两个标记，
+		// 但会话本身留着也没有意义——账号都禁用了。
+		s.Runtime.DropUserSessions(id)
 		return nil
 	}
+	s.Runtime.SetUserBlocked(id, false)
 
 	// 重新启用时**立即**按真实配额重算，而不是等下一轮流量采集。
 	//

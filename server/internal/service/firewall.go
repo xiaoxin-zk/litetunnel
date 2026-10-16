@@ -115,6 +115,47 @@ func (s *Services) FirewallClosePort(port int, proto string) error {
 	return nil
 }
 
+// portProto 是一个待回收的隧道端口。
+type portProto struct {
+	port  int
+	proto string
+}
+
+// tunnelPortsOf 取出某用户当前所有已放行的隧道端口。
+//
+// 必须在删除之前取：隧道记录一旦删掉，端口号就再也查不回来了，
+// 而防火墙规则会留在宿主机上。启动时的规则对齐只负责「放行已有的」，
+// 刻意不清理孤立规则（那需要判断哪些是孤立的，误删会让管理员连不上机器）。
+func (s *Services) tunnelPortsOf(userID uint) []portProto {
+	var tunnels []model.Tunnel
+	if err := s.DB.Where("user_id = ? AND remote_port > 0", userID).
+		Find(&tunnels).Error; err != nil {
+		log.Printf("[firewall] 读取用户 %d 的隧道端口失败，删除后可能有残留规则: %v", userID, err)
+		return nil
+	}
+	out := make([]portProto, 0, len(tunnels))
+	for i := range tunnels {
+		out = append(out, portProto{
+			port:  tunnels[i].RemotePort,
+			proto: ProtoOfTunnel(tunnels[i].Type),
+		})
+	}
+	return out
+}
+
+// closePorts 逐个回收端口。
+//
+// 只记日志、不返回错误：调用方此刻已经删完数据了，让回收失败把
+// 「删除成功」变成错误返回，只会让管理员以为没删掉而重复操作。
+// 失败必须留痕，因为这类残留规则只能靠人工清理。
+func (s *Services) closePorts(ports []portProto) {
+	for _, p := range ports {
+		if err := s.FirewallClosePort(p.port, p.proto); err != nil {
+			log.Printf("[firewall] 回收端口 %d/%s 失败，需要人工清理: %v", p.port, p.proto, err)
+		}
+	}
+}
+
 // FirewallManualOpen 管理员手工放行端口。
 //
 // 与 FirewallOpenPort 的区别在于「失败时的态度」：

@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -202,31 +204,72 @@ func TestDropUserSessionsOnlyDropsThatUser(t *testing.T) {
 	}
 }
 
-// TestAdminSetUserStatusRecomputesQuotaOnEnable 覆盖「启用后仍是超额」。
+// TestAdminSetUserStatusBlocksWithoutBorrowingQuotaFlag 覆盖「禁用被采集解除」。
 //
-// 禁用时会把超额标记强制置为 true 来立刻断流。重新启用时如果不按真实
-// 配额重算，就要等下一轮流量采集才会恢复；而采集依赖 frps 管理接口，
-// 它不可用时用户会看到「账号已启用，但新建连接一律被拒」，且无从得知原因。
-func TestAdminSetUserStatusRecomputesQuotaOnEnable(t *testing.T) {
+// 禁用原先靠把超额标记强制置 true 实现，而超额标记会被每轮流量采集按配额
+// 重算——配额没超限的禁用用户，在下一次成功采集后就被重新放行了。
+// 现象是「禁用是否生效取决于采集有没有跑过」，随机且无法复现。
+func TestAdminSetUserStatusBlocksWithoutBorrowingQuotaFlag(t *testing.T) {
 	svc := newTestServices(t, nil)
 
-	u := &model.User{Username: "quotauser", Password: "not-used", Status: model.UserStatusActive}
+	u := &model.User{Username: "blockuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
+	svc.Runtime.RecordLogin("run-block-1", u.ID, u.Username)
 
 	if err := svc.AdminSetUserStatus(u.ID, model.UserStatusDisabled); err != nil {
 		t.Fatalf("禁用失败: %v", err)
 	}
-	if !svc.Runtime.IsQuotaExceeded(u.ID) {
-		t.Fatal("禁用后应处于「不放行」状态")
+	if !svc.Runtime.IsUserBlocked(u.ID) {
+		t.Fatal("禁用后应处于「账号不可用」状态")
+	}
+	if svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Error("禁用不该借用超额标记：那个值会被采集按配额重算，禁用因此可能被悄悄解除")
+	}
+	if _, ok := svc.Runtime.LookupSession("run-block-1"); ok {
+		t.Error("禁用时应撤销该用户的运行时会话")
 	}
 
+	// 关键一步：跑一轮配额刷新（等价于一次成功的流量采集）。
+	svc.refreshQuotaFlags()
+	if !svc.Runtime.IsUserBlocked(u.ID) {
+		t.Fatal("采集之后禁用被解除了——这正是要防的：配额没超限的禁用用户被重新放行")
+	}
+
+	// 重新启用：解除禁用，并按真实配额重算超额标记。
 	if err := svc.AdminSetUserStatus(u.ID, model.UserStatusActive); err != nil {
 		t.Fatalf("启用失败: %v", err)
 	}
+	if svc.Runtime.IsUserBlocked(u.ID) {
+		t.Error("启用后应解除「账号不可用」")
+	}
 	if svc.Runtime.IsQuotaExceeded(u.ID) {
 		t.Error("重新启用后应立即按真实配额重算，而不是等下一轮采集")
+	}
+}
+
+// TestRefreshQuotaFlagsSyncsBlockedFromDB 覆盖重启后的禁用状态。
+//
+// 进程重启后内存是空的，而插件热路径只查内存。不在采集里按库里的账号状态
+// 补齐禁用标记的话，已禁用的账号在重启后会重新被放行，直到管理员再动一次。
+func TestRefreshQuotaFlagsSyncsBlockedFromDB(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "disableduser", Password: "not-used", Status: model.UserStatusDisabled}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 模拟刚重启：内存里什么都不知道。
+	if svc.Runtime.IsUserBlocked(u.ID) {
+		t.Fatal("前置条件：内存里不该有该用户的禁用标记")
+	}
+
+	svc.refreshQuotaFlags()
+
+	if !svc.Runtime.IsUserBlocked(u.ID) {
+		t.Fatal("采集应把库里的禁用状态同步到内存，否则重启后禁用会失效")
 	}
 }
 
@@ -358,6 +401,151 @@ func TestRedeemRefreshesQuotaFlag(t *testing.T) {
 
 	if svc.Runtime.IsQuotaExceeded(u.ID) {
 		t.Error("兑换流量后应立即解除超额，而不是等下一轮采集")
+	}
+}
+
+// TestRedeemWritesAuditRecords 覆盖兑换流水的两种丢失。
+//
+//  1. 无效兑换码的审计原先写在业务事务里，紧接着事务回滚——等于从来没记录过。
+//     而「有人在撞码」恰恰是风控最关心的信号。
+//  2. 成功兑换的流水写入错误被忽略，可能出现「权益已发放但查不到流水」，
+//     事后对不上账且无从追查。
+func TestRedeemWritesAuditRecords(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "audituser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	countRecords := func(result string) int64 {
+		t.Helper()
+		var n int64
+		if err := svc.DB.Model(&model.RedeemRecord{}).
+			Where("user_id = ? AND result = ?", u.ID, result).Count(&n).Error; err != nil {
+			t.Fatalf("统计流水失败: %v", err)
+		}
+		return n
+	}
+
+	// 1) 无效兑换码必须留下审计
+	if _, err := svc.Redeem(u.ID, "NO-SUCH-CODE-0000", "127.0.0.1"); err == nil {
+		t.Fatal("无效兑换码应报错")
+	}
+	if got := countRecords("invalid"); got != 1 {
+		t.Fatalf("无效尝试应留下 1 条审计，实际 %d 条（写在事务里会被回滚掉）", got)
+	}
+
+	// 2) 成功兑换的流水必须落库
+	code := &model.RedeemCode{
+		Code: "TEST-AUDIT-0001", Type: model.RedeemTypeTraffic,
+		Value: 1 << 20, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	if err := svc.DB.Create(code).Error; err != nil {
+		t.Fatalf("建兑换码失败: %v", err)
+	}
+	if _, err := svc.Redeem(u.ID, code.Code, "127.0.0.1"); err != nil {
+		t.Fatalf("兑换失败: %v", err)
+	}
+	if got := countRecords("success"); got != 1 {
+		t.Fatalf("成功兑换应留下 1 条流水，实际 %d 条", got)
+	}
+}
+
+// fakeFirewallHelper 冒充宿主机上的 lt-fw helper，记录收到的关端口请求。
+//
+// 面板自身没有任何防火墙写能力（全部转发给 helper），所以这里假的是 helper，
+// 而不是「防火墙」——这样测到的就是真实那条转发链路。
+type fakeFirewallHelper struct {
+	*httptest.Server
+
+	mu     sync.Mutex
+	closed []string
+}
+
+func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
+	t.Helper()
+	f := &fakeFirewallHelper{}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_, _ = w.Write([]byte(`{"backend":"nft","available":true,"enabled":true}`))
+		case "/ports/close":
+			var body struct {
+				Port  int    `json:"port"`
+				Proto string `json:"proto"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.closed = append(f.closed, fmt.Sprintf("%d/%s", body.Port, body.Proto))
+			f.mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/ports/open":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+func (f *fakeFirewallHelper) closedPorts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.closed))
+	copy(out, f.closed)
+	return out
+}
+
+// TestAdminDeleteUserClosesFirewallPorts 覆盖「删除用户后规则残留」。
+//
+// 单条隧道删除会收回端口，但批量删除用户时不会——隧道记录删掉后端口号
+// 再也查不回来，规则就永久留在宿主机防火墙上。而启动时的规则对齐只负责
+// 「放行已有的」，刻意不清理孤立规则（判断哪些是孤立的很容易误删）。
+func TestAdminDeleteUserClosesFirewallPorts(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyFirewallEnabled:     "true",
+		KeyFirewallHelperAddr:  helper.URL,
+		KeyFirewallHelperToken: "test-token",
+	}); err != nil {
+		t.Fatalf("设置防火墙配置失败: %v", err)
+	}
+
+	u := &model.User{Username: "fwuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	for i, port := range []int{20001, 20002} {
+		tun := &model.Tunnel{
+			UserID: u.ID, Name: fmt.Sprintf("mc%d", i), Type: model.ProxyTypeTCP,
+			LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: port,
+			Status: model.TunnelStatusActive,
+		}
+		if err := svc.DB.Create(tun).Error; err != nil {
+			t.Fatalf("建隧道失败: %v", err)
+		}
+	}
+
+	if err := svc.AdminDeleteUser(u.ID); err != nil {
+		t.Fatalf("删除用户失败: %v", err)
+	}
+
+	got := helper.closedPorts()
+	if len(got) != 2 {
+		t.Fatalf("应回收 2 个端口，实际 %v", got)
+	}
+	seen := map[string]bool{}
+	for _, p := range got {
+		seen[p] = true
+	}
+	for _, want := range []string{"20001/tcp", "20002/tcp"} {
+		if !seen[want] {
+			t.Errorf("端口 %s 未被回收，实际 %v", want, got)
+		}
 	}
 }
 

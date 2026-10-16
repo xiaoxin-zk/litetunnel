@@ -538,6 +538,15 @@ func (h *Handler) onNewUserConn(req *request) response {
 	// 优先走会话缓存；缓存未命中时才回落数据库。
 	if content.User.RunID != "" {
 		if s, ok := h.svc.Runtime.LookupSession(content.User.RunID); ok {
+			// 两个标记都要看，缺一不可：
+			//   - blocked：账号被禁用/封禁；
+			//   - exceeded：流量用超了。
+			// 曾经只看超额，而禁用又是靠把超额强制置 true 实现的，
+			// 于是每轮流量采集都会把禁用用户的超额标记按配额重算回去，
+			// 配额没超限的禁用账号就重新被放行了。
+			if h.svc.Runtime.IsUserBlocked(s.UserID) {
+				return deny("账号已被禁用")
+			}
 			if h.svc.Runtime.IsQuotaExceeded(s.UserID) {
 				return deny("流量额度已用尽")
 			}
@@ -547,6 +556,12 @@ func (h *Handler) onNewUserConn(req *request) response {
 	u, ok := h.resolveUser(content.User.User, content.User.RunID, content.User.Metas)
 	if !ok {
 		return deny("客户端未完成认证")
+	}
+	if u.Status != model.UserStatusActive {
+		return deny("账号已被禁用")
+	}
+	if h.svc.Runtime.IsUserBlocked(u.ID) {
+		return deny("账号已被禁用")
 	}
 	if h.svc.Runtime.IsQuotaExceeded(u.ID) {
 		return deny("流量额度已用尽")

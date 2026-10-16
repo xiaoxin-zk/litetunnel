@@ -114,7 +114,8 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 		var c model.RedeemCode
 		err := tx.Where("code = ?", code).First(&c).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.recordRedeem(tx, userID, 0, code, "", 0, "invalid", ip)
+			// 这里**不**写审计：这条记录会随事务一起回滚，写了等于没写。
+			// 无效尝试统一在事务之外补记（见下面的 err 分支）。
 			return ErrCodeInvalid
 		}
 		if err != nil {
@@ -223,10 +224,19 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 
 		// 核销计数已在前面用 CAS 完成，这里不再写 used_count，
 		// 否则又会退回「读-改-写」的老问题。
-		s.recordRedeem(tx, userID, c.ID, code, c.Type, c.Value, "success", ip)
-		return nil
+		//
+		// 流水与权益必须同生共死：写不进去就整体回滚。忽略这个错误的话，
+		// 会出现「权益已发放但查不到流水」——事后对不上账，且无从追查。
+		return s.recordRedeem(tx, userID, c.ID, code, c.Type, c.Value, "success", ip)
 	})
 	if err != nil {
+		// 无效兑换码在事务之外补一条审计。
+		//
+		// 这类尝试是风控最关心的信号（有人在撞码），而它原先写在事务里，
+		// 紧接着就随回滚消失了——等于从来没记录过。
+		if errors.Is(err, ErrCodeInvalid) {
+			_ = s.recordRedeem(s.DB, userID, 0, code, "", 0, "invalid", ip)
+		}
 		return nil, err
 	}
 
@@ -240,8 +250,12 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 	return &result, nil
 }
 
-func (s *Services) recordRedeem(tx *gorm.DB, userID, codeID uint, code, rtype string, value int64, result, ip string) {
-	_ = tx.Create(&model.RedeemRecord{
+// recordRedeem 写一条兑换流水。
+//
+// 返回错误而不是吞掉：成功兑换那条流水必须与权益同一个事务，
+// 写不进去就得整体回滚——否则权益发放了却查不到记录，事后对不上账。
+func (s *Services) recordRedeem(tx *gorm.DB, userID, codeID uint, code, rtype string, value int64, result, ip string) error {
+	return tx.Create(&model.RedeemRecord{
 		UserID: userID,
 		CodeID: codeID,
 		Code:   code,

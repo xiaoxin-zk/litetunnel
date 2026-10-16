@@ -45,6 +45,15 @@ type Runtime struct {
 	lastStat map[string]trafficPair // frp 代理全名 -> 上次采样的当日累计值
 	touchAt  map[string]time.Time   // runID -> 上次会话落库时间（节流用）
 
+	// blocked 记录「账号被禁用/封禁」。
+	//
+	// 必须与 exceeded **分开存**：exceeded 是「流量用超了」，会被每次流量
+	// 采集按配额重算；而账号是否可用只由管理员的状态设置决定。
+	// 以前禁用是靠把 exceeded 强制置 true 实现的，于是配额没超限的禁用用户
+	// 会在下一次成功采集后被重新放行——禁用形同虚设，而且完全取决于
+	// 采集是否跑过，现象随机。
+	blocked map[uint]bool
+
 	identities map[identityKey]identityState // 账号有效性短缓存
 }
 
@@ -78,6 +87,7 @@ func NewRuntime() *Runtime {
 	return &Runtime{
 		sessions:   make(map[string]sessionInfo),
 		exceeded:   make(map[uint]bool),
+		blocked:    make(map[uint]bool),
 		online:     make(map[uint]bool),
 		lastStat:   make(map[string]trafficPair),
 		touchAt:    make(map[string]time.Time),
@@ -242,6 +252,27 @@ func (r *Runtime) SetQuotaExceeded(userID uint, v bool) {
 		r.exceeded[userID] = true
 	} else {
 		delete(r.exceeded, userID)
+	}
+}
+
+// IsUserBlocked 查询账号是否被禁用/封禁。
+func (r *Runtime) IsUserBlocked(userID uint) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.blocked[userID]
+}
+
+// SetUserBlocked 写入「账号不可用」状态。
+//
+// 与 SetQuotaExceeded 分开：这个值只由管理员的状态设置与账号状态同步决定，
+// 不会被流量采集重算，因此禁用之后不会因为一次成功采集而被悄悄解除。
+func (r *Runtime) SetUserBlocked(userID uint, v bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v {
+		r.blocked[userID] = true
+	} else {
+		delete(r.blocked, userID)
 	}
 }
 
@@ -489,7 +520,16 @@ func (s *Services) flushTraffic(tunnelDeltas map[uint]*tunnelDelta, userDeltas m
 	return err
 }
 
-// refreshQuotaFlags 刷新内存中的超额标记，供 frps 插件实时拦截。
+// refreshQuotaFlags 刷新内存中的超额与禁用标记，供 frps 插件实时拦截。
+//
+// 两个标记一起同步，因为它们来源不同、用途也不同：
+//
+//   - 超额：由用量与配额算出来（会随流量变化）；
+//   - 禁用：由账号状态决定（只随管理员操作变化）。
+//
+// 放在这里同步「禁用」是为了覆盖重启：进程重启后内存是空的，而插件热路径
+// 只查内存，不在这里补齐的话，已禁用的账号在重启后会重新被放行，
+// 直到管理员再动一次那个账号。
 func (s *Services) refreshQuotaFlags() {
 	var users []model.User
 	if err := s.DB.Preload("Group").Find(&users).Error; err != nil {
@@ -499,5 +539,6 @@ func (s *Services) refreshQuotaFlags() {
 	for i := range users {
 		s.EnsureTrafficPeriod(&users[i])
 		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
+		s.Runtime.SetUserBlocked(users[i].ID, users[i].Status != model.UserStatusActive)
 	}
 }

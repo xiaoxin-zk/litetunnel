@@ -514,6 +514,10 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 	}
 
+	// 端口要在删除前取出来：记录一删就再也查不回来了，
+	// 而防火墙上的放行规则会一直留在宿主机上。
+	ports := s.tunnelPortsOf(userID)
+
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("user_id = ?", userID).Delete(&model.Tunnel{}).Error; err != nil {
 			return err
@@ -534,12 +538,20 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		return err
 	}
 
+	// ---- 事务提交之后再做这些 ----
+	//
+	// 内存清理放进事务回调里的话，事务一旦失败就会出现「缓存已清、库里还在」
+	// 的不一致；多连接数据库上还可能与并发回调抢跑。
 	s.Runtime.SetQuotaExceeded(userID, false)
+	s.Runtime.SetUserBlocked(userID, false)
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
 	// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
-	// （onNewUserConn）查的是内存会话表，命中后只看配额就放行。
-	// 账号都注销了还能继续建新连接，是最不该出现的一种。
+	// （onNewUserConn）查的是内存会话表。账号都注销了还能继续建新连接，
+	// 是最不该出现的一种。
 	s.Runtime.DropUserSessions(userID)
+
+	// 隧道没了，主机防火墙上的放行规则也要收回。
+	s.closePorts(ports)
 	return nil
 }
 

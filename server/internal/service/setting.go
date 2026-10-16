@@ -138,6 +138,11 @@ const (
 	//
 	// 所以把「已应用」独立记一份，只有 helper 真的重建了容器才更新它，
 	// 界面上把两者的差异显示成「待下发」。
+	//
+	// 「有没有成功下发过」的判据是**这一行存不存在**，而不是值是否为空：
+	// 空值本身是有含义的——一次成功的下发可以把隧道关掉（期望值与已生效值
+	// 都为空，两者一致，因此不该显示「待下发」）。升级路径也据此不猜：
+	// 见 hasRow 附近那段说明。
 	KeyDomainAppliedPanel  SettingKey = "domain.applied_panel"
 	KeyDomainAppliedTunnel SettingKey = "domain.applied_tunnel"
 	KeyDomainAppliedMode   SettingKey = "domain.applied_https_mode"
@@ -262,9 +267,11 @@ var settingSpecs = []settingSpec{
 
 	// 已生效的域名配置。
 	//
-	// 默认值刻意留空而不是取环境变量：空表示「还没有任何一次成功下发」，
-	// 此时运行期回落到 .env（那才是实际在跑的配置）。若默认成期望值，
-	// 「只保存未下发」就会被当成效已生效——正是这一组字段要解决的问题。
+	// 默认值刻意留空而不是取环境变量：**没有这一行**才表示「还没有任何一次
+	// 成功下发」，此时运行期回落到 .env（那才是实际在跑的配置）。若默认成
+	// 期望值，「只保存未下发」就会被当成效已生效——正是这一组字段要解决的问题。
+	//
+	// 注意「有行且为空」是第三种状态，不是「没下发过」：它是隧道的明确关闭。
 	{Key: KeyDomainAppliedPanel, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedTunnel, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedMode, Internal: true, Default: func(*config.Config) string { return "" }},
@@ -290,23 +297,35 @@ type SettingStore struct {
 
 	mu   sync.RWMutex
 	vals map[SettingKey]string
+	// present 记录每个键在数据库里**有没有行**，与它的值是否为空无关。
+	//
+	// 为什么要单独记：这些配置的默认值取自 .env，因此「值恰好等于默认值」与
+	// 「管理员显式配成了这个值」在 vals 里长得一模一样。而隧道根域名必须区分
+	// 这两种情况：
+	//	没有行     → 从未配置过，继续以 .env 为准；
+	//	有行且为空 → 管理员明确关闭了 HTTP/HTTPS 隧道。
+	// 只看值的话，「清空后保存」会被静默当成「没配过」而回落到 .env——关闭
+	// 动作成了空操作，而 Caddyfile 里的泛域名站点块也不会被剪掉。
+	//
+	// 放内存里而不是每次查库：用它的都是热路径（每个 HTTP/HTTPS 隧道请求都要
+	// 按隧道根域名判权），一次 count 查询就把 SettingStore 存在的意义抵消了。
+	present map[SettingKey]bool
 }
 
 // NewSettingStore 构造配置存储并完成首次加载。
 func NewSettingStore(db *gorm.DB, cfg *config.Config) *SettingStore {
 	s := &SettingStore{
-		db:     db,
-		cfg:    cfg,
-		encKey: cfg.APIKeyEncKey,
-		vals:   make(map[SettingKey]string, len(settingSpecs)),
+		db:      db,
+		cfg:     cfg,
+		encKey:  cfg.APIKeyEncKey,
+		vals:    make(map[SettingKey]string, len(settingSpecs)),
+		present: make(map[SettingKey]bool, len(settingSpecs)),
 	}
 	if err := s.Reload(); err != nil {
 		// 加载失败不阻断启动：回落到全部默认值，服务仍可用。
 		log.Printf("[setting] 加载运行期配置失败，已回落到默认值: %v", err)
 		s.applyDefaults()
 	}
-	// 升级路径的一次性对齐，之后运行期只认「已生效」的那一份。
-	s.bootstrapAppliedDomain()
 	return s
 }
 
@@ -315,6 +334,8 @@ func (s *SettingStore) applyDefaults() {
 	defer s.mu.Unlock()
 	for _, spec := range settingSpecs {
 		s.vals[spec.Key] = spec.Default(s.cfg)
+		// 回落默认值意味着「这一份不是从库里读出来的」，因此视为没有行。
+		s.present[spec.Key] = false
 	}
 }
 
@@ -330,9 +351,11 @@ func (s *SettingStore) Reload() error {
 	}
 
 	vals := make(map[SettingKey]string, len(settingSpecs))
+	present := make(map[SettingKey]bool, len(settingSpecs))
 	for _, spec := range settingSpecs {
 		raw, ok := stored[string(spec.Key)]
 		if !ok {
+			// 库里没有这一行：回落到 .env 派生的默认值，并记住「没有行」。
 			vals[spec.Key] = spec.Default(s.cfg)
 			continue
 		}
@@ -340,18 +363,21 @@ func (s *SettingStore) Reload() error {
 			plain, err := auth.DecryptAPIKey(s.encKey, raw)
 			if err != nil {
 				// 密钥轮换或密文损坏时回落默认值，而不是让整站起不来。
+				// 未采用库里的值，因此同样算「没有行」。
 				log.Printf("[setting] 解密 %s 失败，已回落默认值: %v", spec.Key, err)
 				vals[spec.Key] = spec.Default(s.cfg)
 				continue
 			}
 			vals[spec.Key] = plain
-			continue
+		} else {
+			vals[spec.Key] = raw
 		}
-		vals[spec.Key] = raw
+		present[spec.Key] = true
 	}
 
 	s.mu.Lock()
 	s.vals = vals
+	s.present = present
 	s.mu.Unlock()
 	return nil
 }
@@ -472,48 +498,25 @@ func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
 }
 
 // hasRow 判断某个键在数据库里是否有记录（与它的值是否为空无关）。
+//
+// 结果取自内存快照（见 SettingStore.present）：每次写入都会重建它，因此刚
+// SetMany / SetInternal 写下的行不会漏。
 func (s *SettingStore) hasRow(k SettingKey) bool {
-	var n int64
-	if err := s.db.Model(&model.Setting{}).Where("key = ?", string(k)).Count(&n).Error; err != nil {
-		return false
-	}
-	return n > 0
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.present[k]
 }
 
-// bootstrapAppliedDomain 为「已生效的域名配置」补一次基线。
+// 这里刻意**没有**「升级时把期望值补成已生效」的对齐逻辑。
 //
-// 为什么要它：这一组字段是后加的，而在此之前运行期是按数据库里的期望值算的
-// （已成功下发的部署确实如此，未下发的那些则是个 bug）。升级后如果这一组
-// 一直是空的，运行期会回落到面板容器启动时的环境变量——对于「改过域名、
-// 但面板容器一直没重启」的部署，那是个更旧的域名，子域名隧道会立刻失效。
+// 老版本里运行期是按库中的期望值算的，因此存在一种诱惑：升级后把期望值直接
+// 记为已生效，省掉管理员的一次下发。但那只是把「不确定」伪装成「确定」——
+// 那份期望值到底有没有真的下发过（helper 是否成功重建过 caddy 与 frps），
+// 面板无从得知。猜错的代价是流量走在与界面不符的配置上，而猜对只省一次点击。
 //
-// 因此做一次性对齐：某一项为空、且它的期望值**确实存过库**（说明管理员用过
-// 这个页面）时，把期望值记为已生效。
-//
-// 判定用「库里有没有这一行」而不是「值是否为空」：从未用过该页面的部署本来
-// 就没有行，那种情况必须继续以 .env 为准，因为那才是实际在跑的配置。
-func (s *SettingStore) bootstrapAppliedDomain() {
-	pairs := []struct{ applied, desired SettingKey }{
-		{KeyDomainAppliedPanel, KeyDomainPanel},
-		{KeyDomainAppliedTunnel, KeyDomainTunnel},
-		{KeyDomainAppliedMode, KeyDomainHTTPSMode},
-	}
-	updates := map[SettingKey]string{}
-	for _, p := range pairs {
-		if strings.TrimSpace(s.Get(p.applied)) != "" || !s.hasRow(p.desired) {
-			continue
-		}
-		updates[p.applied] = s.Get(p.desired)
-	}
-	if len(updates) == 0 {
-		return
-	}
-	if err := s.SetInternal(updates); err != nil {
-		log.Printf("[setting] 补齐「已生效的域名配置」失败，界面会提示需要重新下发: %v", err)
-		return
-	}
-	log.Printf("[setting] 已按数据库里的域名配置补齐「已生效」基线（升级后的一次性对齐）")
-}
+// 所以这一组保持为空，运行期以 .env 为准（那是唯一被证实正在跑的配置），
+// 界面按「期望 ≠ 已生效」显示「待下发」，由管理员点一次下发来收敛——
+// 那是唯一能确定答案的操作。
 
 // AllForAdmin 返回给管理端的配置快照：敏感字段以占位符代替，绝不回传明文。
 //

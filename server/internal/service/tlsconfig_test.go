@@ -189,12 +189,14 @@ func TestDomainPendingFalseWhenOnlyEnvConfigured(t *testing.T) {
 	}
 }
 
-// TestBootstrapAppliedDomainAlignsUpgradePath 覆盖升级路径的一次性对齐。
+// TestUpgradeDoesNotAssumeDesiredApplied 覆盖升级路径**不猜**的取舍。
 //
-// 「已生效」是后加的字段。升级前管理员若改过域名（期望值存了库），升级后
-// 若没有基线，运行期会回落到面板启动时的环境变量——那是个更旧的域名，
-// 子域名隧道会立刻失效。这里断言会把已有的期望值补成基线。
-func TestBootstrapAppliedDomainAlignsUpgradePath(t *testing.T) {
+// 老版本里运行期按库中的期望值算，所以存在一种诱惑：升级后把期望值直接记为
+// 已生效，省掉管理员一次下发。但那份期望值有没有真的下发过（helper 是否成功
+// 重建过 caddy 与 frps），面板无从得知——猜错就是让流量走在与界面不符的配置上。
+// 因此这里断言什么都不补：已生效那一组保持为空，运行期以 .env 为准，
+// 界面显示「待下发」，由管理员点一次下发来收敛。
+func TestUpgradeDoesNotAssumeDesiredApplied(t *testing.T) {
 	cfg := &config.Config{
 		Env:          "test",
 		LogLevel:     "warn",
@@ -221,12 +223,26 @@ func TestBootstrapAppliedDomainAlignsUpgradePath(t *testing.T) {
 	}
 
 	s := NewSettingStore(db, cfg)
-	if got := s.Get(KeyDomainAppliedTunnel); got != "panel-set.example.com" {
-		t.Fatalf("升级后应把已有的期望值记为已生效，实际 %q", got)
+	for _, k := range []SettingKey{KeyDomainAppliedPanel, KeyDomainAppliedTunnel, KeyDomainAppliedMode} {
+		if got := s.Get(k); got != "" {
+			t.Errorf("升级时不该把期望值当成已生效（%s = %q）", k, got)
+		}
+		if s.hasRow(k) {
+			t.Errorf("升级时不该凭空造出「已生效」记录（%s）", k)
+		}
 	}
-	// 从未用过的项不能被凭空补上：那种部署必须继续以 .env 为准。
-	if got := s.Get(KeyDomainAppliedPanel); got != "" {
-		t.Fatalf("没有期望值的项不该被补成已生效，实际 %q", got)
+	// 期望值本身要留着：界面靠它显示「待下发」。
+	if got := s.Get(KeyDomainTunnel); got != "panel-set.example.com" || !s.hasRow(KeyDomainTunnel) {
+		t.Fatalf("期望值不该被动过，实际 %q", got)
+	}
+
+	// 于是运行期按 .env 判权，而界面如实提示「待下发」。
+	svc := New(db, cfg)
+	if got := svc.TunnelDomain(); got != "env.example.com" {
+		t.Fatalf("没有下发记录时运行期必须以 .env 为准，实际 %q", got)
+	}
+	if !svc.DomainPending() {
+		t.Fatal("库里的期望值与 .env 不一致时必须显示「待下发」，否则等于谎报已生效")
 	}
 
 	// 这一组由系统维护，管理端不能手工改，也不会出现在管理端返回里。
@@ -235,6 +251,57 @@ func TestBootstrapAppliedDomainAlignsUpgradePath(t *testing.T) {
 	}
 	if _, ok := s.AllForAdmin()[string(KeyDomainAppliedTunnel)]; ok {
 		t.Fatal("「已生效」这一组不该出现在管理端返回中")
+	}
+}
+
+// TestEmptyTunnelDomainMeansDisabled 覆盖「空域名 = 明确关闭隧道」。
+//
+// 「留空即关闭」是界面上的承诺（Caddyfile 模板里整段泛域名站点块也会被剪掉），
+// 但判据必须是「库里有没有这一行」，而不是「值是否为空」：否则清空保存会被
+// 当成「从没配过」而回落到 .env，关闭动作成了空操作，用户看到「已关闭」而
+// 泛域名隧道其实还开着。
+func TestEmptyTunnelDomainMeansDisabled(t *testing.T) {
+	svc := newTestServices(t, &config.Config{
+		TunnelDomain:  "tunnel.example.com",
+		UserPublicURL: "https://panel.example.com",
+	})
+
+	// 从未配置过：以 .env 为准。
+	if got := svc.DesiredTunnelDomain(); got != "tunnel.example.com" {
+		t.Fatalf("没有行时应当以 .env 为准，实际 %q", got)
+	}
+
+	// 显式清空：走真实保存路径（含校验），期望值必须真的变成「关闭」。
+	if err := svc.UpdateSettings(map[SettingKey]string{KeyDomainTunnel: ""}); err != nil {
+		t.Fatalf("清空隧道根域名失败: %v", err)
+	}
+	if got := svc.DesiredTunnelDomain(); got != "" {
+		t.Fatalf("清空后应当表达「关闭」，不该回落到 .env 得到 %q", got)
+	}
+	// 期望值变了、还没下发：运行期仍按 .env 的旧域名判权。
+	if got := svc.TunnelDomain(); got != "tunnel.example.com" {
+		t.Fatalf("只保存未下发时应继续按 .env 判权，实际 %q", got)
+	}
+	if !svc.DomainPending() {
+		t.Fatal("「已关闭」还没下发时必须显示「待下发」")
+	}
+
+	// 下发之后隧道才算真的关掉：连二级域名都建不出来。
+	applyDomain(t, svc)
+	if got := svc.TunnelDomain(); got != "" {
+		t.Fatalf("下发后隧道应当已关闭，实际 %q", got)
+	}
+	if svc.DomainPending() {
+		t.Fatalf("关闭同样是一次成功的下发，不该仍显示「待下发」（desired=%+v applied=%+v）",
+			svc.DomainDesired(), svc.DomainApplied())
+	}
+
+	g := &model.Group{AllowProtocols: "http"}
+	u := &model.User{ID: 1, Username: "closeduser"}
+	if _, err := svc.normalizeInput(u, g, TunnelInput{
+		Name: "site", Type: model.ProxyTypeHTTP, LocalPort: 8080, Subdomain: "web",
+	}); !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("隧道关闭后不该再允许创建子域名隧道，实际 %v", err)
 	}
 }
 

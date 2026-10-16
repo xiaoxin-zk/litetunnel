@@ -116,6 +116,10 @@ func (s *Services) DomainConfigVars() (map[string]string, error) {
 }
 
 // DesiredPanelDomain 返回界面上保存的面板域名（期望值，未必已生效）。
+//
+// 面板域名不能用下面隧道域名那套「行存在即用其值」的判据：它**不允许为空**
+// （Caddy 要靠它签证书、找回密码邮件要靠它拼链接），空值只会是异常状态，
+// 此时回落到 .env 比把一个空域名下发出去要好。
 func (s *Services) DesiredPanelDomain() string {
 	if v := normalizeDomainValue(s.Settings.Get(KeyDomainPanel)); v != "" {
 		return v
@@ -124,9 +128,18 @@ func (s *Services) DesiredPanelDomain() string {
 }
 
 // DesiredTunnelDomain 返回界面上保存的隧道根域名（期望值，未必已生效）。
+//
+// 空值有两种含义，必须按「库里有没有这一行」区分，而不是按「值是否为空」：
+//
+//	没有行     → 从未配置过，继续以 .env 为准；
+//	有行且为空 → 管理员明确关闭了 HTTP/HTTPS 隧道。
+//
+// 混为一谈的后果是「关闭」这个操作根本不生效：清空后保存会被当成「没配过」
+// 而回落到 .env，下发给 helper 的仍然是旧域名，Caddyfile 里的泛域名站点块
+// （// @if LT_TUNNEL_DOMAIN）也永远不会被剪掉。
 func (s *Services) DesiredTunnelDomain() string {
-	if v := normalizeDomainValue(s.Settings.Get(KeyDomainTunnel)); v != "" {
-		return v
+	if s.Settings.hasRow(KeyDomainTunnel) {
+		return normalizeDomainValue(s.Settings.Get(KeyDomainTunnel))
 	}
 	return normalizeDomainValue(s.Cfg.TunnelDomain)
 }
@@ -180,9 +193,13 @@ func (s *Services) envHTTPSMode() string {
 //	失败」时新域名还没生效，按它放行只会得到一条打不开的隧道。
 //
 // 所以取「已下发」的记录，没有记录时回落到 .env——那才是实际在跑的配置。
+//
+// 与 DesiredTunnelDomain 一样要区分「没有行」与「有行但为空」：后者是一次
+// 成功的下发把隧道关掉了，运行期必须真的关掉（不再放行任何子域名隧道），
+// 而不是回落到 .env 把 .env 里的旧域名又捡回来。
 func (s *Services) TunnelDomain() string {
-	if v := normalizeDomainValue(s.Settings.Get(KeyDomainAppliedTunnel)); v != "" {
-		return v
+	if s.Settings.hasRow(KeyDomainAppliedTunnel) {
+		return normalizeDomainValue(s.Settings.Get(KeyDomainAppliedTunnel))
 	}
 	return normalizeDomainValue(s.Cfg.TunnelDomain)
 }

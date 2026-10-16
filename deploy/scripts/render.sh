@@ -55,6 +55,24 @@ VARS[LT_ADMIN_ALLOW_CIDR]="${VARS[LT_ADMIN_ALLOW_CIDR]:-127.0.0.1/32}"
 VARS[LT_ACME_EMAIL]="${VARS[LT_ACME_EMAIL]:-admin@${USER_DOMAIN}}"
 VARS[LT_TUNNEL_DOMAIN]="${VARS[LT_TUNNEL_DOMAIN]:-}"
 
+# DNS Challenge：泛域名证书的唯一签发途径。
+VARS[LT_CADDY_DNS_PROVIDER]="${VARS[LT_CADDY_DNS_PROVIDER]:-}"
+if [[ -z "${VARS[LT_CADDY_DNS_ARGS]:-}" ]]; then
+  # 默认从环境变量取凭据：这样凭据不落进 Caddyfile，
+  # 也就不进版本库、不进日志、不进任何备份。
+  VARS[LT_CADDY_DNS_ARGS]='{env.LT_CADDY_DNS_CREDENTIAL}'
+fi
+
+# 配了隧道域名却没有 DNS 服务商：这不是「少配一项」，而是根本签不出证书。
+# 与其产出一份 Caddy 拒绝加载（或反复重试失败）的配置，不如现在就报错。
+if [[ -n "${VARS[LT_TUNNEL_DOMAIN]}" && -z "${VARS[LT_CADDY_DNS_PROVIDER]}" ]]; then
+  echo "已设置 LT_TUNNEL_DOMAIN 但 LT_CADDY_DNS_PROVIDER 为空。" >&2
+  echo "泛域名证书无法用 HTTP-01/TLS-ALPN-01 验证，只能用 DNS Challenge 签发。" >&2
+  echo "请填写 dns 指令名（如 cloudflare，需与 Caddy 镜像里编入的插件一致），" >&2
+  echo "或清空 LT_TUNNEL_DOMAIN 以关闭 HTTP/HTTPS 隧道。" >&2
+  exit 1
+fi
+
 REQUIRED=(
   LT_GATEWAY_PORT LT_KCP_PORT LT_VHOST_HTTP_PORT LT_VHOST_HTTPS_PORT
   LT_FRPS_TOKEN LT_PORT_RANGE_START LT_PORT_RANGE_END LT_MAX_PORTS_PER_USER
@@ -77,10 +95,67 @@ for k in "${!VARS[@]}"; do
   fi
 done
 
+# ---- HTTPS 隧道模式 ----
+#
+# edge：证书留在 Caddy，Caddy 用泛域名证书终止 TLS 后走 vhostHTTPPort；
+# e2e ：证书留在本地网站，frps 在 vhostHTTPSPort 上按 SNI 透传原始 TLS 连接，
+#       这个端口必须对公网放行。
+#
+# 放到必填项检查之后：e2e 模式下端口号是从 LT_VHOST_HTTPS_PORT 派生的，
+# 那个值缺失时这里的派生结果会是一个「看起来没配 e2e」的空值，
+# 而真正的问题（端口没填）已经在上面报过了。
+VARS[LT_HTTPS_TUNNEL_MODE]="${VARS[LT_HTTPS_TUNNEL_MODE]:-edge}"
+VARS[LT_HTTPS_E2E_PORT]=""
+case "${VARS[LT_HTTPS_TUNNEL_MODE]}" in
+  edge) ;;
+  e2e) VARS[LT_HTTPS_E2E_PORT]="${VARS[LT_VHOST_HTTPS_PORT]}" ;;
+  *)
+    echo "LT_HTTPS_TUNNEL_MODE 只能是 edge 或 e2e，当前为 ${VARS[LT_HTTPS_TUNNEL_MODE]}。" >&2
+    exit 1
+    ;;
+esac
+
+# ---- 条件块 ----
+# 模板里用 "# @if VAR" 与 "# @endif" 包住「VAR 为空时整段删除」的内容。
+#
+# 为什么必须整段删，而不是让它替换成空：渲染是纯文本替换，留空只会得到一份
+# 「站点地址是空行」的配置，而 Caddy 会因此拒绝加载**整份** Caddyfile——
+# 一个可选项没填，代价是整个反代起不来。泛域名段（LT_TUNNEL_DOMAIN 默认为空）
+# 正好是这种情况，也就是「默认配置根本起不来」。
+#
+# 语义只有一种：变量非空则保留整段，否则连同标记行一起删掉。支持嵌套。
+apply_conditionals() {
+  local text="$1"
+  local line var out=''
+  local states='1' # 每层一个字符：1=保留 0=丢弃，末位是当前层
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*#[[:space:]]*@if[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*$ ]]; then
+      var="${BASH_REMATCH[1]}"
+      if [[ "${states: -1}" == '1' && -n "${VARS[${var}]:-}" ]]; then
+        states="${states}1"
+      else
+        states="${states}0"
+      fi
+      continue
+    fi
+    if [[ "${line}" =~ ^[[:space:]]*#[[:space:]]*@endif[[:space:]]*$ ]]; then
+      if (( ${#states} > 1 )); then
+        # 去掉末位（当前层）。用 %? 而不是 ${x:0:${#x}-1}：后者嵌套展开容易踩坑
+        states="${states%?}"
+      fi
+      continue
+    fi
+    if [[ "${states: -1}" == '1' ]]; then
+      out+="${line}"$'\n'
+    fi
+  done <<< "${text}"
+  printf '%s' "${out}"
+}
+
 render() {
   local tpl="$1" out="$2"
   local text
-  text="$(cat "${tpl}")"
+  text="$(apply_conditionals "$(cat "${tpl}")")"
   # 长键优先替换，避免前缀重叠导致误替换
   while IFS= read -r k; do
     local v="${VARS[$k]:-}"
@@ -104,5 +179,14 @@ cat <<'EOF'
 
 渲染完成。接下来：
   1) 确保防火墙/安全组只放行 80、443 与隧道端口池（默认 20000-30000），以及网关端口 7001/TCP 与 7002/UDP
-  2) 在仓库根目录执行： docker compose -f deploy/docker-compose.yml up -d --build
+  2) 在仓库根目录执行：
+       docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
+     （--env-file 是必须的：.env 在仓库根目录，而默认只读 compose 文件所在目录的那份）
 EOF
+
+if [[ -n "${VARS[LT_HTTPS_E2E_PORT]}" ]]; then
+  echo "  3) 端到端 HTTPS 已启用（LT_HTTPS_TUNNEL_MODE=e2e）："
+  echo "     · 放行 ${VARS[LT_HTTPS_E2E_PORT]}/TCP，证书由本地网站自己持有"
+  echo "     · HTTPS 隧道请用 <子域>.${VARS[LT_TUNNEL_DOMAIN]}:${VARS[LT_HTTPS_E2E_PORT]} 访问"
+  echo "       （443 由 Caddy 接管，返回的是平台证书，浏览器会提示不匹配）"
+fi

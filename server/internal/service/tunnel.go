@@ -95,11 +95,12 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 			return created, nil
 		}
 		if !isPortConflict(err) {
-			return nil, err
+			return nil, describeTunnelWriteError(err)
 		}
 		log.Printf("[tunnel] 端口分配撞车（第 %d/%d 次尝试），重新随机分配后重试", attempt, attempts)
 	}
-	return nil, err
+	// 重试次数用尽仍是端口冲突：如实返回（下面这行对它没有影响）。
+	return nil, describeTunnelWriteError(err)
 }
 
 // portAllocAttempts 是自动分配端口撞车后的最大尝试次数。
@@ -110,18 +111,54 @@ const portAllocAttempts = 5
 
 // isPortConflict 判断错误是否来自「端口唯一索引冲突」。
 //
-// 两个驱动的报错文本不同（SQLite 是 "UNIQUE constraint failed"，PostgreSQL
-// 是 "duplicate key value violates unique constraint"），这里按关键字匹配。
+// 两个驱动的报错文本不同，但都会带上端口这个标识：
 //
-// 注意它只用来决定**要不要重试**：匹配不上最多退化为「不重试」，原始错误
-// 照样返回给调用方，不会被吞掉。名字冲突（user_id + name 的唯一索引）也会
-// 命中这里，但那种情况重试几次后依旧失败，最终返回的还是原始错误。
+//	SQLite     ：UNIQUE constraint failed: lt_tunnels.remote_port
+//	PostgreSQL ：duplicate key value violates unique constraint "idx_lt_tunnels_remote_port"
+//
+// 判定必须**同时**要求「是唯一约束」和「提到端口」，只认前者会把名称冲突
+// 也算进来（见 isNameConflict）：那种冲突重试再多次也还是同一个错误，
+// 却会在日志里留下 5 行「端口分配撞车」——把排查方向直接带到错的地方。
 func isPortConflict(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate key")
+	if !strings.Contains(msg, "unique") && !strings.Contains(msg, "duplicate key") {
+		return false
+	}
+	return strings.Contains(msg, "remote_port")
+}
+
+// isNameConflict 判断错误是否来自「同一用户下隧道名重复」（user_id + name）。
+//
+// 排除法是刻意的：PG 的报错里往往只有索引名，而索引名是建表时定的
+//（idx_user_tunnel），靠它反而更脆；带上 remote_port 的一定是端口冲突，
+// 剩下的唯一约束冲突就只可能是名字。
+func isNameConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "unique") && !strings.Contains(msg, "duplicate key") {
+		return false
+	}
+	return !strings.Contains(msg, "remote_port")
+}
+
+// describeTunnelWriteError 把唯一索引冲突翻译成用户看得懂的错误。
+//
+// 数据库原文（UNIQUE constraint failed: lt_tunnels.user_id, lt_tunnels.name）
+// 对用户没有任何意义，原样往上抛只会变成一句「服务内部错误，请稍后重试」，
+// 而用户真正需要知道的是「换个隧道名」。
+func describeTunnelWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !isPortConflict(err) && isNameConflict(err) {
+		return fmt.Errorf("%w: 隧道名已存在，请换一个名字", ErrInvalidParam)
+	}
+	return err
 }
 
 // createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。
@@ -320,6 +357,13 @@ func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 		return err
 	}
 
+	// 重新启用一条 HTTPS 隧道时同样要确认入口还在：管理员可能已经把平台
+	// 切回了边缘模式。否则「停用 → 切换模式 → 启用」会绕开创建时的检查，
+	// 得到一条状态为运行中、实际永远连不上的隧道。
+	if status == model.TunnelStatusActive && t.Type == model.ProxyTypeHTTPS && !s.HTTPSProxyEntryEnabled() {
+		return ErrNoHTTPSProxyEntry
+	}
+
 	if err := s.DB.Model(&model.Tunnel{}).
 		Where("id = ? AND user_id = ?", id, userID).
 		Update("status", status).Error; err != nil {
@@ -423,10 +467,13 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 			LocalPort: port,
 		})
 		if err != nil {
+			// 逐条回报失败原因，同样要把数据库原文翻译一遍：
+			// 批量失败列表里出现 "UNIQUE constraint failed" 这种内容，
+			// 用户既看不懂，也不知道该怎么改。
 			res.Failures = append(res.Failures, BatchFailure{
 				LocalPort: port,
 				Name:      name,
-				Reason:    err.Error(),
+				Reason:    describeTunnelWriteError(err).Error(),
 			})
 			// 上限类错误后续每一条都会重复出现，直接结束，
 			// 避免把同一个原因播报二十遍。
@@ -481,6 +528,17 @@ func (s *Services) normalizeInput(u *model.User, g *model.Group, in TunnelInput)
 		return out, ErrProtocolDenied
 	}
 
+	// HTTPS 隧道与 HTTP 隧道的入口不是同一条：HTTP 走 Caddy 的 443，
+	// 由 Caddy 用泛域名证书终止 TLS 后转发给 frps；HTTPS 则由 frps 在独立
+	// 端口上按 SNI 透传原始 TLS 连接，证书留在本地网站——而那条入口只在
+	// 端到端模式下存在。
+	//
+	// 不拦的话，用户会创建一个永远打不开的隧道，然后去查本地网站的配置、
+	// 防火墙、证书，一路查到最后才发现是平台根本不提供这条入口。
+	if ptype == model.ProxyTypeHTTPS && !s.HTTPSProxyEntryEnabled() {
+		return out, ErrNoHTTPSProxyEntry
+	}
+
 	if in.LocalPort < 1 || in.LocalPort > 65535 {
 		return out, fmt.Errorf("%w: 本地端口需在 1-65535 之间", ErrInvalidParam)
 	}
@@ -532,13 +590,18 @@ func (s *Services) normalizeDomain(g *model.Group, in TunnelInput) (domain, sub 
 			return "", "", fmt.Errorf("%w: 域名格式不正确", ErrInvalidParam)
 		}
 		// 自定义域名必须落在平台泛域名之下，防止用户劫持他人域名。
-		if s.Cfg.TunnelDomain != "" && !strings.HasSuffix(domain, "."+s.Cfg.TunnelDomain) && domain != s.Cfg.TunnelDomain {
-			return "", "", fmt.Errorf("%w: 仅允许使用 *.%s 下的域名", ErrDomainDenied, s.Cfg.TunnelDomain)
+		//
+		// 用 TunnelDomain() 而不是 Cfg.TunnelDomain：管理员在「域名与证书」
+		// 里改完域名后，面板容器不会重启，照 Cfg 判权会让「新域名的子域
+		// 被拒绝、旧域名的子域被放行」——而渲染出的 Caddyfile 里只有新域名。
+		td := s.TunnelDomain()
+		if td != "" && !strings.HasSuffix(domain, "."+td) && domain != td {
+			return "", "", fmt.Errorf("%w: 仅允许使用 *.%s 下的域名", ErrDomainDenied, td)
 		}
 		return domain, "", nil
 	}
 
-	if s.Cfg.TunnelDomain == "" {
+	if s.TunnelDomain() == "" {
 		return "", "", fmt.Errorf("%w: 平台未配置泛域名，暂不支持二级域名", ErrInvalidParam)
 	}
 	if !IsSafeName(sub) {

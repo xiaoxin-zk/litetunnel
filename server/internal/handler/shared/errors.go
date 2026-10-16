@@ -126,6 +126,9 @@ func Fail(c *gin.Context, err error) {
 		httpx.Forbidden(c, err.Error())
 
 	case errors.Is(err, service.ErrInvalidParam),
+		// 这类「选了但本站没有对应能力」的提示要原样返回前端：
+		// 换成笼统的错误，用户只会反复重试同一个选项。
+		errors.Is(err, service.ErrNoHTTPSProxyEntry),
 		errors.Is(err, service.ErrPortInUse),
 		errors.Is(err, service.ErrNoPortAvailable),
 		errors.Is(err, service.ErrCodeInvalid),

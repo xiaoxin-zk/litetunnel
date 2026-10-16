@@ -86,6 +86,23 @@ type Config struct {
 
 	TunnelDomain string
 
+	// VhostHTTPSPort 是 frps 的 HTTPS 隧道入口端口（LT_VHOST_HTTPS_PORT，默认 8444）。
+	//
+	// 面板需要知道它，才能在客户端里显示 HTTPS 隧道的**真实**访问地址：
+	// 端到端模式下那条隧道不在 443 上，地址必须带端口——只给一个裸域名的话，
+	// 用户会拿到 Caddy 的证书并看到「证书不匹配」，然后以为是自己配错了。
+	//
+	// 值来自 .env：面板容器通过 env_file 读到整份 .env，与渲染 frps.toml
+	// 用的是同一个来源，因此不存在「两份数据互相分叉」的问题。
+	VhostHTTPSPort int
+
+	// HTTPSProxyMode 是 HTTPS 隧道模式（LT_HTTPS_TUNNEL_MODE：edge / e2e）。
+	//
+	// 只作为管理端设置的**初始默认值**：运行期以数据库里的设置为准
+	// （管理端改完由 helper 回写 .env，而面板容器不会重启，
+	// 拿这里当运行期真相会让界面与实际配置长期不一致）。
+	HTTPSProxyMode string
+
 	// ClientDistDir 存放对外分发的客户端安装包目录，由控制台列出供下载。
 	ClientDistDir string
 
@@ -180,6 +197,9 @@ func Load() (*Config, error) {
 		MaxPortsPerUser: envInt("LT_MAX_PORTS_PER_USER", 10),
 
 		TunnelDomain: strings.ToLower(strings.TrimSpace(env("LT_TUNNEL_DOMAIN", ""))),
+
+		VhostHTTPSPort: envInt("LT_VHOST_HTTPS_PORT", 8444),
+		HTTPSProxyMode: strings.ToLower(strings.TrimSpace(env("LT_HTTPS_TUNNEL_MODE", "edge"))),
 
 		ClientDistDir: env("LT_CLIENT_DIST_DIR", "./data/clients"),
 		UserWebDir:    env("LT_USER_WEB_DIR", "./web/user/dist"),

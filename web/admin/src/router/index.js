@@ -14,6 +14,7 @@ const routes = [
       { path: 'logs', name: 'logs', meta: { title: '审计与客户端' }, component: () => import('../views/Logs.vue') },
       { path: 'login-logs', name: 'login-logs', meta: { title: '登录日志' }, component: () => import('../views/LoginLogs.vue') },
       { path: 'admins', name: 'admins', meta: { title: '管理员管理' }, component: () => import('../views/Admins.vue') },
+      { path: 'domain', name: 'domain', meta: { title: '域名与证书' }, component: () => import('../views/DomainTLS.vue') },
       { path: 'firewall', name: 'firewall', meta: { title: '端口与防火墙' }, component: () => import('../views/Firewall.vue') },
       { path: 'client-dist', name: 'client-dist', meta: { title: '客户端分发' }, component: () => import('../views/ClientDist.vue') },
       { path: 'system', name: 'system', meta: { title: '系统设置' }, component: () => import('../views/SystemSettings.vue') },

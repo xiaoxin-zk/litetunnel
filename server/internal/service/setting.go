@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
 // SettingKey 是管理端可随时调整的运行期配置项。
@@ -104,6 +106,25 @@ const (
 	// 这样做的好处是客户端不再需要人工搬运到服务器、也不会因为
 	// 服务器磁盘被大文件占满而出问题；留空则回退到本地目录分发。
 	KeySiteClientDownloadURL SettingKey = "site.client_download_url"
+
+	// ---- 域名与证书 ----
+	//
+	// 这一组决定 Caddy 与 frps 的域名、证书与入口路由。
+	//
+	// 与其它运行期配置最大的不同：**只写数据库是不生效的**。Caddyfile 与
+	// frps.toml 在宿主机上，改完必须重新渲染并重建容器，因此保存之后还有一步
+	// 「下发」——由宿主机上的 lt-config helper 完成（见 cmd/lt-config）。
+	// helper 的地址与令牌也就成了这一组配置的一部分，形制与防火墙 helper 一致。
+	KeyDomainPanel         SettingKey = "domain.panel"
+	KeyDomainTunnel        SettingKey = "domain.tunnel"
+	KeyDomainACMEEmail     SettingKey = "domain.acme_email"
+	KeyDomainDNSProvider   SettingKey = "domain.dns_provider"
+	KeyDomainDNSCredential SettingKey = "domain.dns_credential"
+	KeyDomainDNSArgs       SettingKey = "domain.dns_args"
+	KeyDomainHTTPSMode     SettingKey = "domain.https_mode"
+	KeyDomainExpectedIP    SettingKey = "domain.expected_ip"
+	KeyDomainHelperAddr    SettingKey = "domain.helper_addr"
+	KeyDomainHelperToken   SettingKey = "domain.helper_token"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -193,6 +214,29 @@ var settingSpecs = []settingSpec{
 	{Key: KeySiteAnnouncement, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteICP, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteClientDownloadURL, Default: func(*config.Config) string { return "" }},
+
+	// 域名与证书。
+	//
+	// 默认值全部来自环境变量：这样「手工部署时在 .env 里填的域名」会
+	// 自动成为界面上的初始值，第一次进后台就看到当前实际生效的配置，
+	// 而不是一片空白。
+	{Key: KeyDomainPanel, Default: func(c *config.Config) string { return normalizeDomainValue(c.UserPublicURL) }},
+	{Key: KeyDomainTunnel, Default: func(c *config.Config) string { return normalizeDomainValue(c.TunnelDomain) }},
+	{Key: KeyDomainACMEEmail, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSProvider, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSCredential, Secret: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSArgs, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainHTTPSMode, Default: func(c *config.Config) string {
+		// 初始值跟随 .env 里的 LT_HTTPS_TUNNEL_MODE：手工部署时怎么配的，
+		// 后台第一次打开就显示什么，而不是一律显示默认值。
+		if strings.EqualFold(strings.TrimSpace(c.HTTPSProxyMode), tlscfg.HTTPSModeE2E) {
+			return tlscfg.HTTPSModeE2E
+		}
+		return tlscfg.HTTPSModeEdge
+	}},
+	{Key: KeyDomainExpectedIP, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainHelperAddr, Default: func(*config.Config) string { return "http://127.0.0.1:7850" }},
+	{Key: KeyDomainHelperToken, Secret: true, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。
@@ -488,6 +532,11 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 接口突发容量需为 1-10000 的整数", ErrInvalidParam)
 	}
 
+	// ---- 域名与证书 ----
+	if err := validateDomainSettings(view, s.Settings.Get); err != nil {
+		return err
+	}
+
 	// 记下改动前的防火墙开关：如果这次把它打开了，要立刻唤醒协调器，
 	// 让它马上做一次规则对齐并开始重试待办，而不是等下一个轮询周期。
 	firewallWasOn := s.Settings.Bool(KeyFirewallEnabled)
@@ -498,6 +547,69 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 
 	if _, changed := in[KeyFirewallEnabled]; changed && !firewallWasOn && s.Settings.Bool(KeyFirewallEnabled) {
 		s.KickFirewall()
+	}
+	return nil
+}
+
+// validateDomainSettings 校验「域名与证书」这一组。
+//
+// 只做面板自己就能判定的检查（域名格式、字段之间的依赖关系）；「这份配置
+// Caddy 到底能不能加载」必须在宿主机上用**目标镜像**验证，那是 helper 的
+// 职责（见 cmd/lt-config 的 validateCaddy）。
+//
+// 校验范围的取舍：域名本来就为空时直接放过。否则任何一次「改 SMTP 端口」
+// 的保存都会因为「面板域名为空」而失败——把一个功能的未配置状态
+// 扩散成整个设置页不可用。
+func validateDomainSettings(view, current func(SettingKey) string) error {
+	panel := normalizeDomainValue(view(KeyDomainPanel))
+	if panel == "" {
+		// 「本来就是空的」与「被清空了」必须分开处理。
+		//
+		// 前者是「域名还没配」的部署（开发环境、刚拉起还没填 .env），
+		// 此时把整个设置页的保存一起堵死，等于让一个功能的未配置状态
+		// 变成全站不可用；后者才是真正需要拦下的操作——Caddy 没有域名
+		// 就签不出证书，找回密码的链接也无从拼起。
+		if current(KeyDomainPanel) != "" {
+			return fmt.Errorf("%w: 面板域名不能为空：Caddy 需要它签发证书，找回密码邮件也要用它拼链接", ErrInvalidParam)
+		}
+		return nil
+	}
+	if err := checkDomain(panel); err != nil {
+		return fmt.Errorf("%w: 面板域名不合法（%s）", ErrInvalidParam, err.Error())
+	}
+
+	tunnel := normalizeDomainValue(view(KeyDomainTunnel))
+	if tunnel != "" {
+		if err := checkDomain(tunnel); err != nil {
+			return fmt.Errorf("%w: 隧道根域名不合法（%s）", ErrInvalidParam, err.Error())
+		}
+		if tunnel == panel {
+			return fmt.Errorf("%w: 隧道根域名不能与面板域名相同：同一个域名既要由 Caddy 提供控制台、又要按子域转发隧道，"+
+				"证书配额与排查都会立刻变成灾难", ErrInvalidParam)
+		}
+		// 泛域名证书只能走 DNS Challenge：没有 dns 指令就签不出证书，
+		// 缺的不是「一项配置」，而是整个 HTTP/HTTPS 隧道入口。
+		if strings.TrimSpace(view(KeyDomainDNSProvider)) == "" {
+			return fmt.Errorf("%w: 已填写隧道根域名但未选择 DNS 服务商：泛域名证书无法用 HTTP-01/TLS-ALPN-01 验证", ErrInvalidParam)
+		}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(view(KeyDomainHTTPSMode))) {
+	case "", tlscfg.HTTPSModeEdge, tlscfg.HTTPSModeE2E:
+	default:
+		return fmt.Errorf("%w: HTTPS 隧道模式只能是 %s（证书留在 Caddy）或 %s（证书留在本地网站）",
+			ErrInvalidParam, tlscfg.HTTPSModeEdge, tlscfg.HTTPSModeE2E)
+	}
+
+	if ip := strings.TrimSpace(view(KeyDomainExpectedIP)); ip != "" && net.ParseIP(ip) == nil {
+		return fmt.Errorf("%w: DNS 检查的期望地址不是合法 IP", ErrInvalidParam)
+	}
+
+	if addr := strings.TrimSpace(view(KeyDomainHelperAddr)); addr != "" && !strings.HasPrefix(addr, "http") {
+		return fmt.Errorf("%w: 配置服务地址需形如 http://127.0.0.1:7850", ErrInvalidParam)
+	}
+	if token := view(KeyDomainHelperToken); token != "" && len(token) < 16 {
+		return fmt.Errorf("%w: 配置服务访问令牌至少 16 个字符，否则本机任意进程都能让它重写 TLS 配置并重启容器", ErrInvalidParam)
 	}
 	return nil
 }

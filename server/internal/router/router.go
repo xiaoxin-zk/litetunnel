@@ -254,6 +254,9 @@ func New(
 		adminRead.GET("/login-logs", adminH.ListLoginLogs)
 		adminRead.GET("/admins", adminH.ListAdmins)
 		adminRead.GET("/settings", adminH.GetSettings)
+		// 「域名与证书」的状态：helper 健康度 + Caddy 证书 + 待检查域名。
+		// 只读组：看证书什么时候到期，是审计角色也该能做的事。
+		adminRead.GET("/domain/status", adminH.DomainStatus)
 	}
 
 	// 写操作额外要求 super / operator 角色，auditor 只读。
@@ -306,6 +309,11 @@ func New(
 		adminSuper.POST("/firewall/rescan", adminH.FirewallRescan)
 		adminSuper.POST("/firewall/ports", adminH.FirewallOpenPort)
 		adminSuper.DELETE("/firewall/ports", adminH.FirewallClosePort)
+
+		// 域名与证书的下发会改宿主机上的 Caddyfile / frps.toml 并重建容器，
+		// 配错直接等于「网站打不开、隧道全断」，因此仅超级管理员可操作。
+		adminSuper.POST("/domain/apply", adminH.DomainApply)
+		adminSuper.POST("/domain/dns-check", adminH.DomainDNSCheck)
 
 		// 客户端安装包分发。上传的文件会被分发给所有用户下载，
 		// 因此仅超级管理员可写（查看在只读组）。

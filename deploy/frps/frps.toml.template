@@ -10,9 +10,22 @@ bindPort = ${LT_GATEWAY_PORT}
 # KCP/QUIC 使用同一 UDP 端口，游戏联机走 KCP 可显著降低延迟
 kcpBindPort = ${LT_KCP_PORT}
 
-# HTTP/HTTPS 隧道入口：仅监听本机，由 Caddy 按域名转发进来
+# ---------- HTTP/HTTPS 隧道入口 ----------
+#
+# vhostHTTPPort：只对回环开放。Caddy 用泛域名证书在 443 上终止 TLS，
+# 再以 HTTP 转发进来——本地网站因此可以继续用 HTTP，证书留在 Caddy。
 vhostHTTPPort = ${LT_VHOST_HTTP_PORT}
+#
+# vhostHTTPSPort：定位取决于 HTTPS 隧道模式（LT_HTTPS_TUNNEL_MODE）
+#   edge（默认）：HTTPS 隧道同样由 Caddy 终止 TLS 后走上面的 HTTP 入口，
+#                 这个端口不对公网放行，留着是为了流量特征与 frp 版本兼容。
+#   e2e         ：直接对公网提供。frps 在这里按 SNI 把**原始 TLS 连接**转给
+#                 frpc，证书由本地网站自己持有，加密是端到端的。
 vhostHTTPSPort = ${LT_VHOST_HTTPS_PORT}
+# @if LT_HTTPS_E2E_PORT
+# 当前为端到端模式：请务必放行 ${LT_HTTPS_E2E_PORT}/TCP，
+# 并且让 HTTPS 隧道用这个端口访问（443 由 Caddy 接管，会返回平台自己的证书）。
+# @endif
 
 # 强制 TLS：拒绝任何明文连接
 transport.tls.force = true

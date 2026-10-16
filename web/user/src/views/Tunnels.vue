@@ -74,6 +74,10 @@
           <div class="lt-muted" style="margin-top: 6px">
             TCP/UDP 用于游戏联机与 NAS；HTTP/HTTPS 用于内网网站。
           </div>
+          <div v-if="httpsUnavailable" class="lt-muted" style="margin-top: 6px">
+            本站未开启端到端 HTTPS，因此没有 HTTPS 隧道入口：本地网站走 HTTP 时请选
+            <b>HTTP</b> 隧道，由平台提供访客侧 HTTPS。
+          </div>
         </el-form-item>
 
         <el-form-item label="本地地址" required>
@@ -144,8 +148,22 @@ const group = computed(() => props.profile?.group)
 
 const allowedProtocols = computed(() => {
   const raw = group.value?.allow_protocols || 'tcp,udp'
-  return raw.split(',').map((s) => s.trim()).filter(Boolean)
+  const list = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  // HTTPS 隧道需要平台在独立端口上做 SNI 透传（端到端模式），而 HTTP 隧道
+  // 由 Caddy 在 443 上提供访客侧 HTTPS——没有那条入口时就把 https 选项拿掉。
+  // 服务端也会拒绝，这里只是别让用户白填一遍表单。
+  if (group.value && group.value.https_tunnel_enabled === false) {
+    return list.filter((p) => p !== 'https')
+  }
+  return list
 })
+
+/** 当前隐藏了 https 选项（用于给出解释，而不是让选项「凭空消失」）。 */
+const httpsUnavailable = computed(
+  () =>
+    (group.value?.allow_protocols || '').includes('https') &&
+    group.value?.https_tunnel_enabled === false
+)
 
 const isPortType = computed(() => ['tcp', 'udp'].includes(form.type))
 

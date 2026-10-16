@@ -767,6 +767,74 @@ func (h *Handler) TestMail(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "测试邮件已发送，请查收"})
 }
 
+// ---- 域名与证书 ----
+
+// DomainStatus 返回宿主机配置服务的健康度与证书状态。
+//
+// 归在只读组：这些信息（helper 通不通、证书还有几天到期）是排查问题的
+// 第一手材料，审计角色同样需要看到。
+func (h *Handler) DomainStatus(c *gin.Context) {
+	st := h.svc.DomainStatus()
+	httpx.OK(c, gin.H{
+		"helper":            st.Helper,
+		"helper_reason":     st.HelperReason,
+		"helper_configured": st.HelperConfigured,
+		"certs":             st.Certs,
+	})
+}
+
+// DomainApply 把当前设置渲染成 Caddyfile / frps.toml 并（默认）应用。
+//
+// 与 /settings 分成两个接口是刻意的：保存配置是「记下来」，下发是
+// 「改宿主机上的文件并重启容器」。后者可能失败（helper 没起、镜像拉不到、
+// 配置校验不通过），而失败时不能让「保存」也跟着回滚——管理员需要
+// 保留着填好的值去修环境。
+func (h *Handler) DomainApply(c *gin.Context) {
+	var req struct {
+		// Apply 为 false 时只渲染与校验，不动容器。默认应用。
+		Apply *bool `json:"apply"`
+	}
+	// 空 body 合法：界面上的「保存并应用」不带参数。
+	_ = c.ShouldBindJSON(&req)
+	apply := true
+	if req.Apply != nil {
+		apply = *req.Apply
+	}
+
+	res, err := h.svc.ApplyDomainConfig(apply)
+	if err != nil {
+		h.audit(c, "domain.apply_failed", "domain", "", err.Error())
+		failWithReason(c, err)
+		return
+	}
+	h.audit(c, "domain.apply", "domain", "",
+		fmt.Sprintf("下发域名与证书配置（变化文件：%s）", strings.Join(res.Changed, ", ")))
+	httpx.OK(c, res)
+}
+
+// DomainDNSCheck 检查面板域名、隧道根域名与一个随机子域的解析。
+func (h *Handler) DomainDNSCheck(c *gin.Context) {
+	records, err := h.svc.DomainDNSCheck()
+	if err != nil {
+		failWithReason(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"records": records})
+}
+
+// failWithReason 把原始错误信息交给管理员。
+//
+// shared.Fail 对未识别的错误统一返回「服务内部错误」并把真实原因留在日志里——
+// 对大部分接口这是对的，但这里不行：渲染、校验、重启失败的原因就是管理员
+// 接下来要修的东西，换成一句笼统的提示只会让他去猜。
+func failWithReason(c *gin.Context, err error) {
+	if errors.Is(err, service.ErrInvalidParam) {
+		httpx.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	httpx.Fail(c, http.StatusBadGateway, err.Error())
+}
+
 // ---- 系统监控 ----
 
 // SystemMetrics 返回服务器实时指标与最近的采样序列。

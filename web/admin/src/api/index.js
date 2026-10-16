@@ -143,6 +143,19 @@ export const settingsApi = {
   testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
+// 域名与证书。
+//
+// 与 settingsApi 的分工：settingsApi 只是「把值存下来」，
+// 而 domainApi.apply 会让宿主机上的 lt-config 重新渲染 Caddyfile / frps.toml
+// 并重建 caddy 与 frps 容器——那是会短暂影响线上的操作，因此单独成一步。
+export const domainApi = {
+  // 宿主机配置服务健康度 + Caddy 证书 + 默认要检查的域名。
+  status: () => http.get('/domain/status'),
+  // apply 为 false 时只渲染与校验，不动容器。
+  apply: (apply = true) => http.post('/domain/apply', { apply }),
+  dnsCheck: () => http.post('/domain/dns-check')
+}
+
 export const logApi = {
   audit: (params) => http.get('/audit-logs', { params }),
   clients: (params) => http.get('/clients', { params }),

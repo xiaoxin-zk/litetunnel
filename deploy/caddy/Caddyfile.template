@@ -50,14 +50,52 @@ ${LT_USER_DOMAIN} {
 #		respond "Not Found" 404
 #	}
 
+# @if LT_HTTPS_E2E_PORT
+# ---------- 端到端 HTTPS（独立公网端口）----------
+#
+# 本模式下 HTTPS 隧道**完全不经过 Caddy**：frps 在 ${LT_HTTPS_E2E_PORT} 上按
+# SNI 把原始 TLS 连接转给 frpc，证书由本地网站自己持有。因此浏览器看到的是
+# 本地网站的证书，加密是端到端的——平台无法解密，也无法替它续期。
+#
+# 所以这里不生成站点块，但有两件事必须由人来确认：
+#   1. 防火墙 / 云安全组放行 ${LT_HTTPS_E2E_PORT}（TCP）；
+#   2. 访问 HTTPS 隧道时用 <子域>.域名:${LT_HTTPS_E2E_PORT}，
+#      而不是 443 —— 443 由下面的泛域名站点块接管，返回的是平台自己的证书，
+#      浏览器会提示证书不匹配。
+#
+# 想同时用 HTTP 隧道与端到端 HTTPS 隧道是可以的：前者走 443（下面那段），
+# 后者走 ${LT_HTTPS_E2E_PORT}，两条路径互不干扰。
+# @endif
+
+# @if LT_TUNNEL_DOMAIN
 # ---------- HTTP 隧道泛域名 ----------
-# 需要把 *.隧道域名 解析到本机，并在此处使用 DNS Challenge 申请泛域名证书。
-# 未配置泛域名时，本段可整体删除。
-${LT_TUNNEL_DOMAIN} {
+# 需要把 ${LT_TUNNEL_DOMAIN} 及其子域解析到本机。
+#
+# 这段站点块负责的是**边缘模式**的 HTTP 隧道：Caddy 用泛域名证书在 443 上
+# 终止 TLS，再以 HTTP 转发给 frps 的 vhostHTTPPort。证书留在 Caddy，
+# 本地网站可以继续用 HTTP。
+#
+# 端到端 HTTPS 隧道不在这里：它由 frps 在独立端口上按 SNI 透传，
+# 见上面的说明（LT_HTTPS_TUNNEL_MODE=e2e）。
+#
+# 站点地址写成通配符 *.${LT_TUNNEL_DOMAIN}：隧道走的是
+# <子域>.${LT_TUNNEL_DOMAIN}，只写裸域名的话 Caddy 只为裸域名签一张证书，
+# 子域请求全部对不上证书名。注意泛域名证书只覆盖**一级**子域（RFC 6125），
+# frp 分配的子域名正好是一级；要服务更深层的域名得另签证书。
+#
+# 泛域名证书无法用 HTTP-01/TLS-ALPN-01 验证，只能走 DNS Challenge，因此还需要：
+#   1. Caddy 镜像里编入对应插件 —— 官方 caddy:2-alpine 不带任何 dns 指令，
+#      照抄 dns ... 会让 Caddy 以 "unrecognized directive: dns" 拒绝启动；
+#      见 deploy/caddy/Dockerfile 与 LT_CADDY_DNS_MODULES / LT_CADDY_IMAGE；
+#   2. .env 里填 LT_CADDY_DNS_PROVIDER（即 dns 指令名，如 cloudflare）；
+#   3. 凭据从环境变量读，不写进本文件（见 LT_CADDY_DNS_ARGS）。
+#
+# 不配置泛域名时把 LT_TUNNEL_DOMAIN 留空即可：整段会被渲染脚本删掉。
+# 渲染是纯文本替换，留空只会得到一个「空地址行」的站点块，
+# 而 Caddy 会因此拒绝加载**整份**配置——所以必须整段剪掉。
+*.${LT_TUNNEL_DOMAIN} {
 	tls {
-		# 泛域名证书必须使用 DNS Challenge，请按你的 DNS 服务商补充插件：
-		# dns <provider> <credentials>
-		# 若无法使用 DNS Challenge，请改为逐个域名签发（不使用通配符）。
+		dns ${LT_CADDY_DNS_PROVIDER} ${LT_CADDY_DNS_ARGS}
 	}
 
 	reverse_proxy 127.0.0.1:${LT_VHOST_HTTP_PORT}
@@ -70,3 +108,4 @@ ${LT_TUNNEL_DOMAIN} {
 		format json
 	}
 }
+# @endif

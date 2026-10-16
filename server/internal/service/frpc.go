@@ -146,8 +146,11 @@ func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 		ServerPort:    s.Cfg.GatewayPort,
 		User:          FrpUserOf(u.ID),
 		Token:         secret,
-		FrpsToken:     s.Cfg.FrpsToken,
-		TunnelDomain:  s.Cfg.TunnelDomain,
+		FrpsToken: s.Cfg.FrpsToken,
+		// 用 TunnelDomain()（数据库设置优先）：管理端改完域名后 frps 与
+		// Caddy 已按新域名重建，而面板容器不会重启——这里返回旧域名的话，
+		// 客户端就会把子域名的访问地址拼成已经不存在的那个域名。
+		TunnelDomain:  s.TunnelDomain(),
 		ProxyNameFmt:  "{user}.{name}",
 		BandwidthUnit: "MB/KB (字节/秒)",
 	}, nil

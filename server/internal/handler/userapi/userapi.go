@@ -208,6 +208,11 @@ func (h *Handler) profileVO(u *model.User) gin.H {
 			"bandwidth_limit_str": service.FormatBandwidthHuman(g.BandwidthLimit),
 			"allow_protocols":     g.AllowProtocols,
 			"allow_custom_domain": g.AllowCustomDomain,
+			// HTTPS 隧道入口。不并入 allow_protocols，是因为它属于**平台能力**
+			// 而不是分组权限：管理员随时可能切模式，分组配置不该被迫跟着改。
+			// 前端据此隐藏 https 选项——否则用户选了它，只能拿到一句报错。
+			"https_tunnel_enabled": h.svc.HTTPSProxyEntryEnabled(),
+			"https_entry":          h.svc.HTTPSProxyEntry(),
 		}
 	}
 	return vo
@@ -241,7 +246,9 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 	// 未配置时不发信、但对外仍返回统一提示：一来不暴露「服务端配置有误」，
 	// 二来本接口不能因为内部状态而变得可区分（否则又会退化成账号枚举工具）。
 	// 配置问题通过启动期提示与这里的日志暴露给管理员。
-	baseURL := h.svc.Cfg.UserPublicURL
+	// 用设置里的面板域名（数据库优先）：管理员在「域名与证书」里改完域名后，
+	// Caddy 已按新域名重建，而面板进程仍持有启动时的环境变量。
+	baseURL := h.svc.UserPublicURL()
 	if baseURL == "" {
 		log.Printf("[reset] 未配置 LT_USER_PUBLIC_URL，无法生成重置链接，本次不发信")
 		httpx.OK(c, gin.H{
@@ -487,6 +494,9 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 			"bandwidth_limit_str": service.FormatBandwidthHuman(g.BandwidthLimit),
 			"allow_protocols":     g.AllowProtocols,
 			"allow_custom_domain": g.AllowCustomDomain,
+			// 同上：客户端据此决定要不要把 https 选项放进建隧道表单。
+			"https_tunnel_enabled": h.svc.HTTPSProxyEntryEnabled(),
+			"https_entry":          h.svc.HTTPSProxyEntry(),
 		}
 	}
 
@@ -665,38 +675,10 @@ func (h *Handler) tunnelVO(t *model.Tunnel, bandwidthLimit int64) gin.H {
 		"use_compression":      t.UseCompression,
 		"last_online_at":       t.LastOnlineAt,
 		"created_at":           t.CreatedAt,
-		"public_addr":          h.publicAddr(t),
+		// 地址由 service 统一计算：HTTP 与 HTTPS 的入口不是同一条，
+		// 而这两条规则必须在客户端、用户控制台、管理端之间完全一致。
+		"public_addr": h.svc.TunnelPublicAddr(t),
 	}
-}
-
-// publicAddr 给出该隧道对外的访问地址，方便用户直接复制。
-func (h *Handler) publicAddr(t *model.Tunnel) string {
-	host := h.svc.Cfg.GatewayHost
-	switch t.Type {
-	case model.ProxyTypeTCP, model.ProxyTypeUDP:
-		if t.RemotePort == 0 {
-			return ""
-		}
-		return host + ":" + strconv.Itoa(t.RemotePort)
-	case model.ProxyTypeHTTP, model.ProxyTypeHTTPS:
-		// HTTP 类隧道统一带上 https:// 前缀。
-		//
-		// 证书由 Caddy 按域名自动签发——这本来就是这套架构的一部分，
-		// 但只给一个裸域名的话，用户不知道该加 http 还是 https：
-		// 加 http 会先跳转一次，而且浏览器会在地址栏标成「不安全」，
-		// 用户会以为是自己配错了。
-		//
-		// 这里可以放心用 https：自定义域名必须落在平台泛域名之下
-		//（normalizeInput 会校验），二级域名更是直接拼在泛域名前面，
-		// 两者都在 Caddy 的证书覆盖范围内。
-		if t.Domain != "" {
-			return "https://" + t.Domain
-		}
-		if t.Subdomain != "" && h.svc.Cfg.TunnelDomain != "" {
-			return "https://" + t.Subdomain + "." + h.svc.Cfg.TunnelDomain
-		}
-	}
-	return ""
 }
 
 // CreateTunnel 新建隧道。

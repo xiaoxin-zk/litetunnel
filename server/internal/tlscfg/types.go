@@ -1,0 +1,193 @@
+// Package tlscfg 承载「域名与证书」配置的渲染与下发。
+//
+// # 分工
+//
+//	控制面（internal/service）  —— 保存配置、组装模板变量、调用下面的客户端
+//	宿主机 helper（cmd/lt-config）—— 渲染 Caddyfile / frps.toml、校验、写盘、重建容器
+//
+// # 为什么渲染不放在控制面
+//
+// 面板容器以 read_only 运行，只挂载了 /data：它既写不了部署目录，
+// 也不持有 docker socket。让它去改 Caddy 配置，等于把「从面板打到宿主机」
+// 的入口直接摆到公网上——这与防火墙写操作一律交给 lt-fw 是同一条理由
+// （见 cmd/lt-fw 的包注释）。渲染留在宿主机侧，面板只负责「说要什么」。
+package tlscfg
+
+// 模板变量名，与 deploy/caddy/Caddyfile.template 和
+// deploy/frps/frps.toml.template 里的 ${...} 占位符一一对应。
+const (
+	// VarUserPublicURL 是面板对外地址（带 scheme），渲染脚本由它派生站点地址。
+	VarUserPublicURL = "LT_USER_PUBLIC_URL"
+	// VarPanelDomain 是 Caddy 站点地址（裸域名，不带 scheme）。
+	VarPanelDomain = "LT_USER_DOMAIN"
+	// VarTunnelDomain 是隧道根域名（裸域名，不带 *.）。
+	VarTunnelDomain = "LT_TUNNEL_DOMAIN"
+	// VarACMEEmail 是 ACME 通知邮箱。
+	VarACMEEmail = "LT_ACME_EMAIL"
+	// VarDNSProvider 是 dns 指令名，必须与镜像里编入的插件一致。
+	VarDNSProvider = "LT_CADDY_DNS_PROVIDER"
+	// VarDNSArgs 是传给 dns 指令的参数，默认读环境变量里的凭据。
+	VarDNSArgs = "LT_CADDY_DNS_ARGS"
+	// VarDNSCredential 是 DNS 服务商凭据，只经容器环境变量注入。
+	VarDNSCredential = "LT_CADDY_DNS_CREDENTIAL"
+	// VarHTTPSMode 是 HTTPS 隧道模式，取值见 HTTPSModeEdge / HTTPSModeE2E。
+	VarHTTPSMode = "LT_HTTPS_TUNNEL_MODE"
+	// VarHTTPSE2EPort 只在端到端 HTTPS 模式下非空，模板用它做条件块。
+	//
+	// 之所以要一个派生变量而不是直接判断 LT_HTTPS_TUNNEL_MODE：
+	// 模板的条件语法只支持「非空则保留」（与渲染脚本一致），
+	// 而 edge / e2e 两个取值都是非空的。
+	VarHTTPSE2EPort = "LT_HTTPS_E2E_PORT"
+)
+
+// HTTPS 隧道的两种模式。
+const (
+	// HTTPSModeEdge：证书留在 Caddy。Caddy 用泛域名证书在 443 上终止 TLS，
+	// 再以 HTTP 转发给 frps 的 vhostHTTPPort。本地网站继续用 HTTP。
+	HTTPSModeEdge = "edge"
+	// HTTPSModeE2E：证书留在本地网站。frps 在独立公网端口上按 SNI 转发
+	// 原始 TLS 连接，Caddy 不参与——因此是真正的端到端加密。
+	HTTPSModeE2E = "e2e"
+)
+
+// OverridableVars 是面板**允许**覆盖的变量白名单。
+//
+// helper 只接受这些键，其余一律从部署目录的 .env 读取。这条约束的意义在于：
+// 即使面板被完全控制，攻击者也不能借 /render 改掉 frps token、端口池范围
+// 或面板监听地址——他能动的只有「域名与证书」这一小块。
+var OverridableVars = []string{
+	VarUserPublicURL,
+	VarTunnelDomain,
+	VarACMEEmail,
+	VarDNSProvider,
+	VarDNSArgs,
+	VarDNSCredential,
+	VarHTTPSMode,
+}
+
+// SecretVars 标记「值本身是密钥」的变量。
+//
+// 用途有二：写回 .env 时收紧文件权限；回显与日志里一律脱敏。
+var SecretVars = map[string]bool{
+	VarDNSCredential: true,
+}
+
+// IsOverridable 判断某个变量是否允许由面板覆盖。
+func IsOverridable(name string) bool {
+	for _, v := range OverridableVars {
+		if v == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Health 是 helper 的健康状态。
+type Health struct {
+	// Available 表示 helper 可用（部署目录可写、模板存在）。
+	Available bool `json:"available"`
+	// DeployDir 是 helper 实际操作的部署目录，界面上直接展示，
+	// 避免「面板改的那份」和「实际在跑的那份」不是同一个目录这种诡异问题。
+	DeployDir string `json:"deploy_dir"`
+	// Docker 表示能否调用 docker（校验与重建容器都依赖它）。
+	Docker bool `json:"docker"`
+	// Reason 在不可用时说明原因，供界面直接展示。
+	Reason string `json:"reason"`
+	// Ports 是部署目录 .env 里那几个**与入口路由直接相关**的端口。
+	//
+	// 由 helper 读取而不是面板自己算：这些值（网关、KCP、vhost 入口）
+	// 只在 .env 里，面板的环境变量里没有，也不该为此再存一份到数据库——
+	// 两份数据一定会分叉，而分叉的表现是「界面显示的端口和实际转发的不一致」。
+	Ports Ports `json:"ports"`
+}
+
+// Ports 是入口路由相关的端口。
+type Ports struct {
+	// Gateway 是 frpc 接入端口（TCP）。
+	Gateway int `json:"gateway"`
+	// KCP 是 KCP 加速端口（UDP）。
+	KCP int `json:"kcp"`
+	// VhostHTTP 是 HTTP 隧道入口，由 Caddy 转发进来。
+	VhostHTTP int `json:"vhost_http"`
+	// VhostHTTPS 是 HTTPS 隧道入口：端到端模式下它直接对公网提供，
+	// 边缘模式下只对回环开放（由 Caddy 终止 TLS 后走 HTTP 入口）。
+	VhostHTTPS int `json:"vhost_https"`
+}
+
+// RenderRequest 是「渲染并（可选）应用」的请求。
+type RenderRequest struct {
+	// Vars 只允许出现 OverridableVars 里的键；空值表示「该项留空」。
+	//
+	// 用「显式给出」而不是 helper 自己去读配置：面板才是配置的权威来源
+	// （值存在数据库里，可加密），helper 只负责把它变成文件。
+	Vars map[string]string `json:"vars"`
+	// Apply 为真时，写盘后重建 caddy 与 frps 容器。
+	Apply bool `json:"apply"`
+	// WriteEnv 为真时，把 Vars 里的键同步写回部署目录的 .env。
+	//
+	// 必须要写：docker-compose 是靠 .env 插值把 DNS 凭据注入 Caddy 容器的，
+	// 不写回的话 Caddyfile 里引用 {env.LT_CADDY_DNS_CREDENTIAL} 会取到空值。
+	WriteEnv bool `json:"write_env"`
+}
+
+// RenderResult 是渲染与应用的结果。
+type RenderResult struct {
+	// Applied 表示是否真的重建了容器。
+	Applied bool `json:"applied"`
+	// Changed 是内容确实变化的文件清单（没变就不写、不重建）。
+	Changed []string `json:"changed"`
+	// EnvUpdated 是同步写回 .env 的键名（不含值，值不进日志）。
+	EnvUpdated []string `json:"env_updated"`
+	// Validate 是配置校验器的输出，原样回显给管理员。
+	Validate string `json:"validate"`
+	// Warnings 是不致命但需要管理员知道的问题。
+	Warnings []string `json:"warnings"`
+	// RequiredPorts 是当前配置下**必须对公网放行**的端口。
+	RequiredPorts []int `json:"required_ports"`
+	// Message 是给界面的一句话结论。
+	Message string `json:"message"`
+}
+
+// DNSCheckRequest 是一次 DNS 检查请求。
+type DNSCheckRequest struct {
+	// Names 是要解析的记录名（含通配符探测用的随机子域）。
+	Names []string `json:"names"`
+	// ExpectedIP 非空时，逐条判断解析结果里是否包含该地址。
+	ExpectedIP string `json:"expected_ip"`
+}
+
+// DNSRecord 是一条 DNS 检查结果。
+type DNSRecord struct {
+	Name string `json:"name"`
+	// CNAME 是解析链上的别名（有就展示，「为什么 IP 对不上」多半在这里）。
+	CNAME string `json:"cname"`
+	// IPs 是解析出的地址，可能同时有 IPv4 与 IPv6。
+	IPs []string `json:"ips"`
+	// Matched 仅在请求给了 ExpectedIP 时有意义：解析结果命中该地址。
+	Matched bool `json:"matched"`
+	// Error 记录解析失败的原因（NXDOMAIN、超时等）。
+	Error string `json:"error"`
+	// Hint 是给管理员的下一步提示。
+	Hint string `json:"hint"`
+}
+
+// Certificate 是 Caddy 证书存储里的一张证书。
+type Certificate struct {
+	Domain    string `json:"domain"`
+	Issuer    string `json:"issuer"`
+	NotBefore string `json:"not_before"`
+	NotAfter  string `json:"not_after"`
+	DaysLeft  int    `json:"days_left"`
+	// Kind 区分 ACME 签发（acme）与 Caddy 内部 CA（local）。
+	// local 证书只在「Caddy 与本地网站之间」有意义，浏览器不认。
+	Kind string `json:"kind"`
+	// Names 是证书覆盖的域名（泛域名证书的 *.example.com 会在这里）。
+	Names []string `json:"names"`
+}
+
+// CertStatus 是证书状态总览。
+type CertStatus struct {
+	Available bool          `json:"available"`
+	Reason    string        `json:"reason"`
+	Certs     []Certificate `json:"certs"`
+}

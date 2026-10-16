@@ -9,6 +9,10 @@
 #  对外暴露的端口只有：80、443、网关端口(默认 7001)、KCP 端口(默认 7002/udp)、
 #  以及隧道端口池(默认 20000-30000)。管理端口始终只监听回环。
 #
+#  若把 HTTPS 隧道设为端到端模式（LT_HTTPS_TUNNEL_MODE=e2e），还要额外放行
+#  LT_VHOST_HTTPS_PORT(默认 8444)：该端口由 frps 直接对公网提供，按 SNI 透传
+#  原始 TLS 连接，证书由本地网站持有，Caddy 不参与。
+#
 #  使用前先执行：deploy/scripts/render.ps1（或 render.sh）生成 frps.toml 与 Caddyfile。
 # ============================================================
 name: litetunnel
@@ -83,11 +87,38 @@ services:
       - frps
 
   caddy:
-    image: caddy:2-alpine
+    # 官方镜像**不含任何 DNS 插件**，只够用在「仅裸域名证书」的部署上。
+    # 一旦配置了 LT_TUNNEL_DOMAIN，泛域名证书只能走 DNS Challenge，
+    # 而 DNS Challenge 的 dns 指令来自插件，必须换成自行构建的镜像：
+    #
+    #   1) 在 .env 里填 LT_CADDY_DNS_MODULES=cloudflare（按你的服务商）
+    #   2) 取消下面 build 段的注释并构建：
+    #        docker compose --env-file .env -f deploy/docker-compose.yml build caddy
+    #   3) 把 .env 里的 LT_CADDY_IMAGE 指向构建出的镜像名（如 litetunnel-caddy:latest）
+    #
+    # 构建文件见 deploy/caddy/Dockerfile。
+    image: ${LT_CADDY_IMAGE:-caddy:2-alpine}
+    # build:
+    #   context: ./caddy
+    #   args:
+    #     CADDY_VERSION: ${LT_CADDY_VERSION:-2}
+    #     CADDY_DNS_MODULES: ${LT_CADDY_DNS_MODULES:-}
     container_name: lt-caddy
     restart: unless-stopped
     network_mode: host
+    environment:
+      # DNS Challenge 凭据。只经容器环境注入：不落进 Caddyfile、不进日志、
+      # 不进版本库。变量名要与 Caddyfile 里 dns 指令的参数一致——默认参数是
+      # {env.LT_CADDY_DNS_CREDENTIAL}（见 .env 的 LT_CADDY_DNS_ARGS）。
+      #
+      # 注意这里是**插值**，所以要跑 compose 时必须带上 --env-file .env
+      # （默认只读 deploy/.env）。后台「域名与证书」页保存时会由 lt-config
+      # 按同一份 .env 重建容器，那条路径已经显式带上了 --env-file。
+      LT_CADDY_DNS_CREDENTIAL: ${LT_CADDY_DNS_CREDENTIAL:-}
     volumes:
+      # 注意：必须先跑 deploy/scripts/render（或 render.ps1）。
+      # 若 Caddyfile 还不存在，Docker 会把绑定源创建成一个**目录**，
+      # 容器随后会以 "is a directory" 拒绝启动，报错信息与真正的原因无关。
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./data/caddy:/data
       - ./data/caddy-config:/config

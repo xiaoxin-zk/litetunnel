@@ -14,7 +14,7 @@
 | 模块 | 说明 |
 |---|---|
 | 用户控制台 | 隧道管理、流量曲线、API Key、兑换码、客户端下载、账号资料自助修改（用户名/昵称/邮箱/密码）、**邮箱找回密码**、**账号注销** |
-| 管理后台 | 用户禁用/删除、流量限制、分组权限、兑换码生成、审计日志、**管理员管理（新增/角色分配/改密/重置 2FA）**、**登录日志** |
+| 管理后台 | 用户禁用/删除、流量限制、分组权限、兑换码生成、审计日志、**管理员管理（新增/角色分配/改密/重置 2FA）**、**登录日志**、**域名与证书（面板域名 / 隧道根域名 / DNS 服务商与凭据 / DNS 检查 / 证书状态）** |
 | 隧道类型 | TCP / UDP（游戏、NAS）、HTTP / HTTPS（内网网站） |
 | Windows 客户端 | Wails + Vue 单文件 exe，**只需粘贴 API Key 即可接入**（地址由构建注入），自动同步配置、内置 frpc 托管 |
 | 多用户 | 每用户独立接入凭据，可单独吊销 |
@@ -97,6 +97,8 @@ frpc 配置里的 `user` 字段会被 frp 用作代理名前缀（`{user}.{proxy
 .
 ├── server/                     Go 控制面
 │   ├── cmd/panel/              入口（同时监听用户侧与管理侧）
+│   ├── cmd/lt-fw/              宿主机防火墙 helper（可选，产物不进镜像）
+│   ├── cmd/lt-config/          宿主机域名与证书配置服务（可选，产物不进镜像）
 │   ├── internal/
 │   │   ├── config/             环境变量配置与生产环境强校验
 │   │   ├── model/              持久化实体
@@ -118,6 +120,8 @@ frpc 配置里的 `user` 字段会被 frp 用作代理名前缀（`{user}.{proxy
 │   ├── docker-compose.yml
 │   ├── frps/frps.toml.template
 │   ├── caddy/Caddyfile.template
+│   ├── caddy/Dockerfile        泛域名场景：自带 DNS 插件的 Caddy 镜像
+│   ├── systemd/                lt-fw 与 lt-config 的 systemd 单元与配置样板
 │   └── scripts/render.{ps1,sh}
 ├── scripts/
 │   ├── build.ps1               可选：本地调试构建（正式产物由 CI 产出）
@@ -211,7 +215,9 @@ echo "LT_BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 15 | tr -d '/+=')"
 | `LT_GATEWAY_HOST` | 客户端接入地址，填域名或公网 IP |
 | `LT_ACME_EMAIL` | Let's Encrypt 通知邮箱 |
 | 上面生成的 6 个密钥 | 直接粘贴 |
-| `LT_TUNNEL_DOMAIN` | 可选，启用 HTTP/HTTPS 隧道时填泛域名 |
+| `LT_TUNNEL_DOMAIN` | 可选，启用 HTTP/HTTPS 隧道时填**裸域名**（如 `tunnel.example.com`，不要带 `*.`）：同一个值还会写进 frps 的 `subDomainHost`。留空即关闭该功能，Caddyfile 里的泛域名段会被整段删除 |
+| `LT_CADDY_DNS_PROVIDER` | 配了 `LT_TUNNEL_DOMAIN` 时必填：泛域名证书只能走 DNS Challenge，这里填 `dns` 指令名（如 `cloudflare`），并需构建带插件的 Caddy 镜像（见步骤 3 之后的说明） |
+| `LT_HTTPS_TUNNEL_MODE` | 可选，`edge`（默认，证书留在 Caddy）或 `e2e`（证书留在本地网站，走独立公网端口 `LT_VHOST_HTTPS_PORT` 的 SNI 透传）。两种模式的含义与端口要求见「步骤 3.5」 |
 
 ### 步骤 3：渲染 frps.toml 与 Caddyfile
 
@@ -222,28 +228,117 @@ bash deploy/scripts/render.sh
 
 脚本会校验 `.env` 完整性、拒绝 `CHANGE_ME` 占位符，并生成 `deploy/frps/frps.toml` 与 `deploy/caddy/Caddyfile`（两者均已被 gitignore）。
 
+> **若启用 HTTP/HTTPS 隧道（`LT_TUNNEL_DOMAIN`），这里还要多做一步。**
+>
+> 泛域名证书无法用 HTTP-01/TLS-ALPN-01 验证，只能走 DNS Challenge；而 `dns` 指令来自插件，
+> 官方 `caddy:2-alpine` 一个都不带（照抄 `dns ...` 会让 Caddy 以
+> `unrecognized directive: dns` 拒绝启动）。所以要用 `deploy/caddy/Dockerfile` 自行构建：
+>
+> ```bash
+> # 1) .env 里填好插件名与服务商（两者同名，例如 cloudflare）
+> #    LT_CADDY_DNS_MODULES=cloudflare
+> #    LT_CADDY_DNS_PROVIDER=cloudflare
+> #    LT_CADDY_DNS_CREDENTIAL=<你的 API Token>
+> # 2) 取消 deploy/docker-compose.yml 中 caddy.build 段的注释，然后构建：
+> docker compose --env-file .env -f deploy/docker-compose.yml build caddy
+> # 3) 把 .env 里的 LT_CADDY_IMAGE 指向构建出的镜像名（如 litetunnel-caddy:latest）
+> ```
+>
+> 三步缺一不可：少了 `LT_CADDY_DNS_PROVIDER` 渲染脚本会直接报错（宁可在渲染阶段失败，
+> 也不要产出一份 Caddy 拒绝加载的配置）；少了插件则 Caddy 起不来。
+
+### 步骤 3.5：域名与证书后台自助（可选）
+
+**不改这一节也能用**：按 `.env` 渲染出来的配置已经是可运行的。这一节是给「想在后台
+改域名 / DNS 凭据」的部署用的，它需要一个额外的宿主机服务 `lt-config`。
+
+为什么不能由面板自己改：面板容器是 `read_only` 的，只挂载了 `/data`，既写不了部署目录，
+也没有 docker socket。让它去改 Caddy 配置，等于把一个能操纵宿主机的入口放到公网路径上。
+这与防火墙写操作交给 `lt-fw` 是同一条理由。
+
+同样地，**Caddy 自身的 admin API 始终保持关闭**（`admin off`）。它不是被藏起来了，
+而是根本不开：配置的每一条生效路由都能在磁盘上找到对应的那一行，代价是改完要重启容器。
+
+```bash
+# 1) 构建并安装二进制（与 lt-fw 一样，产物不进镜像）
+cd server && go build -o /usr/local/bin/lt-config ./cmd/lt-config
+
+# 2) 生成令牌并写配置
+mkdir -p /etc/litetunnel
+cp deploy/systemd/lt-config.env.example /etc/litetunnel/lt-config.env
+openssl rand -hex 32          # 填进 LT_CFG_TOKEN，并改好 LT_CFG_DEPLOY_DIR
+vi /etc/litetunnel/lt-config.env
+
+# 3) 安装 systemd 单元（注意按部署目录实际路径改 ReadWritePaths）
+cp deploy/systemd/lt-config.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now lt-config
+```
+
+然后在 **管理后台 → 域名与证书** 里填：
+
+| 项 | 说明 |
+|---|---|
+| 面板域名 | 控制台域名（裸域名），必须解析到本机 |
+| 隧道根域名 | 裸域名，**不要带 `*.`**；留空即关闭 HTTP/HTTPS 隧道 |
+| DNS 服务商 | 即 Caddyfile 里的 `dns` 指令名，必须与镜像里编入的插件一致 |
+| DNS API 凭据 | 加密落库、只回显脱敏值；下发时写进部署目录的 `.env`，由 compose 注入容器 |
+| 配置服务地址 / 令牌 | `http://127.0.0.1:7850` 与上一步生成的令牌，两者必须完全一致 |
+
+点「保存并校验」只会渲染并校验（用**将要上线的那个镜像**跑 `caddy validate`，用 `frps verify`
+校验 frps.toml），不碰容器；点「保存并应用」才会写盘并重建 `caddy` 与 `frps`（HTTPS 与隧道
+会中断数秒）。内容没变化的文件不会被写，因此重复点保存不会造成无谓的重启。
+
+页面上的「DNS 检查」会解析面板域名、隧道根域名与一个**随机子域**：泛域名证书签发的第一步
+就是服务商侧存在一条泛解析记录，那一条探测不到，证书就签不下来。
+
+#### 两种 HTTPS 隧道模式
+
+| 模式 | 证书在哪 | 入口 | 适用 |
+|---|---|---|---|
+| `edge`（默认） | Caddy | 443，Caddy 终止 TLS 后以 HTTP 转发给 frps | 内网网站想白嫖自动 HTTPS，本地网站继续用 HTTP |
+| `e2e` | 本地网站 | 独立端口（`LT_VHOST_HTTPS_PORT`，默认 8444），frps 按 SNI 透传原始 TLS | 端到端加密，平台无法解密也无法替它续期 |
+
+`e2e` 模式下必须放行该端口，并且用 `<子域>.隧道域名:8444` 访问——443 由 Caddy 接管，
+返回的是平台自己的证书，浏览器会提示证书不匹配。两种模式可以同时使用，互不干扰。
+
+> **HTTPS 隧道只在 `e2e` 模式下可用。** 边缘模式里 443 由 Caddy 终止 TLS、只把请求
+> 按 HTTP 转发给 frps 的 HTTP vhost，HTTPS 隧道没有任何入口——因此那种配置下创建
+> HTTPS 隧道会被直接拒绝（用户控制台与客户端也会把 `https` 选项隐藏掉），
+> 提示改用 HTTP 隧道。本地网站走 HTTP 时，正确做法就是选 HTTP 隧道：访客侧
+> 的 HTTPS 由 Caddy 提供，证书不下发给客户端。
+
+> 无论哪种模式，**证书都不会下发给客户端**：`edge` 下证书留在 Caddy 的 `/data`，
+> 只有 Caddy 与本地网站之间的那一段是明文 HTTP（同机或隧道内）；`e2e` 下证书留在
+> 本地网站，Caddy 完全不参与。
+
 ### 步骤 4：启动
 
 ```bash
 # 仓库公开后镜像通常也是公开的，可跳过 login；若拉取报 401 则执行：
 # echo "<PAT>" | docker login ghcr.io -u xiaoxin-zk --password-stdin
 
-docker compose -f deploy/docker-compose.yml pull
-docker compose -f deploy/docker-compose.yml up -d
-docker compose -f deploy/docker-compose.yml ps
+docker compose --env-file .env -f deploy/docker-compose.yml pull
+docker compose --env-file .env -f deploy/docker-compose.yml up -d
+docker compose --env-file .env -f deploy/docker-compose.yml ps
 ```
+
+> **`--env-file .env` 不能省。** `.env` 在仓库根目录，而 Compose 默认只找
+> compose 文件所在目录（`deploy/`）下的那一份。省掉它的后果不是「起不来」，
+> 而是**静默降级**：`LT_CADDY_IMAGE` 取不到，容器会跑官方 `caddy:2-alpine`；
+> `LT_CADDY_DNS_CREDENTIAL` 取不到，DNS Challenge 会一直失败——而日志里
+> 只有证书签发失败，看不出是变量没读到。
 
 ### 步骤 5：验证
 
 ```bash
 # 三个容器都应为 running
-docker compose -f deploy/docker-compose.yml ps
+docker compose --env-file .env -f deploy/docker-compose.yml ps
 
 # 控制面健康检查
 curl -fsS http://127.0.0.1:7848/healthz && echo
 
 # 查看启动日志（首次会打印初始管理员账号）
-docker compose -f deploy/docker-compose.yml logs panel | head -30
+docker compose --env-file .env -f deploy/docker-compose.yml logs panel | head -30
 ```
 
 首次启动会打印一行 `【注意】初始管理员账号 ... 密码 ...`，把它记下来。
@@ -259,6 +354,7 @@ docker compose -f deploy/docker-compose.yml logs panel | head -30
 | 7001 | TCP | 客户端 frpc 接入 |
 | 7002 | UDP | KCP 加速（游戏联机建议开） |
 | 20000-30000 | TCP+UDP | 隧道端口池 |
+| 8444（`LT_VHOST_HTTPS_PORT`） | TCP | **仅端到端 HTTPS 隧道模式需要**（`LT_HTTPS_TUNNEL_MODE=e2e`）；此时证书由本地网站持有，frps 按 SNI 透传 |
 
 DNS：把控制台域名 A 记录指向服务器，泛域名（如 `*.tunnel.example.com`）按需解析。
 
@@ -309,6 +405,7 @@ DNS：把控制台域名 A 记录指向服务器，泛域名（如 `*.tunnel.exa
 | 7001 | TCP | frpc 接入（强制 TLS） | 是 |
 | 7002 | UDP | KCP 加速、NAT 打洞 | 游戏联机建议开 |
 | 20000-30000 | TCP+UDP | 隧道端口池 | 是 |
+| 8444（`LT_VHOST_HTTPS_PORT`） | TCP | 端到端 HTTPS 隧道入口（仅 `e2e` 模式） | 该模式必须 |
 | 7848 / 7500 | TCP | 内部端口（控制面、frps 管理接口） | **禁止放行** |
 
 > 管理后台不占用独立端口：它与用户控制台共用 443，挂载在 `LT_ADMIN_PATH` 指定的路径下。
@@ -433,6 +530,9 @@ git push origin v1.0.0
 | **短期数据分批清理** | 过期验证码、过期重置令牌、终态邮件记录按保留期清理，每轮每表上限 500 条，避免长期运行把表和索引撑大 |
 | **注销账号** | 需密码二次确认，级联清理隧道/流量/会话；兑换流水与登录日志作为审计数据保留 |
 | **权限提升防护** | 管理员账号管理仅限 `super`，避免 `operator` 通过创建管理员给自己提权；系统始终保留至少一个启用的超级管理员 |
+| **配置下发权限边界** | Caddyfile / frps.toml 只能由宿主机 `lt-config` 改写（回环 + Bearer token）。面板能覆盖的只有白名单内的域名 / DNS 变量，改不了 frps token、端口池与监听地址；且**校验通过才写盘**，只会重建 caddy 与 frps 两个容器 |
+| **Caddy 管理 API 关闭** | 全局 `admin off`：不为「改配置方便」开一个能绕过文件的运行时接口，代价是改完重启容器（数秒中断） |
+| **DNS 凭据不进配置文件** | 凭据只在 .env 与容器环境变量里，Caddyfile 里写的是 `{env.LT_CADDY_DNS_CREDENTIAL}`；下发结果与日志中的凭据会被脱敏后再回显 |
 | 自检 | `scripts/check-secrets.ps1` 扫描硬编码地址；CI 冒烟测试校验管理路由未出现在公网端口 |
 
 ### 威胁模型与已知取舍
@@ -490,7 +590,34 @@ git push origin v1.0.0
 优先使用 KCP 端口（`LT_KCP_PORT`），并确保该 UDP 端口已放行；中转节点应选择离玩家更近的地域。
 
 **Q：HTTP 隧道访问 404？**
-需要在 DNS 把泛域名 `*.你的隧道域名` 解析到本机，并在 `Caddyfile` 中配置 DNS Challenge 申请泛域名证书。
+先确认 DNS 把 `*.你的隧道域名` 解析到了本机，且 `.env` 里配了 `LT_CADDY_DNS_PROVIDER`、
+Caddy 用的是带该插件的镜像。DNS Challenge 的 `dns` 指令由渲染脚本按这两项自动生成，
+不需要手改 `Caddyfile`（改 `.env` 后重新渲染并重启 caddy 即可）。
+若 Caddy 日志里出现 `unrecognized directive: dns`，说明镜像还是官方的 `caddy:2-alpine`——
+见步骤 3 之后的构建说明。
+
+**Q：在后台「域名与证书」里改完，为什么没生效？**
+
+保存与下发是**两步**：保存只是把值记进数据库，点「保存并应用」才会渲染文件并重建
+`caddy` 与 `frps`。如果页面提示配置服务不可用，按顺序查：
+
+1. `systemctl status lt-config`（没装它的话见「步骤 3.5」）；
+2. 「配置服务地址 / 令牌」与 `lt-config.env` 里的 `LT_CFG_ADDR` / `LT_CFG_TOKEN` 是否一致；
+3. 宿主机 `docker` 是否可用（校验与重建容器都依赖它）。
+
+配置本身有问题时页面会带出 `caddy validate` / `frps verify` 的原文，照它改即可。
+最常见的两条是：配了泛域名但用的是官方 `caddy:2-alpine`（没有 dns 插件），
+以及隧道根域名写成了 `*.tunnel.example.com`（应该只填裸域名）。
+
+**Q：HTTPS 隧道打开提示证书不匹配？**
+
+看当前模式（`LT_HTTPS_TUNNEL_MODE`，后台页面也有）：
+
+- **端到端（e2e）**：隧道必须用独立端口访问，即 `<子域>.隧道域名:<LT_VHOST_HTTPS_PORT>`
+  （默认 8444）。443 由 Caddy 接管，返回的是平台自己的泛域名证书，所以「证书不匹配」
+  是预期行为，不是故障。
+- **边缘（edge）**：443 上由 Caddy 提供证书，隧道应当是 HTTP 类型；如果本地网站强上
+  HTTPS，那一段就成了「Caddy 与本地网站之间的自签证书」，浏览器一样会拦。
 
 **Q：忘记管理员密码？**
 `Seed` 只在 `lt_admins` 表为空时才创建管理员，所以把该表清空后重启即可按 `.env` 重新播种：

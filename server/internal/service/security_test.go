@@ -339,6 +339,93 @@ func TestLoadAccessGuardKeepsUnknownOnDBError(t *testing.T) {
 	}
 }
 
+// TestCaptchaThresholdSurvivesLogBacklog 覆盖「账号级验证码依赖可丢弃的日志」。
+//
+// 登录日志走容量有限的异步队列，满了就丢弃——这是有意的，写日志绝不能拖住
+// 登录判定。但验证码阈值曾经直接查这张表，于是日志一积压，账号级防线就静默
+// 失效：不报错、不告警，只是不再要求验证码。而这恰恰发生在数据库慢、攻击最
+// 容易得手的时候。
+//
+// 这里把队列灌满（不启动写库协程），断言阈值仍然生效。
+func TestCaptchaThresholdSurvivesLogBacklog(t *testing.T) {
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyLoginCaptchaAfter: "3"}); err != nil {
+		t.Fatalf("设置阈值失败: %v", err)
+	}
+
+	const account = "backlog-user"
+	// 第 loginLogBuffer+1 条起，日志会全部被丢弃。
+	for i := 0; i < loginLogBuffer+1; i++ {
+		svc.RecordLogin(LoginAttempt{
+			Kind:     model.LoginKindUser,
+			Username: account,
+			Result:   model.LoginResultBadCred,
+		})
+	}
+
+	// 前置条件：队列确实已经堵死，审计日志一条都没落库。
+	if got := len(svc.loginLogCh); got != loginLogBuffer {
+		t.Fatalf("前置条件：队列应当已被灌满，实际 %d", got)
+	}
+	if n := svc.CountRecentFailedLogins(model.LoginKindUser, account, 30*time.Minute); n != 0 {
+		t.Fatalf("前置条件：此刻不该有登录日志落库，实际 %d 条", n)
+	}
+
+	if !svc.CaptchaRequired("login", account) {
+		t.Fatal("日志积压丢光之后，账号级验证码要求必须仍然生效")
+	}
+	// 对照组：没失败过的账号不受影响。少了它，「一律要求验证码」也能通过。
+	if svc.CaptchaRequired("login", "innocent-user") {
+		t.Fatal("从未失败过的账号不该被要求验证码")
+	}
+}
+
+// TestLoginFailureCountsOnlyCredentialGuesses 覆盖计数口径。
+//
+// 三个要点：
+//  1. 只有真正的猜测（密码错、动态口令错）才算；
+//  2. 成功一次就清零——判定的是「连续」失败，否则改对密码的正常用户
+//     会被一直要求验证码；
+//  3. 大小写是同一个账号，否则交替提交就能把计数摊薄。
+func TestLoginFailureCountsOnlyCredentialGuesses(t *testing.T) {
+	svc := newTestServices(t, nil)
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyLoginCaptchaAfter: "2"}); err != nil {
+		t.Fatalf("设置阈值失败: %v", err)
+	}
+	const account = "reset-user"
+
+	fail := func(result string) {
+		svc.RecordLogin(LoginAttempt{Kind: model.LoginKindUser, Username: account, Result: result})
+	}
+
+	// 1) 密码错 + 动态口令错，各一次 → 到阈值。
+	fail(model.LoginResultBadCred)
+	fail(model.LoginResultTOTPFail)
+	if !svc.CaptchaRequired("login", account) {
+		t.Fatal("两次凭据猜测之后应当要求验证码")
+	}
+
+	// 3) 大小写不同也必须是同一个账号。
+	if !svc.CaptchaRequired("login", "ReSet-User") {
+		t.Fatal("计数键必须规范化：换个大小写不能变成另一个账号")
+	}
+
+	// 2) 成功一次即清零。
+	svc.RecordLogin(LoginAttempt{Kind: model.LoginKindUser, Username: account, Result: model.LoginResultSuccess})
+	if svc.CaptchaRequired("login", account) {
+		t.Fatal("成功登录后应清零：判定的是连续失败")
+	}
+
+	// 1) 「要求验证码」与「账号被禁用」都不是密码猜测，不该累计。
+	for i := 0; i < 5; i++ {
+		fail(model.LoginResultLocked)
+		fail(model.LoginResultDisabled)
+	}
+	if svc.CaptchaRequired("login", account) {
+		t.Fatal("locked / disabled 不是一次密码猜测，不该把账号推到阈值")
+	}
+}
+
 // TestAdminSetUserGroupDoesNotDeadlock 覆盖 SQLite 单连接下的自锁。
 //
 // AdminSetUserGroup 曾经在事务里调用 refreshQuotaFor，而后者要用**主连接**

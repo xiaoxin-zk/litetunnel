@@ -122,6 +122,13 @@ type Services struct {
 	// 登录日志不能阻塞登录判定。
 	loginLogCh chan model.LoginLog
 
+	// loginFails 是账号级登录失败计数，**专供验证码判定**。
+	//
+	// 与上面那条队列刻意分开：队列满了会丢弃（写日志不能拖住登录判定），
+	// 而「要不要出验证码」是认证门槛，数据源不能是可丢弃的。
+	// 缘由见 loginfail.go。
+	loginFails *loginFailureCounter
+
 	// mailWake 用于唤醒发信协程（邮件本身存在发件箱表里，不走内存队列：
 	// 内存队列重启即丢，而验证码/重置链接一旦丢了，用户就找不回账号）。
 	mailWake chan struct{}
@@ -218,6 +225,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 
 		Monitor:    monitor.New(),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
+		loginFails: newLoginFailureCounter(),
 		mailWake:   make(chan struct{}, 1),
 		fwPending:  map[int]pendingFW{},
 		fwKick:     make(chan struct{}, 1),

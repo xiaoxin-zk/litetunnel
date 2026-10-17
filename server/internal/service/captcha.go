@@ -11,8 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
 const (
@@ -145,6 +143,11 @@ func (s *Services) CheckCaptcha(ticket, answer string) bool {
 //
 // 策略：注册场景由开关控制；登录场景只在「该账号已连续失败若干次」后才要求，
 // 这样正常用户无感，而脚本爆破必然触发。
+//
+// 计数取自 loginFailureCounter，而不是登录日志：后者是容量有限的异步队列，
+// 满了会丢弃（写日志不能拖住登录判定）。把认证门槛建在可丢弃的数据上，
+// 等于让日志的吞吐决定防线强度——积压时不报错、不告警，只是静默失效，
+// 而这恰好发生在数据库慢、攻击最容易得手的时候。
 func (s *Services) CaptchaRequired(kind, account string) bool {
 	switch kind {
 	case "register":
@@ -154,9 +157,10 @@ func (s *Services) CaptchaRequired(kind, account string) bool {
 		if threshold <= 0 {
 			return false
 		}
-		n := s.CountRecentFailedLogins(model.LoginKindUser, account, 30*time.Minute)
-		n += s.CountRecentFailedLogins(model.LoginKindAdmin, account, 30*time.Minute)
-		return int(n) >= threshold
+		if s.loginFails == nil {
+			return false
+		}
+		return s.loginFails.count(account, time.Now()) >= threshold
 	default:
 		return false
 	}

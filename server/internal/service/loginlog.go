@@ -31,6 +31,13 @@ type LoginAttempt struct {
 // RecordLogin 记录一次登录尝试。成功与失败都要记：
 // 失败记录才是发现暴力破解与撞库的依据。
 func (s *Services) RecordLogin(a LoginAttempt) {
+	// 先更新失败计数，再入队写审计日志。
+	//
+	// 顺序不能反：队列满时这条日志会被丢弃，而计数不能——它是验证码阈值的
+	// 数据源。先记计数也顺带让「日志已落库」成为比「计数已生效」更晚的信号，
+	// 外部按日志等待时不会观察到计数还没更新的中间态。
+	s.trackLoginFailure(a)
+
 	entry := model.LoginLog{
 		Kind:      a.Kind,
 		AccountID: a.AccountID,
@@ -115,7 +122,37 @@ func (s *Services) ListLoginLogs(kind, result, username string, offset, limit in
 	return list, total, err
 }
 
-// CountRecentFailedLogins 统计某账号在时间窗内的失败次数，供后台快速识别可疑账号。
+// trackLoginFailure 维护账号级失败计数（验证码判定的数据源）。
+//
+// 只统计真正的「猜测」：
+//   - bad_credentials：密码错，这是爆破信号；
+//   - totp_failed：密码对了但动态口令错，同样是一次猜测。
+//
+// 其余结果一律不计：
+//   - locked：我们主动要求验证码，密码还没被校验过，计进去等于自己抬高自己；
+//   - disabled：账号本来就不能用，猜对了也进不来；
+//   - account_deleted 之类：不是一次登录尝试。
+//
+// 成功则清零——判定的是「连续」失败，见 loginfail.go。
+func (s *Services) trackLoginFailure(a LoginAttempt) {
+	if s.loginFails == nil {
+		return
+	}
+	if a.Result == model.LoginResultSuccess {
+		s.loginFails.reset(a.Username)
+		return
+	}
+	switch a.Result {
+	case model.LoginResultBadCred, model.LoginResultTOTPFail:
+		s.loginFails.record(a.Username, time.Now())
+	}
+}
+
+// CountRecentFailedLogins 统计某账号在时间窗内的失败次数。
+//
+// 只供审计与排查（例如后台识别可疑账号），**不能**用作认证门槛的数据源：
+// 它查的是异步登录日志，日志队列满了会丢弃。验证码阈值用的是
+// loginFailureCounter（见 loginfail.go）。
 func (s *Services) CountRecentFailedLogins(kind, username string, within time.Duration) int64 {
 	var n int64
 	_ = s.DB.Model(&model.LoginLog{}).

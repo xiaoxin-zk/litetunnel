@@ -91,7 +91,7 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 			Type:      in.Type,
 			LocalIP:   in.LocalIP,
 			LocalPort: port,
-		})
+		}, false)
 		if err != nil {
 			// 逐条回报失败原因，同样要把数据库原文翻译一遍：
 			// 批量失败列表里出现 "UNIQUE constraint failed" 这种内容，
@@ -109,6 +109,24 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 			continue
 		}
 		res.Created = append(res.Created, *t)
+	}
+
+	// 防火墙放行挪到用户锁临界区之外异步补做。
+	//
+	// helper 不可达时，单次探测/操作的网络调用可达 10 秒；在锁内逐条
+	// 同步放行的话，20 条的批次能拖上几分钟，同一用户的其他隧道操作
+	// 全部排队。改为：放行失败本就进重试队列兜底（见 applyPortIntent），
+	// 这里再用一个协程按序补一次立即尝试，让规则尽快生效——协程只拿
+	// 端口锁，不碰用户锁，不会阻塞该用户的任何其他操作。
+	if len(res.Created) > 0 {
+		created := res.Created
+		go func() {
+			for i := range created {
+				if created[i].RemotePort > 0 {
+					s.applyPortIntent(created[i].RemotePort, ProtoOfTunnel(created[i].Type), true)
+				}
+			}
+		}()
 	}
 	return res, nil
 }

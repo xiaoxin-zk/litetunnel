@@ -6,9 +6,11 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -89,7 +91,7 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 		err     error
 	)
 	for attempt := 1; attempt <= attempts; attempt++ {
-		created, err = s.createTunnelLocked(u, in)
+		created, err = s.createTunnelLocked(u, in, true)
 		if err == nil {
 			return created, nil
 		}
@@ -102,18 +104,72 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 	return nil, describeTunnelWriteError(err)
 }
 
-// createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。
-func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tunnel, error) {
-	g := s.EffectiveGroup(u)
-	if g == nil {
-		return nil, errors.New("当前账号未绑定任何分组，请联系管理员")
+// reloadUserWithGroupTx 在事务内重读用户行与生效分组，两者都加行锁。
+//
+// handler 传入的 u 是请求开始时加载的快照：管理员改组（AdminSetUserGroup
+// 锁用户行）、调套餐与我们交错时，快照里的协议、隧道数、域名权限都可能
+// 已经过时——按旧套餐建出的隧道会一直带着越权参数跑下去。
+//
+// FOR UPDATE 必须在**事务内**才真正持锁到提交：放在事务外只是一次
+// 立即释放的读，挡不住紧接着提交的改组。锁序「用户行 → 分组行」，
+// 与 Redeem / AdminSetUserGroup / DeleteGroup 一致。
+func (s *Services) reloadUserWithGroupTx(tx *gorm.DB, userID uint) (*model.User, *model.Group, error) {
+	var u model.User
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&u, userID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, err
 	}
-
-	normalized, err := s.normalizeInput(u, g, in)
+	g, err := s.effectiveGroupTx(tx, &u)
 	if err != nil {
+		return nil, nil, err
+	}
+	return &u, g, nil
+}
+
+// effectiveGroupTx 按 EffectiveGroup 的语义取生效分组，但对分组行加锁，
+// 且只使用传入的 tx——SQLite 只开一个连接，事务内再用 s.DB 查询会自己
+// 等死自己。
+func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, error) {
+	// 分组已过期或未绑定：回落默认分组（与 EffectiveGroup 一致）。
+	// 默认分组不允许删除（见 DeleteGroup），普通读即可。
+	if u.GroupExpireAt != nil && u.GroupExpireAt.Before(time.Now()) {
+		return s.defaultGroupTx(tx), nil
+	}
+	if u.GroupID == 0 {
+		return s.defaultGroupTx(tx), nil
+	}
+	var g model.Group
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&g, u.GroupID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 分组刚被并发删除：按未绑定处理，回落默认分组。
+			return s.defaultGroupTx(tx), nil
+		}
 		return nil, err
 	}
+	return &g, nil
+}
 
+// defaultGroupTx 是 defaultGroup 的事务内版本，原因同上。
+func (s *Services) defaultGroupTx(tx *gorm.DB) *model.Group {
+	var g model.Group
+	if err := tx.Where("is_default = ?", true).First(&g).Error; err != nil {
+		return nil
+	}
+	return &g
+}
+
+// createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。
+//
+// firewallNow 决定是否在事务提交后立即尝试放行防火墙端口：
+// 单条创建传 true（规则即时生效）；批量创建传 false 并把放行挪到
+// 用户锁之外异步执行——helper 不可达时单次网络调用可达 10 秒，
+// 串行二十条会把同一用户的其他操作全部卡在锁上（见 CreateTunnelsBatch）。
+// 无论哪种，放行失败都会进重试队列兜底。
+func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow bool) (*model.Tunnel, error) {
 	var created model.Tunnel
 
 	// portUnlock 在事务内取到端口锁之后赋值，事务结束（无论成败）后释放。
@@ -125,7 +181,23 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 		}
 	}()
 
-	err = s.DB.Transaction(func(tx *gorm.DB) error {
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// 用户与生效分组在事务内重读并加行锁（见 reloadUserWithGroupTx）：
+		// 数量上限、协议、域名权限都以**此刻**的套餐为准，而不是请求
+		// 开始时的快照。
+		u, g, err := s.reloadUserWithGroupTx(tx, u.ID)
+		if err != nil {
+			return err
+		}
+		if g == nil {
+			return errors.New("当前账号未绑定任何分组，请联系管理员")
+		}
+
+		normalized, err := s.normalizeInput(u, g, in)
+		if err != nil {
+			return err
+		}
+
 		// 数量上限校验放在事务内，避免并发绕过限制。
 		var count int64
 		if err := tx.Model(&model.Tunnel{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil {
@@ -200,7 +272,7 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 	//
 	// 用 Locked 版本：该端口的锁已经在事务里拿到了（见上面取锁处），
 	// 这里再调一次会重复加锁、直接死锁。
-	if created.RemotePort > 0 {
+	if firewallNow && created.RemotePort > 0 {
 		s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true)
 	}
 	return &created, nil
@@ -235,10 +307,6 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 	if err != nil {
 		return nil, err
 	}
-	g := s.EffectiveGroup(u)
-	if g == nil {
-		return nil, errors.New("当前账号未绑定任何分组，请联系管理员")
-	}
 
 	if in.LocalPort < 1 || in.LocalPort > 65535 {
 		return nil, fmt.Errorf("%w: 本地端口需在 1-65535 之间", ErrInvalidParam)
@@ -251,32 +319,48 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 		return nil, fmt.Errorf("%w: 本地地址格式不正确", ErrInvalidParam)
 	}
 
-	updates := map[string]any{
-		"local_ip":        localIP,
-		"local_port":      in.LocalPort,
-		"remark":          truncate(in.Remark, 200),
-		"use_encryption":  in.UseEncryption,
-		"use_compression": in.UseCompression,
-	}
-	if t.Type == model.ProxyTypeHTTP || t.Type == model.ProxyTypeHTTPS {
-		domain, sub, err := s.normalizeDomain(g, in)
+	// 用户与生效分组在事务内重读并加行锁：编辑 HTTP/HTTPS 隧道时的域名
+	// 权限按**此刻**的套餐判定，而不是请求开始时的快照（见
+	// reloadUserWithGroupTx）。
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		u, g, err := s.reloadUserWithGroupTx(tx, u.ID)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		updates["domain"] = domain
-		updates["subdomain"] = sub
-	}
+		if g == nil {
+			return errors.New("当前账号未绑定任何分组，请联系管理员")
+		}
 
-	res := s.DB.Model(&model.Tunnel{}).
-		Where("id = ? AND user_id = ?", id, u.ID).
-		Updates(updates)
-	if res.Error != nil {
-		return nil, res.Error
-	}
-	if res.RowsAffected == 0 {
-		// 记录在编辑期间被删除（或从未属于该用户）：如实报不存在。
-		// 这里绝不能像 Save 的零行回退那样把它重新插回去。
-		return nil, ErrNotFound
+		updates := map[string]any{
+			"local_ip":        localIP,
+			"local_port":      in.LocalPort,
+			"remark":          truncate(in.Remark, 200),
+			"use_encryption":  in.UseEncryption,
+			"use_compression": in.UseCompression,
+		}
+		if t.Type == model.ProxyTypeHTTP || t.Type == model.ProxyTypeHTTPS {
+			domain, sub, err := s.normalizeDomain(g, in)
+			if err != nil {
+				return err
+			}
+			updates["domain"] = domain
+			updates["subdomain"] = sub
+		}
+
+		res := tx.Model(&model.Tunnel{}).
+			Where("id = ? AND user_id = ?", id, u.ID).
+			Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			// 记录在编辑期间被删除（或从未属于该用户）：如实报不存在。
+			// 这里绝不能像 Save 的零行回退那样把它重新插回去。
+			return ErrNotFound
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return s.GetTunnel(u.ID, id)
 }

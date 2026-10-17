@@ -8,6 +8,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,8 +67,8 @@ var (
 	ErrDomainNotTrusted = errors.New("本站当前仅允许白名单内的邮箱域名注册")
 	// ErrDomainRegisterLimited 表示该邮箱域名当日注册量已达上限。
 	ErrDomainRegisterLimited = errors.New("该邮箱域名今日注册数量已达上限，请改用其他邮箱或明日再试")
-	ErrEmailCodeNeeded = errors.New("请输入邮箱验证码")
-	ErrEmailCodeWrong  = errors.New("邮箱验证码不正确或已过期")
+	ErrEmailCodeNeeded       = errors.New("请输入邮箱验证码")
+	ErrEmailCodeWrong        = errors.New("邮箱验证码不正确或已过期")
 	// ErrEmailCodeCheckFailed 表示校验本身没法完成（例如失败次数写不进库）。
 	//
 	// 必须与 ErrEmailCodeWrong 分开：后者是「你填错了」，前者是「我们这边暂时
@@ -108,7 +109,6 @@ type Services struct {
 	// TOTPReplay 记录已用过的动态口令步进码，阻止窗口内重放。
 	// 动态口令的防重放记录在管理员表上（totp_last_step），不在这里：
 	// 内存记录重启即丢，而口令的有效窗口还在。
-
 
 	// Monitor 采集宿主机与面板自身的运行指标。
 	//
@@ -364,16 +364,42 @@ func (s *Services) QuotaExceeded(u *model.User) bool {
 
 // EnsureTrafficPeriod 在跨计费周期时重置已用流量。
 // 采用惰性重置，避免额外的定时任务。
+//
+// # 与流量采集的协调
+//
+// 重置写的是绝对值（traffic_used = 0），采集写的是增量（+delta）：
+//
+//   - 采集的增量在重置提交**之前**落库 → 随重置一起清零。正确：
+//     那部分流量属于旧周期；
+//   - 增量在重置提交**之后**落库 → 保留。基本正确：采集一轮最长
+//     TrafficPollInterval，跨重置时刻的那一轮会把少量旧周期流量算进
+//     新周期，这是一个采样周期的固有粒度，且只多不少地偏向用户。
+//
+// 采集协程里的顺序是「先落增量、后刷新配额标记（内含本函数）」，
+// 重置天然发生在增量边界之后，不会把同一轮增量算两遍。
+//
+// # 为什么必须检查写库结果
+//
+// 以前在写库**之前**就把内存对象的用量清零、并忽略写库错误：写失败时
+// 配额刷新照样按「零用量」更新拦截标记，超额用户被错误放行，要等下一轮
+// 采集才纠正。现在只有数据库确认成功才改内存；条件更新没命中（reset_at
+// 已被并发改动）时重读最终状态，绝不拿过时快照当事实。
 func (s *Services) EnsureTrafficPeriod(u *model.User) {
-	if u == nil {
+	if u == nil || u.ID == 0 {
 		return
 	}
 	now := time.Now()
 	if u.TrafficResetAt.IsZero() {
+		// 初始化周期起点：没有用量要清，两个并发方同时写也只是起点
+		// 相差几毫秒，无碍。
 		next := now.AddDate(0, 1, 0)
+		res := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
+			Update("traffic_reset_at", next)
+		if res.Error != nil {
+			log.Printf("[quota] 初始化流量周期失败（用户 %d），下轮重试: %v", u.ID, res.Error)
+			return
+		}
 		u.TrafficResetAt = next
-		_ = s.DB.Model(&model.User{}).Where("id = ?", u.ID).
-			Update("traffic_reset_at", next).Error
 		return
 	}
 	if now.Before(u.TrafficResetAt) {
@@ -384,12 +410,28 @@ func (s *Services) EnsureTrafficPeriod(u *model.User) {
 	for !next.After(now) {
 		next = next.AddDate(0, 1, 0)
 	}
+	// 条件更新：reset_at 与读到的一致才动手。别的路径（管理员清零、
+	// 并发的另一处重置）改过 reset_at 时本方放弃，避免用过时快照覆盖。
+	res := s.DB.Model(&model.User{}).
+		Where("id = ? AND traffic_reset_at = ?", u.ID, u.TrafficResetAt).
+		Updates(map[string]any{
+			"traffic_used":     0,
+			"traffic_reset_at": next,
+		})
+	if res.Error != nil {
+		log.Printf("[quota] 流量周期重置失败（用户 %d），保持原状态下轮重试: %v", u.ID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		// 已被并发方重置或 reset_at 被改动：内存快照过时，重读最终状态。
+		var fresh model.User
+		if err := s.DB.First(&fresh, u.ID).Error; err == nil {
+			*u = fresh
+		}
+		return
+	}
 	u.TrafficUsed = 0
 	u.TrafficResetAt = next
-	_ = s.DB.Model(&model.User{}).Where("id = ?", u.ID).Updates(map[string]any{
-		"traffic_used":     0,
-		"traffic_reset_at": next,
-	}).Error
 }
 
 // ResolveCredential 把长期凭据解析为身份，供桌面客户端使用。

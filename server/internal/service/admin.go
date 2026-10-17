@@ -928,7 +928,14 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 }
 
 // AdminResetUserTraffic 清零用户已用流量。
+//
+// 必须先在采集器登记待协调标记、再清零（见 Runtime.pendingTrafficReset）：
+// 清零后紧邻一轮的增量是清零前采样的旧流量，不拦的话最多一个采样周期后
+// 它会重新加回用户用量——管理员看到「明明清零了又涨回来了」。
+// 顺序反过来（先清零后登记）会有一个窗口：增量恰好插在两步之间落库，
+// 标记拦不住它。
 func (s *Services) AdminResetUserTraffic(id uint) error {
+	s.Runtime.MarkTrafficResetPending(id)
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(map[string]any{
 		"traffic_used":     0,
 		"traffic_reset_at": time.Now().AddDate(0, 1, 0),

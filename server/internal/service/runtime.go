@@ -53,6 +53,16 @@ type Runtime struct {
 	// 不对称：少记一轮最多丢两分钟的账，重复计入是实打实的双倍扣费）。
 	baselineSeedPending bool
 
+	// pendingTrafficReset 登记了「管理员刚清零用量」的用户。
+	//
+	// 为什么需要它：清零写的是绝对值（traffic_used = 0），采集写的是增量。
+	// 清零后紧邻一轮的增量是清零**之前**采样的旧流量，照常加回去等于
+	// 「清零完又冒出来」。清零操作在这里登记；flushTraffic 落增量前取走
+	// 标记并在**同一事务**里跳过这些用户——清零时刻之前的增量全部丢弃，
+	// 边界明确。标记先于清零写库登记，因此任何在清零提交后落库的增量
+	// 都会被至少一轮的跳过覆盖住。
+	pendingTrafficReset map[uint]bool
+
 	// blocked 记录「账号被禁用/封禁」。
 	//
 	// 必须与 exceeded **分开存**：exceeded 是「流量用超了」，会被每次流量
@@ -321,6 +331,31 @@ func (r *Runtime) SetQuotaExceeded(userID uint, v bool) {
 	} else {
 		delete(r.exceeded, userID)
 	}
+}
+
+// MarkTrafficResetPending 登记一次用量清零（见 pendingTrafficReset）。
+func (r *Runtime) MarkTrafficResetPending(userID uint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingTrafficReset == nil {
+		r.pendingTrafficReset = map[uint]bool{}
+	}
+	r.pendingTrafficReset[userID] = true
+}
+
+// takePendingTrafficResets 取走全部待协调的清零标记。
+//
+// 只该被 flushTraffic 在落增量前调用一次：取走即消费，
+// 跳过只作用于紧邻的那一轮采集。
+func (r *Runtime) takePendingTrafficResets() map[uint]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pendingTrafficReset) == 0 {
+		return nil
+	}
+	out := r.pendingTrafficReset
+	r.pendingTrafficReset = nil
+	return out
 }
 
 // IsUserBlocked 查询账号是否被禁用/封禁。
@@ -625,8 +660,14 @@ func (s *Services) flushTraffic(
 				}
 			}
 
+			// 管理员清零与采集增量的协调（见 pendingTrafficReset）：
+			// 清零后紧邻一轮的增量是清零前采样的旧流量，加回去等于
+			// 「清零完又冒出来」。取走标记并在同一事务里跳过这些用户——
+			// 清零时刻之前的增量全部丢弃。隧道级统计照常累加：
+			// 清零的是用户的周期用量，隧道的累计与日明细不受影响。
+			skipUsers := s.Runtime.takePendingTrafficResets()
 			for uid, delta := range userDeltas {
-				if delta <= 0 {
+				if delta <= 0 || skipUsers[uid] {
 					continue
 				}
 				if err := tx.Model(&model.User{}).Where("id = ?", uid).

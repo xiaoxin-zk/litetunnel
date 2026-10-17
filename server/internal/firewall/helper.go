@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +56,48 @@ func NewHelperBackend(base, token string) *HelperBackend {
 
 func (h *HelperBackend) Name() string { return "helper" }
 
+// probeCacheTTL 是健康探测结果的缓存时长。
+//
+// 以前每次调用都重新探测，理由是「helper 可能刚被重启，长缓存会让面板
+// 持续报不可达」。但完全不缓存有两个真实代价：
+//
+//   - 同一条调用链上要探两次：FirewallBackend 先 Available() 判断可达，
+//     失败后 Reason() 又探一次——helper 不可达时每次都是两个 10 秒超时；
+//   - 批量建隧道这类连续操作，20 条就是 20 次探测，helper 卡顿时整批
+//     以分钟计。
+//
+// 5 秒的短缓存同时解决两者：helper 重启最多 5 秒内被感知，而一次调用
+// 链、一个批次内不再重复探测。HelperBackend 本身每次调用都会被重建
+// （见 service.FirewallBackend），所以缓存挂在包级、按地址键控。
+const probeCacheTTL = 5 * time.Second
+
+type probeEntry struct {
+	at  time.Time
+	ok  bool
+	err error
+}
+
+var probeCache = struct {
+	sync.Mutex
+	m map[string]probeEntry
+}{m: map[string]probeEntry{}}
+
+// probe 探测 helper 健康状态，TTL 内复用上次结果。
+func (h *HelperBackend) probe() (bool, error) {
+	probeCache.Lock()
+	e, hit := probeCache.m[h.base]
+	probeCache.Unlock()
+	if hit && time.Since(e.at) < probeCacheTTL {
+		return e.ok, e.err
+	}
+	var out helperHealth
+	err := h.get("/health", &out)
+	probeCache.Lock()
+	probeCache.m[h.base] = probeEntry{at: time.Now(), ok: err == nil, err: err}
+	probeCache.Unlock()
+	return err == nil, err
+}
+
 // Available 判断 helper 是否可达。
 //
 // 这是面板决定「能不能操作防火墙」的唯一依据：
@@ -64,8 +107,8 @@ func (h *HelperBackend) Available() bool {
 	if h.base == "" {
 		return false
 	}
-	var out helperHealth
-	return h.get("/health", &out) == nil
+	ok, _ := h.probe()
+	return ok
 }
 
 func (h *HelperBackend) Status() (bool, error) {
@@ -106,8 +149,9 @@ func (h *HelperBackend) Reason() string {
 	if h.token == "" {
 		return "未配置 helper 访问令牌，请在「系统设置 → 端口与防火墙」中填写"
 	}
-	if !h.Available() {
-		return fmt.Sprintf("无法连接宿主机 helper（%s），请确认 lt-fw 服务已启动", h.base)
+	// 复用缓存：调用方几乎总是刚调过 Available()，这里不应再探一次。
+	if _, err := h.probe(); err != nil {
+		return fmt.Sprintf("无法连接宿主机 helper（%s），请确认 lt-fw 服务已启动（%v）", h.base, err)
 	}
 	return ""
 }

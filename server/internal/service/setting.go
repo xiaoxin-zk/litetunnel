@@ -368,6 +368,18 @@ type SettingStore struct {
 	// 加密字段解出来是同一个明文就说明没变，但解密的成本与失败回落都
 	// 不该掺进这个判断里。
 	raw map[string]string
+
+	// reloadMu 串行化「读库 → 应用」这一整段，写配置（SetMany / SetInternal）
+	// 与周期刷新（ReloadIfChanged）共用它。
+	//
+	// 没有它时存在一个窗口：周期刷新先读到旧值，管理员随后写入并重载了新值，
+	// 周期刷新最后才把手里那份旧快照应用上去——本实例的缓存短暂回退，
+	// 要等下一个轮询周期才恢复。持有这把锁之后，「读」与「写 + 重载」不再
+	// 交错：晚到的快照只可能来自更晚的读，不会覆盖更新的本地写入。
+	//
+	// 注意它只保护「缓存与库的同步顺序」，不是 mu 的替代：缓存本身的读写
+	// 仍由 mu（RWMutex）保护，Get 等热路径不受这把锁影响。
+	reloadMu sync.Mutex
 }
 
 // NewSettingStore 构造配置存储并完成首次加载。
@@ -402,6 +414,16 @@ func (s *SettingStore) applyDefaults() {
 
 // Reload 从数据库重新载入全部配置。
 func (s *SettingStore) Reload() error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	return s.reloadLocked()
+}
+
+// reloadLocked 在**已持有 reloadMu** 的前提下读库并重建缓存。
+//
+// 写配置的路径也在锁内调用它：写入与随后的重载必须相对其他重载是原子的，
+// 否则一次更早开始的刷新可能在本实例写完、重载完之后才把旧快照贴回来。
+func (s *SettingStore) reloadLocked() error {
 	stored, err := s.fetch()
 	if err != nil {
 		return err
@@ -422,6 +444,11 @@ func (s *SettingStore) Reload() error {
 // 而时间戳依赖每条写入路径都正确维护它，漏掉一处（原生 SQL、批量更新）
 // 就会永远同步不过去。整表比较不依赖任何列语义。
 func (s *SettingStore) ReloadIfChanged() (bool, error) {
+	// 整段「读 → 比较 → 应用」都在 reloadMu 内：否则一份在管理员写入之前
+	// 读到的旧快照，可能在写入并重载之后才被应用，缓存短暂回退到旧值。
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	stored, err := s.fetch()
 	if err != nil {
 		return false, err
@@ -566,6 +593,11 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 		return nil
 	}
 
+	// 写入与随后的重载必须在同一把锁内完成（见 reloadMu）：否则一次更早
+	// 开始、更晚结束的周期刷新会把旧快照贴回来，本实例缓存回退到写入前。
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, p := range toWrite {
 			row := model.Setting{Key: p.key}
@@ -579,7 +611,7 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 	if err != nil {
 		return err
 	}
-	return s.Reload()
+	return s.reloadLocked()
 }
 
 // SetInternal 写入系统维护项（Internal 标记的那些值）并刷新缓存。
@@ -596,6 +628,10 @@ func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
 			return fmt.Errorf("%w: %s 不是系统维护项", ErrInvalidParam, k)
 		}
 	}
+	// 与 SetMany 同样：写入与重载在同一把锁内，避免被更早的快照覆盖。
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		for k, v := range in {
 			key := string(k)
@@ -610,7 +646,7 @@ func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
 	if err != nil {
 		return err
 	}
-	return s.Reload()
+	return s.reloadLocked()
 }
 
 // hasRow 判断某个键在数据库里是否有记录（与它的值是否为空无关）。

@@ -3562,6 +3562,50 @@ func TestSettingStoreReloadIfChanged(t *testing.T) {
 	}
 }
 
+// TestSettingStoreConcurrentReloadKeepsNewest 覆盖「旧快照覆盖新写入」。
+//
+// 周期刷新与管理员写入并发时，刷新可能先读到旧值、最后才应用：若它晚于
+// 写入自己的重载完成，本实例的缓存会短暂回退（刚加的保留端口又变回可分配），
+// 直到下一个轮询周期。reloadMu 把「读 → 应用」与「写 → 重载」串行化之后，
+// 更早的快照只可能应用在更新的写入之前。
+func TestSettingStoreConcurrentReloadKeepsNewest(t *testing.T) {
+	svc := newTestServices(t, &config.Config{})
+	store := svc.Settings
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := store.ReloadIfChanged(); err != nil {
+				return
+			}
+		}
+	}()
+
+	last := ""
+	for i := 0; i < 30; i++ {
+		last = fmt.Sprintf("%d", 30000+i)
+		if err := store.SetMany(map[SettingKey]string{KeyPortReserved: last}); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("写入配置失败: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if got := store.Get(KeyPortReserved); got != last {
+		t.Fatalf("缓存被更早的快照覆盖了：期望 %q，实际 %q", last, got)
+	}
+}
+
 // TestPortAllocationSkipsReservedPorts 覆盖「自动/手动分配落到保留端口」。
 func TestPortAllocationSkipsReservedPorts(t *testing.T) {
 	svc := newTestServices(t, &config.Config{PortRangeStart: 30000, PortRangeEnd: 30005})

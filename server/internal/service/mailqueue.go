@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
+
+	"gorm.io/gorm"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -55,14 +58,41 @@ func mailRetryDelay(attempts int) time.Duration {
 	return d
 }
 
-// queueMail 把一封邮件写进发件箱并唤醒发送协程。
+// mailQuota 描述一类邮件的发送额度：同一收件地址的冷却窗口与每日上限。
+// 0 值表示该项不限制。
+type mailQuota struct {
+	cooldown   time.Duration
+	dailyLimit int
+	// dailyAllKinds 为真时，每日上限按「该地址的全部邮件」统计而不是只算同类。
+	//
+	// 验证码沿用这个口径（原来就是按邮箱统计的）：注册、找回、换绑三种码
+	// 各算各的话，单个地址一天能收到的信就变成三倍，防滥用效果打折。
+	dailyAllKinds bool
+}
+
+// 额度不足的两种原因。调用方据此决定对外怎么说：
+// 找回密码这类会泄露账号状态的接口必须把它们吞掉、照常返回成功。
+var (
+	errMailQuotaCooldown = errors.New("同一邮箱发送过于频繁")
+	errMailQuotaDaily    = errors.New("该邮箱当日发送已达上限")
+)
+
+// enqueueMail 按额度入队：加锁 → 复核额度 → 写入待发。
+//
+// 三步必须在**同一个事务**里，且顺序是「先复核、后写入」：
+//
+//   - 复核放在写入之前，超限时一条记录都不留。先写再查的话，一批并发请求
+//     会各自留下草稿、各自超限作废，而这些失败记录还会继续占额度，
+//     把用户当天的额度一次性耗光——失败反而变成惩罚；
+//   - 加锁是为了让同一收件地址的「复核 + 写入」串行。不加锁时并发请求
+//     都读到「还没满」，各自入队，一起超额（分布式来源尤其容易）。
 //
 // 返回错误意味着**没写进去**，调用方必须据此回滚已经做的准备（例如撤掉刚建的
 // 凭据记录）：否则用户既收不到信、旧凭据又已经失效。
 //
 // 注意「写进发件箱」不等于「已送达」：送达由后台协程负责并带重试，
 // 凭据动作（激活新凭据、作废旧凭据）在**确认送达之后**才执行。
-func (s *Services) queueMail(to, subject, body, kind string, payload any) (*model.MailOutbox, error) {
+func (s *Services) enqueueMail(to, subject, body, kind string, payload any, q mailQuota) (*model.MailOutbox, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -73,39 +103,84 @@ func (s *Services) queueMail(to, subject, body, kind string, payload any) (*mode
 		Body:    body,
 		Kind:    kind,
 		Payload: string(raw),
-		// 先写成草稿：worker 只认 pending，所以这封信此刻发不出去。
-		// 调用方复核完额度（并在这里就作废超额的那一封）之后再调 releaseMail。
-		Status: model.MailDraft,
-		NextAt: time.Now(),
+		Status:  model.MailPending,
+		NextAt:  time.Now(),
 	}
-	if err := s.DB.Create(&rec).Error; err != nil {
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := s.lockMailRecipient(tx, to); err != nil {
+			return err
+		}
+		if err := checkMailQuota(tx, to, kind, q); err != nil {
+			return err
+		}
+		return tx.Create(&rec).Error
+	})
+	if err != nil {
+		if errors.Is(err, errMailQuotaCooldown) || errors.Is(err, errMailQuotaDaily) {
+			return nil, err
+		}
 		// 用「稍后重试」的口径对外：对用户来说这与队列繁忙是一回事，
 		// 而真正的原因（数据库写不进去）已经在日志里。
 		log.Printf("[mail] 写入发件箱失败（收件人 %s）: %v", maskEmail(to), err)
 		return nil, ErrMailQueueFull
 	}
-	// 返回刚写入的记录：调用方要拿它做「入队后复核额度」，
-	// 拿到 ID 才能把超额的那一封作废掉（见 emailcode.go）。
+	s.kickMailWorker()
 	return &rec, nil
 }
 
-// releaseMail 把草稿邮件转为待发送，并唤醒发信协程。
+// lockMailRecipient 在事务内按收件地址加锁，把「复核 + 入队」串行化。
 //
-// 条件更新（仅 draft）：若这封已被作废，就不该再放出去。
-// 返回是否真的释放了。
-func (s *Services) releaseMail(id uint) bool {
-	res := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status = ?", id, model.MailDraft).
-		Updates(map[string]any{"status": model.MailPending, "next_at": time.Now()})
-	if res.Error != nil {
-		log.Printf("[mail] 释放邮件失败（id=%d）: %v", id, res.Error)
-		return false
+// PostgreSQL 用事务级 advisory lock（与注册额度同一手法）；SQLite 不需要——
+// store.Open 里连接池只有一个连接，事务天然串行。
+func (s *Services) lockMailRecipient(tx *gorm.DB, to string) error {
+	if s.Cfg == nil || !strings.EqualFold(strings.TrimSpace(s.Cfg.DBDriver), "postgres") {
+		return nil
 	}
-	if res.RowsAffected == 0 {
-		return false
+	key := "mail:" + strings.ToLower(strings.TrimSpace(to))
+	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", key).Error
+}
+
+// checkMailQuota 复核某个收件地址的发信额度。
+//
+// 只统计**有效**记录：草稿与已作废的尝试不算。它们没有送达、没有凭据生效，
+// 把它们计入额度的话，一次并发突发就会把当日额度用失败记录填满。
+//
+// 统计口径是「不含自己」（调用方尚未写入），所以达到上限即拒绝。
+// 统计失败一律放行：额度是防滥用手段，不该因为一次计数失败挡住正常用户。
+func checkMailQuota(tx *gorm.DB, to, kind string, q mailQuota) error {
+	to = strings.ToLower(strings.TrimSpace(to))
+
+	if q.cooldown > 0 {
+		var prev model.MailOutbox
+		err := tx.Where("lower(to_addr) = ? AND kind = ? AND status NOT IN ?",
+			to, kind, []string{model.MailFailed}).
+			Order("id desc").First(&prev).Error
+		if err == nil && time.Since(prev.CreatedAt) < q.cooldown {
+			return errMailQuotaCooldown
+		}
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
 	}
-	s.kickMailWorker()
-	return true
+
+	if q.dailyLimit > 0 {
+		now := time.Now()
+		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		qry := tx.Model(&model.MailOutbox{}).
+			Where("lower(to_addr) = ? AND created_at >= ? AND status NOT IN ?",
+				to, dayStart, []string{model.MailFailed})
+		if !q.dailyAllKinds {
+			qry = qry.Where("kind = ?", kind)
+		}
+		var n int64
+		if err := qry.Count(&n).Error; err != nil {
+			return nil
+		}
+		if n >= int64(q.dailyLimit) {
+			return errMailQuotaDaily
+		}
+	}
+	return nil
 }
 
 // kickMailWorker 唤醒发送协程，不必等下一个轮询周期。
@@ -417,10 +492,6 @@ func (s *Services) finishMail(id uint, f mailFinish) {
 func (s *Services) pruneMailOutbox() {
 	s.pruneTable("已送达邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailSent, time.Now().Add(-mailSentRetention))
-	// 未释放的草稿：正常路径在同一次调用里就会被释放或作废，留下的只可能是
-	// 「进程在写完草稿与复核之间崩溃」。它们永远不会被发送，直接清掉。
-	s.pruneTable("未释放的邮件草稿", &model.MailOutbox{},
-		"status = ? AND created_at < ?", model.MailDraft, time.Now().Add(-time.Hour))
 }
 
 // maskEmail 对日志中的邮箱做脱敏，避免日志成为邮箱收集来源。

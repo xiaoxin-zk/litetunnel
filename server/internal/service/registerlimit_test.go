@@ -82,16 +82,17 @@ func TestRegisterEnforcesDomainLimit(t *testing.T) {
 	}
 }
 
-// TestRecheckEmailCodeQuotaRejectsConcurrentSend 覆盖「并发发码绕过冷却」。
+// TestEmailCodeQuotaEnforcedBeforeWrite 覆盖「并发发码绕过冷却」。
 //
-// 前置的冷却与每日上限都是先查后写，两封同时进来会都通过。入队后复核
-// 把刚写入的那封也算进去，超了就让调用方把它作废。
-func TestRecheckEmailCodeQuotaRejectsConcurrentSend(t *testing.T) {
+// 冷却与每日上限都在写入**之前**、且在按收件地址加锁的事务里判断，
+// 所以并发请求不会都读到「还没满」，超限的那次也不会留下记录。
+func TestEmailCodeQuotaEnforcedBeforeWrite(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	const to = "quotarace@example.com"
 	now := time.Now()
-	mk := func(createdAt time.Time) *model.MailOutbox {
+	quota := mailQuota{cooldown: emailCodeResendCooldown, dailyLimit: emailCodeDailyPerEmail}
+	mk := func(createdAt time.Time) {
 		row := &model.MailOutbox{
 			To: to, Subject: "s", Kind: model.MailKindEmailCodeReset,
 			Status: model.MailPending, NextAt: now, CreatedAt: createdAt,
@@ -99,25 +100,25 @@ func TestRecheckEmailCodeQuotaRejectsConcurrentSend(t *testing.T) {
 		if err := svc.DB.Create(row).Error; err != nil {
 			t.Fatalf("建待发邮件失败: %v", err)
 		}
-		return row
 	}
 
-	// 场景一：冷却窗口内又发了一封。
+	// 场景一：冷却窗口内已经发过一封。
 	mk(now)
-	second := mk(now)
-	if err := svc.recheckEmailCodeQuota(second); !errors.Is(err, ErrEmailCodeTooSoon) {
-		t.Fatalf("冷却窗口内的第二封应被作废，实际 %v", err)
+	if err := checkMailQuota(svc.DB, to, model.MailKindEmailCodeReset, quota); !errors.Is(err, errMailQuotaCooldown) {
+		t.Fatalf("冷却窗口内应拒绝，实际 %v", err)
 	}
 
-	// 场景二：当日总量超过上限（用较早的时间避开冷却是另一回事，
-	// 这里让所有行都早于冷却窗口）。
+	// 场景二：当日总量达到上限（时间推到冷却窗口之外）。
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	old := dayStart.Add(time.Minute)
-	for i := int64(0); i < emailCodeDailyPerEmail; i++ {
+	if err := svc.DB.Model(&model.MailOutbox{}).
+		Where("lower(to_addr) = ?", to).Update("created_at", old).Error; err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < emailCodeDailyPerEmail; i++ {
 		mk(old)
 	}
-	last := mk(old)
-	if err := svc.recheckEmailCodeQuota(last); !errors.Is(err, ErrEmailCodeTooMany) {
-		t.Fatalf("超过每日上限应作废，实际 %v", err)
+	if err := checkMailQuota(svc.DB, to, model.MailKindEmailCodeReset, quota); !errors.Is(err, errMailQuotaDaily) {
+		t.Fatalf("达到每日上限应拒绝，实际 %v", err)
 	}
 }

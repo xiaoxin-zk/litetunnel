@@ -108,34 +108,26 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	// 的判断，此时返回错误会让「已注册 + 入队失败」与「未注册」产生可区分的
 	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
 	// 「重新发送」，也不给枚举留口子。
-	row, err := s.queueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
+	// 入队时按收件地址复核额度（冷却 + 每日上限），复核与写入在同一个事务里。
+	//
+	// 这条路径原先只有按 IP 的令牌桶：分布式来源可以轮流换 IP，对同一个
+	// 邮箱持续排队重置邮件、挤占发件箱。复核放在写入**之前**，超限时一条
+	// 记录都不留——否则失败记录会继续占额度，一次突发就能把当日额度耗光。
+	//
+	// 入队失败只记日志、对外仍然返回成功：这里已经走完了「账号存在 + 有效」
+	// 的判断，此时返回错误会让「已注册 + 入队失败」与「未注册」产生可区分的
+	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
+	// 「重新发送」，也不给枚举留口子。
+	if _, err := s.enqueueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
 		UserID:    u.ID,
 		TokenHash: hash,
 		// 存 TTL 而不是绝对时间：有效期从**送达时刻**起算，否则排队或重试
 		// 拖久了，用户点开链接时它已经过期。
 		TTLSeconds: int(resetTokenTTL.Seconds()),
 		IP:         truncate(ip, 64),
-	})
-	if err != nil {
-		log.Printf("[reset] 重置邮件入队失败（账号 %d），原有令牌未受影响: %v", u.ID, err)
+	}, mailQuota{cooldown: resetLinkCooldown, dailyLimit: resetLinkDailyPerEmail}); err != nil {
+		log.Printf("[reset] 重置邮件未发出（账号 %d），原有令牌未受影响: %v", u.ID, err)
 		return nil
-	}
-
-	// 按收件地址限流（冷却 + 每日上限）。
-	//
-	// 这条路径原先只有按 IP 的令牌桶：分布式来源可以轮流换 IP，对同一个
-	// 邮箱持续排队重置邮件、挤占发件箱。此时还是草稿状态，超了就作废——
-	// 用户收不到信，也不会有一封「已发出但无效」的邮件。
-	if qerr := s.recheckResetLinkQuota(row); qerr != nil {
-		s.voidMail(row.ID, qerr.Error())
-		log.Printf("[reset] 重置邮件超出该邮箱的发送额度，已作废（邮箱 %s）: %v",
-			maskEmail(u.Email), qerr)
-		return nil
-	}
-	if !s.releaseMail(row.ID) {
-		// 释放失败：这封信不会发出去。对外仍返回成功（否则会暴露账号状态），
-		// 日志里留痕，用户可以再点一次「重新发送」。
-		log.Printf("[reset] 重置邮件释放失败（账号 %d），已按未发送处理", u.ID)
 	}
 	return nil
 }
@@ -148,38 +140,6 @@ const (
 	resetLinkCooldown      = 60 * time.Second
 	resetLinkDailyPerEmail = 5
 )
-
-// recheckResetLinkQuota 复核「发往某个地址的重置链接」的额度。
-//
-// 把刚写入的这封也算进去：前置判断与写入之间可能插进了并发请求
-// （分布式来源尤其容易），只看前置检查等于没有上限。
-// 统计失败一律放行——限流是防滥用手段，不该因为一次计数失败挡住正常用户。
-func (s *Services) recheckResetLinkQuota(row *model.MailOutbox) error {
-	to := strings.ToLower(strings.TrimSpace(row.To))
-
-	var prev model.MailOutbox
-	err := s.DB.Where("lower(to_addr) = ? AND kind = ? AND id < ?", to, row.Kind, row.ID).
-		Order("id desc").First(&prev).Error
-	if err == nil && time.Since(prev.CreatedAt) < resetLinkCooldown {
-		return fmt.Errorf("同一邮箱的找回邮件发送过于频繁（冷却 %s）", resetLinkCooldown)
-	}
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-
-	now := time.Now()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	var sent int64
-	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("lower(to_addr) = ? AND kind = ? AND created_at >= ?", to, row.Kind, dayStart).
-		Count(&sent).Error; err != nil {
-		return nil
-	}
-	if sent > int64(resetLinkDailyPerEmail) {
-		return fmt.Errorf("该邮箱当日找回邮件已达上限（%d 封）", resetLinkDailyPerEmail)
-	}
-	return nil
-}
 
 // ResetPassword 使用令牌重置密码。
 //

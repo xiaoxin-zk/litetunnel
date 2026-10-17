@@ -89,33 +89,7 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		kind = model.MailKindEmailCodeChange
 	}
 
-	// 限流 1：同邮箱同用途的重发冷却。
-	//
-	// 计数改为看**发件箱**而不是验证码表：验证码记录现在要等送达才创建，
-	// 拿它做限流的话，反复触发发送就能绕过冷却（每次都还没送达）。
-	// 用发件箱计数也更贴合限流的本意——拦的是「发送行为」，不是「可用验证码」。
-	var recent model.MailOutbox
-	err := s.DB.Where("to_addr = ? AND kind = ?", email, kind).
-		Order("id desc").First(&recent).Error
-	if err == nil && time.Since(recent.CreatedAt) < emailCodeResendCooldown {
-		return ErrEmailCodeTooSoon
-	}
-
-	// 限流 2：同邮箱每日上限（不限用途，与原先按邮箱统计一致）。
-	now := time.Now()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	var sent int64
-	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("to_addr = ? AND created_at >= ?", email, dayStart).
-		Count(&sent).Error; err != nil {
-		return err
-	}
-	if sent >= emailCodeDailyPerEmail {
-		return ErrEmailCodeTooMany
-	}
-
 	// 找回场景且邮箱不存在：不真的发信，但仍返回成功。
-	// 走完了上面全部限流逻辑，因此响应时间与「邮箱存在」时基本一致。
 	if scene == EmailSceneReset && exists == 0 {
 		log.Printf("[emailcode] 找回密码请求的邮箱未注册，已静默忽略")
 		return nil
@@ -139,7 +113,7 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	//
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 同步发送会让「邮箱是否存在」通过响应时间泄露出去。
-	row, err := s.queueMail(email, subject,
+	_, err = s.enqueueMail(email, subject,
 		emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())),
 		kind, emailCodePayload{
 			Email:    email,
@@ -151,86 +125,39 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			// 实际上一到手就失效了。
 			TTLSeconds: int(emailCodeTTL.Seconds()),
 			IP:         truncate(ip, 64),
+		}, mailQuota{
+			cooldown:   emailCodeResendCooldown,
+			dailyLimit: emailCodeDailyPerEmail,
+			// 与原先一致：同一地址的验证码总数（不分注册/找回/换绑）受限。
+			dailyAllKinds: true,
 		})
 	if err != nil {
-		// 找回场景必须保持「不暴露账号是否存在」：这里已经走完了账号判断，
-		// 返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
+		// 找回场景必须保持「不暴露账号是否存在、是否被限流」：这里已经走完了
+		// 账号判断，返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
 		if scene == EmailSceneReset {
-			log.Printf("[emailcode] 找回密码的验证码入队失败（邮箱 %s）: %v", maskEmail(email), err)
+			log.Printf("[emailcode] 找回密码的验证码未发出（邮箱 %s）: %v", maskEmail(email), err)
 			return nil
 		}
-		// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
-		return err
-	}
-
-	// 入队后复核：上面的冷却与每日上限都是「先查后写」，并发请求会同时
-	// 读到「还没满」而各自发出。把刚写入的这封也算进去再判一次，
-	// 超了就把它作废——用户收不到，限流才真正生效。
-	//
-	// 此时这封还是草稿（worker 不会取），所以「复核」真的发生在发送之前：
-	// 先发后查的话，作废只能拦住凭据生效，拦不住收件人收到一个无效验证码。
-	if qerr := s.recheckEmailCodeQuota(row); qerr != nil {
-		s.voidMail(row.ID, qerr.Error())
-		if scene == EmailSceneReset {
-			log.Printf("[emailcode] 找回密码验证码超出额度，已作废（邮箱 %s）: %v", maskEmail(email), qerr)
-			return nil
+		switch {
+		case errors.Is(err, errMailQuotaCooldown):
+			return ErrEmailCodeTooSoon
+		case errors.Is(err, errMailQuotaDaily):
+			return ErrEmailCodeTooMany
+		default:
+			// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
+			return err
 		}
-		return qerr
-	}
-	if !s.releaseMail(row.ID) {
-		// 释放失败（多半是数据库写不进去）：这封信不会发出去，
-		// 必须如实报错——否则用户会一直等一封永远不会来的验证码。
-		if scene == EmailSceneReset {
-			log.Printf("[emailcode] 找回密码验证码释放失败（邮箱 %s），已按未发送处理", maskEmail(email))
-			return nil
-		}
-		return ErrMailQueueFull
-	}
-	return nil
-}
-
-// recheckEmailCodeQuota 在邮件入队之后复核发送额度。
-//
-// 把「刚写入的这一封」纳入统计：冷却窗口内还有前封、或当日总数超过上限，
-// 都说明前置检查与这次写入之间插进了并发请求。返回错误由调用方作废这封。
-//
-// 统计失败一律放行：配额是防滥用手段，不该因为一次计数查询失败
-// 把正常用户挡在门外（与前置检查同一取舍）。
-func (s *Services) recheckEmailCodeQuota(row *model.MailOutbox) error {
-	to := strings.ToLower(strings.TrimSpace(row.To))
-
-	var prev model.MailOutbox
-	err := s.DB.Where("lower(to_addr) = ? AND kind = ? AND id < ?", to, row.Kind, row.ID).
-		Order("id desc").First(&prev).Error
-	if err == nil && time.Since(prev.CreatedAt) < emailCodeResendCooldown {
-		return ErrEmailCodeTooSoon
-	}
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil
-	}
-
-	now := time.Now()
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	var sent int64
-	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("lower(to_addr) = ? AND created_at >= ?", to, dayStart).
-		Count(&sent).Error; err != nil {
-		return nil
-	}
-	// 含自己在内：正好等于上限是正常的，超过才作废。
-	if sent > int64(emailCodeDailyPerEmail) {
-		return ErrEmailCodeTooMany
 	}
 	return nil
 }
 
 // voidMail 作废一封尚未投递的邮件：不再发送，正文与参数一并清掉。
 //
-// 条件更新（仅 draft / pending）：如果它已经被 worker 取走发出去了，
+// 条件更新（仅 pending）：如果它已经被 worker 取走发出去了，
 // 这里不改状态——那封信的凭据动作会由激活环节按当前账号状态再判一次。
 func (s *Services) voidMail(id uint, reason string) {
 	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status IN ?", id, []string{model.MailDraft, model.MailPending}).
+		Where("id = ? AND status = ?", id, model.MailPending).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",

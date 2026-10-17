@@ -391,11 +391,6 @@ func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens"
 
 // 发件箱状态。
 const (
-	// MailDraft 已写好但**还不能发**：调用方要复核发送额度之后再释放。
-	//
-	// 两段式是必要的：入队即发的话，等额度复核做完，信可能已经在路上，
-	// 作废只能拦住凭据生效，拦不住收件人收到一个无效验证码。
-	MailDraft = "draft"
 	// MailPending 待发送（含等待重试）。
 	MailPending = "pending"
 	// MailDelivered 邮件已送达，但凭据动作还没完成。

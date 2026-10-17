@@ -20,6 +20,67 @@ type sessionInfo struct {
 	LastSeen time.Time
 }
 
+// baselineLegacyKeep 是「无从确认归属的旧基线」在代理缺席后最多保留多久。
+//
+// 这些条目来自升级前（没有隧道标识）的数据，无法判断它属于哪条隧道：
+// 留久了会让规模失控，丢太早又可能让同名重建的代理被重复计费。
+// 一小时是个折中——超过这个时间还没再出现，就当它不会再回来。
+const baselineLegacyKeep = time.Hour
+
+// pruneDeadBaselines 从继承来的基线里剔除「已经不可能再用上」的条目。
+//
+//   - 隧道行已被删除：精确判断（基线带隧道 ID），立即剔除；
+//   - 没有隧道标识的旧条目：无从判断，缺席超过 baselineLegacyKeep 才剔除。
+//
+// 只处理本轮**没出现**的名字：出现过的已经在上面覆盖成新值了。
+// 查询失败时按「都还活着」处理——宁可多留一天，也不要把仍在使用的基线误删
+// （误删的代价是那一轮把当天累计值重记一遍）。
+func (s *Services) pruneDeadBaselines(nextStat map[string]trafficPair, seen map[string]bool, now time.Time) {
+	ids := make([]uint, 0, len(nextStat))
+	for name, prev := range nextStat {
+		if seen[name] || prev.tunnelID == 0 {
+			continue
+		}
+		ids = append(ids, prev.tunnelID)
+	}
+
+	alive := make(map[uint]bool, len(ids))
+	if len(ids) > 0 {
+		for start := 0; start < len(ids); start += inQueryBatch {
+			end := start + inQueryBatch
+			if end > len(ids) {
+				end = len(ids)
+			}
+			var batch []uint
+			if err := s.DB.Model(&model.Tunnel{}).
+				Where("id IN ?", ids[start:end]).Pluck("id", &batch).Error; err != nil {
+				for _, id := range ids[start:end] {
+					alive[id] = true
+				}
+				continue
+			}
+			for _, id := range batch {
+				alive[id] = true
+			}
+		}
+	}
+
+	for name, prev := range nextStat {
+		if seen[name] {
+			continue
+		}
+		if prev.tunnelID == 0 {
+			if now.Sub(prev.seenAt) > baselineLegacyKeep {
+				delete(nextStat, name)
+			}
+			continue
+		}
+		if !alive[prev.tunnelID] {
+			delete(nextStat, name)
+		}
+	}
+}
+
 // sameDay 判断两个时刻是否落在同一天（服务端本地时区，与哨兵 key 的
 // 「今天」口径一致）。
 //
@@ -42,6 +103,11 @@ type trafficPair struct {
 	// 基线去减新代理的计数——旧基线更大时走「跨零点」分支（把新计数整个记一遍），
 	// 更小时则把新隧道前段的流量整段吃掉。两种情况都算错。
 	tunnelID uint
+	// unknown 表示这条基线来自**没有隧道标识的旧数据**（升级前的行）。
+	//
+	// 它可能是同名重建之前的旧值，无从判断，所以第一次用上它时不计增量
+	// （见 collectTraffic）：最多损失一个采集周期的流量，好过把整天算错。
+	unknown bool
 	// seenAt 是这个名字最后一次出现在 frps 列表里的时刻。
 	//
 	// 只用于「本轮没出现的代理要不要保留基线」，不参与增量计算：
@@ -917,6 +983,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			nextStat[name] = prev
 		}
 	}
+	seenNames := make(map[string]bool, len(refs))
 
 	for _, ref := range refs {
 		p := proxies[ref.idx]
@@ -938,6 +1005,12 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			prev = trafficPair{}
 		}
 		din, dout := cur.in-prev.in, cur.out-prev.out
+		if prev.unknown {
+			// 升级前的基线没有隧道标识，可能是同名重建之前的旧值。
+			// 无从判断，就**不计这一轮增量**：直接把当前值当作新基线，
+			// 最多损失一个采集周期，好过把整天的流量重记或少记。
+			din, dout = 0, 0
+		}
 		// frps 的当日统计跨零点归零，此时当前值本身就是增量。
 		if din < 0 {
 			din = cur.in
@@ -946,6 +1019,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			dout = cur.out
 		}
 		nextStat[p.Name] = cur
+		seenNames[p.Name] = true
 
 		d := tunnelDeltas[t.ID]
 		if d == nil {
@@ -966,6 +1040,11 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	s.Runtime.mu.Unlock()
 
 	s.Runtime.setOnlineTunnels(onlineNow)
+
+	// 继承来的基线里，属于「隧道已被删除」的条目要清掉：它们永远不会再出现，
+	// 留着只会让内存与基线表随「当天创建过的隧道数」增长，而不是当前隧道数。
+	// 隧道仍然存在、只是暂时离线的（客户端关了）必须保留——那正是基线保留的意义。
+	s.pruneDeadBaselines(nextStat, seenNames, now)
 
 	s.Runtime.mu.Lock()
 	seedBaseline := s.Runtime.baselineSeedPending
@@ -1370,8 +1449,10 @@ func (s *Services) loadTrafficBaseline() bool {
 	now := time.Now()
 	m := make(map[string]trafficPair, len(rows))
 	for _, r := range rows {
+		// TunnelID 为零说明这行是升级前写的（那时还没有这一列）：
+		// 它可能是同名重建之前的旧值，标记为「无从判断」，首次使用时不计增量。
 		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes,
-			seenAt: now, tunnelID: r.TunnelID}
+			seenAt: now, tunnelID: r.TunnelID, unknown: r.TunnelID == 0}
 	}
 
 	s.Runtime.mu.Lock()

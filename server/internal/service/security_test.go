@@ -3141,6 +3141,113 @@ func TestCollectTrafficResetsBaselineForRecreatedTunnel(t *testing.T) {
 	}
 }
 
+// TestCollectTrafficSkipsDeltaForLegacyBaseline 覆盖「升级前留下的基线」。
+//
+// 新增隧道标识列之后，旧行是零值：它可能正是同名重建之前的旧累计值。
+// 直接相减会算错（少记或重记整天），所以第一次用上这种基线时不计增量——
+// 最多损失一个采集周期，好过把一整天的流量算错。
+func TestCollectTrafficSkipsDeltaForLegacyBaseline(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	// 基线迁移标记：否则首轮本来就只记基线、不计增量，测不出这条规则。
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+		t.Fatalf("写迁移标记失败: %v", err)
+	}
+
+	u := &model.User{Username: "legacybase", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20001,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	// 旧数据：没有隧道标识的基线行。
+	if err := svc.DB.Create(&model.TrafficBaseline{
+		ProxyName: FrpUserOf(u.ID) + ".mc",
+		Date:      time.Now().Format("2006-01-02"),
+		InBytes:   5000,
+	}).Error; err != nil {
+		t.Fatalf("写旧基线失败: %v", err)
+	}
+
+	proxy := FrpUserOf(u.ID) + ".mc"
+	frps := newFakeFrpsTraffic(proxy)
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	if !svc.loadTrafficBaseline() {
+		t.Fatal("基线应能恢复")
+	}
+
+	ctx := context.Background()
+	frps.total.Store(6000)
+	svc.collectTraffic(ctx)
+
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 0 {
+		t.Fatalf("旧基线无从判断归属，这一轮不该计增量，实际记了 %d", got)
+	}
+
+	// 之后正常计增量：基线已被推进到 6000。
+	frps.total.Store(6300)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 300 {
+		t.Fatalf("后续应只记新增的 300，实际 %d", got)
+	}
+}
+
+// TestPruneDeadBaselines 覆盖继承基线的清理口径。
+//
+//   - 隧道仍在、只是本轮没出现（客户端关了）→ 必须保留，否则它回来时
+//     会把当天累计值整个重记一遍；
+//   - 隧道行已删除 → 立即剔除，否则内存与基线表会随「当天创建过的隧道数」增长；
+//   - 没有隧道标识的旧条目 → 无从判断，缺席超过保留期才剔除。
+func TestPruneDeadBaselines(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "prunebase", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	alive := &model.Tunnel{
+		UserID: u.ID, Name: "alive", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 1, RemotePort: 20001,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(alive).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	now := time.Now()
+	nextStat := map[string]trafficPair{
+		"lt_u1.alive":  {in: 100, seenAt: now, tunnelID: alive.ID}, // 隧道仍在
+		"lt_u1.dead":   {in: 200, seenAt: now, tunnelID: 999999},   // 隧道已删
+		"lt_u1.legacy": {in: 300, seenAt: now.Add(-2 * time.Hour)}, // 旧数据，缺席超期
+		"lt_u1.recent": {in: 400, seenAt: now.Add(-time.Minute)},   // 旧数据，还在保留期
+	}
+	svc.pruneDeadBaselines(nextStat, map[string]bool{}, now)
+
+	if _, ok := nextStat["lt_u1.alive"]; !ok {
+		t.Fatal("隧道仍在、只是暂时离线的基线必须保留")
+	}
+	if _, ok := nextStat["lt_u1.dead"]; ok {
+		t.Fatal("隧道已删除的基线应被剔除")
+	}
+	if _, ok := nextStat["lt_u1.legacy"]; ok {
+		t.Fatal("旧数据缺席超过保留期应被剔除")
+	}
+	if _, ok := nextStat["lt_u1.recent"]; !ok {
+		t.Fatal("旧数据仍在保留期内应保留")
+	}
+}
+
 // TestCollectTrafficKeepsBaselineWhenFlushFails 覆盖「落库失败永久漏记流量」。
 //
 // 采样基线（Runtime.lastStat）如果先推进、再落库，事务失败时那一轮的增量

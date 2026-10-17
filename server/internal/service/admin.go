@@ -1115,16 +1115,20 @@ func (s *Services) ListAllTunnels(keyword, status string, userID uint, offset, l
 
 // AdminSetTunnelStatus 启用/停用任意隧道。
 //
-// 与用户侧的 SetTunnelStatus 一样必须联动防火墙：停用即收回端口、
-// 启用即重新放行。管理员这条路径不联动的话，「停用」只改了数据库，
-// 主机防火墙上的规则仍然放行——后台显示已停用，端口其实还开着。
-// 而启动时的规则对齐只负责「补开活跃端口」，不会清理这种残留。
+// 只负责「按 id 圈定目标」，状态切换与副作用全部交给 setTunnelStatus，
+// 与用户侧共用同一套实现。这条路径原先自己写了一遍状态变更，于是漏掉了
+// 用户侧有、这里没有的 HTTPS 入口校验：平台切回边缘模式后，管理员仍能把
+// 旧 HTTPS 隧道重新启用，得到一条状态为运行中、实际永远连不上的隧道。
+//
+// 联动防火墙同样必须共用：不联动的话「停用」只改了数据库，主机防火墙上的
+// 规则仍然放行——后台显示已停用，端口其实还开着。而启动时的规则对齐只负责
+// 「补开活跃端口」，不会清理这种残留。
 func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
 		return ErrInvalidParam
 	}
 
-	// 需要 Type 与 RemotePort 才能操作防火墙，先取出来。
+	// 需要 Type 与 RemotePort 才能校验入口、操作防火墙，先取出来。
 	var t model.Tunnel
 	if err := s.DB.First(&t, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1132,21 +1136,7 @@ func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 		}
 		return err
 	}
-
-	if err := s.DB.Model(&model.Tunnel{}).Where("id = ?", id).
-		Update("status", status).Error; err != nil {
-		return err
-	}
-
-	if t.RemotePort > 0 {
-		if status == model.TunnelStatusActive {
-			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true)
-		} else {
-			// 与用户侧一致：收回失败要进重试队列，而不是只写一行日志。
-			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
-		}
-	}
-	return nil
+	return s.setTunnelStatus(&t, status)
 }
 
 // AdminDeleteTunnel 删除任意隧道并回收其端口。

@@ -282,8 +282,8 @@ func (s *Services) DeleteTunnel(userID, id uint) error {
 
 // SetTunnelStatus 启用/停用隧道。
 //
-// 状态切换同时联动防火墙：停用即收回端口，启用即重新放行。
-// 否则「停用的隧道端口仍然对外开放」会成为一个隐蔽的安全缺口。
+// 这里只负责「按用户圈定目标」；状态切换本身走 setTunnelStatus——管理员那条
+// 路径也要用同一套检查，两处各写一份迟早会分叉（见 assertTunnelCanEnable）。
 func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
 		return ErrInvalidParam
@@ -296,16 +296,38 @@ func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 		}
 		return err
 	}
+	return s.setTunnelStatus(&t, status)
+}
 
-	// 重新启用一条 HTTPS 隧道时同样要确认入口还在：管理员可能已经把平台
-	// 切回了边缘模式。否则「停用 → 切换模式 → 启用」会绕开创建时的检查，
-	// 得到一条状态为运行中、实际永远连不上的隧道。
-	if status == model.TunnelStatusActive && t.Type == model.ProxyTypeHTTPS && !s.HTTPSProxyEntryEnabled() {
+// assertTunnelCanEnable 是「把隧道切到启用」的唯一前置检查。
+//
+// 只检查启用方向的 HTTPS：平台切回边缘模式后，那条隧道在 Caddy 与 frps 上
+// 都没有对应入口了。此时「停用 → 切模式 → 启用」会绕开创建时的检查，得到一条
+// 状态为运行中、实际永远连不上的隧道——用户只会看到连不上，界面却一切正常。
+//
+// 用户侧与管理员侧都必须走它。分开写的话，先漏掉的一定是后来新增的那条路径。
+func (s *Services) assertTunnelCanEnable(t *model.Tunnel, status string) error {
+	if status != model.TunnelStatusActive || t.Type != model.ProxyTypeHTTPS {
+		return nil
+	}
+	if !s.HTTPSProxyEntryEnabled() {
 		return ErrNoHTTPSProxyEntry
+	}
+	return nil
+}
+
+// setTunnelStatus 是「启用/停用隧道」的唯一实现。
+//
+// 状态切换的副作用不止改一行数据库：还要校验 HTTPS 入口、联动防火墙。
+// 这些必须与状态变更保持同一份代码，否则新增一条入口（管理员批量操作、
+// 命令行工具）就会漏掉其中一项。
+func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
+	if err := s.assertTunnelCanEnable(t, status); err != nil {
+		return err
 	}
 
 	if err := s.DB.Model(&model.Tunnel{}).
-		Where("id = ? AND user_id = ?", id, userID).
+		Where("id = ?", t.ID).
 		Update("status", status).Error; err != nil {
 		return err
 	}

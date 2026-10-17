@@ -20,6 +20,7 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
 // 这个文件守的都是同一类缺陷：**一处改了、另一处没跟上**。
@@ -423,6 +424,60 @@ func TestLoginFailureCountsOnlyCredentialGuesses(t *testing.T) {
 	}
 	if svc.CaptchaRequired("login", account) {
 		t.Fatal("locked / disabled 不是一次密码猜测，不该把账号推到阈值")
+	}
+}
+
+// TestAdminCannotEnableTunnelWithoutHTTPSEntry 覆盖「管理员绕过 HTTPS 入口检查」。
+//
+// 用户侧的启用路径会确认当前有没有 HTTPS 入口，管理员那条原先自己写了一遍
+// 状态变更，于是没有这个检查：平台切回边缘模式后（Caddy 与 frps 上都不再有
+// 对应入口），管理员仍能把旧 HTTPS 隧道重新启用，得到一条状态为运行中、
+// 实际永远连不上的隧道——用户只看到连不上，后台却一切正常。
+//
+// 修法是把状态切换收敛到 setTunnelStatus 一处，这里同时验证两条路径。
+func TestAdminCannotEnableTunnelWithoutHTTPSEntry(t *testing.T) {
+	// 边缘模式：443 由 Caddy 接管，HTTPS 隧道没有入口。
+	svc := newTestServices(t, &config.Config{
+		TunnelDomain:   "tunnel.example.com",
+		UserPublicURL:  "https://panel.example.com",
+		HTTPSProxyMode: tlscfg.HTTPSModeEdge,
+	})
+
+	u := &model.User{Username: "tunnelowner", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID:    u.ID,
+		Name:      "lt_owner.web",
+		Type:      model.ProxyTypeHTTPS,
+		Subdomain: "web",
+		Status:    model.TunnelStatusDisabled,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	// 管理员路径必须拒绝，且不能偷偷改掉状态。
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusActive); !errors.Is(err, ErrNoHTTPSProxyEntry) {
+		t.Fatalf("边缘模式下管理员不该能启用 HTTPS 隧道，实际 %v", err)
+	}
+	var got model.Tunnel
+	if err := svc.DB.First(&got, tun.ID).Error; err != nil {
+		t.Fatalf("回读隧道失败: %v", err)
+	}
+	if got.Status != model.TunnelStatusDisabled {
+		t.Fatalf("被拒绝时状态不能变，实际 %q", got.Status)
+	}
+
+	// 用户侧必须同样拒绝：两条路径一旦分叉，绕过的那条就是攻击面。
+	if err := svc.SetTunnelStatus(u.ID, tun.ID, model.TunnelStatusActive); !errors.Is(err, ErrNoHTTPSProxyEntry) {
+		t.Fatalf("用户侧也不该能启用，实际 %v", err)
+	}
+
+	// 停用方向不受影响：边缘模式下停用一条 HTTPS 隧道仍然是合法操作。
+	if err := svc.AdminSetTunnelStatus(tun.ID, model.TunnelStatusDisabled); err != nil {
+		t.Fatalf("停用不该被入口检查挡住，实际 %v", err)
 	}
 }
 

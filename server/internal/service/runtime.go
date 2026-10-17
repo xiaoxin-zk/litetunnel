@@ -79,6 +79,15 @@ type Runtime struct {
 	resetSeq       uint64
 	resetVoidUntil map[uint]uint64
 
+	// resetMu 串行化「采集按清零标记跳过并提交」与「登记方撤销」。
+	//
+	// 光靠代次比较还不够：flushTraffic 在事务里校验代次有效之后、提交之前，
+	// 清零那笔的写库可能失败并撤销——撤销抹不掉已经做出的跳过决定，
+	// 这一轮的真实增量仍然被丢掉。持有这把锁之后，撤销不可能插进
+	// 「校验 → 提交」之间：要么它先完成（本轮直接看到无效代次、不跳过），
+	// 要么等本轮提交完（此时跳过基于当时仍然有效的标记）。
+	resetMu sync.Mutex
+
 	// guardVer 是准入标记（超额/禁用）的版本号。
 	//
 	// 后台配额刷新按「读库快照 → 逐个写标记」两步走，两步之间管理员的
@@ -447,6 +456,9 @@ func (r *Runtime) consumePendingTrafficResets(taken map[uint]uint64) {
 // 全局代次——快照里代次 ≤ 本代次的跳过失效，更大的（并发的成功登记）
 // 依然有效。
 func (r *Runtime) UnmarkTrafficResetPending(userID uint, gen uint64) {
+	// 与采集的「校验 → 提交」互斥，见 resetMu 的说明。
+	r.resetMu.Lock()
+	defer r.resetMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resetVoidUntil == nil {
@@ -458,6 +470,17 @@ func (r *Runtime) UnmarkTrafficResetPending(userID uint, gen uint64) {
 	if cur, ok := r.pendingTrafficReset[userID]; ok && cur == gen {
 		delete(r.pendingTrafficReset, userID)
 	}
+}
+
+// lockTrafficReset 取得「清零协调」的互斥锁，返回释放函数。
+//
+// flushTraffic 用它在整轮「快照 → 事务校验 → 提交 → 摘除」期间持有，
+// 撤销（UnmarkTrafficResetPending）也取同一把锁：撤销不可能插进
+// 「代次校验通过」与「事务提交」之间，从而不会出现「标记已撤销、
+// 这一轮却仍按它跳过了真实增量」。
+func (r *Runtime) lockTrafficReset() func() {
+	r.resetMu.Lock()
+	return r.resetMu.Unlock
 }
 
 // BumpGuardVer 递增准入标记版本号：管理路径写标记前必须调用，
@@ -777,6 +800,12 @@ func (s *Services) flushTraffic(
 ) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
+
+	// 整轮（快照 → 事务校验 → 提交 → 摘除）持清零协调锁：撤销只能发生在
+	// 本轮之前或之后，不会插进「代次校验通过」与「事务提交」之间——
+	// 否则清零写库失败并撤销后，这一轮仍会按已失效的标记跳过真实增量。
+	unlockReset := s.Runtime.lockTrafficReset()
+	defer unlockReset()
 
 	// 在事务**外**对清零标记做快照：快照只读不摘，事务失败时标记原样
 	// 留在 map 里等下一轮；事务成功后按代次摘除已消费的标记。

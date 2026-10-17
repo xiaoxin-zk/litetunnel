@@ -42,6 +42,10 @@ type resetLinkPayload struct {
 // finishMailAction 据此把记录标成已办结，而不是当成失败去重试。
 var errMailActionSuperseded = errors.New("已被更新的凭据取代")
 
+// errMailActionObsolete 表示凭据动作的目标账号已不存在（被管理员删除），
+// 动作整体作废：重试再多次也不会成功，按已办结处理。
+var errMailActionObsolete = errors.New("目标账号已不存在，凭据动作作废")
+
 // applyMailAction 在邮件**确认送达之后**让新凭据生效，并作废同类的旧凭据。
 //
 // # 为什么必须等到送达
@@ -145,6 +149,17 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return errors.New("重置令牌缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 账号已被删除：这条链接注定无效，直接作废。
+		// 不检查的话，邮件照样送达、令牌照样落库，用户点开链接会被
+		// 引导去重置一个不存在的账号（见 applyPasswordResetTx 的行数检查）。
+		var alive int64
+		if err := tx.Model(&model.User{}).Where("id = ?", p.UserID).
+			Count(&alive).Error; err != nil {
+			return err
+		}
+		if alive == 0 {
+			return errMailActionObsolete
+		}
 		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便
 		// 已被用户用掉）直接按成功处理，不会因唯一索引冲突误判失败。
 		var activated int64

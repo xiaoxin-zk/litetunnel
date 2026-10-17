@@ -35,26 +35,33 @@ func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
 	return list, err
 }
 
-// ListTunnelsPage 分页取某用户的隧道，limit<=0 表示不分页（全部）。
+// ListTunnelsPage 按游标分页取某用户的隧道：返回 id < beforeID 的记录，
+// beforeID 为 0 表示从最新一条开始；limit<=0 表示不分页（全部）。
 //
 // 为什么要分页：客户端接入信息接口原先一次返回该账号的全部隧道，
 // 隧道一多响应就能顶到客户端 4 MiB 的读取上限，截断后 JSON 解析失败，
-// 表现为「同步一直失败、界面上什么都没变」。分页后单页大小可控，
-// 客户端按 offset 逐页取全。
+// 表现为「同步一直失败、界面上什么都没变」。分页后单页大小可控。
 //
-// 同时返回总数，客户端据此判断还有没有下一页——只看「本页是否取满」
-// 在最后一页恰好整页时会多打一次空请求。
-func (s *Services) ListTunnelsPage(userID uint, offset, limit int) ([]model.Tunnel, int64, error) {
+// 为什么用游标而不是 offset：分页期间发生增删时，offset 会错位——
+// 删掉一条之后下一页的 offset 越过了本来该出现的那条，或新增一条
+// 导致下一页重复返回。客户端拿到漏项的清单，会把漏掉的隧道当成
+// 「服务端已删除」而停掉本机进程、删掉本地配置。游标只依赖 id 的
+// 单调性，增删都不会让分页错位。
+//
+// 同时返回总数，客户端据此做一致性校验（取到的条数与总数不符时
+// 说明清单在分页期间发生了变化，应当重取而不是拿不完整清单去对账）。
+func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) ([]model.Tunnel, int64, error) {
 	var total int64
 	if err := s.DB.Model(&model.Tunnel{}).Where("user_id = ?", userID).
 		Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	q := s.DB.Where("user_id = ?", userID).Order("id desc")
+	if beforeID > 0 {
+		q = q.Where("id < ?", beforeID)
+	}
 	if limit > 0 {
-		q = q.Offset(offset).Limit(limit)
-	} else if offset > 0 {
-		q = q.Offset(offset)
+		q = q.Limit(limit)
 	}
 	var list []model.Tunnel
 	err := q.Find(&list).Error

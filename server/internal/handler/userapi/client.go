@@ -157,13 +157,15 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	// 分页：?offset=0&limit=200。不带 limit 时返回全部——
-	// 老客户端不知道分页参数，必须保持原行为。
-	offset, _ := strconv.Atoi(c.Query("offset"))
-	limit, _ := strconv.Atoi(c.Query("limit"))
-	if offset < 0 {
-		offset = 0
+	// 分页：?before_id=<上一页最后一条的 id>&limit=200。
+	// 不带 limit 时返回全部——老客户端不知道分页参数，必须保持原行为。
+	// 用游标而不是 offset：分页期间的增删不会让结果错位（见
+	// ListTunnelsPage 的说明）。
+	beforeID, _ := strconv.Atoi(c.Query("before_id"))
+	if beforeID < 0 {
+		beforeID = 0
 	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit < 0 {
 		limit = 0
 	}
@@ -172,7 +174,7 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 	if limit > maxClientPageSize {
 		limit = maxClientPageSize
 	}
-	tunnels, total, err := h.svc.ListTunnelsPage(u.ID, offset, limit)
+	tunnels, total, err := h.svc.ListTunnelsPage(u.ID, uint(beforeID), limit)
 	if err != nil {
 		shared.Fail(c, err)
 		return

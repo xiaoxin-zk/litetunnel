@@ -172,13 +172,21 @@ func (s *Services) ResetPassword(token, newPassword, ip string) error {
 			return ErrResetTokenInvalid
 		}
 
-		if err := tx.Model(&model.User{}).Where("id = ?", tok.UserID).Updates(map[string]any{
+		// 必须检查影响行数：账号可能在邮件送达之后被管理员删除，
+		// 此时这条更新一行都改不到。不看的话事务照样提交（令牌被标记为
+		// 已用），接口返回「重置成功」——而根本没有账号被改动。
+		// 返回令牌无效让整个事务回滚，令牌也不会被白白消费。
+		res = tx.Model(&model.User{}).Where("id = ?", tok.UserID).Updates(map[string]any{
 			"password":      hashed,
 			"token_version": gorm.Expr("token_version + 1"),
 			// 客户端凭据一并吊销，避免已泄露的 frpc 配置继续可用。
 			"client_secret": newSecret,
-		}).Error; err != nil {
-			return err
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrResetTokenInvalid
 		}
 
 		// 该用户已建立的客户端会话全部标记离线，迫使其重新认证。
@@ -337,12 +345,20 @@ func (s *Services) preparePasswordReset(newPassword string) (hashed, newSecret s
 //
 // 拆出来是为了让调用方能把它和别的操作（例如消费验证码）放进同一个事务。
 func (s *Services) applyPasswordResetTx(tx *gorm.DB, userID uint, hashed, newSecret string) error {
-	if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+	// 影响行数为 0 说明账号已不存在（例如邮件发出后被管理员删除）。
+	// 不看的话：验证码/令牌已被标记为使用、接口返回「重置成功」，
+	// 而密码根本没有更新——用户以为账号还在、密码已重置。
+	// 返回错误让事务整体回滚，调用方按「凭据无效」处理。
+	res := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
 		"password":      hashed,
 		"token_version": gorm.Expr("token_version + 1"),
 		"client_secret": newSecret,
-	}).Error; err != nil {
-		return err
+	})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrResetTokenInvalid
 	}
 	return revokeClientSessionsTx(tx, userID)
 }

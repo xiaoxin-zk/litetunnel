@@ -829,6 +829,32 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Where("user_id = ?", id).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
+		// 重置令牌与验证码一并删除：账号都没了，留下的令牌不该还能
+		// 走完「重置密码」的流程（否则会返回一个空洞的「重置成功」）。
+		if err := tx.Where("user_id = ?", id).Delete(&model.PasswordResetToken{}).Error; err != nil {
+			return err
+		}
+		if u.Email != "" {
+			if err := tx.Where("email = ?", u.Email).Delete(&model.EmailCode{}).Error; err != nil {
+				return err
+			}
+			// 待发送/待激活的凭据邮件一并作废：账号已删除，邮件再送达
+			// 只会把用户引向一个不存在的账号。正文与参数里是明文凭据，
+			// 作废时立刻清掉。
+			if err := tx.Model(&model.MailOutbox{}).
+				Where("to_addr = ? AND kind IN ? AND status IN ?", u.Email,
+					[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
+						model.MailKindEmailCodeRegister},
+					[]string{model.MailPending, model.MailDelivered}).
+				Updates(map[string]any{
+					"status":   model.MailFailed,
+					"body":     "",
+					"payload":  "",
+					"last_err": "账号已删除，邮件作废",
+				}).Error; err != nil {
+				return err
+			}
+		}
 		return tx.Delete(&model.User{}, id).Error
 	})
 	if err != nil {
@@ -874,6 +900,16 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	default:
 		return fmt.Errorf("%w: 不支持的用户状态", ErrInvalidParam)
 	}
+	// 同一用户的「数据库状态更新 + 运行时标记同步」必须成对串行化。
+	//
+	// 两笔相反的请求（禁用 / 启用）交错时，各自的数据库写入与内存写入
+	// 可能以不同顺序完成：数据库最后落到「已启用」，内存却被较早那笔
+	// 置成「已封禁」——用户看到账号正常，新连接却一直被拒。持有用户锁
+	// 之后，两者只可能是先后关系，内存标记随之与数据库一致。
+	lock := s.userLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Update("status", status)
 	if res.Error != nil {
 		return res.Error
@@ -907,11 +943,13 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 连接一律被拒」，且没有任何地方说明原因。
 	// 走与配额调整相同的版本条件写：并发的配额调整若在读取后发生，
 	// 这里基于旧快照算出的结果会被拒绝并重读，不会把新标记覆盖回去。
+	//
+	// 刷新失败时**不能**把超额标记清成 false：启用账号只是恢复登录资格，
+	// 并不代表获得了额外流量。清掉标记等于给一个已超额的账号放行，
+	// 直到下一轮采集成功才纠正——期间流量照跑、配额照超。保持原标记
+	// 并把失败明确报给管理员（重试本操作幂等，或等采集纠正）。
 	if err := s.refreshQuotaFor(id); err != nil {
-		// 取不到用户（理论上不会走到）时保守放行：
-		// 账号状态已经是 active，宁可让下一轮采集再纠正，
-		// 也不要因为一次读取失败把用户挡在门外。
-		s.Runtime.SetQuotaExceeded(id, false)
+		return fmt.Errorf("账号已启用，但配额标记刷新失败（沿用原有超额状态，重试本操作或等下一轮采集可纠正）: %w", err)
 	}
 	return nil
 }

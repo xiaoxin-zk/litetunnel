@@ -7,10 +7,10 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// TestListTunnelsPage 覆盖「隧道清单分页与总数」。
+// TestListTunnelsPage 覆盖「隧道清单游标分页与总数」。
 //
-// 客户端接入信息接口按 offset/limit 分页返回：总数必须不受分页影响
-// （客户端据此判断还有没有下一页），单页内容按 id 倒序与不分页时一致。
+// 客户端接入信息接口按 before_id 游标分页：总数必须不受分页影响
+// （客户端据此做一致性校验），单页内容按 id 倒序与全量顺序一致。
 func TestListTunnelsPage(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -38,8 +38,8 @@ func TestListTunnelsPage(t *testing.T) {
 		t.Fatalf("不分页应返回 5 条（total=%d），实际 %d 条", total, len(all))
 	}
 
-	// 第二页：offset=2、limit=2。
-	page, total, err := svc.ListTunnelsPage(u.ID, 2, 2)
+	// 第二页：以第一页第 2 条的 id 为游标（id < 游标）。
+	page, total, err := svc.ListTunnelsPage(u.ID, all[1].ID, 2)
 	if err != nil {
 		t.Fatalf("分页失败: %v", err)
 	}
@@ -49,56 +49,65 @@ func TestListTunnelsPage(t *testing.T) {
 	if len(page) != 2 {
 		t.Fatalf("单页应有 2 条，实际 %d", len(page))
 	}
-	// 倒序排列：第一页是 id 最大的两条，第二页接下去。
 	if page[0].ID != all[2].ID || page[1].ID != all[3].ID {
-		t.Fatalf("分页内容应与全量顺序一致：实际 %d,%d（期望 %d,%d）",
+		t.Fatalf("游标分页内容应与全量顺序一致：实际 %d,%d（期望 %d,%d）",
 			page[0].ID, page[1].ID, all[2].ID, all[3].ID)
 	}
 
-	// 越界页：返回空列表，但总数仍然正确。
-	empty, total, err := svc.ListTunnelsPage(u.ID, 10, 2)
+	// 游标走到最后一条之后：空列表，总数仍然正确。
+	empty, total, err := svc.ListTunnelsPage(u.ID, all[4].ID, 2)
 	if err != nil {
 		t.Fatalf("越界分页失败: %v", err)
 	}
 	if len(empty) != 0 || total != 5 {
-		t.Fatalf("越界页应为空、总数仍为 5，实际 %d 条 / total=%d", len(empty), total)
+		t.Fatalf("游标到底后应为空、总数仍为 5，实际 %d 条 / total=%d", len(empty), total)
 	}
 }
 
-// TestListTunnelsPageIsolatedByUser 覆盖「分页不串号」。
-func TestListTunnelsPageIsolatedByUser(t *testing.T) {
+// TestListTunnelsPageStableUnderDeletion 覆盖「分页期间删除不导致漏项」。
+//
+// offset 分页在删除后会跳过一条：删掉第 1 页的某条之后，第 2 页的
+// offset 越过了一条本来该返回的记录。游标分页只依赖 id 单调性，
+// 删除不会让后面几页漏掉记录。
+func TestListTunnelsPageStableUnderDeletion(t *testing.T) {
 	svc := newTestServices(t, nil)
 
-	mk := func(name string, n int) *model.User {
-		t.Helper()
-		u := &model.User{Username: name, Password: "not-used", Status: model.UserStatusActive}
-		if err := svc.DB.Create(u).Error; err != nil {
-			t.Fatalf("建用户失败: %v", err)
-		}
-		for i := 0; i < n; i++ {
-			tun := &model.Tunnel{
-				UserID: u.ID, Name: fmt.Sprintf("%s-%d", name, i), Type: model.ProxyTypeTCP,
-				LocalIP: "127.0.0.1", LocalPort: 30000 + i, RemotePort: 21000 + i,
-			}
-			if err := svc.DB.Create(tun).Error; err != nil {
-				t.Fatalf("建隧道失败: %v", err)
-			}
-		}
-		return u
+	u := &model.User{Username: "pagedel", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
 	}
-	u1 := mk("u1", 2)
-	mk("u2", 3)
+	for i := 0; i < 4; i++ {
+		tun := &model.Tunnel{
+			UserID: u.ID, Name: fmt.Sprintf("t%d", i), Type: model.ProxyTypeTCP,
+			LocalIP: "127.0.0.1", LocalPort: 26000 + i, RemotePort: 22000 + i,
+		}
+		if err := svc.DB.Create(tun).Error; err != nil {
+			t.Fatalf("建隧道失败: %v", err)
+		}
+	}
 
-	page, total, err := svc.ListTunnelsPage(u1.ID, 0, 10)
+	first, _, err := svc.ListTunnelsPage(u.ID, 0, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 2 || len(page) != 2 {
-		t.Fatalf("只应取到自己那 2 条，实际 %d 条 / total=%d", len(page), total)
+	if len(first) != 2 {
+		t.Fatalf("第一页应有 2 条，实际 %d", len(first))
 	}
-	for _, tun := range page {
-		if tun.UserID != u1.ID {
-			t.Fatalf("分页结果串到了别的用户: %+v", tun)
-		}
+
+	// 分页期间删掉第一页里的一条（模拟用户同时在网页端删除）。
+	if err := svc.DB.Delete(&model.Tunnel{}, first[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 按游标取下一页：剩下的两条都必须取到，不能因为删除而漏项。
+	rest, _, err := svc.ListTunnelsPage(u.ID, first[len(first)-1].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 2 {
+		t.Fatalf("删除不应让后续页漏项：应取到 2 条，实际 %d 条", len(rest))
+	}
+	if rest[0].ID != 2 || rest[1].ID != 1 {
+		t.Fatalf("后续页顺序应按 id 倒序，实际 %d,%d", rest[0].ID, rest[1].ID)
 	}
 }

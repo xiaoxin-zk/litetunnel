@@ -233,6 +233,19 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 		})
 		return
 	}
+	if errors.Is(err, errMailActionObsolete) {
+		// 目标账号已删除：凭据动作注定无效，重试只是空转。
+		log.Printf("[mail] 凭据激活已作废：目标账号不存在（收件人 %s，类型 %s，id=%d）",
+			maskEmail(row.To), row.Kind, row.ID)
+		s.finishMail(row.ID, mailFinish{
+			status:         model.MailSent,
+			attempts:       row.Attempts,
+			actionAttempts: row.ActionAttempts,
+			lastErr:        "账号已删除，凭据动作作废",
+			clearSensitive: true,
+		})
+		return
+	}
 	if err == nil {
 		log.Printf("[mail] 凭据已生效（收件人 %s，类型 %s）", maskEmail(row.To), row.Kind)
 		// 凭据已生效：参数（含验证码摘要）也没有保留价值了，一并清掉。

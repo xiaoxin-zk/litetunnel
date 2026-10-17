@@ -45,6 +45,14 @@ type Runtime struct {
 	lastStat map[string]trafficPair // frp 代理全名 -> 上次采样的当日累计值
 	touchAt  map[string]time.Time   // runID -> 上次会话落库时间（节流用）
 
+	// baselineSeedPending 表示「基线表首次迁移后的第一轮采集」尚未完成。
+	//
+	// 只在采集协程内读写。置位由 loadTrafficBaseline 依据设置表里的迁移标记
+	// 判定，清位由 collectTraffic 在基线成功落库后执行——中间任何一轮失败
+	// 都保持置位，下一轮继续播种，宁可少记增量也不重复计入（两种错误方向
+	// 不对称：少记一轮最多丢两分钟的账，重复计入是实打实的双倍扣费）。
+	baselineSeedPending bool
+
 	// blocked 记录「账号被禁用/封禁」。
 	//
 	// 必须与 exceeded **分开存**：exceeded 是「流量用超了」，会被每次流量
@@ -543,12 +551,27 @@ func (s *Services) collectTraffic(ctx context.Context) {
 
 	s.Runtime.setOnlineTunnels(onlineNow)
 
-	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat); err != nil {
+	s.Runtime.mu.Lock()
+	seedBaseline := s.Runtime.baselineSeedPending
+	s.Runtime.mu.Unlock()
+
+	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline); err != nil {
 		log.Printf("[traffic] 流量落库失败，本轮不推进采样基线（增量下轮补记）: %v", err)
 	} else {
 		s.Runtime.mu.Lock()
 		s.Runtime.lastStat = nextStat
+		s.Runtime.baselineSeedPending = false
 		s.Runtime.mu.Unlock()
+		if seedBaseline {
+			// 首次迁移的基线写成功了，落下迁移标记。
+			// 两步之间若崩溃，下次启动仍按首次迁移处理：再跳过一轮增量。
+			// 代价是极小窗口内少记两分钟流量，方向仍然安全。
+			if err := s.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+				log.Printf("[traffic] 写入基线迁移标记失败（下轮仍按首次迁移处理）: %v", err)
+			} else {
+				log.Printf("[traffic] 首次基线已建立，后续采集恢复正常计增量")
+			}
+		}
 	}
 	// 配额标记无论落库成败都要重算：它读的是库里**已有**的用量，
 	// 与这一次写入是否成功无关。跳过它只会让超额状态更久不收敛。
@@ -566,70 +589,77 @@ func (s *Services) collectTraffic(ctx context.Context) {
 //   - 基线推进了、增量没记上 → 这批流量永久漏记。
 //
 // 两种失真都会直接影响用户配额，且事后很难发现，所以它们必须同生共死。
+//
+// seed 为 true 时只写基线、跳过全部增量写入：这是基线表首次迁移后的
+// 第一轮采集，frps 的当天累计值是旧版本已经计过的，从零起算会把当天
+// 已计流量整个重复计入（见 loadTrafficBaseline 的迁移标记说明）。
 func (s *Services) flushTraffic(
 	tunnelDeltas map[uint]*tunnelDelta,
 	userDeltas map[uint]int64,
 	tunnelOwner map[uint]uint,
 	nextStat map[string]trafficPair,
+	seed bool,
 ) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		for id, d := range tunnelDeltas {
-			total := d.in + d.out
-			if total == 0 && !d.online {
-				continue
+		if !seed {
+			for id, d := range tunnelDeltas {
+				total := d.in + d.out
+				if total == 0 && !d.online {
+					continue
+				}
+				updates := map[string]any{}
+				if total > 0 {
+					updates["traffic_used"] = gorm.Expr("traffic_used + ?", total)
+				}
+				if d.online {
+					updates["last_online_at"] = now
+				}
+				if len(updates) == 0 {
+					continue
+				}
+				if err := tx.Model(&model.Tunnel{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+					return err
+				}
 			}
-			updates := map[string]any{}
-			if total > 0 {
-				updates["traffic_used"] = gorm.Expr("traffic_used + ?", total)
-			}
-			if d.online {
-				updates["last_online_at"] = now
-			}
-			if len(updates) == 0 {
-				continue
-			}
-			if err := tx.Model(&model.Tunnel{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-				return err
-			}
-		}
 
-		for uid, delta := range userDeltas {
-			if delta <= 0 {
-				continue
+			for uid, delta := range userDeltas {
+				if delta <= 0 {
+					continue
+				}
+				if err := tx.Model(&model.User{}).Where("id = ?", uid).
+					Update("traffic_used", gorm.Expr("traffic_used + ?", delta)).Error; err != nil {
+					return err
+				}
 			}
-			if err := tx.Model(&model.User{}).Where("id = ?", uid).
-				Update("traffic_used", gorm.Expr("traffic_used + ?", delta)).Error; err != nil {
-				return err
-			}
-		}
 
-		for id, d := range tunnelDeltas {
-			if d.in == 0 && d.out == 0 {
-				continue
-			}
-			uid, ok := tunnelOwner[id]
-			if !ok {
-				continue
-			}
-			row := model.TrafficDaily{
-				UserID:   uid,
-				TunnelID: id,
-				Date:     today,
-				InBytes:  d.in,
-				OutBytes: d.out,
-			}
-			// 唯一键 (user_id, tunnel_id, date) 上做累加 upsert。
-			if err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "user_id"}, {Name: "tunnel_id"}, {Name: "date"}},
-				DoUpdates: clause.Assignments(map[string]any{
-					"in_bytes":  gorm.Expr("lt_traffic_daily.in_bytes + ?", d.in),
-					"out_bytes": gorm.Expr("lt_traffic_daily.out_bytes + ?", d.out),
-				}),
-			}).Create(&row).Error; err != nil {
-				return err
+			for id, d := range tunnelDeltas {
+				if d.in == 0 && d.out == 0 {
+					continue
+				}
+				uid, ok := tunnelOwner[id]
+				if !ok {
+					continue
+				}
+				row := model.TrafficDaily{
+					UserID:   uid,
+					TunnelID: id,
+					Date:     today,
+					InBytes:  d.in,
+					OutBytes: d.out,
+				}
+				// 唯一键 (user_id, tunnel_id, date) 上做累加 upsert。
+				if err := tx.Clauses(clause.OnConflict{
+					Columns: []clause.Column{{Name: "user_id"}, {Name: "tunnel_id"}, {Name: "date"}},
+					DoUpdates: clause.Assignments(map[string]any{
+						"in_bytes":  gorm.Expr("lt_traffic_daily.in_bytes + ?", d.in),
+						"out_bytes": gorm.Expr("lt_traffic_daily.out_bytes + ?", d.out),
+					}),
+				}).Create(&row).Error; err != nil {
+					return err
+				}
 			}
 		}
 
@@ -682,6 +712,20 @@ func (s *Services) flushTraffic(
 // 是同一件事，照样会把当天累计值重复记一遍。正确做法是跳过这一轮采集，
 // 等下个周期重试。
 func (s *Services) loadTrafficBaseline() bool {
+	// 首次迁移判定放在读基线之前。基线表的「空」有两种含义：
+	//
+	//   a) 首次迁移 / 全新部署：从没写过任何基线；
+	//   b) 当天还没有采集轮次写入：正常状态。
+	//
+	// 不区分的话，升级旧库后的第一轮采集会把 frps 的当天累计值从零起算
+	// 整个计入——而那部分流量旧版本已经计过，用户被重复扣费，甚至触发
+	// 超额封禁。用设置表里的迁移标记区分：缺失即首次迁移，第一轮只写
+	// 基线、不计增量（见 collectTraffic 与 flushTraffic）。
+	//
+	// 读标记失败按「需要播种」处理：宁可少记一轮增量，也不能重复计入
+	// ——两种错误方向不对称。
+	seed := !s.Settings.Bool(KeyTrafficBaselineReady)
+
 	today := time.Now().Format("2006-01-02")
 	var rows []model.TrafficBaseline
 	if err := s.DB.Where("date = ?", today).Find(&rows).Error; err != nil {
@@ -696,10 +740,14 @@ func (s *Services) loadTrafficBaseline() bool {
 
 	s.Runtime.mu.Lock()
 	s.Runtime.lastStat = m
+	s.Runtime.baselineSeedPending = seed
 	s.Runtime.mu.Unlock()
 
 	if len(m) > 0 {
 		log.Printf("[traffic] 已恢复 %d 条采样基线（避免重启后重复计入当天流量）", len(m))
+	}
+	if seed {
+		log.Printf("[traffic] 未发现基线迁移标记，第一轮采集只记录基线、不计流量增量")
 	}
 	return true
 }

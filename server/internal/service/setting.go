@@ -158,6 +158,19 @@ const (
 	// 存摘要而不是逐项存明文：凭据是密钥，复制一份到设置表等于多一处泄漏面。
 	// 摘要只用于判等，不参与渲染。
 	KeyDomainAppliedDigest SettingKey = "domain.applied_digest"
+
+	// KeyTrafficBaselineReady 是「流量采样基线已建立」的一次性迁移标记。
+	//
+	// TrafficBaseline 表是后续版本才加入的：升级旧库时这张表是空的，
+	// 而表的「空」有两种含义——「首次迁移，还没写过任何基线」与
+	// 「当天还没有采集轮次写入」。不区分的话，升级后的第一轮采集会把
+	// frps 的当天累计值从零起算整个计入，而那部分流量旧版本已经计过：
+	// 用户被重复扣费，甚至触发超额封禁。
+	//
+	// 缺失 = 首次迁移：第一轮采集只写基线、不计增量，写成功后置位
+	// （见 loadTrafficBaseline 与 collectTraffic）。之后这张表再怎么空
+	// 都是正常状态（frps 重启归零、当天没有代理），恢复正常计增量。
+	KeyTrafficBaselineReady SettingKey = "traffic.baseline_ready"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -297,6 +310,9 @@ var settingSpecs = []settingSpec{
 	{Key: KeyDomainAppliedTunnel, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedMode, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedDigest, Internal: true, Default: func(*config.Config) string { return "" }},
+
+	// 流量采集迁移标记：见 KeyTrafficBaselineReady 的说明。
+	{Key: KeyTrafficBaselineReady, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。

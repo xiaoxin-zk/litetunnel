@@ -2098,12 +2098,15 @@ func TestRunMaintenanceIsBatched(t *testing.T) {
 	}
 }
 
-// TestTrafficCollectorSkipsWhenBaselineUnavailable 覆盖「基线读失败仍继续采集」。
+// TestTrafficCollectorSeedsBaselineAfterMigration 覆盖「基线首次迁移不重复计入」。
 //
-// 读不到基线却照常采集，与「没有基线」是同一件事：当天累计值会被整个算成
-// 新增量，用户配额被凭空扣掉一大截。所以读失败时必须跳过这一轮，等下个周期
-// 重试；恢复之后要能自动继续。
-func TestTrafficCollectorSkipsWhenBaselineUnavailable(t *testing.T) {
+// TrafficBaseline 表是后续版本加入的：升级旧库时它不存在/为空，而 frps 的
+// 当天累计值是旧版本**已经计过**的。此时第一轮采集若照常从零算增量，
+// 用户会被重复扣费、甚至触发超额封禁。
+//
+// 迁移标记（KeyTrafficBaselineReady）缺失时，第一轮只写基线、不计增量；
+// 标记落定后恢复正常。表读不出来（升级中途）时整轮跳过，等下个周期重试。
+func TestTrafficCollectorSeedsBaselineAfterMigration(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
 
@@ -2125,10 +2128,10 @@ func TestTrafficCollectorSkipsWhenBaselineUnavailable(t *testing.T) {
 	cfg.FrpsAPIAddr = frps.URL
 	svc.Frps = NewFrpsClient(cfg)
 
-	// frps 今天已经累计了 5000 字节。
+	// frps 今天已经累计了 5000 字节——这些是旧版本已经计入过的。
 	frps.total.Store(5000)
 
-	// 制造「基线读不出来」：把基线表删掉。
+	// 模拟升级前状态：基线表不存在，迁移标记（settings 表）也缺失。
 	if err := svc.DB.Migrator().DropTable(&model.TrafficBaseline{}); err != nil {
 		t.Fatalf("删表失败: %v", err)
 	}
@@ -2140,9 +2143,8 @@ func TestTrafficCollectorSkipsWhenBaselineUnavailable(t *testing.T) {
 	// 给它足够时间跑第一次（被跳过的）采集。
 	//
 	// 观测点用「在线状态」而不是「已用流量」：这一轮里落库本身也会失败
-	// （基线表刚被删掉，flushTraffic 的事务会整体回滚），所以只看流量的话，
-	// 旧代码也能「碰巧」通过。在线状态是在落库**之前**更新的，能干净地区分
-	// 「跳过采集」与「采集了但落库失败」。
+	// （基线表刚被删掉），所以只看流量的话区分不出「跳过」与「失败」。
+	// 在线状态是在落库**之前**更新的，能干净地区分两者。
 	time.Sleep(700 * time.Millisecond)
 	if svc.Runtime.IsTunnelOnline(tun.ID) {
 		t.Fatal("基线不可用时不该采集（会把当天累计值整个记成新增量），本轮连在线状态都不该更新")
@@ -2151,19 +2153,39 @@ func TestTrafficCollectorSkipsWhenBaselineUnavailable(t *testing.T) {
 		t.Fatalf("基线不可用时不该记入流量，实际已记 %d", got)
 	}
 
-	// 基线表恢复后，下一轮应当自动继续，并把当天累计值作为基线对齐。
+	// 重建表：迁移标记仍然缺失 → 第一轮是「播种轮」。
 	if err := svc.DB.AutoMigrate(&model.TrafficBaseline{}); err != nil {
 		t.Fatalf("重建表失败: %v", err)
 	}
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if tunnelTrafficUsed(t, svc, tun.ID) == 5000 {
+		if svc.Settings.Bool(KeyTrafficBaselineReady) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !svc.Settings.Bool(KeyTrafficBaselineReady) {
+		t.Fatal("播种轮完成后应落下迁移标记")
+	}
+	// 采集确实跑了（在线状态在落库前更新），但当天累计值没有被重复计入。
+	if !svc.Runtime.IsTunnelOnline(tun.ID) {
+		t.Fatal("播种轮应正常采集在线状态")
+	}
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 0 {
+		t.Fatalf("首次迁移的第一轮只应写基线、不计增量，实际已记 %d（这正是要防的重复计入）", got)
+	}
+
+	// 标记落定后恢复正常：frps 计数从 5000 涨到 6500，下一轮只记增量 1500。
+	frps.total.Store(6500)
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := tunnelTrafficUsed(t, svc, tun.ID); got == 1500 {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("基线恢复后应继续采集，实际已记 %d，期望 5000", tunnelTrafficUsed(t, svc, tun.ID))
+	t.Fatalf("标记落定后应按增量计流量，实际已记 %d，期望 1500", tunnelTrafficUsed(t, svc, tun.ID))
 }
 
 // TestDeliveredCodeIsValidFromDeliveryTime 覆盖「重试/积压导致收到已过期的码」。

@@ -121,6 +121,14 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 
 	code, err := newNumericCode(6)
 	if err != nil {
+		// 找回场景同样不能把错误抛出去：未注册邮箱在这之前已经静默成功，
+		// 这里返回错误就能把「已注册」区分出来（随机数生成失败虽然罕见，
+		// 但接口层会把它转成一次失败响应）。注册/换绑场景必须如实报错——
+		// 用户需要知道验证码没发出去，而且那里本来就要告知邮箱占用。
+		if scene == EmailSceneReset {
+			log.Printf("[emailcode] 生成找回验证码失败，本次不发送（对外仍返回成功）: %v", err)
+			return nil
+		}
 		return err
 	}
 	sum := sha256.Sum256([]byte(code))

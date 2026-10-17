@@ -5,7 +5,7 @@
         <div class="logo">LT</div>
         <div>
           <h1>重置密码</h1>
-          <p>{{ mailEnabled ? '通过邮箱验证码重置' : '通过当前密码验证身份' }}</p>
+          <p>{{ mailEnabled === null ? '正在确认重置方式' : mailEnabled ? '通过注册邮箱验证码重置' : '通过当前密码验证身份' }}</p>
         </div>
       </div>
 
@@ -19,12 +19,17 @@
         description="因此改用「当前密码 + 新密码」的方式验证身份。如果你已忘记当前密码，请联系管理员重置。"
       />
 
-      <el-form :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
-        <el-form-item label="用户名或邮箱" prop="account">
+      <div v-if="mailEnabled === null" style="margin-bottom: 16px">
+        <el-alert :title="statusError || '正在查询邮件服务状态…'" :type="statusError ? 'warning' : 'info'" :closable="false" />
+        <el-button v-if="statusError" :loading="statusLoading" @click="loadMailStatus" style="margin-top: 10px">重试查询</el-button>
+      </div>
+
+      <el-form v-else :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
+        <el-form-item :label="mailEnabled ? '注册邮箱' : '用户名或邮箱'" prop="account">
           <el-input
             v-model="form.account"
             size="large"
-            placeholder="请输入用户名或注册邮箱"
+            :placeholder="mailEnabled ? '请输入已验证的注册邮箱' : '请输入用户名或邮箱'"
             :prefix-icon="User"
           />
         </el-form-item>
@@ -94,6 +99,9 @@ const error = ref('')
 const countdown = ref(0)
 // null 表示尚未探测出来，避免首屏闪烁
 const mailEnabled = ref(null)
+const statusLoading = ref(false)
+const statusError = ref('')
+const isEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 
 const form = reactive({
   account: '',
@@ -104,7 +112,15 @@ const form = reactive({
 })
 
 const rules = {
-  account: [{ required: true, message: '请输入用户名或邮箱', trigger: 'blur' }],
+  account: [{
+    validator: (_r, value, cb) => {
+      const account = value.trim()
+      if (!account) return cb(new Error(mailEnabled.value ? '请输入注册邮箱' : '请输入用户名或邮箱'))
+      if (mailEnabled.value && !isEmail(account)) return cb(new Error('请输入有效的注册邮箱，验证码流程不支持用户名'))
+      cb()
+    },
+    trigger: 'blur'
+  }],
   password: [
     { required: true, message: '请输入新密码', trigger: 'blur' },
     { min: 8, message: '密码至少 8 位', trigger: 'blur' }
@@ -118,9 +134,10 @@ const rules = {
 }
 
 async function sendCode() {
+  if (mailEnabled.value !== true || countdown.value > 0) return
   const account = form.account.trim()
-  if (!account) {
-    ElMessage.warning('请先填写用户名或邮箱')
+  if (!isEmail(account)) {
+    ElMessage.warning('请先填写有效的注册邮箱，不能使用用户名获取验证码')
     return
   }
   try {
@@ -138,8 +155,9 @@ async function sendCode() {
 }
 
 async function submit() {
+  if (mailEnabled.value === null || loading.value) return
   error.value = ''
-  await formRef.value.validate()
+  if (!await formRef.value.validate().catch(() => false)) return
 
   if (mailEnabled.value && !form.email_code.trim()) {
     error.value = '请填写邮箱验证码'
@@ -167,15 +185,23 @@ async function submit() {
   }
 }
 
-onMounted(async () => {
+async function loadMailStatus() {
+  if (statusLoading.value) return
+  statusLoading.value = true
+  statusError.value = ''
+  mailEnabled.value = null
   try {
     const data = await authApi.mailStatus()
-    mailEnabled.value = !!data?.mail_enabled
+    if (typeof data?.mail_enabled !== 'boolean') throw new Error('邮件状态无效')
+    mailEnabled.value = data.mail_enabled
   } catch {
-    // 探测失败时按「未启用邮件」处理：旧密码模式在任何配置下都可用
-    mailEnabled.value = false
+    statusError.value = '邮件服务状态未知，暂时无法确定重置方式，请重试查询。'
+  } finally {
+    statusLoading.value = false
   }
-})
+}
+
+onMounted(loadMailStatus)
 </script>
 
 <style scoped>

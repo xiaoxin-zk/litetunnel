@@ -39,7 +39,7 @@ func (n *Nftables) ensureTable() error {
 	return err
 }
 
-func (n *Nftables) compatible(target ...int) error {
+func (n *Nftables) compatible(target ...nftTarget) error {
 	out, err := run("nft", "-j", "list", "ruleset")
 	if err != nil {
 		return err
@@ -56,7 +56,7 @@ type nftChainSpec struct {
 	Policy string `json:"policy"`
 }
 
-func checkNftInputCompatibility(raw []byte, target ...int) error {
+func checkNftInputCompatibility(raw []byte, target ...nftTarget) error {
 	var dump struct {
 		Objects []struct {
 			Chain *nftChainSpec `json:"chain"`
@@ -110,7 +110,7 @@ func checkNftInputCompatibility(raw []byte, target ...int) error {
 							continue
 						}
 						if !nftNATRuleSafe(r.Expr, target[0]) {
-							return fmt.Errorf("nftables NAT 链 %s/%s/%s 可能改写或拦截端口 %d，未修改规则", c.Family, c.Table, chain, target[0])
+							return fmt.Errorf("nftables NAT 链 %s/%s/%s 可能改写或拦截端口 %d，未修改规则", c.Family, c.Table, chain, target[0].port)
 						}
 						for _, statement := range r.Expr {
 							for _, kind := range []string{"jump", "goto"} {
@@ -198,7 +198,7 @@ func (n *Nftables) AddPort(port int, proto string) error {
 	if err != nil {
 		return err
 	}
-	if err := n.compatible(port); err != nil {
+	if err := n.compatible(nftTarget{port: port, proto: proto}); err != nil {
 		return err
 	}
 	if err := n.ensureTable(); err != nil {

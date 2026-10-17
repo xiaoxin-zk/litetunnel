@@ -48,13 +48,13 @@ var (
 	// 是否真的可用。它与「端口池耗尽」「端口被占用」都不是一回事：前两者
 	// 让用户换端口/找管理员，而这里只能等扫描恢复后重试。
 	ErrPortScanUnavailable = errors.New("暂时无法读取系统端口占用情况，请稍后重试")
-	ErrProtocolDenied  = errors.New("当前分组不允许使用该协议")
-	ErrDomainDenied    = errors.New("当前分组不允许使用自定义域名")
-	ErrCodeInvalid     = errors.New("兑换码无效")
-	ErrCodeUsed        = errors.New("兑换码已被使用")
-	ErrCodeExpired     = errors.New("兑换码已过期")
-	ErrCodeDisabled    = errors.New("兑换码已被禁用")
-	ErrInvalidParam    = errors.New("参数不合法")
+	ErrProtocolDenied      = errors.New("当前分组不允许使用该协议")
+	ErrDomainDenied        = errors.New("当前分组不允许使用自定义域名")
+	ErrCodeInvalid         = errors.New("兑换码无效")
+	ErrCodeUsed            = errors.New("兑换码已被使用")
+	ErrCodeExpired         = errors.New("兑换码已过期")
+	ErrCodeDisabled        = errors.New("兑换码已被禁用")
+	ErrInvalidParam        = errors.New("参数不合法")
 
 	// ErrMembershipExpired 表示账号当前的分组有效期已过，需要先续期。
 	//
@@ -143,7 +143,8 @@ type Services struct {
 
 	// mailWake 用于唤醒发信协程（邮件本身存在发件箱表里，不走内存队列：
 	// 内存队列重启即丢，而验证码/重置链接一旦丢了，用户就找不回账号）。
-	mailWake chan struct{}
+	mailWake   chan struct{}
+	recoveryCh chan recoveryRequest
 	// mailerOverride 仅供测试注入发信替身，非 nil 时优先于真实 SMTP 配置。
 	mailerOverride mailSender
 
@@ -289,6 +290,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		loginFails: newLoginFailureCounter(),
 		mailWake:   make(chan struct{}, 1),
+		recoveryCh: make(chan recoveryRequest, recoveryBuffer),
 		fwPending:  map[int]pendingFW{},
 		fwKick:     make(chan struct{}, 1),
 	}

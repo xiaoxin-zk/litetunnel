@@ -276,11 +276,11 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 	}
 
 	// 第一次：正常排队。
-	if err := svc.RequestPasswordReset(u.Username, "1.1.1.1", "https://panel.example.com"); err != nil {
+	if err := svc.requestPasswordReset(u.Username, "1.1.1.1", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码失败: %v", err)
 	}
 	// 第二次（立刻，换个 IP 也绕不过）：冷却窗口内，静默拒绝且不写记录。
-	if err := svc.RequestPasswordReset(u.Username, "2.2.2.2", "https://panel.example.com"); err != nil {
+	if err := svc.requestPasswordReset(u.Username, "2.2.2.2", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码不该报错（会泄露账号状态）: %v", err)
 	}
 
@@ -313,7 +313,7 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 		}
 	}
 
-	if err := svc.RequestPasswordReset(u.Username, "3.3.3.3", "https://panel.example.com"); err != nil {
+	if err := svc.requestPasswordReset(u.Username, "3.3.3.3", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码不该报错: %v", err)
 	}
 	var after int64

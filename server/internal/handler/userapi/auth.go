@@ -2,7 +2,6 @@ package userapi
 
 import (
 	"errors"
-	"log"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -61,7 +60,7 @@ type forgotPasswordReq struct {
 // ForgotPassword 发起找回密码。
 //
 // 无论账号是否存在，一律返回同样的提示：该接口若区分「不存在」与「已发送」，
-// 就会变成账号枚举工具。找回密码页面的响应时间也做了对齐（发信走异步队列）。
+// 就会变成账号枚举工具。账号查询与邮件准备统一交给后台请求队列。
 func (h *Handler) ForgotPassword(c *gin.Context) {
 	var req forgotPasswordReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -82,13 +81,6 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 	// 用设置里的面板域名（数据库优先）：管理员在「域名与证书」里改完域名后，
 	// Caddy 已按新域名重建，而面板进程仍持有启动时的环境变量。
 	baseURL := h.svc.UserPublicURL()
-	if baseURL == "" {
-		log.Printf("[reset] 未配置 LT_USER_PUBLIC_URL，无法生成重置链接，本次不发信")
-		httpx.OK(c, gin.H{
-			"message": "如果该账号存在且已绑定邮箱，我们已发送重置链接，请查收（30 分钟内有效）",
-		})
-		return
-	}
 
 	if err := h.svc.RequestPasswordReset(req.Account, httpx.ClientIP(c), baseURL); err != nil {
 		shared.Fail(c, err)

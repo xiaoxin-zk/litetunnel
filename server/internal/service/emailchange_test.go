@@ -282,7 +282,7 @@ func TestForgotPasswordRequiresVerifiedEmail(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	if err := svc.RequestPasswordReset(u.Username, "127.0.0.1", "https://panel.example.com"); err != nil {
+	if err := svc.requestPasswordReset(u.Username, "127.0.0.1", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码接口不该因此报错（会泄露账号状态）: %v", err)
 	}
 

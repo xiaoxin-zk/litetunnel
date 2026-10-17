@@ -1,12 +1,14 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -151,9 +153,19 @@ func TestForgotPasswordLinkUsesConfiguredURL(t *testing.T) {
 		t.Fatalf("应返回统一提示，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartRecoveryWorker(ctx)
 	var row model.MailOutbox
-	if err := svc.DB.Where("to_addr = ?", u.Email).First(&row).Error; err != nil {
-		t.Fatalf("应有一封待发邮件: %v", err)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := svc.DB.Where("to_addr = ?", u.Email).First(&row).Error; err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("后台应生成一封待发邮件")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !strings.Contains(row.Body, publicURL+"/reset-password?token=") {
 		t.Fatalf("链接必须用配置的对外地址生成，实际正文:\n%s", row.Body)

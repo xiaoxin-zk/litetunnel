@@ -26,6 +26,10 @@ func TestNftInputCompatibility(t *testing.T) {
 		{"empty accept", `{"nftables":[{"chain":{"family":"ip6","table":"filter","name":"input","type":"filter","hook":"input","policy":"accept"}}]}`, false},
 		{"later drop", `{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"drop"}}]}`, true},
 		{"conditional reject", `{"nftables":[{"chain":{"family":"ip","table":"custom","name":"in","type":"filter","hook":"input","policy":"accept"}},{"rule":{"family":"ip","table":"custom","chain":"in","expr":[{"reject":null}]}}]}`, true},
+		{"bridge input", `{"nftables":[{"chain":{"family":"bridge","table":"filter","name":"input","type":"filter","hook":"input","policy":"drop"}}]}`, true},
+		{"netdev ingress", `{"nftables":[{"chain":{"family":"netdev","table":"filter","name":"ingress","type":"filter","hook":"ingress","policy":"drop"}}]}`, true},
+		{"inet ingress", `{"nftables":[{"chain":{"family":"inet","table":"filter","name":"ingress","type":"filter","hook":"ingress","policy":"accept"}}]}`, true},
+		{"ip prerouting", `{"nftables":[{"chain":{"family":"ip","table":"raw","name":"pre","type":"filter","hook":"prerouting","policy":"accept"}}]}`, true},
 		{"invalid", `{"nftables":`, true},
 		{"missing", `{}`, true},
 	} {

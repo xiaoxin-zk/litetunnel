@@ -69,6 +69,7 @@ func main() {
 	svc.StartTrafficCollector(ctx)
 	svc.StartLoginLogWriter(ctx)
 	svc.StartMailWorker(ctx)
+	svc.StartRecoveryWorker(ctx)
 	// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
 	// 没有它，公网服务跑久了这几张表会一直膨胀。
 	svc.StartMaintenanceWorker(ctx)

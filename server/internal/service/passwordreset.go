@@ -49,15 +49,13 @@ var (
 
 // RequestPasswordReset 发起找回密码。account 可以是用户名或邮箱。
 //
-// 安全要求：无论账号是否存在、是否填写邮箱、是否被禁用，
-// 本方法都返回 nil 且耗时基本一致——否则该接口会退化成账号枚举工具。
-// 真正的失败原因只写日志。
+// 无论账号是否存在、是否有已验证邮箱，都只入请求队列，不同步查询账号。
+// 仅格式、邮件开关与全局队列容量这类与账号无关的错误可对外返回。
 func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
-	// 与找回验证码同理：账号不存在会提前返回，存在的还要读账号、生成令牌、
-	// 同步写发件箱。把两条路径垫到同一下限，避免响应耗时暴露账号是否存在。
-	start := time.Now()
-	defer padResetTiming(start)
-	return s.requestPasswordReset(account, ip, baseURL)
+	if !s.MailEnabled() {
+		return ErrMailDisabled
+	}
+	return s.enqueueRecovery(recoveryRequest{account: strings.TrimSpace(account), ip: truncate(ip, 64), baseURL: baseURL})
 }
 
 // requestPasswordReset 是 RequestPasswordReset 的实际实现。
@@ -143,23 +141,6 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 		return nil
 	}
 	return nil
-}
-
-// resetTimingFloor 是找回类请求的最小响应耗时。
-//
-// 「邮箱是否存在」不能通过响应内容泄露（文案已经统一），但**耗时**同样是
-// 侧信道：不存在的邮箱查一次库就返回，存在的还要读账号版本、生成凭据、
-// 同步写发件箱（发信是异步的，入队仍在请求内）。把两条路径都垫到同一下限，
-// 差异就落进网络与调度噪声里了。
-//
-// 代价是每次找回请求至少多花这点时间；相对于账号被枚举，这个代价可接受。
-const resetTimingFloor = 250 * time.Millisecond
-
-// padResetTiming 把一次找回请求垫到 resetTimingFloor（已超时则不等待）。
-func padResetTiming(start time.Time) {
-	if d := resetTimingFloor - time.Since(start); d > 0 {
-		time.Sleep(d)
-	}
 }
 
 // 找回密码链接按收件地址的限流参数。

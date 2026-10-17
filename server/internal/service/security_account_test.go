@@ -538,7 +538,7 @@ func TestPasswordResetKeepsOldTokenWhenDeliveryFails(t *testing.T) {
 		t.Fatalf("建旧令牌失败: %v", err)
 	}
 
-	if err := svc.RequestPasswordReset(u.Username, "127.0.0.1", "https://example.com"); err != nil {
+	if err := svc.requestPasswordReset(u.Username, "127.0.0.1", "https://example.com"); err != nil {
 		t.Fatalf("找回密码必须保持静默（否则可用于枚举账号），实际返回 %v", err)
 	}
 

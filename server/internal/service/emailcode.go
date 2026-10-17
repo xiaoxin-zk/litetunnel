@@ -53,15 +53,17 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	if scene != EmailSceneReset {
 		return s.sendEmailCode(email, scene, ip)
 	}
-	// 找回场景：两条路径（邮箱存在 / 不存在）的耗时必须落在同一水平。
-	// 不存在的邮箱会提前返回，存在的还要读账号版本、生成验证码、同步写
-	// 发件箱——差异是可测的，攻击者据此就能枚举账号（响应文案一致没用）。
-	start := time.Now()
-	defer padResetTiming(start)
-	return s.sendEmailCode(email, scene, ip)
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || !IsValidEmail(email) {
+		return ErrEmailRequired
+	}
+	if !s.MailEnabled() {
+		return ErrMailDisabled
+	}
+	return s.enqueueRecovery(recoveryRequest{account: email, ip: truncate(ip, 64), emailCode: true})
 }
 
-// sendEmailCode 是 SendEmailCode 的实际实现（找回场景由上面的包装垫平耗时）。
+// sendEmailCode 在后台处理找回请求，其他场景保持同步入发件箱。
 func (s *Services) sendEmailCode(email, scene, ip string) error {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" || !IsValidEmail(email) {
@@ -81,7 +83,7 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 	// 用 lower() 比较：老库里可能存着大小写混写的地址。
 	userQuery := s.DB.Model(&model.User{}).Where("lower(email) = ?", email)
 	if scene == EmailSceneReset {
-		userQuery = userQuery.Where("email_verified = ?", true)
+		userQuery = userQuery.Where("email_verified = ? AND status = ?", true, model.UserStatusActive)
 	}
 	var exists int64
 	if err := userQuery.Count(&exists).Error; err != nil {

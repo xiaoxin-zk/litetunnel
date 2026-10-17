@@ -92,6 +92,9 @@ func checkNftInputCompatibility(raw []byte) error {
 			}
 			continue
 		}
+		if c.Hook != "" && (c.Family == "bridge" || c.Family == "netdev" || c.Hook == "ingress" || c.Hook == "prerouting") {
+			return fmt.Errorf("nftables 基链 %s 使用不支持的 %s hook，无法保证入站放行生效，未修改规则", key(c.Family, c.Table, c.Name), c.Hook)
+		}
 		if c.Hook != "input" || (c.Family != "inet" && c.Family != "ip" && c.Family != "ip6") {
 			continue
 		}
@@ -121,7 +124,10 @@ var nftRuleRe = regexp.MustCompile(`(tcp|udp)\s+dport\s+(\d+)\s+accept`)
 
 func (n *Nftables) ListRules() ([]Rule, error) {
 	var rules []Rule
-	for _, chain := range []struct{ table, name string; managed bool }{
+	for _, chain := range []struct {
+		table, name string
+		managed     bool
+	}{
 		{nftTable, nftChain, true},
 		{"filter", "input", false},
 	} {

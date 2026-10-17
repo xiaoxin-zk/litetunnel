@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
@@ -114,6 +115,46 @@ func TestDedupeMailCredentials(t *testing.T) {
 	// 幂等：再跑一次不该报错。
 	if err := dedupeMailCredentials(db); err != nil {
 		t.Fatalf("重复清理应幂等: %v", err)
+	}
+}
+
+// TestOpenRefusesWhenCredentialCleanupFails 覆盖「清理不掉还照常启动」。
+//
+// 建不起唯一索引时，旧库里同一封邮件对应的多条未使用凭据仍然可用，
+// 而运行期不会有任何报错。与其带着这个洞跑，不如让启动失败、先修数据。
+func TestOpenRefusesWhenCredentialCleanupFails(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "dirty.db")
+	cfg := &config.Config{DBDriver: "sqlite", DBDSN: dsn}
+
+	// 先手工造一个「有重复凭据、且删不掉」的库：用一个拒绝删除的触发器模拟
+	// 清理失败（真实原因可能是权限或数据损坏）。
+	raw, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	if err := raw.AutoMigrate(&model.EmailCode{}); err != nil {
+		t.Fatalf("建表失败: %v", err)
+	}
+	for _, h := range []string{"a", "b"} {
+		if err := raw.Create(&model.EmailCode{
+			Email: "dup@example.com", Scene: "reset", CodeHash: h,
+			ExpireAt: time.Now().Add(time.Hour), MailID: 9,
+		}).Error; err != nil {
+			t.Fatalf("造重复数据失败: %v", err)
+		}
+	}
+	if err := raw.Exec(`CREATE TRIGGER block_mail_delete BEFORE DELETE ON lt_email_codes
+		BEGIN SELECT RAISE(ABORT, 'blocked'); END`).Error; err != nil {
+		t.Fatalf("装触发器失败: %v", err)
+	}
+	sqlDB, err := raw.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = sqlDB.Close()
+
+	if _, err := Open(cfg); err == nil {
+		t.Fatal("清理重复凭据失败时必须拒绝启动（否则一次性语义仍可被绕过）")
 	}
 }
 

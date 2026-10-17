@@ -116,7 +116,7 @@ func TestAdminResetUserTrafficSuppressesStaleDelta(t *testing.T) {
 	if err := svc.flushTraffic(
 		map[uint]*tunnelDelta{},
 		map[uint]int64{tun.UserID: 500},
-		nil, map[string]trafficPair{}, false,
+		nil, map[string]trafficPair{}, false, 0,
 	); err != nil {
 		t.Fatalf("落库失败: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestAdminResetUserTrafficSuppressesStaleDelta(t *testing.T) {
 	if err := svc.flushTraffic(
 		map[uint]*tunnelDelta{},
 		map[uint]int64{tun.UserID: 300},
-		nil, map[string]trafficPair{}, false,
+		nil, map[string]trafficPair{}, false, 0,
 	); err != nil {
 		t.Fatalf("落库失败: %v", err)
 	}

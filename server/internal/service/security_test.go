@@ -3330,6 +3330,33 @@ func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
 	}
 }
 
+// TestBaselineReadFailureReleasesLease 覆盖「读基线失败却仍算持有采集权」。
+//
+// 先置 collectorOwned 再读基线的话，读失败返回后标记仍是 true：下一轮租约还在
+// 自己手里，于是跳过重读，拿**过期的内存基线**算增量——重复计费。
+func TestBaselineReadFailureReleasesLease(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 删掉基线表，让 loadTrafficBaseline 失败。
+	if err := svc.DB.Migrator().DropTable(&model.TrafficBaseline{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+
+	svc.collectTraffic(context.Background())
+
+	if svc.collectorOwned.Load() {
+		t.Fatal("基线读不到时不能算「已持有采集权」，否则下一轮会跳过重读")
+	}
+
+	var lease model.RuntimeLease
+	if err := svc.DB.Where("name = ?", leaseTrafficCollector).First(&lease).Error; err != nil {
+		t.Fatalf("读租约失败: %v", err)
+	}
+	if lease.ExpiresAt.After(time.Now()) {
+		t.Fatal("读基线失败时应交还租约，让下一轮重新走接管流程")
+	}
+}
+
 // TestAcquireLeaseFencing 覆盖「租约过期后旧持有者仍能写账」。
 //
 // 采集可能因为 frps 慢、库慢而超过租约时长：到期后另一个实例接手并开始记账，
@@ -3339,16 +3366,19 @@ func TestAcquireLeaseFencing(t *testing.T) {
 	svc := newTestServices(t, nil)
 	other := New(svc.DB, svc.Cfg)
 
-	const name = "fencing-test"
-	if !svc.acquireLease(name, time.Minute) {
+	// 用采集租约的名字：flushTraffic 的 fencing 校验的就是这一行。
+	const name = leaseTrafficCollector
+	gen1, ok := svc.acquireLease(name, time.Minute)
+	if !ok {
 		t.Fatal("首个实例应取得租约")
 	}
-	// 持有者可以续租。
-	if !svc.acquireLease(name, time.Minute) {
-		t.Fatal("持有者应能续租")
+	// 持有者可以续租，且每次续租推进代次。
+	gen2, ok := svc.acquireLease(name, time.Minute)
+	if !ok || gen2 <= gen1 {
+		t.Fatalf("续租应推进代次（%d → %d）", gen1, gen2)
 	}
 	// 租约有效期内，别的实例抢不到。
-	if other.acquireLease(name, time.Minute) {
+	if _, ok := other.acquireLease(name, time.Minute); ok {
 		t.Fatal("租约有效期内不该被别的实例抢走")
 	}
 
@@ -3357,13 +3387,24 @@ func TestAcquireLeaseFencing(t *testing.T) {
 		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
 		t.Fatal(err)
 	}
-	if !other.acquireLease(name, time.Minute) {
+	gen3, ok := other.acquireLease(name, time.Minute)
+	if !ok {
 		t.Fatal("租约到期后应可被接手")
 	}
 
-	// 旧实例此时再想续租/落库：必须失败（否则它会写出一份重复的账）。
-	if svc.acquireLease(name, time.Minute) {
+	// 旧实例此时再想续租：必须失败（否则它会写出一份重复的账）。
+	if _, ok := svc.acquireLease(name, time.Minute); ok {
 		t.Fatal("已被接手的租约不该被旧持有者抢回")
+	}
+
+	// 更关键的一步：旧实例拿着旧代次落库，事务内的 fencing 必须拒绝它。
+	empty := map[string]trafficPair{}
+	if err := svc.flushTraffic(nil, nil, nil, empty, true, gen2); !errors.Is(err, errLeaseLost) {
+		t.Fatalf("旧代次落库应被拒绝，实际 %v", err)
+	}
+	// 新持有者用新代次可以正常落库。
+	if err := other.flushTraffic(nil, nil, nil, empty, true, gen3); err != nil {
+		t.Fatalf("当前持有者应能落库: %v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -884,39 +885,59 @@ const leaseTrafficCollector = "traffic-collector"
 // 否则正常采集中的实例会被另一个实例抢走，两边同时记账。
 const trafficCollectLease = 2 * time.Minute
 
-// acquireLease 抢占一个跨实例租约，返回是否持有。
+// acquireLease 抢占（或续租）一个跨实例租约，返回本次的代次与是否持有。
 //
 // 抢占用条件更新：只有把 expires_at 推进成功的那一个实例，在租期内独占。
 // 首次插入即成功；已存在时按「已过期」或「仍由我持有」续租——后者让持有者
-// 每轮都能刷新租期，而不必等它过期。
+// 每轮都能刷新租期，而不必等它过期。每次成功都推进 Gen（fencing token），
+// 写库时在事务内核对它，过期持有者的写入会被拒。
 //
 // 插入失败不能一律当成「已被占用」：也可能是数据库真出错。此时走更新分支，
 // 失败就返回 false（这一轮不采集），错误会在下一轮重试。
-func (s *Services) acquireLease(name string, ttl time.Duration) bool {
+func (s *Services) acquireLease(name string, ttl time.Duration) (int64, bool) {
 	now := time.Now()
 	exp := now.Add(ttl)
-	rec := model.RuntimeLease{Name: name, Holder: s.instanceID, ExpiresAt: exp}
+	rec := model.RuntimeLease{Name: name, Holder: s.instanceID, ExpiresAt: exp, Gen: 1}
 	if err := s.DB.Create(&rec).Error; err == nil {
-		return true
+		return rec.Gen, true
 	}
 	res := s.DB.Model(&model.RuntimeLease{}).
 		Where("name = ? AND (expires_at < ? OR holder = ?)", name, now, s.instanceID).
-		Updates(map[string]any{"holder": s.instanceID, "expires_at": exp})
+		Updates(map[string]any{
+			"holder":     s.instanceID,
+			"expires_at": exp,
+			"gen":        gorm.Expr("gen + 1"),
+		})
 	if res.Error != nil {
 		log.Printf("[lease] 抢占租约 %s 失败: %v", name, res.Error)
-		return false
+		return 0, false
 	}
-	return res.RowsAffected == 1
+	if res.RowsAffected != 1 {
+		return 0, false
+	}
+	// 只有持有者能推进代次，所以这里读回的必然是自己刚写入的那个值。
+	var lease model.RuntimeLease
+	if err := s.DB.Where("name = ?", name).First(&lease).Error; err != nil {
+		log.Printf("[lease] 读取租约 %s 代次失败: %v", name, err)
+		return 0, false
+	}
+	return lease.Gen, true
 }
 
 // releaseLease 主动交还租约（仅当持有者是自己）。
 //
 // 正常退出时调用：新进程不必等租期到期就能接手采集。
 // 崩溃退出时没人调用，租约自然过期——所以租期本身要短于「可接受的空窗」。
+//
+// 交还时也推进代次：任何仍拿着旧代次的在途写库都会因此被拒，
+// 不会出现「已经交还了、旧进程又写进一笔」。
 func (s *Services) releaseLease(name string) {
 	res := s.DB.Model(&model.RuntimeLease{}).
 		Where("name = ? AND holder = ?", name, s.instanceID).
-		Update("expires_at", time.Now().Add(-time.Second))
+		Updates(map[string]any{
+			"expires_at": time.Now().Add(-time.Second),
+			"gen":        gorm.Expr("gen + 1"),
+		})
 	if res.Error != nil {
 		log.Printf("[lease] 交还租约 %s 失败: %v", name, res.Error)
 	}
@@ -927,22 +948,28 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	// 多实例共用一个库时，每个进程都会启动采集器：各自读同一份 frps 累计值、
 	// 各自算增量、各自累加——同一段流量会被记两遍。进程内的 Runtime.mu 管不到
 	// 别的进程，所以用数据库里的租约把「谁采集」收敛成一个。
-	if !s.acquireLease(leaseTrafficCollector, trafficCollectLease) {
+	leaseGen, ok := s.acquireLease(leaseTrafficCollector, trafficCollectLease)
+	if !ok {
 		if s.collectorOwned.Swap(false) {
 			log.Printf("[traffic] 采集租约已转交其他实例，本实例暂停采集")
 		}
 		return
 	}
-	if !s.collectorOwned.Swap(true) {
+	if !s.collectorOwned.Load() {
 		// 每次「从未持有到持有」的转换都按库里的最新基线重建。
 		//
 		// 启动时虽然读过一次，但那时租约可能正被别的实例持有；它在随后的
 		// 每一轮都在记账，等我们接手时内存里的基线已经落后好几轮——拿它算
 		// 增量会把别人已经记过的流量再记一遍。重新读一次的成本只是一条查询。
 		if !s.loadTrafficBaseline() {
-			log.Printf("[traffic] 取得采集租约时读取基线失败，本轮跳过（下轮重试）")
+			// 读不到基线就**不能**算「已持有」：否则下一轮会跳过重读，
+			// 拿过期的内存基线算增量。交还租约，让下一轮重新走一遍接管流程。
+			s.releaseLease(leaseTrafficCollector)
+			s.collectorOwned.Store(false)
+			log.Printf("[traffic] 取得采集租约时读取基线失败，已交还租约（下轮重试）")
 			return
 		}
+		s.collectorOwned.Store(true)
 		log.Printf("[traffic] 已取得采集租约，按库中基线继续采集")
 	}
 
@@ -1120,17 +1147,23 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	seedBaseline := s.Runtime.baselineSeedPending
 	s.Runtime.mu.Unlock()
 
-	// 提交前再确认一次租约仍在我们手里：续租成功才继续，否则丢弃本轮结果。
+	// 提交前先续租：一轮采集可能因为 frps 慢、库慢而超过租约时长，
+	// 续不上就说明已被别的实例接手，本轮结果直接丢弃。
 	//
-	// 一轮采集可能因为 frps 慢、库慢而超过租约时长；租约到期后另一个实例会
-	// 接手并开始记账，旧实例若照常落库，同一段流量就被记了两遍。
-	// 这次续租同时充当 fencing：拿不到就说明持有者已经换人，我们无权写账。
-	if !s.acquireLease(leaseTrafficCollector, trafficCollectLease) {
+	// 续租只缩小窗口，不构成完整 fencing——真正的校验在落库事务里：
+	// 锁定租约行并核对代次（见 flushTraffic），检查与提交之间不再有缝隙。
+	renewGen, ok := s.acquireLease(leaseTrafficCollector, trafficCollectLease)
+	if !ok {
 		log.Printf("[traffic] 采集租约已被其他实例接手，本轮结果丢弃（不写账）")
 		return
 	}
+	leaseGen = renewGen
 
-	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline); err != nil {
+	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline, leaseGen); err != nil {
+		if errors.Is(err, errLeaseLost) {
+			log.Printf("[traffic] 租约在落库前被接管，本轮结果丢弃（不写账）")
+			return
+		}
 		log.Printf("[traffic] 流量落库失败，本轮不推进采样基线（增量下轮补记）: %v", err)
 	} else {
 		s.Runtime.mu.Lock()
@@ -1352,12 +1385,17 @@ func (s *Services) applyGuardFlags(users []model.User, ver uint64) {
 // seed 为 true 时只写基线、跳过全部增量写入：这是基线表首次迁移后的
 // 第一轮采集，frps 的当天累计值是旧版本已经计过的，从零起算会把当天
 // 已计流量整个重复计入（见 loadTrafficBaseline 的迁移标记说明）。
+// errLeaseLost 表示落库时发现采集租约已被别的实例接手。
+var errLeaseLost = errors.New("采集租约已被其他实例接手")
+
 func (s *Services) flushTraffic(
 	tunnelDeltas map[uint]*tunnelDelta,
 	userDeltas map[uint]int64,
 	tunnelOwner map[uint]uint,
 	nextStat map[string]trafficPair,
 	seed bool,
+	// leaseGen 是本次采集持有的租约代次；0 表示调用方不参与租约（测试直接调用）。
+	leaseGen int64,
 ) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
@@ -1375,6 +1413,22 @@ func (s *Services) flushTraffic(
 	skipUsers := s.Runtime.takePendingTrafficResets()
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// fencing：在同一事务里锁住租约行并核对代次。
+		//
+		// 只在事务外「续租成功才写」是不够的：进程暂停或事务排队时租约仍可能
+		// 在检查与提交之间被接手，两边于是各提交一份同一段增量。锁住这一行之后，
+		// 接手的实例必须等本事务结束才能改它，而本事务在改之前就核对过代次。
+		if leaseGen != 0 {
+			var lease model.RuntimeLease
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("name = ?", leaseTrafficCollector).First(&lease).Error; err != nil {
+				return fmt.Errorf("%w: %v", errLeaseLost, err)
+			}
+			if lease.Holder != s.instanceID || lease.Gen != leaseGen {
+				return errLeaseLost
+			}
+		}
+
 		if !seed {
 			for id, d := range tunnelDeltas {
 				total := d.in + d.out

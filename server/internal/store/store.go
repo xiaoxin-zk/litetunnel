@@ -59,6 +59,14 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 后续任一步失败都关掉连接再返回：否则调用方拿到 nil + error 之后
+	// 没有句柄可以关闭，进程（或测试）会一直占着数据库文件。
+	opened := false
+	defer func() {
+		if !opened {
+			_ = sqlDB.Close()
+		}
+	}()
 	if cfg.DBDriver == "sqlite" {
 		// SQLite 单写者模型，连接数过多反而增加锁竞争。
 		sqlDB.SetMaxOpenConns(1)
@@ -135,22 +143,24 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	//
 	// 建索引前先清掉历史重复：旧版本可能已经留下这种数据，不清的话索引建不上，
 	// 而那些**未使用的重复记录仍然可用**——等于漏洞还在。
+	// 这两步失败一律**拒绝启动**：没有唯一约束时，旧库里同一封邮件对应的
+	// 多条未使用凭据仍然可用（一次性语义已破），而且不会有任何运行期报错。
+	// 与其带着这个洞跑，不如让运维先修数据——消息里写清了要清理哪张表。
 	if err := dedupeMailCredentials(db); err != nil {
-		log.Printf("[store] 清理重复的邮件凭据失败（唯一索引可能建不上）：%v", err)
+		return nil, fmt.Errorf("清理重复的邮件凭据失败（请先人工修复 lt_email_codes / "+
+			"lt_password_reset_tokens 中重复的 mail_id）: %w", err)
 	}
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq
 		 ON lt_email_codes(mail_id) WHERE mail_id > 0`,
 	).Error; err != nil {
-		log.Printf("[store] 验证码来源唯一索引未建立：请人工清理 lt_email_codes 中重复的 mail_id 后重启，"+
-			"否则同一封邮件仍可能激活出多条可用验证码：%v", err)
+		return nil, fmt.Errorf("创建验证码来源唯一索引失败（请清理 lt_email_codes 中重复的 mail_id 后重启）: %w", err)
 	}
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_reset_tokens_mail_uniq
 		 ON lt_password_reset_tokens(mail_id) WHERE mail_id > 0`,
 	).Error; err != nil {
-		log.Printf("[store] 重置令牌来源唯一索引未建立：请人工清理 lt_password_reset_tokens 中重复的 mail_id 后重启，"+
-			"否则同一封邮件仍可能激活出多条可用令牌：%v", err)
+		return nil, fmt.Errorf("创建重置令牌来源唯一索引失败（请清理 lt_password_reset_tokens 中重复的 mail_id 后重启）: %w", err)
 	}
 
 	// 清理旧版本遗留的邮件草稿，见 purgeLegacyMailDrafts 的说明。
@@ -165,6 +175,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)
 	}
 
+	opened = true
 	return db, nil
 }
 

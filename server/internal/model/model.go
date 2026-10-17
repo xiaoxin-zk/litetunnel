@@ -536,6 +536,12 @@ type RuntimeLease struct {
 	Name      string    `gorm:"primarykey;size:64" json:"name"`
 	Holder    string    `gorm:"size:64" json:"holder"`
 	ExpiresAt time.Time `gorm:"index" json:"expires_at"`
+	// Gen 是递增的租约代次：每次取得/续租/交还都 +1。
+	//
+	// 它是 fencing token：持有者写库时在**同一个事务里**核对代次，代次变了
+	// 就说明租约已被别人接手（或已交还），本轮结果必须丢弃。只看「现在是不是
+	// 我持有」是不够的——检查与提交之间仍可能被接管。
+	Gen       int64     `gorm:"not null;default:0" json:"gen"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

@@ -62,6 +62,13 @@ type User struct {
 	// 而那正是要避免的全表成本（见 refreshGuardDue）。
 	TrafficResetAt time.Time `gorm:"index" json:"traffic_reset_at"`
 
+	// TrafficResetGen 在管理员清零用量时自增，是**跨进程**的清零代次。
+	//
+	// 采集写增量时按它做条件更新：清零之后，任何按清零前基线算出的增量都
+	// 写不进去，不会出现「清零完流量又冒出来」。进程内的清零标记只对当前
+	// 实例可见——多副本时清零请求落在 B、采集跑在 A，A 根本看不到那个标记。
+	TrafficResetGen int64 `gorm:"not null;default:0" json:"-"`
+
 	// 余额（单位：分）
 	Balance int64 `json:"balance"`
 

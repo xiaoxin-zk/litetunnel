@@ -19,6 +19,15 @@ type sessionInfo struct {
 	UserID   uint
 	Username string
 	LastSeen time.Time
+
+	// GuardAt / Blocked / Exceeded 是**会话级**的准入快照，随 Ping 定期从库里刷新。
+	//
+	// 多副本下每个实例都有独立的内存标记：账号在别的实例被禁用后，本实例的
+	// 标记要等重启或全量刷新才会变，这段时间里插件会继续放行。改成按会话刷新
+	// 之后，最多一个 Ping 周期就能拦住，而且不需要在每次新建连接时查库。
+	GuardAt  time.Time
+	Blocked  bool
+	Exceeded bool
 }
 
 // baselineLegacyKeep 是「无从确认归属的旧基线」在代理缺席后最多保留多久。
@@ -165,6 +174,14 @@ type Runtime struct {
 	// 不大于它的快照一律失效——无论标记还在 map 里、还是已在某次快照
 	// 中，都无法再造成跳过。
 	pendingTrafficReset map[uint]uint64
+
+	// lastResetGen 记录「上次成功提交时」各用户的清零代次（users.traffic_reset_gen）。
+	//
+	// 进程内的 pendingTrafficReset 只对当前实例可见；清零请求落在别的实例时，
+	// 采集侧只能靠库里的代次发现「这中间被清零过」。没有上次记录的用户
+	// （刚启动/刚接管）按「没变」处理——宁可少丢一轮，也不要一次重启吞掉
+	// 所有人的一轮用量。
+	lastResetGen map[uint]int64
 
 	// resetSeq 是清零登记的单调代次；resetVoid 记录每个用户最后一次
 	// 撤销时的代次，代次 ≤ 它的快照跳过一律无效（见 pendingTrafficReset）。
@@ -461,6 +478,18 @@ func (r *Runtime) TouchSession(runID string) {
 	}
 }
 
+// SetSessionGuard 写入会话级的准入快照（见 sessionInfo.GuardAt）。
+func (r *Runtime) SetSessionGuard(runID string, blocked, exceeded bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.sessions[runID]; ok {
+		s.Blocked = blocked
+		s.Exceeded = exceeded
+		s.GuardAt = time.Now()
+		r.sessions[runID] = s
+	}
+}
+
 // DropSession 注销会话。
 func (r *Runtime) DropSession(runID string) {
 	r.mu.Lock()
@@ -509,6 +538,75 @@ func (r *Runtime) markAccessGuardReady() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.guardReady = true
+}
+
+// guardRefreshInterval 是会话级准入快照的刷新间隔。
+//
+// 取 30 秒：最多落后一个 Ping 周期，换来的是「每次新建连接都不查库」。
+// 账号禁用这类操作要求尽快生效，但不必做到实时——本地标记那条路径仍然即时，
+// 这里只负责跨实例的收敛。
+const guardRefreshInterval = 30 * time.Second
+
+// RefreshSessionGuard 按需从库里刷新会话的准入快照。
+//
+// 只在 Ping 路径调用：那是周期性事件，不是每次新建连接。
+// 读库失败时保持原判（不清标记）——「已知但略旧」比「未知」安全。
+func (s *Services) RefreshSessionGuard(runID string) {
+	if runID == "" {
+		return
+	}
+	sess, ok := s.Runtime.LookupSession(runID)
+	if !ok {
+		return
+	}
+	if !sess.GuardAt.IsZero() && time.Since(sess.GuardAt) < guardRefreshInterval {
+		return
+	}
+	var u model.User
+	if err := s.DB.Preload("Group").First(&u, sess.UserID).Error; err != nil {
+		return
+	}
+	s.Runtime.SetSessionGuard(runID,
+		u.Status != model.UserStatusActive,
+		s.QuotaExceeded(&u))
+}
+
+// changedResetGens 返回「清零代次与上次提交时不同」的用户集合。
+//
+// 清零请求可能落在别的实例，本地的 pendingTrafficReset 根本看不到；代次存在
+// 库里，采集侧据此判断这一轮增量是否横跨了清零点（横跨就丢弃，避免清零后
+// 又把旧流量加回去）。
+func (r *Runtime) changedResetGens(gens map[uint]int64) map[uint]bool {
+	if len(gens) == 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out map[uint]bool
+	for uid, gen := range gens {
+		if prev, ok := r.lastResetGen[uid]; ok && prev != gen {
+			if out == nil {
+				out = make(map[uint]bool, 1)
+			}
+			out[uid] = true
+		}
+	}
+	return out
+}
+
+// rememberResetGens 记录本轮成功提交时的清零代次。
+func (r *Runtime) rememberResetGens(gens map[uint]int64) {
+	if len(gens) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastResetGen == nil {
+		r.lastResetGen = make(map[uint]int64, len(gens))
+	}
+	for uid, gen := range gens {
+		r.lastResetGen[uid] = gen
+	}
 }
 
 // IsQuotaExceeded 查询用户是否超额。
@@ -711,6 +809,30 @@ func (r *Runtime) SetUserBlocked(userID uint, v bool) {
 	} else {
 		delete(r.blocked, userID)
 	}
+}
+
+// tunnelOnlineGrace 是「在线」的判定窗口。
+//
+// 采集器每轮把在线隧道的 last_online_at 写成当前时间，接口按它判断在线。
+// 窗口取两个采集周期（下限 60 秒），留出抖动余量：窗口太小会让一轮延迟
+// 就闪成离线，太大则断线后迟迟不显示离线。
+func (s *Services) tunnelOnlineGrace() time.Duration {
+	grace := 2 * s.Cfg.TrafficPollInterval
+	if grace < time.Minute {
+		grace = time.Minute
+	}
+	return grace
+}
+
+// IsTunnelOnline 判断隧道是否在线（以数据库里的最后在线时间为准）。
+//
+// 不用进程内的在线集合：多副本时只有持有采集租约的实例会更新它，
+// 其他实例的用户接口会一直显示离线。last_online_at 由采集器写库，谁读都对。
+func (s *Services) IsTunnelOnline(t *model.Tunnel) bool {
+	if t == nil || t.LastOnlineAt == nil {
+		return false
+	}
+	return time.Since(*t.LastOnlineAt) <= s.tunnelOnlineGrace()
 }
 
 // IsTunnelOnline 查询隧道在线态。
@@ -948,8 +1070,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	// 多实例共用一个库时，每个进程都会启动采集器：各自读同一份 frps 累计值、
 	// 各自算增量、各自累加——同一段流量会被记两遍。进程内的 Runtime.mu 管不到
 	// 别的进程，所以用数据库里的租约把「谁采集」收敛成一个。
-	leaseGen, ok := s.acquireLease(leaseTrafficCollector, trafficCollectLease)
-	if !ok {
+	if _, ok := s.acquireLease(leaseTrafficCollector, trafficCollectLease); !ok {
 		if s.collectorOwned.Swap(false) {
 			log.Printf("[traffic] 采集租约已转交其他实例，本实例暂停采集")
 		}
@@ -1023,6 +1144,8 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	userByID := make(map[uint]*model.User, len(userIDs))
 	tunnelByKey := make(map[tunnelKey]*model.Tunnel, len(refs))
 	tunnelOwner := make(map[uint]uint, len(refs))
+	// resetGens 是本轮采样时刻各用户的清零代次（见 flushTraffic 的条件更新）。
+	var resetGens map[uint]int64
 	if len(userIDs) > 0 {
 		// 分批查而不是一次性展开：IN (?) 占用的绑定参数个数随在线隧道数增长，
 		// SQLite 的上限是 32766（更早的编译选项下还要小），PostgreSQL 是 65535。
@@ -1034,6 +1157,12 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		}
 		for i := range users {
 			userByID[users[i].ID] = &users[i]
+		}
+		// 记下本轮采样时刻的清零代次：落库时按它做条件更新，
+		// 期间发生的清零（可能来自别的实例）会让这次增量写不进去。
+		resetGens = make(map[uint]int64, len(users))
+		for i := range users {
+			resetGens[users[i].ID] = users[i].TrafficResetGen
 		}
 
 		// 隧道按用户收敛，再在内存里按名字匹配：单个用户的隧道数有限，
@@ -1154,13 +1283,25 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	// 锁定租约行并核对代次（见 flushTraffic），检查与提交之间不再有缝隙。
 	renewGen, ok := s.acquireLease(leaseTrafficCollector, trafficCollectLease)
 	if !ok {
+		// 丢掉本地持有标记：下一轮若重新抢到租约，必须走一遍「重新读基线」，
+		// 否则会拿这份已经过时的 lastStat 继续算增量。
+		s.collectorOwned.Store(false)
 		log.Printf("[traffic] 采集租约已被其他实例接手，本轮结果丢弃（不写账）")
 		return
 	}
-	leaseGen = renewGen
+	// 与本实例上次提交时的清零代次比对：期间发生过清零的用户，这一轮增量
+	// 横跨了清零点，直接丢弃（清零请求可能落在别的实例，本地标记看不到）。
+	changed := s.Runtime.changedResetGens(resetGens)
 
-	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline, leaseGen); err != nil {
+	fence := trafficFence{
+		leaseGen:     renewGen,
+		resetGens:    resetGens,
+		resetChanged: changed,
+	}
+
+	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline, fence); err != nil {
 		if errors.Is(err, errLeaseLost) {
+			s.collectorOwned.Store(false)
 			log.Printf("[traffic] 租约在落库前被接管，本轮结果丢弃（不写账）")
 			return
 		}
@@ -1388,14 +1529,27 @@ func (s *Services) applyGuardFlags(users []model.User, ver uint64) {
 // errLeaseLost 表示落库时发现采集租约已被别的实例接手。
 var errLeaseLost = errors.New("采集租约已被其他实例接手")
 
+// trafficFence 是落库时的写库闸门。
+//
+// 零值表示「不参与校验」——只有测试会直接调用 flushTraffic；
+// 生产路径一定带上租约代次与清零代次。
+type trafficFence struct {
+	// leaseGen 是本次采集持有的租约代次，0 表示不校验租约。
+	leaseGen int64
+	// resetGens 是采样时刻各用户的清零代次；resetChanged 是「自上次提交以来
+	// 代次变过」的用户集合（清零可能来自别的实例，本地标记看不见）。
+	resetGens    map[uint]int64
+	resetChanged map[uint]bool
+}
+
 func (s *Services) flushTraffic(
 	tunnelDeltas map[uint]*tunnelDelta,
 	userDeltas map[uint]int64,
 	tunnelOwner map[uint]uint,
 	nextStat map[string]trafficPair,
 	seed bool,
-	// leaseGen 是本次采集持有的租约代次；0 表示调用方不参与租约（测试直接调用）。
-	leaseGen int64,
+	// fence 是本轮采集的写库闸门；零值表示调用方不参与（测试直接调用）。
+	fence trafficFence,
 ) error {
 	now := time.Now()
 	today := now.Format("2006-01-02")
@@ -1418,37 +1572,40 @@ func (s *Services) flushTraffic(
 		// 只在事务外「续租成功才写」是不够的：进程暂停或事务排队时租约仍可能
 		// 在检查与提交之间被接手，两边于是各提交一份同一段增量。锁住这一行之后，
 		// 接手的实例必须等本事务结束才能改它，而本事务在改之前就核对过代次。
-		if leaseGen != 0 {
+		if fence.leaseGen != 0 {
 			var lease model.RuntimeLease
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where("name = ?", leaseTrafficCollector).First(&lease).Error; err != nil {
 				return fmt.Errorf("%w: %v", errLeaseLost, err)
 			}
-			if lease.Holder != s.instanceID || lease.Gen != leaseGen {
+			if lease.Holder != s.instanceID || lease.Gen != fence.leaseGen {
 				return errLeaseLost
 			}
 		}
 
-		if !seed {
-			for id, d := range tunnelDeltas {
-				total := d.in + d.out
-				if total == 0 && !d.online {
-					continue
-				}
-				updates := map[string]any{}
-				if total > 0 {
+		// 在线时间**不受 seed 影响**：它记的是「这条隧道此刻在线」，
+		// 与流量计费无关。seed 轮跳过的是增量（避免把当天累计重复计入），
+		// 但用户接口靠 last_online_at 判断在线——首轮不写的话，迁移后的
+		// 第一轮里所有隧道都会显示离线。
+		for id, d := range tunnelDeltas {
+			updates := map[string]any{}
+			if d.online {
+				updates["last_online_at"] = now
+			}
+			if !seed {
+				if total := d.in + d.out; total > 0 {
 					updates["traffic_used"] = gorm.Expr("traffic_used + ?", total)
 				}
-				if d.online {
-					updates["last_online_at"] = now
-				}
-				if len(updates) == 0 {
-					continue
-				}
-				if err := tx.Model(&model.Tunnel{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-					return err
-				}
 			}
+			if len(updates) == 0 {
+				continue
+			}
+			if err := tx.Model(&model.Tunnel{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+
+		if !seed {
 
 			// 管理员清零与采集增量的协调（见 pendingTrafficReset）：
 			// 清零后紧邻一轮的增量是清零前采样的旧流量，加回去等于
@@ -1464,10 +1621,26 @@ func (s *Services) flushTraffic(
 				if gen, ok := skipUsers[uid]; ok && s.Runtime.resetSkipValid(uid, gen) {
 					continue
 				}
-				if err := tx.Model(&model.User{}).Where("id = ?", uid).
-					Update("traffic_used", gorm.Expr("traffic_used + ?", delta)).Error; err != nil {
-					return err
+				// 自上次提交以来被清零过（可能来自别的实例）：这一轮增量横跨了
+				// 清零点，丢弃。库里的条件更新只能挡住「事务期间」的清零，
+				// 挡不住「上一轮之后」的清零。
+				if fence.resetChanged[uid] {
+					continue
 				}
+				q := tx.Model(&model.User{}).Where("id = ?", uid)
+				// 跨实例的清零协调：只在「清零代次仍等于本轮采样时读到的值」
+				// 时累加。代次对不上说明期间发生过清零（可能来自别的实例），
+				// 这笔增量属于清零前的流量，丢掉才对。
+				if fence.resetGens != nil {
+					if gen, ok := fence.resetGens[uid]; ok {
+						q = q.Where("traffic_reset_gen = ?", gen)
+					}
+				}
+				res := q.Update("traffic_used", gorm.Expr("traffic_used + ?", delta))
+				if res.Error != nil {
+					return res.Error
+				}
+				// RowsAffected = 0：期间被清零，这笔增量不计。
 			}
 
 			for id, d := range tunnelDeltas {
@@ -1544,6 +1717,8 @@ func (s *Services) flushTraffic(
 	// 成功提交：本轮快照消费完毕。期间被重新登记的用户代次已推进，
 	// consume 只摘除代次未变的，新标记留给下一轮。
 	s.Runtime.consumePendingTrafficResets(skipUsers)
+	// 记下本轮提交时的清零代次，供下一轮判断「期间是否被清零过」。
+	s.Runtime.rememberResetGens(fence.resetGens)
 	return nil
 }
 

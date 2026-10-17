@@ -3357,6 +3357,129 @@ func TestBaselineReadFailureReleasesLease(t *testing.T) {
 	}
 }
 
+// TestTrafficResetCrossesInstances 覆盖「清零请求落在别的实例」。
+//
+// 清零标记只存在进程内：多副本时请求落在 B、采集跑在 A，A 看不到那个标记，
+// 仍会把清零前的旧增量加回去。清零代次存在库里，A 按它判断这一轮增量
+// 是否横跨了清零点。
+func TestTrafficResetCrossesInstances(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
+
+	u := &model.User{Username: "crossreset", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20111,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+	frps.total.Store(1000)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 1000 {
+		t.Fatalf("首轮应记 1000，实际 %d", got)
+	}
+
+	// 另一个实例执行清零（共享同一个库）。
+	other := New(svc.DB, cfg)
+	if err := other.AdminResetUserTraffic(u.ID); err != nil {
+		t.Fatalf("清零失败: %v", err)
+	}
+	if got := userTrafficUsed(t, svc, u.ID); got != 0 {
+		t.Fatalf("清零后用量应为 0，实际 %d", got)
+	}
+
+	// 采集实例下一轮：这批增量属于清零前的流量，不能再加回去。
+	frps.total.Store(1200)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 0 {
+		t.Fatalf("清零之后不该把旧流量加回来，实际 %d", got)
+	}
+
+	// 再下一轮：清零之后的流量要正常入账。
+	frps.total.Store(1500)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 300 {
+		t.Fatalf("清零后的新增流量应记 300，实际 %d", got)
+	}
+}
+
+// TestTunnelOnlineFromDatabase 覆盖「多副本下非采集实例显示离线」。
+//
+// 进程内的在线集合只有持有采集租约的实例会更新；接口改读 last_online_at，
+// 谁读都对。
+func TestTunnelOnlineFromDatabase(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	recent := time.Now().Add(-10 * time.Second)
+	old := time.Now().Add(-time.Hour)
+
+	if !svc.IsTunnelOnline(&model.Tunnel{LastOnlineAt: &recent}) {
+		t.Fatal("最近上报过在线时间的隧道应判为在线")
+	}
+	if svc.IsTunnelOnline(&model.Tunnel{LastOnlineAt: &old}) {
+		t.Fatal("很久没上报的隧道应判为离线")
+	}
+	if svc.IsTunnelOnline(&model.Tunnel{}) {
+		t.Fatal("从未上报过的隧道应判为离线")
+	}
+}
+
+// TestSessionGuardRefresh 覆盖「别的实例禁用账号后本实例继续放行」。
+func TestSessionGuardRefresh(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{
+		Username: "guardrefresh", Password: "not-used", Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-guard"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	svc.RefreshSessionGuard(runID)
+
+	sess, ok := svc.Runtime.LookupSession(runID)
+	if !ok {
+		t.Fatal("会话应存在")
+	}
+	if sess.Blocked || sess.Exceeded {
+		t.Fatalf("正常账号不该被拦：blocked=%v exceeded=%v", sess.Blocked, sess.Exceeded)
+	}
+
+	// 另一个实例把账号禁用（只写库，不碰本实例的内存标记）。
+	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Update("status", model.UserStatusBanned).Error; err != nil {
+		t.Fatalf("禁用失败: %v", err)
+	}
+	// 立刻刷新会被节流，这里把快照时间拨回过去模拟「一个 Ping 周期之后」。
+	svc.Runtime.mu.Lock()
+	s := svc.Runtime.sessions[runID]
+	s.GuardAt = time.Now().Add(-time.Minute)
+	svc.Runtime.sessions[runID] = s
+	svc.Runtime.mu.Unlock()
+
+	svc.RefreshSessionGuard(runID)
+
+	sess, _ = svc.Runtime.LookupSession(runID)
+	if !sess.Blocked {
+		t.Fatal("账号在别的实例被禁用后，本实例的会话快照应在一个刷新周期内变为「已禁用」")
+	}
+}
+
 // TestAcquireLeaseFencing 覆盖「租约过期后旧持有者仍能写账」。
 //
 // 采集可能因为 frps 慢、库慢而超过租约时长：到期后另一个实例接手并开始记账，
@@ -3399,11 +3522,11 @@ func TestAcquireLeaseFencing(t *testing.T) {
 
 	// 更关键的一步：旧实例拿着旧代次落库，事务内的 fencing 必须拒绝它。
 	empty := map[string]trafficPair{}
-	if err := svc.flushTraffic(nil, nil, nil, empty, true, gen2); !errors.Is(err, errLeaseLost) {
+	if err := svc.flushTraffic(nil, nil, nil, empty, true, trafficFence{leaseGen: gen2}); !errors.Is(err, errLeaseLost) {
 		t.Fatalf("旧代次落库应被拒绝，实际 %v", err)
 	}
 	// 新持有者用新代次可以正常落库。
-	if err := other.flushTraffic(nil, nil, nil, empty, true, gen3); err != nil {
+	if err := other.flushTraffic(nil, nil, nil, empty, true, trafficFence{leaseGen: gen3}); err != nil {
 		t.Fatalf("当前持有者应能落库: %v", err)
 	}
 }

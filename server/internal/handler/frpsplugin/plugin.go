@@ -570,6 +570,10 @@ func (h *Handler) onPing(req *request) response {
 	if content.User.RunID != "" {
 		h.svc.Runtime.TouchSession(content.User.RunID)
 		h.svc.TouchClientSession(content.User.RunID)
+		// 顺带按需刷新会话的准入快照：多副本时账号可能在别的实例被禁用/超额，
+		// 本地内存标记不会变。放在 Ping（周期性事件）而不是每次新建连接，
+		// 既能让状态在一个 Ping 周期内收敛，又不会把查库压到连接热路径上。
+		h.svc.RefreshSessionGuard(content.User.RunID)
 	}
 	return allow()
 }
@@ -598,6 +602,19 @@ func (h *Handler) onNewUserConn(req *request) response {
 			// 曾经只看超额，而禁用又是靠把超额强制置 true 实现的，
 			// 于是每轮流量采集都会把禁用用户的超额标记按配额重算回去，
 			// 配额没超限的禁用账号就重新被放行了。
+			//
+			// 会话里有一份按 Ping 周期刷新的快照：多副本时账号可能在别的实例
+			// 被禁用，本地内存标记要等重启才会变，而快照最多落后一个 Ping 周期。
+			// 快照还没建立（刚登录）时回落到本地标记。
+			if !s.GuardAt.IsZero() {
+				if s.Blocked {
+					return deny("账号已被禁用")
+				}
+				if s.Exceeded {
+					return deny("流量额度已用尽")
+				}
+				return allow()
+			}
 			if h.svc.Runtime.IsUserBlocked(s.UserID) {
 				return deny("账号已被禁用")
 			}

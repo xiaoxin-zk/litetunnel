@@ -146,9 +146,14 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	// 这两步失败一律**拒绝启动**：没有唯一约束时，旧库里同一封邮件对应的
 	// 多条未使用凭据仍然可用（一次性语义已破），而且不会有任何运行期报错。
 	// 与其带着这个洞跑，不如让运维先修数据——消息里写清了要清理哪张表。
-	if err := dedupeMailCredentials(db); err != nil {
-		return nil, fmt.Errorf("清理重复的邮件凭据失败（请先人工修复 lt_email_codes / "+
-			"lt_password_reset_tokens 中重复的 mail_id）: %w", err)
+	// 索引已经存在就说明数据是干净的（唯一约束保证不会有重复），
+	// 不必每次启动都分组扫两张表。
+	if !db.Migrator().HasIndex(&model.EmailCode{}, "idx_lt_email_codes_mail_uniq") ||
+		!db.Migrator().HasIndex(&model.PasswordResetToken{}, "idx_lt_reset_tokens_mail_uniq") {
+		if err := dedupeMailCredentials(db); err != nil {
+			return nil, fmt.Errorf("清理重复的邮件凭据失败（请先人工修复 lt_email_codes / "+
+				"lt_password_reset_tokens 中重复的 mail_id）: %w", err)
+		}
 	}
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq

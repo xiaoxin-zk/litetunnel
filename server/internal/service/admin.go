@@ -978,8 +978,11 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 	// 那一笔清零前的旧增量随后就会被加回。
 	gen := s.Runtime.MarkTrafficResetPending(id)
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(map[string]any{
-		"traffic_used":     0,
-		"traffic_reset_at": time.Now().AddDate(0, 1, 0),
+		"traffic_used": 0,
+		// 推进清零代次：采集器写增量时按它做条件更新。多副本下清零请求可能
+		// 落在别的实例，进程内的标记对方看不见——代次在库里，谁都看得见。
+		"traffic_reset_gen": gorm.Expr("traffic_reset_gen + 1"),
+		"traffic_reset_at":  time.Now().AddDate(0, 1, 0),
 	})
 	if res.Error != nil {
 		// 清零没写进去，登记的标记必须撤销：留着它，后续采集会错误地

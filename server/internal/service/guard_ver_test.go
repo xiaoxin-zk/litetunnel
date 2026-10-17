@@ -313,7 +313,7 @@ func TestFlushTrafficKeepsMarkOnTxFailure(t *testing.T) {
 		map[uint]*tunnelDelta{tun.ID: {in: 100, out: 100}},
 		map[uint]int64{tun.UserID: 500},
 		map[uint]uint{tun.ID: tun.UserID},
-		map[string]trafficPair{}, false, 0,
+		map[string]trafficPair{}, false, trafficFence{},
 	)
 	if err == nil {
 		t.Fatal("日明细表缺失时落库应失败")
@@ -330,7 +330,7 @@ func TestFlushTrafficKeepsMarkOnTxFailure(t *testing.T) {
 	if err := svc.flushTraffic(
 		map[uint]*tunnelDelta{},
 		map[uint]int64{tun.UserID: 500},
-		nil, map[string]trafficPair{}, false, 0,
+		nil, map[string]trafficPair{}, false, trafficFence{},
 	); err != nil {
 		t.Fatalf("落库失败: %v", err)
 	}
@@ -343,7 +343,7 @@ func TestFlushTrafficKeepsMarkOnTxFailure(t *testing.T) {
 	if err := svc.flushTraffic(
 		map[uint]*tunnelDelta{},
 		map[uint]int64{tun.UserID: 300},
-		nil, map[string]trafficPair{}, false, 0,
+		nil, map[string]trafficPair{}, false, trafficFence{},
 	); err != nil {
 		t.Fatalf("落库失败: %v", err)
 	}

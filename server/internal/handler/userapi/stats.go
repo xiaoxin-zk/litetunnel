@@ -27,7 +27,7 @@ func (h *Handler) StatsOverview(c *gin.Context) {
 	}
 	online := 0
 	for i := range tunnels {
-		if h.svc.Runtime.IsTunnelOnline(tunnels[i].ID) {
+		if h.svc.IsTunnelOnline(&tunnels[i]) {
 			online++
 		}
 	}

@@ -221,7 +221,13 @@ func (s *Services) ResetPassword(token, newPassword, ip string) error {
 		return err
 	}
 
-	s.Runtime.InvalidateIdentity(IdentityKindUser, tok.UserID)
+	// 走公共收尾：除了失效身份缓存，还要清掉**本机内存里的 frpc 会话**。
+	//
+	// 只把数据库会话标成离线是不够的：插件热路径命中内存会话后只看配额就放行，
+	// 不会去读数据库，于是旧 frpc 仍能继续建立新连接——而「重置密码」的前提
+	// 恰恰是账号可能已被他人控制。另一台实例的会话由会话准入快照在 Ping 时
+	// 复核数据库会话状态来收敛（见 RefreshSessionGuard）。
+	s.finishPasswordReset(tok.UserID, ip)
 	log.Printf("[reset] 用户 %d 已通过邮件重置密码（来源 %s）", tok.UserID, ip)
 	return nil
 }

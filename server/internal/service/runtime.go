@@ -566,9 +566,37 @@ func (s *Services) RefreshSessionGuard(runID string) {
 	if err := s.DB.Preload("Group").First(&u, sess.UserID).Error; err != nil {
 		return
 	}
+	// 数据库里的会话状态也要复核：别的实例重置密码/注销会话后会把这里标成
+	// 离线，而本机内存会话还在——不查的话旧 frpc 会一直能建新连接。
+	// 查不到（或已过期）按「已禁用」处理，让下一次建连被拒。
+	if _, err := s.FindTrustedClientSession(runID); err != nil {
+		s.Runtime.SetSessionGuard(runID, true, s.QuotaExceeded(&u))
+		return
+	}
 	s.Runtime.SetSessionGuard(runID,
 		u.Status != model.UserStatusActive,
 		s.QuotaExceeded(&u))
+}
+
+// PrimeSessionGuard 用刚读到的用户数据初始化会话的准入快照。
+//
+// 用于「从数据库回填会话」的路径：新会话的 GuardAt 是零值，若不立刻初始化，
+// 在这台实例收到下一次 Ping 之前，新建连接只能依赖本机的配额缓存——
+// 多副本时那份缓存可能已经落后于别的实例上的配额/禁用变更。
+func (s *Services) PrimeSessionGuard(runID string, u *model.User) {
+	if runID == "" || u == nil {
+		return
+	}
+	// QuotaExceeded 需要分组信息；调用方给的 user 不一定预加载了关联。
+	if u.Group == nil && u.GroupID != 0 {
+		var g model.Group
+		if err := s.DB.First(&g, u.GroupID).Error; err == nil {
+			u.Group = &g
+		}
+	}
+	s.Runtime.SetSessionGuard(runID,
+		u.Status != model.UserStatusActive,
+		s.QuotaExceeded(u))
 }
 
 // changedResetGens 返回「清零代次与上次提交时不同」的用户集合。
@@ -1566,6 +1594,14 @@ func (s *Services) flushTraffic(
 	// 撤销——一次失败的清零仍会让采集器丢一轮真实用量。）
 	skipUsers := s.Runtime.takePendingTrafficResets()
 
+	// missedReset 记录「条件更新没命中」的用户：事务期间发生过清零。
+	missedReset := make(map[uint]bool)
+	// committedGens 是本次基线推进后应当记下的清零代次（落库 + 内存各一份）。
+	committedGens := make(map[uint]int64, len(fence.resetGens))
+	for uid, gen := range fence.resetGens {
+		committedGens[uid] = gen
+	}
+
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		// fencing：在同一事务里锁住租约行并核对代次。
 		//
@@ -1641,6 +1677,9 @@ func (s *Services) flushTraffic(
 					return res.Error
 				}
 				// RowsAffected = 0：期间被清零，这笔增量不计。
+				if res.RowsAffected == 0 {
+					missedReset[uid] = true
+				}
 			}
 
 			for id, d := range tunnelDeltas {
@@ -1668,6 +1707,34 @@ func (s *Services) flushTraffic(
 				}).Create(&row).Error; err != nil {
 					return err
 				}
+			}
+		}
+
+		// 期间被清零的用户（本地快照判定「变过」或条件更新没命中）：
+		// 把库里**当前**的代次记为「本轮基线对应的代次」。
+		// 记旧值的话，下一轮还会再判一次「变过」，白丢一轮清零后的真实流量。
+		for uid := range fence.resetChanged {
+			missedReset[uid] = true
+		}
+		for uid := range missedReset {
+			var cur int64
+			if err := tx.Model(&model.User{}).Where("id = ?", uid).
+				Pluck("traffic_reset_gen", &cur).Error; err != nil {
+				return err
+			}
+			committedGens[uid] = cur
+		}
+		// 代次与基线一起落库：重启/换手后据此判断「期间有没有被清零过」。
+		if len(committedGens) > 0 {
+			marks := make([]model.TrafficResetMark, 0, len(committedGens))
+			for uid, gen := range committedGens {
+				marks = append(marks, model.TrafficResetMark{UserID: uid, Gen: gen})
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "user_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"gen", "updated_at"}),
+			}).Create(&marks).Error; err != nil {
+				return err
 			}
 		}
 
@@ -1717,8 +1784,9 @@ func (s *Services) flushTraffic(
 	// 成功提交：本轮快照消费完毕。期间被重新登记的用户代次已推进，
 	// consume 只摘除代次未变的，新标记留给下一轮。
 	s.Runtime.consumePendingTrafficResets(skipUsers)
-	// 记下本轮提交时的清零代次，供下一轮判断「期间是否被清零过」。
-	s.Runtime.rememberResetGens(fence.resetGens)
+	// 记下本轮提交时的清零代次（含期间被清零、已改成当前值的用户），
+	// 供下一轮判断「期间是否被清零过」。
+	s.Runtime.rememberResetGens(committedGens)
 	return nil
 }
 
@@ -1764,9 +1832,22 @@ func (s *Services) loadTrafficBaseline() bool {
 			seenAt: now, tunnelID: r.TunnelID, unknown: r.TunnelID == 0}
 	}
 
+	// 一并恢复「基线对应的清零代次」：没有它，重启/换手后无法判断
+	// 「清零发生在上次采样之后、重启之前」，那段旧流量会被重新计入。
+	var marks []model.TrafficResetMark
+	if err := s.DB.Find(&marks).Error; err != nil {
+		log.Printf("[traffic] 读取清零代次标记失败，将跳过采集以避免把清零前的流量加回来: %v", err)
+		return false
+	}
+	gens := make(map[uint]int64, len(marks))
+	for _, mk := range marks {
+		gens[mk.UserID] = mk.Gen
+	}
+
 	s.Runtime.mu.Lock()
 	s.Runtime.lastStat = m
 	s.Runtime.baselineSeedPending = seed
+	s.Runtime.lastResetGen = gens
 	s.Runtime.mu.Unlock()
 
 	if len(m) > 0 {

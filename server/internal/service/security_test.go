@@ -3416,6 +3416,119 @@ func TestTrafficResetCrossesInstances(t *testing.T) {
 	}
 }
 
+// TestTrafficResetSurvivesCollectorRestart 覆盖「清零代次只记在内存里」。
+//
+// 采集进程重启或换手后 lastResetGen 是空的，于是「清零发生在上次采样之后、
+// 重启之前」这段窗口里的旧流量会被重新计入。代次与基线一起落库，重启后
+// 读回来才能判断。
+func TestTrafficResetSurvivesCollectorRestart(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
+
+	u := &model.User{Username: "restartreset", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20121,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+	frps.total.Store(1000)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 1000 {
+		t.Fatalf("首轮应记 1000，实际 %d", got)
+	}
+
+	// 「停机」期间：别的实例清零，同时旧采集器退出（租约待过期）。
+	other := New(svc.DB, cfg)
+	if err := other.AdminResetUserTraffic(u.ID); err != nil {
+		t.Fatalf("清零失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.RuntimeLease{}).
+		Where("name = ?", leaseTrafficCollector).
+		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 重启后的实例：必须从库里恢复「基线对应的代次」，认出期间被清零过。
+	restarted := New(svc.DB, cfg)
+	restarted.Frps = NewFrpsClient(cfg)
+	if !restarted.loadTrafficBaseline() {
+		t.Fatal("基线应能恢复")
+	}
+	frps.total.Store(1200)
+	restarted.collectTraffic(ctx)
+	if got := userTrafficUsed(t, restarted, u.ID); got != 0 {
+		t.Fatalf("重启后不该把清零前的流量加回来，实际 %d", got)
+	}
+
+	// 再下一轮：清零之后的流量正常入账（不应因为记着旧代次而再跳过一次）。
+	frps.total.Store(1500)
+	restarted.collectTraffic(ctx)
+	if got := userTrafficUsed(t, restarted, u.ID); got != 300 {
+		t.Fatalf("清零后的新增流量应记 300，实际 %d", got)
+	}
+}
+
+// TestResetPasswordByLinkDropsSessions 覆盖「邮件链接重置密码后旧 frpc 仍可建连」。
+//
+// 链接重置原先只把数据库会话标成离线，没有清本机内存会话；而插件热路径命中
+// 内存会话后只看配额就放行，不会去读数据库——旧 frpc 于是还能继续建立新连接，
+// 而「重置密码」的前提恰恰是账号可能已被他人控制。
+func TestResetPasswordByLinkDropsSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	hashed, err := auth.HashPassword("OldPassw0rd!")
+	if err != nil {
+		t.Fatalf("生成口令失败: %v", err)
+	}
+	u := &model.User{
+		Username: "linkreset", Password: hashed, Status: model.UserStatusActive,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-link-reset"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID,
+		Online: true, LastSeenAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("建客户端会话失败: %v", err)
+	}
+
+	plain, hash, err := newResetToken()
+	if err != nil {
+		t.Fatalf("生成令牌失败: %v", err)
+	}
+	if err := svc.DB.Create(&model.PasswordResetToken{
+		UserID: u.ID, TokenHash: hash, ExpireAt: time.Now().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("写令牌失败: %v", err)
+	}
+
+	if err := svc.ResetPassword(plain, "NewPassw0rd!", "127.0.0.1"); err != nil {
+		t.Fatalf("重置失败: %v", err)
+	}
+
+	if _, ok := svc.Runtime.LookupSession(runID); ok {
+		t.Fatal("链接重置密码后必须清掉本机内存会话，否则旧 frpc 仍能建立新连接")
+	}
+}
+
 // TestTunnelOnlineFromDatabase 覆盖「多副本下非采集实例显示离线」。
 //
 // 进程内的在线集合只有持有采集租约的实例会更新；接口改读 last_online_at，
@@ -3449,6 +3562,13 @@ func TestSessionGuardRefresh(t *testing.T) {
 	}
 
 	const runID = "run-guard"
+	// 真实流程里内存会话一定对应一条数据库会话（登录时写入）。
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID,
+		Online: true, LastSeenAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("建客户端会话失败: %v", err)
+	}
 	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
 	svc.RefreshSessionGuard(runID)
 
@@ -3477,6 +3597,27 @@ func TestSessionGuardRefresh(t *testing.T) {
 	sess, _ = svc.Runtime.LookupSession(runID)
 	if !sess.Blocked {
 		t.Fatal("账号在别的实例被禁用后，本实例的会话快照应在一个刷新周期内变为「已禁用」")
+	}
+
+	// 会话被撤销（重置密码/注销）同理：数据库里已离线，本机内存会话不能继续放行。
+	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Update("status", model.UserStatusActive).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DB.Model(&model.ClientSession{}).Where("run_id = ?", runID).
+		Update("online", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc.Runtime.mu.Lock()
+	s = svc.Runtime.sessions[runID]
+	s.GuardAt = time.Now().Add(-time.Minute)
+	svc.Runtime.sessions[runID] = s
+	svc.Runtime.mu.Unlock()
+
+	svc.RefreshSessionGuard(runID)
+	sess, _ = svc.Runtime.LookupSession(runID)
+	if !sess.Blocked {
+		t.Fatal("数据库会话已撤销时，本机会话应在一个刷新周期内被拦下")
 	}
 }
 

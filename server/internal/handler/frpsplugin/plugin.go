@@ -310,6 +310,9 @@ func (h *Handler) resolveUser(frpUser, runID string, metas map[string]string) (*
 			}
 			if u, err := h.svc.LoadUser(sess.UserID); err == nil {
 				h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+				// 回填会话时顺手初始化准入快照：否则在收到下一次 Ping 之前，
+				// 这台实例只能靠本机的配额缓存判断，多副本时可能已经落后。
+				h.svc.PrimeSessionGuard(runID, u)
 				return u, true
 			}
 		}
@@ -354,6 +357,7 @@ func (h *Handler) authenticateByMeta(frpUser, runID string, metas map[string]str
 
 	if runID != "" {
 		h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+		h.svc.PrimeSessionGuard(runID, u)
 		// 传空串表示「这些字段本次拿不到」——UpsertClientSession 会
 		// 保留登录时记录的真实值，不会把它们抹成空。
 		h.UpsertClientSession(u.ID, u.Username, runID, "", "", "", "")
@@ -406,6 +410,7 @@ func (h *Handler) onLogin(req *request) response {
 	}
 
 	h.svc.Runtime.RecordLogin(content.RunID, u.ID, u.Username)
+	h.svc.PrimeSessionGuard(content.RunID, u)
 	h.UpsertClientSession(u.ID, u.Username, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
 	return allow()
 }

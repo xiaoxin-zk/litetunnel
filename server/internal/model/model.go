@@ -528,6 +528,25 @@ type TrafficBaseline struct {
 // TableName 固定表名。
 func (TrafficBaseline) TableName() string { return "lt_traffic_baseline" }
 
+// TrafficResetMark 记录「当前采样基线对应的用户清零代次」。
+//
+// # 为什么必须落库
+//
+// 清零代次（User.TrafficResetGen）用来判断「这一轮增量是否横跨了清零点」。
+// 判断需要两个值：当前代次，以及**上一次基线对应的代次**。后者原先只在内存里，
+// 采集进程重启或换手后是空的，于是「清零发生在上次采样之后、重启之前」这段
+// 窗口里的旧流量会被重新计入——而这正是代次机制要防的事。
+//
+// 与基线一样，写入发生在落库事务里：基线推进到哪，代次就记到哪。
+type TrafficResetMark struct {
+	UserID    uint      `gorm:"primarykey" json:"user_id"`
+	Gen       int64     `gorm:"not null;default:0" json:"gen"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (TrafficResetMark) TableName() string { return "lt_traffic_reset_marks" }
+
 // RuntimeLease 是跨实例的运行期租约（当前用于「流量采集只由一个实例跑」）。
 //
 // # 为什么需要它

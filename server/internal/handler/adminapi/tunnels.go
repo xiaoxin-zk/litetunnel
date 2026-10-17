@@ -23,19 +23,19 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 	out := make([]gin.H, 0, len(list))
 	for i := range list {
 		out = append(out, gin.H{
-			"id":          list[i].ID,
-			"user_id":     list[i].UserID,
-			"name":        list[i].Name,
-			"type":        list[i].Type,
-			"local_ip":    list[i].LocalIP,
-			"local_port":  list[i].LocalPort,
-			"remote_port": list[i].RemotePort,
-			"domain":      list[i].Domain,
-			"subdomain":   list[i].Subdomain,
-			"status":      list[i].Status,
-			"online":      h.svc.Runtime.IsTunnelOnline(list[i].ID),
+			"id":           list[i].ID,
+			"user_id":      list[i].UserID,
+			"name":         list[i].Name,
+			"type":         list[i].Type,
+			"local_ip":     list[i].LocalIP,
+			"local_port":   list[i].LocalPort,
+			"remote_port":  list[i].RemotePort,
+			"domain":       list[i].Domain,
+			"subdomain":    list[i].Subdomain,
+			"status":       list[i].Status,
+			"online":       h.svc.IsTunnelOnline(&list[i]),
 			"traffic_used": list[i].TrafficUsed,
-			"created_at":  list[i].CreatedAt,
+			"created_at":   list[i].CreatedAt,
 		})
 	}
 	httpx.PageOK(c, out, total, page, pageSize)

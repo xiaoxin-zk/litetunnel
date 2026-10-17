@@ -158,6 +158,16 @@ func (s *Services) activateEmailCode(row model.MailOutbox, token string) error {
 		if activated > 0 {
 			return nil
 		}
+		// 同一邮箱同一场景的激活必须串行。
+		//
+		// 两封不同的验证码邮件可能被两个实例分别领取：各自都查到「还没有更新的
+		// 记录」，随后先后插入；若较早的那封最后提交，它的记录 ID 反而更大，
+		// 而校验端按记录 ID 取最新——用户手里的**新码**就用不了了。
+		// 锁住 (邮箱, 场景) 之后，插入顺序与邮件顺序一致。
+		if err := s.lockAdvisory(tx, "emailcode:"+p.Email+":"+p.Scene); err != nil {
+			return err
+		}
+
 		// 被更新者取代：本邮件之后激活的同类凭据胜出（含已使用的）。
 		var newer int64
 		if err := tx.Model(&model.EmailCode{}).

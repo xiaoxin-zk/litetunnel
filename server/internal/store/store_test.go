@@ -63,6 +63,60 @@ func TestMailIDIsUniquePerCredential(t *testing.T) {
 	}
 }
 
+// TestDedupeMailCredentials 覆盖「旧版本留下的重复凭据」。
+//
+// 同一封邮件激活出多条验证码时，未使用的那些**仍然可用**——一次性语义已经破了。
+// 只告警不清理的话，唯一索引也建不上，等于漏洞一直开着。
+func TestDedupeMailCredentials(t *testing.T) {
+	db := newTestDB(t)
+
+	// 模拟旧数据：先去掉唯一索引，才能插进重复行。
+	if err := db.Exec(`DROP INDEX IF EXISTS idx_lt_email_codes_mail_uniq`).Error; err != nil {
+		t.Fatalf("删索引失败: %v", err)
+	}
+
+	old := &model.EmailCode{
+		Email: "dup@example.com", Scene: "reset", CodeHash: "old-hash",
+		ExpireAt: time.Now().Add(time.Hour), MailID: 42,
+	}
+	newer := &model.EmailCode{
+		Email: "dup@example.com", Scene: "reset", CodeHash: "new-hash",
+		ExpireAt: time.Now().Add(time.Hour), MailID: 42,
+	}
+	for _, row := range []*model.EmailCode{old, newer} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("写入重复记录失败: %v", err)
+		}
+	}
+
+	if err := dedupeMailCredentials(db); err != nil {
+		t.Fatalf("清理失败: %v", err)
+	}
+
+	var rows []model.EmailCode
+	if err := db.Where("mail_id = ?", 42).Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("同一封邮件应只保留一条凭据，实际 %d 条", len(rows))
+	}
+	if rows[0].CodeHash != "new-hash" {
+		t.Fatalf("应保留最新的一条（id 最大），实际 %q", rows[0].CodeHash)
+	}
+
+	// 清理之后唯一索引应能建起来。
+	if err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq
+		 ON lt_email_codes(mail_id) WHERE mail_id > 0`).Error; err != nil {
+		t.Fatalf("清理后应能建立唯一索引: %v", err)
+	}
+
+	// 幂等：再跑一次不该报错。
+	if err := dedupeMailCredentials(db); err != nil {
+		t.Fatalf("重复清理应幂等: %v", err)
+	}
+}
+
 // TestPurgeLegacyMailDrafts 覆盖「升级遗留的草稿邮件」。
 //
 // 旧版本用 draft 表示「已写好、待复核额度」：进程若在复核与释放之间崩溃，

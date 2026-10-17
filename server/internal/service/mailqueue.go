@@ -133,10 +133,19 @@ func (s *Services) enqueueMail(to, subject, body, kind string, payload any, q ma
 // PostgreSQL 用事务级 advisory lock（与注册额度同一手法）；SQLite 不需要——
 // store.Open 里连接池只有一个连接，事务天然串行。
 func (s *Services) lockMailRecipient(tx *gorm.DB, to string) error {
+	key := "mail:" + strings.ToLower(strings.TrimSpace(to))
+	return s.lockAdvisory(tx, key)
+}
+
+// lockAdvisory 在事务内按 key 取一把事务级排他锁。
+//
+// PostgreSQL 用 pg_advisory_xact_lock：同一 key 的事务排队，事务结束自动释放。
+// SQLite 不需要（连接池只有一个连接，事务天然串行）。
+// hashtext 有 32 位碰撞可能：撞了只是让两组无关的事务多串行一会儿。
+func (s *Services) lockAdvisory(tx *gorm.DB, key string) error {
 	if s.Cfg == nil || !strings.EqualFold(strings.TrimSpace(s.Cfg.DBDriver), "postgres") {
 		return nil
 	}
-	key := "mail:" + strings.ToLower(strings.TrimSpace(to))
 	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", key).Error
 }
 
@@ -246,12 +255,15 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 	// 记录清理交给维护任务（StartMaintenanceWorker）统一做，这里只管收发：
 	// 两处都清会让「谁删了什么」变得难以追溯。
 
-	// 1) 激活：已送达、凭据还没生效。
+	// 1) 激活：已送达、凭据还没生效；以及**租约已过期的 activating**——
+	// 那是某个实例领取后崩溃留下的，不重新扫进来这条记录就永远卡住，
+	// 用户手里的验证码/链接永远不会生效。
 	//
 	// 同样要**领取**：多实例时两个实例会各执行一次凭据动作，各插一条相同
 	// 验证码——而校验只消费命中的一条，另一条仍然可用，一次性语义就没了。
 	var pendingActions []model.MailOutbox
-	if err := s.DB.Where("status = ? AND next_at <= ?", model.MailDelivered, time.Now()).
+	if err := s.DB.Where("status IN ? AND next_at <= ?",
+		[]string{model.MailDelivered, model.MailActivating}, time.Now()).
 		Order("id asc").Limit(mailBatchSize).Find(&pendingActions).Error; err != nil {
 		log.Printf("[mail] 读取待激活记录失败: %v", err)
 	}
@@ -259,7 +271,8 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		token, ok := s.claimMail(row.ID, []string{model.MailDelivered}, model.MailActivating, mailActivateLease)
+		token, ok := s.claimMail(row.ID, []string{model.MailDelivered, model.MailActivating},
+			model.MailActivating, mailActivateLease)
 		if !ok {
 			continue
 		}
@@ -492,7 +505,7 @@ func (s *Services) finishMailAction(row model.MailOutbox, token string) {
 		"claim_token": "",
 	}
 	if uerr := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND claim_token = ?", row.ID, token).
+		Where("id = ? AND claim_token = ? AND status = ?", row.ID, token, model.MailActivating).
 		Updates(updates).Error; uerr != nil {
 		log.Printf("[mail] 更新发件箱失败（id=%d）: %v", row.ID, uerr)
 	}
@@ -573,8 +586,13 @@ func (s *Services) finishMail(id uint, token string, f mailFinish) {
 		updates["body"] = ""
 		updates["payload"] = ""
 	}
+	// 三重条件：id、领取令牌、以及「仍在处理中」的状态。
+	//
+	// 只看 id + 令牌是不够的：作废流程若没来得及清令牌（或将来漏清），
+	// 旧持有者仍能把 failed 改回 sent。状态条件让它只能写自己正在处理的那一行。
 	res := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND claim_token = ?", id, token).
+		Where("id = ? AND claim_token = ? AND status IN ?", id, token,
+			[]string{model.MailSending, model.MailActivating}).
 		Updates(updates)
 	if res.Error != nil {
 		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", id, res.Error)

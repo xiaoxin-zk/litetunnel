@@ -381,10 +381,7 @@ func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) e
 // hashtext 有 32 位碰撞可能：撞了只是让两组无关的注册多串行一会儿，
 // 不影响正确性。
 func (s *Services) lockRegisterQuota(tx *gorm.DB, key string) error {
-	if s.Cfg == nil || !strings.EqualFold(strings.TrimSpace(s.Cfg.DBDriver), "postgres") {
-		return nil
-	}
-	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", key).Error
+	return s.lockAdvisory(tx, key)
 }
 
 // overLimit 判断计数是否已超出注册上限。
@@ -777,10 +774,13 @@ func purgeEmailCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 				model.MailKindEmailCodeChange},
 			[]string{model.MailPending, model.MailSending, model.MailActivating, model.MailDelivered}).
 		Updates(map[string]any{
-			"status":   model.MailFailed,
-			"body":     "",
-			"payload":  "",
-			"last_err": "邮箱已更换，邮件作废",
+			"status": model.MailFailed,
+			// 清空领取令牌：正在发送/激活的实例随后回写时会被条件挡住，
+			// 不会把作废的记录改回 sent / delivered。
+			"claim_token": "",
+			"body":        "",
+			"payload":     "",
+			"last_err":    "邮箱已更换，邮件作废",
 		}).Error
 }
 
@@ -862,10 +862,12 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
 			[]string{model.MailPending, model.MailSending, model.MailActivating, model.MailDelivered}).
 		Updates(map[string]any{
-			"status":   model.MailFailed,
-			"body":     "",
-			"payload":  "",
-			"last_err": "账号已删除，邮件作废",
+			"status": model.MailFailed,
+			// 同上：清空令牌，避免在途的发送/激活把作废记录改回终态。
+			"claim_token": "",
+			"body":        "",
+			"payload":     "",
+			"last_err":    "账号已删除，邮件作废",
 		}).Error
 }
 

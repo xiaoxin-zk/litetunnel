@@ -934,19 +934,16 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		return
 	}
 	if !s.collectorOwned.Swap(true) {
-		// 从别的实例手里接管：内存里的基线是旧的，必须按库里的重建，
-		// 否则会把 frps 的当天累计值整个当成新增量记一遍。
+		// 每次「从未持有到持有」的转换都按库里的最新基线重建。
 		//
-		// 本进程**首次**取得租约时不重复读：启动流程（StartTrafficCollector）
-		// 已经在第一轮之前读过基线，再读一次只会把「首次迁移」的种子标记
-		// 重新置上，白白丢掉一轮增量。
-		if s.collectorStarted.Swap(true) {
-			if !s.loadTrafficBaseline() {
-				log.Printf("[traffic] 接管采集时读取基线失败，本轮跳过（下轮重试）")
-				return
-			}
-			log.Printf("[traffic] 已接管采集租约，按库中基线继续采集")
+		// 启动时虽然读过一次，但那时租约可能正被别的实例持有；它在随后的
+		// 每一轮都在记账，等我们接手时内存里的基线已经落后好几轮——拿它算
+		// 增量会把别人已经记过的流量再记一遍。重新读一次的成本只是一条查询。
+		if !s.loadTrafficBaseline() {
+			log.Printf("[traffic] 取得采集租约时读取基线失败，本轮跳过（下轮重试）")
+			return
 		}
+		log.Printf("[traffic] 已取得采集租约，按库中基线继续采集")
 	}
 
 	proxies, err := s.Frps.ListProxies(ctx)
@@ -1122,6 +1119,16 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	s.Runtime.mu.Lock()
 	seedBaseline := s.Runtime.baselineSeedPending
 	s.Runtime.mu.Unlock()
+
+	// 提交前再确认一次租约仍在我们手里：续租成功才继续，否则丢弃本轮结果。
+	//
+	// 一轮采集可能因为 frps 慢、库慢而超过租约时长；租约到期后另一个实例会
+	// 接手并开始记账，旧实例若照常落库，同一段流量就被记了两遍。
+	// 这次续租同时充当 fencing：拿不到就说明持有者已经换人，我们无权写账。
+	if !s.acquireLease(leaseTrafficCollector, trafficCollectLease) {
+		log.Printf("[traffic] 采集租约已被其他实例接手，本轮结果丢弃（不写账）")
+		return
+	}
 
 	if err := s.flushTraffic(tunnelDeltas, userDeltas, tunnelOwner, nextStat, seedBaseline); err != nil {
 		log.Printf("[traffic] 流量落库失败，本轮不推进采样基线（增量下轮补记）: %v", err)

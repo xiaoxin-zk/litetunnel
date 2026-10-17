@@ -2,6 +2,9 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -140,6 +143,54 @@ func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
 	if after.Status != model.MailSending || after.ClaimToken != newToken {
 		t.Fatalf("旧持有者的回写不该生效：status=%q token=%q（期望 sending / %q）",
 			after.Status, after.ClaimToken, newToken)
+	}
+}
+
+// TestActivatingMailRecoversAfterLeaseExpiry 覆盖「激活到一半进程崩了」。
+//
+// worker 若只扫 delivered，领取为 activating 后崩溃的那条记录就永远卡住：
+// 用户手里的验证码在库里根本不存在，谁也没法救。租约到期后必须能被重新扫到。
+func TestActivatingMailRecoversAfterLeaseExpiry(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+	svc.mailerOverride = &fakeMailer{}
+
+	const email = "stuckactivating@example.com"
+	sum := sha256.Sum256([]byte("123456"))
+	payload, err := json.Marshal(emailCodePayload{
+		Email: email, Scene: EmailSceneRegister,
+		CodeHash: hex.EncodeToString(sum[:]), TTLSeconds: 600,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 一条「领取后崩溃」的记录：状态 activating，租约已过期。
+	row := &model.MailOutbox{
+		To: email, Subject: "s", Kind: model.MailKindEmailCodeRegister,
+		Payload: string(payload), Status: model.MailActivating,
+		ClaimToken: "dead-holder", NextAt: time.Now().Add(-time.Minute),
+	}
+	if err := svc.DB.Create(row).Error; err != nil {
+		t.Fatalf("建记录失败: %v", err)
+	}
+
+	svc.processMailOutbox(context.Background())
+
+	var after model.MailOutbox
+	if err := svc.DB.First(&after, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.MailSent {
+		t.Fatalf("过期未完成的激活应被接手并办结，实际 %q（%s）", after.Status, after.LastErr)
+	}
+	var codes int64
+	if err := svc.DB.Model(&model.EmailCode{}).
+		Where("mail_id = ?", row.ID).Count(&codes).Error; err != nil {
+		t.Fatal(err)
+	}
+	if codes != 1 {
+		t.Fatalf("接手后应激活出验证码，实际 %d 条", codes)
 	}
 }
 

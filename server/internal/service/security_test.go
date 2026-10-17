@@ -29,6 +29,18 @@ import (
 // 才会暴露。所以这些用例都起真实的 sqlite 库与真实服务集合，
 // 而不是把函数拆出来单独喂参数。
 
+// markTrafficBaselineReady 声明「采样基线已经建立」。
+//
+// collectTraffic 每次取得采集租约都会重读一次基线；没有这个标记时，
+// loadTrafficBaseline 会把它当成**首次迁移**（只记基线、不计增量），
+// 于是首轮采集不记账——这些用例要测的是记账，所以先落下标记。
+func markTrafficBaselineReady(t *testing.T, svc *Services) {
+	t.Helper()
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+		t.Fatalf("写基线迁移标记失败: %v", err)
+	}
+}
+
 func newTestServices(t *testing.T, cfg *config.Config) *Services {
 	t.Helper()
 	if cfg == nil {
@@ -1543,6 +1555,7 @@ func TestRetryKeepsNewIntentWrittenDuringOperation(t *testing.T) {
 func TestTrafficBaselineSurvivesRestart(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
 
 	u := &model.User{Username: "restarttraffic", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
@@ -3040,6 +3053,7 @@ func tunnelTrafficUsed(t *testing.T, svc *Services, id uint) int64 {
 func TestCollectTrafficKeepsBaselineForAbsentProxy(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
 
 	u := &model.User{Username: "absentuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
@@ -3102,6 +3116,7 @@ func TestCollectTrafficKeepsBaselineForAbsentProxy(t *testing.T) {
 func TestCollectTrafficResetsBaselineForRecreatedTunnel(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
 
 	u := &model.User{Username: "recreateuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
@@ -3264,6 +3279,7 @@ func TestPruneDeadBaselines(t *testing.T) {
 func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
 
 	u := &model.User{Username: "leaseuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
@@ -3292,14 +3308,10 @@ func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
 
 	// 第二个实例（同一个库）：这一轮拿不到租约，必须完全跳过。
 	//
-	// 先落下「基线已迁移」标记：否则 loadTrafficBaseline 会把它当成首次迁移，
-	// 第一轮只记基线、不计增量，测不出「谁在记账」这件事。
-	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
-		t.Fatalf("写迁移标记失败: %v", err)
-	}
+	// 注意这里**不**手动读基线：接管时 collectTraffic 自己会按库里的最新值
+	// 重建（否则会拿启动时的旧基线，把别人已经记过的流量再记一遍）。
 	second := New(svc.DB, cfg)
 	second.Frps = NewFrpsClient(cfg)
-	second.loadTrafficBaseline()
 	frps.total.Store(1200)
 	second.collectTraffic(ctx)
 	if got := tunnelTrafficUsed(t, second, tun.ID); got != 1000 {
@@ -3318,6 +3330,43 @@ func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
 	}
 }
 
+// TestAcquireLeaseFencing 覆盖「租约过期后旧持有者仍能写账」。
+//
+// 采集可能因为 frps 慢、库慢而超过租约时长：到期后另一个实例接手并开始记账，
+// 旧实例若照常落库，同一段流量会被记两遍。落库前再抢一次租约就是 fencing——
+// 抢不到说明持有者已经换人，本轮结果必须丢弃。
+func TestAcquireLeaseFencing(t *testing.T) {
+	svc := newTestServices(t, nil)
+	other := New(svc.DB, svc.Cfg)
+
+	const name = "fencing-test"
+	if !svc.acquireLease(name, time.Minute) {
+		t.Fatal("首个实例应取得租约")
+	}
+	// 持有者可以续租。
+	if !svc.acquireLease(name, time.Minute) {
+		t.Fatal("持有者应能续租")
+	}
+	// 租约有效期内，别的实例抢不到。
+	if other.acquireLease(name, time.Minute) {
+		t.Fatal("租约有效期内不该被别的实例抢走")
+	}
+
+	// 模拟「旧实例卡住超过租期，另一个实例接手」。
+	if err := svc.DB.Model(&model.RuntimeLease{}).Where("name = ?", name).
+		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !other.acquireLease(name, time.Minute) {
+		t.Fatal("租约到期后应可被接手")
+	}
+
+	// 旧实例此时再想续租/落库：必须失败（否则它会写出一份重复的账）。
+	if svc.acquireLease(name, time.Minute) {
+		t.Fatal("已被接手的租约不该被旧持有者抢回")
+	}
+}
+
 // TestCollectTrafficKeepsBaselineWhenFlushFails 覆盖「落库失败永久漏记流量」。
 //
 // 采样基线（Runtime.lastStat）如果先推进、再落库，事务失败时那一轮的增量
@@ -3327,6 +3376,7 @@ func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
 func TestCollectTrafficKeepsBaselineWhenFlushFails(t *testing.T) {
 	cfg := &config.Config{}
 	svc := newTestServices(t, cfg)
+	markTrafficBaselineReady(t, svc)
 
 	u := &model.User{Username: "trafficuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {

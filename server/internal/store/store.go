@@ -132,19 +132,25 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	// 多实例并发激活同一封邮件时，两边的「已激活」检查可能都落空，各插一条
 	// 相同验证码；而校验只消费命中的那一条，另一条仍然可用——一次性语义就没了。
 	// 代码里的领取已经避免了这种并发，唯一索引是最后一道保险。
-	// 尽力而为：老库里若已有重复（旧版本并发激活留下的），建索引会失败，
-	// 此时只告警、不阻断启动——代码里的领取已经能防止新的重复。
+	//
+	// 建索引前先清掉历史重复：旧版本可能已经留下这种数据，不清的话索引建不上，
+	// 而那些**未使用的重复记录仍然可用**——等于漏洞还在。
+	if err := dedupeMailCredentials(db); err != nil {
+		log.Printf("[store] 清理重复的邮件凭据失败（唯一索引可能建不上）：%v", err)
+	}
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq
 		 ON lt_email_codes(mail_id) WHERE mail_id > 0`,
 	).Error; err != nil {
-		log.Printf("[store] 验证码来源唯一索引未建立（历史数据可能有重复，请人工清理后重启）：%v", err)
+		log.Printf("[store] 验证码来源唯一索引未建立：请人工清理 lt_email_codes 中重复的 mail_id 后重启，"+
+			"否则同一封邮件仍可能激活出多条可用验证码：%v", err)
 	}
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_reset_tokens_mail_uniq
 		 ON lt_password_reset_tokens(mail_id) WHERE mail_id > 0`,
 	).Error; err != nil {
-		log.Printf("[store] 重置令牌来源唯一索引未建立（历史数据可能有重复，请人工清理后重启）：%v", err)
+		log.Printf("[store] 重置令牌来源唯一索引未建立：请人工清理 lt_password_reset_tokens 中重复的 mail_id 后重启，"+
+			"否则同一封邮件仍可能激活出多条可用令牌：%v", err)
 	}
 
 	// 清理旧版本遗留的邮件草稿，见 purgeLegacyMailDrafts 的说明。
@@ -160,6 +166,37 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	}
 
 	return db, nil
+}
+
+// dedupeMailCredentials 清理「同一封邮件激活出多条凭据」的历史数据。
+//
+// 旧版本在多实例下可能并发激活同一封邮件：两边的「已激活」检查都落空，
+// 各插一条相同验证码/令牌。校验时只消费命中的那一条，其余几条**仍然可用**，
+// 一次性语义已经破了——不只是索引建不上那么简单。
+//
+// 每组只保留 id 最大的一条（与「最新凭据胜出」的口径一致）。已使用过的
+// 重复记录一并删掉：它们不能再被使用，留着只会挡住唯一索引。
+func dedupeMailCredentials(db *gorm.DB) error {
+	tables := []struct{ name, label string }{
+		{"lt_email_codes", "验证码"},
+		{"lt_password_reset_tokens", "重置令牌"},
+	}
+	for _, tb := range tables {
+		res := db.Exec(fmt.Sprintf(
+			`DELETE FROM %s
+			  WHERE mail_id > 0
+			    AND id NOT IN (
+			        SELECT MAX(id) FROM %s WHERE mail_id > 0 GROUP BY mail_id
+			    )`, tb.name, tb.name))
+		if res.Error != nil {
+			return fmt.Errorf("清理重复%s失败: %w", tb.label, res.Error)
+		}
+		if res.RowsAffected > 0 {
+			log.Printf("[store] 已清理 %d 条重复的邮件%s（同一封邮件只保留最新一条）",
+				res.RowsAffected, tb.label)
+		}
+	}
+	return nil
 }
 
 // purgeLegacyMailDrafts 把旧版本遗留的邮件草稿按失败处理，并清空敏感内容。

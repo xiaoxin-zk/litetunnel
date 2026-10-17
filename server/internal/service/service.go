@@ -200,12 +200,6 @@ type Services struct {
 	// 只在采集协程里读写；用原子量是因为测试也会并发调用 collectTraffic。
 	collectorOwned atomic.Bool
 
-	// collectorStarted 表示本进程是否已经拿到过采集租约。
-	//
-	// 用来区分「首次启动」与「从别的实例手里接管」：前者由启动流程负责
-	// 读基线，后者必须重新读一次（自己内存里的基线是旧的）。
-	collectorStarted atomic.Bool
-
 	// guardFullAt 是上一次**全量**准入标记校准的时刻（UnixNano）。
 	//
 	// 常规采集轮次只刷新「本轮有流量」与「计费周期到期」的用户，

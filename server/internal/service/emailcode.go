@@ -101,6 +101,10 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	// 读不到版本就**不入队**：没有快照的载荷在激活时无法证明「期间没改过
 	// 密码」，而放它过去等于给这条恢复通道留一个永久的绕过口。宁可让用户
 	// 稍后重试一次，也不能发出一封无法校验的找回邮件。
+	//
+	// 但对外仍返回成功：这里若把错误抛出去，攻击者就能用「已注册邮箱 +
+	// 触发一次读库失败」把「已注册」与「未注册」（后者静默成功）区分开，
+	// 找回接口立刻退化成账号枚举工具。内部记日志，用户稍后再点一次即可。
 	var resetVersion *int
 	if scene == EmailSceneReset {
 		var u model.User
@@ -108,7 +112,8 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			Select("id", "token_version").
 			Where("lower(email) = ? AND email_verified = ?", strings.ToLower(email), true).
 			First(&u).Error; err != nil {
-			return fmt.Errorf("读取账号版本失败，暂不发送找回验证码: %w", err)
+			log.Printf("[emailcode] 读取找回验证码的账号版本失败，本次不发送（对外仍返回成功）: %v", err)
+			return nil
 		}
 		v := u.TokenVersion
 		resetVersion = &v

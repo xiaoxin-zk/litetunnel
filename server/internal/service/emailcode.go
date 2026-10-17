@@ -35,6 +35,12 @@ const (
 	EmailSceneRegister = "register"
 	// EmailSceneReset 找回密码：绝不暴露邮箱是否注册过。
 	EmailSceneReset = "reset"
+	// EmailSceneChange 更换邮箱：验证码发到**新地址**，同样要求未被他人占用。
+	//
+	// 为什么必须单独一个场景而不是复用 register：两者的限流冷却、
+	// 旧码作废范围都按场景划分；混用会让「换个邮箱」和「注册」互相
+	// 作废对方的验证码。
+	EmailSceneChange = "change"
 )
 
 // SendEmailCode 发送一次性邮箱验证码。
@@ -48,7 +54,9 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	if email == "" || !IsValidEmail(email) {
 		return ErrEmailRequired
 	}
-	if scene != EmailSceneRegister && scene != EmailSceneReset {
+	switch scene {
+	case EmailSceneRegister, EmailSceneReset, EmailSceneChange:
+	default:
 		return ErrInvalidParam
 	}
 	if !s.MailEnabled() {
@@ -60,15 +68,18 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return err
 	}
 
-	// 注册场景：邮箱已被占用必须明确告知，否则用户无法继续。
+	// 注册与换绑场景：邮箱已被占用必须明确告知，否则用户无法继续。
 	// 找回场景：**绝不能**暴露邮箱是否注册过，否则本接口会退化成账号枚举工具。
-	if scene == EmailSceneRegister && exists > 0 {
+	if (scene == EmailSceneRegister || scene == EmailSceneChange) && exists > 0 {
 		return ErrEmailTaken
 	}
 
 	kind := model.MailKindEmailCodeRegister
-	if scene == EmailSceneReset {
+	switch scene {
+	case EmailSceneReset:
 		kind = model.MailKindEmailCodeReset
+	case EmailSceneChange:
+		kind = model.MailKindEmailCodeChange
 	}
 
 	// 限流 1：同邮箱同用途的重发冷却。

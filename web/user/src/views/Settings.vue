@@ -18,13 +18,19 @@
             </el-form-item>
 
             <el-form-item label="邮箱" prop="email">
-              <el-input v-model="form.email" placeholder="选填，用于后续找回账号" />
+              <!-- 启用邮件后邮箱只读：换地址要走「验证新邮箱」的流程，
+                   否则拿到被盗会话的人可以先把邮箱改成自己的，再用找回密码接管账号 -->
+              <el-input v-model="form.email" :disabled="mailEnabled" placeholder="选填，用于后续找回账号" />
               <div class="lt-muted hint">
-                平台暂未开通邮件发送，邮箱仅作为联系方式留存。
+                <template v-if="mailEnabled">邮箱用于找回密码。更换需要验证新地址，请点右侧「更换邮箱」。</template>
+                <template v-else>平台暂未开通邮件发送，邮箱仅作为联系方式留存。</template>
               </div>
             </el-form-item>
 
-            <el-button type="primary" :loading="saving" @click="submitProfile">保存资料</el-button>
+            <el-form-item>
+              <el-button type="primary" :loading="saving" @click="submitProfile">保存资料</el-button>
+              <el-button v-if="mailEnabled" @click="openEmailChange">更换邮箱</el-button>
+            </el-form-item>
           </el-form>
         </div>
       </el-col>
@@ -78,6 +84,38 @@
       </div>
     </div>
 
+    <el-dialog v-model="emailVisible" title="更换邮箱" width="460px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="需要两步：先验证新地址"
+        description="验证码会发到新邮箱。邮箱是找回密码的唯一凭据，所以必须确认这个地址确实属于你。"
+        style="margin-bottom: 16px"
+      />
+      <el-form label-width="90px">
+        <el-form-item label="新邮箱">
+          <el-input v-model="emailForm.email" placeholder="新的邮箱地址" />
+        </el-form-item>
+        <el-form-item label="登录密码">
+          <el-input v-model="emailForm.password" type="password" show-password placeholder="确认是本人操作" />
+        </el-form-item>
+        <el-form-item label="验证码">
+          <el-input v-model="emailForm.code" maxlength="6" placeholder="6 位验证码">
+            <template #append>
+              <el-button :disabled="emailCountdown > 0 || sendingEmail" :loading="sendingEmail" @click="sendEmailCode">
+                {{ emailCountdown > 0 ? `${emailCountdown}s` : '发送验证码' }}
+              </el-button>
+            </template>
+          </el-input>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="emailVisible = false">取消</el-button>
+        <el-button type="primary" :loading="confirmingEmail" @click="confirmEmailChange">确认更换</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="deleteVisible" title="确认注销账号" width="440px" :close-on-click-modal="false">
       <el-alert
         type="error"
@@ -107,13 +145,18 @@ const props = defineProps({ profile: Object })
 const router = useRouter()
 // 站点是否启用支付。未启用时不展示余额（没有充值入口，显示它只会造成困惑）。
 const paymentEnabled = ref(false)
+// 站点是否启用邮件。启用后邮箱能用来找回密码，因此**不能**直接改，
+// 必须走「验证新地址」的流程（服务端同样会拒绝直接改）。
+const mailEnabled = ref(false)
 
 onMounted(async () => {
   try {
     const s = await publicApi.settings()
     paymentEnabled.value = !!s?.payment_enabled
+    mailEnabled.value = !!s?.mail_enabled
   } catch {
     paymentEnabled.value = false
+    mailEnabled.value = false
   }
 })
 const reloadProfile = inject('reloadProfile', null)
@@ -126,6 +169,59 @@ const changingPwd = ref(false)
 const deleteVisible = ref(false)
 const deletePassword = ref('')
 const deleting = ref(false)
+
+// 更换邮箱（两步：发码到新地址 → 带码换绑）。
+const emailVisible = ref(false)
+const emailForm = reactive({ email: '', password: '', code: '' })
+const emailCountdown = ref(0)
+const sendingEmail = ref(false)
+const confirmingEmail = ref(false)
+
+function openEmailChange() {
+  emailForm.email = ''
+  emailForm.password = ''
+  emailForm.code = ''
+  emailCountdown.value = 0
+  emailVisible.value = true
+}
+
+async function sendEmailCode() {
+  const email = emailForm.email.trim()
+  if (!email) return ElMessage.warning('请先填写新邮箱')
+  if (!emailForm.password) return ElMessage.warning('请填写登录密码以确认是本人操作')
+  sendingEmail.value = true
+  try {
+    await profileApi.requestEmailChange({ email, password: emailForm.password })
+    ElMessage.success('验证码已发送到新邮箱，请查收')
+    emailCountdown.value = 60
+    const timer = setInterval(() => {
+      emailCountdown.value -= 1
+      if (emailCountdown.value <= 0) clearInterval(timer)
+    }, 1000)
+  } catch (e) {
+    ElMessage.error(e?.message || '发送失败，请稍后重试')
+  } finally {
+    sendingEmail.value = false
+  }
+}
+
+async function confirmEmailChange() {
+  const email = emailForm.email.trim()
+  const code = emailForm.code.trim()
+  if (!email) return ElMessage.warning('请填写新邮箱')
+  if (!code) return ElMessage.warning('请填写验证码')
+  confirmingEmail.value = true
+  try {
+    await profileApi.confirmEmailChange({ email, code })
+    ElMessage.success('邮箱已更换')
+    emailVisible.value = false
+    if (reloadProfile) await reloadProfile()
+  } catch (e) {
+    ElMessage.error(e?.message || '更换失败，请检查验证码')
+  } finally {
+    confirmingEmail.value = false
+  }
+}
 
 const form = reactive({ username: '', nickname: '', email: '' })
 const pwd = reactive({ old_password: '', new_password: '', confirm: '' })

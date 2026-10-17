@@ -50,7 +50,7 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	if err != nil {
 		return a.GetState(), err
 	}
-	if _, err := a.do(context.Background(), http.MethodPost, base+"/api/user/tunnels", apiKey, payload); err != nil {
+	if _, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/tunnels", apiKey, payload); err != nil {
 		return a.GetState(), err
 	}
 	// 建完立刻同步：新建的隧道会带上下发的公网地址，
@@ -103,7 +103,7 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 		return BatchResult{}, a.GetState(), err
 	}
 
-	raw, err := a.do(context.Background(), http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
+	raw, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
 	if err != nil {
 		return BatchResult{}, a.GetState(), err
 	}
@@ -139,7 +139,7 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 		return a.GetState(), err
 	}
 	endpoint := fmt.Sprintf("%s/api/user/tunnels/%d", base, id)
-	if _, err := a.do(context.Background(), http.MethodDelete, endpoint, apiKey, nil); err != nil {
+	if _, err := a.do(a.rootContext(), http.MethodDelete, endpoint, apiKey, nil); err != nil {
 		return a.GetState(), err
 	}
 
@@ -399,7 +399,7 @@ func (a *App) Redeem(code string) (string, State, error) {
 	if err != nil {
 		return "", a.GetState(), err
 	}
-	raw, err := a.do(context.Background(), http.MethodPost, base+"/api/user/redeem", apiKey, payload)
+	raw, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/redeem", apiKey, payload)
 	if err != nil {
 		return "", a.GetState(), err
 	}

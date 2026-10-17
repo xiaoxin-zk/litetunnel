@@ -229,6 +229,10 @@ func New(
 			account.DELETE("/profile", userH.DeleteAccount)
 			account.POST("/logout", userH.Logout)
 			account.PUT("/profile/password", userH.ChangePassword)
+			// 更换邮箱：先给新地址发验证码、再带着验证码换绑。
+			// 直接改 PUT /profile 里的 email 会被拒绝（见 UpdateProfile）。
+			account.POST("/profile/email-code", userH.RequestEmailChange)
+			account.POST("/profile/email", userH.ConfirmEmailChange)
 
 			// 凭据自身的管理：能重置 Key 就等于能复制身份。
 			account.GET("/apikey", userH.GetAPIKey)

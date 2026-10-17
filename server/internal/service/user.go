@@ -501,11 +501,38 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 	}
 
 	if in.Email != nil {
-		email := strings.TrimSpace(*in.Email)
+		email := strings.ToLower(strings.TrimSpace(*in.Email))
 		if email != "" && !IsValidEmail(email) {
 			return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
 		}
-		updates["email"] = email
+		if email != strings.ToLower(strings.TrimSpace(u.Email)) {
+			// 换邮箱必须走验证流程（见 RequestEmailChange）：要有当前密码，
+			// 还要新地址收得到验证码。否则拿到一个被盗会话的人可以先改成
+			// 自己的邮箱，再用「找回密码」把它变成长期接管。
+			if s.MailEnabled() {
+				return nil, fmt.Errorf("%w: 修改邮箱需要验证新地址，请使用「更换邮箱」流程", ErrInvalidParam)
+			}
+			// 站点没开邮件：邮箱只是联系方式，找不回密码，直接保存没有提权风险。
+			// 但必须清掉「已验证」——那个标记针对的是旧地址。
+			//
+			// 唯一性在这里显式判一次：数据库上有 lower(email) 的唯一索引，
+			// 撞上时 update 会失败，而下面那条错误映射是「用户名已被占用」，
+			// 会把一个邮箱问题报成用户名问题。
+			if email != "" {
+				var taken int64
+				if err := s.DB.Model(&model.User{}).
+					Where("email = ? AND id <> ?", email, userID).
+					Count(&taken).Error; err != nil {
+					return nil, err
+				}
+				if taken > 0 {
+					return nil, ErrEmailTaken
+				}
+			}
+			updates["email"] = email
+			updates["email_verified"] = false
+			updates["email_domain"] = truncate(emailDomain(email), 128)
+		}
 	}
 
 	if len(updates) == 0 {
@@ -521,6 +548,107 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 			Update("username", updates["username"]).Error
 	}
 	return s.LoadUser(userID)
+}
+
+// RequestEmailChange 是「更换邮箱」的第一步：校验密码后给**新地址**发验证码。
+//
+// 三道关卡缺一不可：
+//
+//  1. 当前密码 —— 证明操作者是账号本人，而不只是一个被盗的会话令牌；
+//  2. 新邮箱未被他人占用 —— 否则「找回密码」会把验证码发到别人的账号上，
+//     按邮箱查账号的结果也不确定；
+//  3. 新地址收得到验证码 —— 证明这个地址确实属于你（见 ConfirmEmailChange）。
+//
+// 只做格式校验就写库的话，攻击路径是现成的：改邮箱 → 用自己的邮箱收重置码
+// → 设新密码，把一次临时入侵升级成长期控制。
+func (s *Services) RequestEmailChange(userID uint, newEmail, password, ip string) error {
+	u, err := s.LoadUser(userID)
+	if err != nil {
+		return err
+	}
+	if !auth.VerifyPassword(u.Password, password) {
+		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
+	}
+	email := strings.ToLower(strings.TrimSpace(newEmail))
+	if !IsValidEmail(email) {
+		return ErrEmailRequired
+	}
+	if email == strings.ToLower(strings.TrimSpace(u.Email)) {
+		return fmt.Errorf("%w: 新邮箱与当前邮箱相同", ErrInvalidParam)
+	}
+	return s.SendEmailCode(email, EmailSceneChange, ip)
+}
+
+// ConfirmEmailChange 是「更换邮箱」的第二步：校验新地址收到的验证码并换绑。
+func (s *Services) ConfirmEmailChange(userID uint, newEmail, code string) error {
+	email := strings.ToLower(strings.TrimSpace(newEmail))
+	if !IsValidEmail(email) {
+		return ErrEmailRequired
+	}
+
+	var old model.User
+	if err := s.DB.First(&old, userID).Error; err != nil {
+		return ErrNotFound
+	}
+
+	rec, err := s.checkEmailCode(s.DB, email, EmailSceneChange, code)
+	if err != nil {
+		return err
+	}
+
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 唯一性在事务里再判一次：两个账号可能同时确认同一个新邮箱。
+		var taken int64
+		if err := tx.Model(&model.User{}).
+			Where("email = ? AND id <> ?", email, userID).
+			Count(&taken).Error; err != nil {
+			return err
+		}
+		if taken > 0 {
+			return ErrEmailTaken
+		}
+
+		// 消费验证码与换绑必须同生共死：只消费不改，用户得重新申请；
+		// 只改不消费，同一个码还能再用一次。
+		if err := s.consumeEmailCode(tx, rec.ID); err != nil {
+			return err
+		}
+
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+			"email": email,
+			// 新地址刚刚收到并回填了验证码：标记为已验证。
+			// 旧地址的「已验证」不能沿用到新地址上，这正是这里显式赋值的原因。
+			"email_verified": true,
+			"email_domain":   truncate(emailDomain(email), 128),
+		}).Error; err != nil {
+			return err
+		}
+
+		// 旧地址与旧凭据一并作废：换绑之后，旧邮箱收到的重置链接/验证码
+		// 仍然指向这个账号，留着等于给旧邮箱的主人一条后路。
+		if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
+			return err
+		}
+		if old.Email != "" && !strings.EqualFold(old.Email, email) {
+			if err := tx.Where("email = ?", old.Email).Delete(&model.EmailCode{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.MailOutbox{}).
+				Where("to_addr = ? AND kind IN ? AND status IN ?", old.Email,
+					[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
+						model.MailKindEmailCodeChange},
+					[]string{model.MailPending, model.MailDelivered}).
+				Updates(map[string]any{
+					"status":   model.MailFailed,
+					"body":     "",
+					"payload":  "",
+					"last_err": "邮箱已更换，邮件作废",
+				}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // IsValidEmail 做基础格式校验：恰好一个 @，域名部分为合法主机名。
@@ -597,7 +725,7 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 	return tx.Model(&model.MailOutbox{}).
 		Where("to_addr = ? AND kind IN ? AND status IN ?", email,
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
-				model.MailKindEmailCodeRegister},
+				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
 			[]string{model.MailPending, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,

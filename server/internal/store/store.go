@@ -108,6 +108,22 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("创建端口唯一索引失败: %w", err)
 	}
 
+	// 邮箱唯一性由数据库兜底：邮箱是「找回密码」的寻址依据，两条记录共用
+	// 同一个邮箱时，验证码可能发到别人手里。
+	//
+	// 索引建在 lower(email) 上，与查账号时的大小写归一一致；
+	// 用部分索引排除空邮箱（允许没填邮箱的账号）。
+	//
+	// 这里是**尽力而为**：老库里可能已经有重复邮箱（早期没有约束），
+	// 建不上只记警告、不阻断启动——否则升级时整个服务起不来。
+	// 注册与换绑路径上都还有代码级检查，正常运行不会产生新的重复。
+	if err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_users_email_unique
+		 ON lt_users(lower(email)) WHERE email <> ''`,
+	).Error; err != nil {
+		log.Printf("[store] 邮箱唯一索引未建立（历史数据可能存在重复邮箱，请人工清理后重启）：%v", err)
+	}
+
 	// 隧道清单修订号由触发器维护，见 ensureTunnelListRevTriggers 的说明。
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)

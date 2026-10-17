@@ -20,9 +20,27 @@ type sessionInfo struct {
 	LastSeen time.Time
 }
 
+// sameDay 判断两个时刻是否落在同一天（服务端本地时区，与哨兵 key 的
+// 「今天」口径一致）。
+//
+// 用在「旧基线是否还能用」的判断上：frps 的当日累计值跨零点归零，
+// 跨天的旧基线相减会得到负数——调用方把负数当「当天全部流量」处理，
+// 等于把新一天的流量又记一遍。
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
+}
+
 type trafficPair struct {
 	in  int64
 	out int64
+	// seenAt 是这个名字最后一次出现在 frps 列表里的时刻。
+	//
+	// 只用于「本轮没出现的代理要不要保留基线」，不参与增量计算：
+	// 代理因为客户端重连、或分页期间的一删一增而短暂缺席时，若把基线丢掉，
+	// 它下次出现会被当成「此前从未见过」，当天的累计值会被整个再记一遍。
+	seenAt time.Time
 }
 
 // tunnelDelta 单轮采集内某条隧道的流量增量与在线态。
@@ -876,7 +894,23 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	//
 	// 攒在一边之后，失败只是「这一轮不提交」：下一轮仍用旧基线算增量，
 	// 期间的流量会在下次成功时一起补记。
+	// 先继承「今天见过的」旧基线，再覆盖本轮出现过的。
+	//
+	// 本轮没出现的代理**不能**直接丢掉基线：客户端重连、或 frps 分页期间
+	// 发生一删一增导致漏项时，它下一轮会重新出现；那时基线若已被丢弃，
+	// 就会被当成「此前从未见过」，把 frps 的**当天累计值**整个再记一遍
+	// ——用户凭空多扣一大截流量，而且日志里没有任何异常。
+	//
+	// 只保留今天的：frps 的累计值跨零点归零，保留昨天的值反而会算错。
+	// 这同时给内存规模划了界——最多是「今天出现过的代理」。
+	now := time.Now()
 	nextStat := make(map[string]trafficPair, len(proxies))
+	for name, prev := range lastStat {
+		if sameDay(prev.seenAt, now) {
+			nextStat[name] = prev
+		}
+	}
+
 	for _, ref := range refs {
 		p := proxies[ref.idx]
 		u, ok := userByID[ref.userID]
@@ -888,7 +922,7 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			continue
 		}
 
-		cur := trafficPair{in: p.Status.TodayTrafficIn, out: p.Status.TodayTrafficOut}
+		cur := trafficPair{in: p.Status.TodayTrafficIn, out: p.Status.TodayTrafficOut, seenAt: now}
 		prev := lastStat[p.Name]
 		din, dout := cur.in-prev.in, cur.out-prev.out
 		// frps 的当日统计跨零点归零，此时当前值本身就是增量。
@@ -914,8 +948,8 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		}
 		userDeltas[u.ID] += din + dout
 	}
-	// 未匹配到隧道的代理不进新基线，等于顺手清掉了历史残留，
-	// 防止内存随历史代理无限增长。
+	// 未匹配到隧道的代理不进新基线（既不加进来，也不会从继承来的那份里
+	// 保留——它们上轮就没被加过），等于顺手清掉了历史残留。
 	s.Runtime.mu.Unlock()
 
 	s.Runtime.setOnlineTunnels(onlineNow)
@@ -1316,9 +1350,12 @@ func (s *Services) loadTrafficBaseline() bool {
 		return false
 	}
 
+	// 读回来的都是今天的行（上面的 where 已经按日期筛过），seenAt 记成此刻
+	// 即可：它只用于「本轮缺席时是否保留基线」的判断，不参与增量计算。
+	now := time.Now()
 	m := make(map[string]trafficPair, len(rows))
 	for _, r := range rows {
-		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes}
+		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes, seenAt: now}
 	}
 
 	s.Runtime.mu.Lock()

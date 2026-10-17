@@ -91,35 +91,75 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "密码已更新，请重新登录"})
 }
 
+type emailChangeCodeReq struct {
+	Email    string `json:"email" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// RequestEmailChange 更换邮箱的第一步：校验密码后给新地址发验证码。
+func (h *Handler) RequestEmailChange(c *gin.Context) {
+	var req emailChangeCodeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写新邮箱与登录密码")
+		return
+	}
+	err := h.svc.RequestEmailChange(middleware.CurrentUserID(c),
+		req.Email, req.Password, httpx.ClientIP(c))
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"message": "验证码已发送到新邮箱，请查收"})
+}
+
+type emailConfirmReq struct {
+	Email string `json:"email" binding:"required"`
+	Code  string `json:"code" binding:"required"`
+}
+
+// ConfirmEmailChange 更换邮箱的第二步：校验新地址的验证码并换绑。
+func (h *Handler) ConfirmEmailChange(c *gin.Context) {
+	var req emailConfirmReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.BadRequest(c, "请填写新邮箱与验证码")
+		return
+	}
+	if err := h.svc.ConfirmEmailChange(middleware.CurrentUserID(c), req.Email, req.Code); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	httpx.OK(c, gin.H{"message": "邮箱已更换"})
+}
+
 // profileVO 用户信息视图对象。不包含口令与任何密钥字段。
 func (h *Handler) profileVO(u *model.User) gin.H {
 	g := h.svc.EffectiveGroup(u)
 	quota := h.svc.EffectiveQuota(u)
 	vo := gin.H{
-		"id":                u.ID,
-		"username":          u.Username,
-		"nickname":          u.Nickname,
-		"email":             u.Email,
-		"status":            u.Status,
-		"traffic_used":      u.TrafficUsed,
-		"traffic_quota":     quota,
-		"traffic_reset_at":  u.TrafficResetAt,
-		"traffic_exceeded":  h.svc.QuotaExceeded(u),
-		"balance":           u.Balance,
-		"group_expire_at":   u.GroupExpireAt,
-		"api_key_prefix":    u.APIKeyPrefix,
+		"id":                 u.ID,
+		"username":           u.Username,
+		"nickname":           u.Nickname,
+		"email":              u.Email,
+		"status":             u.Status,
+		"traffic_used":       u.TrafficUsed,
+		"traffic_quota":      quota,
+		"traffic_reset_at":   u.TrafficResetAt,
+		"traffic_exceeded":   h.svc.QuotaExceeded(u),
+		"balance":            u.Balance,
+		"group_expire_at":    u.GroupExpireAt,
+		"api_key_prefix":     u.APIKeyPrefix,
 		"api_key_created_at": u.APIKeyCreatedAt,
-		"created_at":        u.CreatedAt,
-		"last_login_at":     u.LastLoginAt,
+		"created_at":         u.CreatedAt,
+		"last_login_at":      u.LastLoginAt,
 	}
 	if g != nil {
 		vo["group"] = gin.H{
-			"id":                  g.ID,
-			"name":                g.Name,
-			"max_tunnels":         g.MaxTunnels,
-			"max_ports":           g.MaxPorts,
-			"traffic_quota":       g.TrafficQuota,
-			"bandwidth_limit":     g.BandwidthLimit,
+			"id":              g.ID,
+			"name":            g.Name,
+			"max_tunnels":     g.MaxTunnels,
+			"max_ports":       g.MaxPorts,
+			"traffic_quota":   g.TrafficQuota,
+			"bandwidth_limit": g.BandwidthLimit,
 			// 给用户看的文案用 Human 版本（Mbps 口径），
 			// 与后台分组表单填写的数字保持一致。
 			"bandwidth_limit_str": service.FormatBandwidthHuman(g.BandwidthLimit),

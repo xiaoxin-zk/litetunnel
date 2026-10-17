@@ -53,6 +53,11 @@ func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
 	if err == nil {
 		t.Fatal("分组有效期已过时兑换分组码应被拒绝（否则码被核销、用户仍被回落默认组）")
 	}
+	// 必须是业务错误：普通 error 会掉进统一错误处理的 500 分支，
+	// 用户看到「服务内部错误」而不是「先兑换时长码」。
+	if !errors.Is(err, ErrMembershipExpired) {
+		t.Fatalf("应返回 ErrMembershipExpired（映射为 400），实际: %v", err)
+	}
 	if !strings.Contains(err.Error(), "过期") {
 		t.Fatalf("错误信息应说明有效期已过，实际: %v", err)
 	}

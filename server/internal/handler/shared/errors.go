@@ -136,6 +136,9 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrCodeInvalid),
 		errors.Is(err, service.ErrCodeUsed),
 		errors.Is(err, service.ErrCodeExpired),
+		// 分组已过期的兑换被拒：用户可自行解决（先兑换时长码），
+		// 必须给出实际原因，不能掉进 500 变成「服务内部错误」。
+		errors.Is(err, service.ErrMembershipExpired),
 		errors.Is(err, service.ErrRegisterClosed),
 		errors.Is(err, service.ErrCaptchaInvalid),
 		errors.Is(err, service.ErrEmailRequired),

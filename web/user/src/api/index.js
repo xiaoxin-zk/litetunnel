@@ -84,6 +84,10 @@ export const profileApi = {
   get: () => http.get('/profile'),
   update: (data) => http.put('/profile', data),
   changePassword: (data) => http.put('/profile/password', data),
+  // 更换邮箱分两步：先给新地址发验证码（需要登录密码），再带验证码换绑。
+  // 直接改 PUT /profile 里的 email 在启用邮件时会被服务端拒绝。
+  requestEmailChange: (data) => http.post('/profile/email-code', data),
+  confirmEmailChange: (data) => http.post('/profile/email', data),
   // 注销需要密码二次确认，放在 body 里传递
   deleteAccount: (password) => http.delete('/profile', { data: { password } })
 }

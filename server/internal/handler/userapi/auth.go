@@ -235,6 +235,14 @@ func (h *Handler) SendEmailCode(c *gin.Context) {
 		httpx.BadRequest(c, "请填写邮箱")
 		return
 	}
+	// 公开接口只允许注册与找回两种场景。
+	//
+	// 「更换邮箱」的验证码必须由已登录的换绑接口发出（它还要求登录密码）：
+	// 放行到这里，等于让任何人都能给任意地址发「换绑验证码」。
+	if req.Scene != service.EmailSceneRegister && req.Scene != service.EmailSceneReset {
+		httpx.BadRequest(c, "参数格式不正确")
+		return
+	}
 	if err := h.svc.SendEmailCode(req.Email, req.Scene, httpx.ClientIP(c)); err != nil {
 		shared.Fail(c, err)
 		return

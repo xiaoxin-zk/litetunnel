@@ -409,6 +409,11 @@ const (
 	MailKindEmailCodeRegister = "email_code_register"
 	// MailKindEmailCodeReset 找回密码的邮箱验证码。
 	MailKindEmailCodeReset = "email_code_reset"
+	// MailKindEmailCodeChange 更换邮箱时发给**新地址**的验证码。
+	//
+	// 单独一种而不是复用上面两种：作废旧凭据、限流计数、注销清理都按
+	// 类型/场景区分，混用会让「换邮箱」与「注册验证」互相干扰。
+	MailKindEmailCodeChange = "email_code_change"
 	// MailKindResetLink 找回密码的重置链接。
 	MailKindResetLink = "reset_link"
 )

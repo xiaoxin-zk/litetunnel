@@ -2992,12 +2992,20 @@ func TestAdminDeleteUserClosesFirewallPorts(t *testing.T) {
 type fakeFrpsTraffic struct {
 	*httptest.Server
 	total atomic.Int64
+	// absent 为真时这一轮列表里没有该代理：模拟客户端重连、或分页期间
+	// 一删一增造成的短暂缺席。
+	absent atomic.Bool
 }
 
 func newFakeFrpsTraffic(proxy string) *fakeFrpsTraffic {
 	f := &fakeFrpsTraffic{}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if f.absent.Load() {
+			_, _ = w.Write([]byte(
+				`{"code":200,"msg":"success","data":{"total":0,"page":1,"pageSize":200,"items":[]}}`))
+			return
+		}
 		fmt.Fprintf(w,
 			`{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":200,"items":[{"name":%q,"status":{"phase":"online","todayTrafficIn":%d,"todayTrafficOut":0,"curConns":0}}]}}`,
 			proxy, f.total.Load())
@@ -3012,6 +3020,68 @@ func tunnelTrafficUsed(t *testing.T, svc *Services, id uint) int64 {
 		t.Fatalf("读隧道失败: %v", err)
 	}
 	return tun.TrafficUsed
+}
+
+// TestCollectTrafficKeepsBaselineForAbsentProxy 覆盖「代理短暂缺席后被重复计费」。
+//
+// 基线（Runtime.lastStat）原先每轮按**本轮看到的代理**整体替换，没出现的直接
+// 丢弃。可代理缺席一轮是常见事：客户端重连、frps 分页期间一删一增的错位都会
+// 造成它。它重新出现时基线已经没了，于是「当前值 - 0」= frps 的当天累计值被
+// 整个再记一遍——用户凭空多扣一大截流量，日志里却什么都没有。
+func TestCollectTrafficKeepsBaselineForAbsentProxy(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	u := &model.User{Username: "absentuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20001,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	proxy := FrpUserOf(u.ID) + ".mc"
+	frps := newFakeFrpsTraffic(proxy)
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+
+	frps.total.Store(5000)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 5000 {
+		t.Fatalf("首轮应记 5000，实际 %d", got)
+	}
+
+	// 这一轮列表里没有这条代理：不该产生流量，基线也不能丢。
+	frps.absent.Store(true)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 5000 {
+		t.Fatalf("代理缺席的一轮不该产生流量，实际 %d", got)
+	}
+	svc.Runtime.mu.RLock()
+	prev, kept := svc.Runtime.lastStat[proxy]
+	svc.Runtime.mu.RUnlock()
+	if !kept {
+		t.Fatal("短暂缺席不该丢掉采样基线：重新出现时会把当天累计值整个再记一遍")
+	}
+	if prev.in != 5000 {
+		t.Fatalf("保留的基线值不对: got %d want 5000", prev.in)
+	}
+
+	// 重新出现：只补记新增的 300，而不是当天的 5300。
+	frps.absent.Store(false)
+	frps.total.Store(5300)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 5300 {
+		t.Fatalf("重新出现应只补记新增流量，实际 %d（丢掉基线会变成 10300）", got)
+	}
 }
 
 // TestCollectTrafficKeepsBaselineWhenFlushFails 覆盖「落库失败永久漏记流量」。

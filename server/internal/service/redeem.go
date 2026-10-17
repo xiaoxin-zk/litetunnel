@@ -292,8 +292,8 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			// 让用户先兑换时长码再回来兑换：这种情况下报错才是对用户有利的。
 			now := time.Now()
 			if u.GroupExpireAt != nil && !u.GroupExpireAt.After(now) {
-				return fmt.Errorf("当前分组有效期已于 %s 过期，请先兑换时长码，再兑换本分组码",
-					u.GroupExpireAt.Format("2006-01-02"))
+				return fmt.Errorf("%w（%s），请先兑换时长码再兑换本分组码",
+					ErrMembershipExpired, u.GroupExpireAt.Format("2006-01-02"))
 			}
 
 			updates["group_id"] = g.ID

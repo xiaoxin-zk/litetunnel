@@ -58,7 +58,7 @@ var errMailActionObsolete = errors.New("目标账号已不存在，凭据动作�
 // 用户原有的凭据仍然可用，可以随时再试。
 func (s *Services) applyMailAction(row model.MailOutbox) error {
 	switch row.Kind {
-	case model.MailKindEmailCodeRegister, model.MailKindEmailCodeReset:
+	case model.MailKindEmailCodeRegister, model.MailKindEmailCodeReset, model.MailKindEmailCodeChange:
 		return s.activateEmailCode(row)
 	case model.MailKindResetLink:
 		return s.activateResetToken(row)

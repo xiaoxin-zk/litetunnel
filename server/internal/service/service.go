@@ -52,6 +52,12 @@ var (
 	ErrCodeDisabled    = errors.New("兑换码已被禁用")
 	ErrInvalidParam    = errors.New("参数不合法")
 
+	// ErrMembershipExpired 表示账号当前的分组有效期已过，需要先续期。
+	//
+	// 单独一个哨兵而不是普通 error：它要映射成 4xx（用户可自行解决），
+	// 掉进默认分支就变成 500「服务内部错误」，用户以为系统坏了。
+	ErrMembershipExpired = errors.New("当前分组有效期已过期")
+
 	// ErrTOTPRequired 表示账号已启用双因素认证但本次未提交动态口令。
 	// 与 ErrTOTPInvalid 区分开：前者只是没填，不应计入暴力破解次数。
 	ErrTOTPRequired = errors.New("该账号已启用双因素认证，请输入动态口令")

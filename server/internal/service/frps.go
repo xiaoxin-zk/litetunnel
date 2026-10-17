@@ -64,10 +64,15 @@ type FrpsProxy struct {
 }
 
 type frpsPage[T any] struct {
-	Total    int `json:"total"`
-	Page     int `json:"page"`
-	PageSize int `json:"pageSize"`
-	Items    []T `json:"items"`
+	// Total 用指针：必须区分「字段缺失」与「total 明确为 0」。
+	//
+	// 解成普通 int 时，缺字段会默认 0；一旦 items 也恰好为空，就会被当成
+	// 「frps 明确表示没有任何代理」——采集器据此把所有隧道判成离线，
+	// 而真实情况是我们根本没读懂响应（版本不兼容、被中间层改写……）。
+	Total    *int `json:"total"`
+	Page     int  `json:"page"`
+	PageSize int  `json:"pageSize"`
+	Items    []T  `json:"items"`
 }
 
 // frpsSuccessCode 是 frps v0.71 管理接口的成功码。
@@ -161,16 +166,22 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 			return nil, err
 		}
 
+		if out.Total == nil {
+			// total 缺失 = 读不懂这份响应，**不能**按「0 条」处理：
+			// 那会让采集器把全部隧道判成离线（items 也恰好为空时尤其隐蔽）。
+			return nil, fmt.Errorf("frps 代理列表缺少 total 字段（第 %d 页），无法确认完整性", page)
+		}
+
 		if total < 0 {
-			total = out.Total
+			total = *out.Total
 			// 提前判上限：total 明摆着超出能力时，不必真翻满 500 页再报错。
 			if total > frpsMaxPages*frpsPageSize {
 				return nil, fmt.Errorf("frps 报告代理数 %d 条，超过采集上限 %d 条",
 					total, frpsMaxPages*frpsPageSize)
 			}
-		} else if out.Total != total {
+		} else if *out.Total != total {
 			return nil, fmt.Errorf("%w：第 %d 页 total=%d，第 1 页是 %d",
-				errFrpsListUnstable, page, out.Total, total)
+				errFrpsListUnstable, page, *out.Total, total)
 		}
 
 		for _, p := range out.Items {

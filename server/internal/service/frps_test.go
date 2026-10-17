@@ -256,6 +256,27 @@ func TestListProxiesRejectsShortPageWithRemainingTotal(t *testing.T) {
 	}
 }
 
+// TestListProxiesRejectsMissingTotalWithEmptyItems 覆盖「缺 total + 空 items」。
+//
+// total 解成普通 int 时缺字段会默认 0，配上空 items 就成了「frps 明确告诉我们
+// 没有任何代理」——采集器据此把所有隧道判成离线，而真实情况是我们没读懂响应。
+// 必须与「total: 0 且 items 为空」区分开。
+func TestListProxiesRejectsMissingTotalWithEmptyItems(t *testing.T) {
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":200,"msg":"success","data":{"page":1,"pageSize":200,"items":[]}}`))
+	})
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatal("缺少 total 时空列表不能当成「没有代理」，应报错")
+	}
+	if proxies != nil {
+		t.Fatal("读不懂的响应不应返回代理列表")
+	}
+	if !strings.Contains(err.Error(), "total") {
+		t.Fatalf("错误信息应指出缺少 total，实际: %v", err)
+	}
+}
+
 // TestListProxiesRejectsMissingTotalWithShortPage 覆盖「total 缺失 + 短页」。
 //
 // total 缺失会被解码成 0，任何短页原先都「满足完成条件」。

@@ -22,6 +22,51 @@ CADDY_OUT="${ROOT}/deploy/caddy/Caddyfile"
 }
 
 # ---- 解析 .env（不使用 source，避免执行到非预期的内容）----
+#
+# 值的解码与面板 helper 写盘时用的编码（server/cmd/lt-config/envfile.go 的
+# encodeEnvValue）互逆，遵循 Compose dotenv 语义：
+#   - 双引号值：先处理转义序列（\\、\"、\n、\r、\t），再还原 $$ 插值转义；
+#   - 单引号值：按字面保留；
+#   - 裸值：只还原 $$。
+# 原先用 xargs 做两端去空白，顺带会把引号和反斜杠按 xargs 自己的规则拆掉
+# ——helper 为多参数 DNS 配置写出的带引号值到这里就面目全非了。
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "${s}"
+}
+
+decode_env_value() {
+  local raw="$1"
+  local n=${#raw}
+  if (( n < 2 )); then
+    printf '%s' "${raw//\$\$/\$}"
+    return
+  fi
+  local first="${raw:0:1}" last="${raw:n-1:1}"
+  if [[ "${first}" == '"' && "${last}" == '"' ]]; then
+    local inner="${raw:1:n-2}"
+    # 单趟替换：先把转义的反斜杠换成哨兵字符，避免 \" 与 \\ 互相纠缠；
+    # 只处理 Compose 定义的转义序列，未知的保持原样（与 helper 一致）。
+    # \x01 不会出现在 helper 写出的值里（控制字符在写入前就被拒绝）。
+    local sent=$'\x01'
+    inner="${inner//\\\\/${sent}}"
+    inner="${inner//\\\"/\"}"
+    inner="${inner//\\n/$'\n'}"
+    inner="${inner//\\r/$'\r'}"
+    inner="${inner//\\t/$'\t'}"
+    inner="${inner//${sent}/\\}"
+    printf '%s' "${inner//\$\$/\$}"
+    return
+  fi
+  if [[ "${first}" == "'" && "${last}" == "'" ]]; then
+    printf '%s' "${raw:1:n-2}"
+    return
+  fi
+  printf '%s' "${raw//\$\$/\$}"
+}
+
 declare -A VARS=()
 while IFS= read -r line || [[ -n "${line}" ]]; do
   line="${line%$'\r'}"
@@ -30,9 +75,9 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   [[ "${line}" != *=* ]] && continue
   key="${line%%=*}"
   val="${line#*=}"
-  key="$(echo "${key}" | xargs)"
-  val="$(echo "${val}" | xargs)"
-  VARS["${key}"]="${val}"
+  key="$(trim "${key}")"
+  val="$(trim "${val}")"
+  VARS["${key}"]="$(decode_env_value "${val}")"
 done < "${ENV_FILE}"
 
 strip_scheme() {

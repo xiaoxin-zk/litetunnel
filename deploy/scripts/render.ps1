@@ -25,13 +25,46 @@ if (-not (Test-Path $envFile)) {
 }
 
 # ---- Parse .env ----
+# Values must be decoded with the same semantics the panel helper uses when
+# writing them (server/cmd/lt-config/envfile.go, encodeEnvValue), which follows
+# Compose dotenv rules:
+#   - double-quoted values: escape sequences first (\\" \\\\ \\n \\r \\t),
+#     then the $$ interpolation escape;
+#   - single-quoted values: taken literally;
+#   - bare values: only the $$ escape.
+# Without this, a quoted multi-argument DNS configuration (LT_CADDY_DNS_ARGS)
+# would reach the Caddyfile template still wrapped in quotes and collapsed into
+# a single argument.
+function ConvertFrom-DotEnvValue([string]$raw) {
+    if ($null -eq $raw -or $raw -eq '') { return '' }
+    if ($raw.Length -ge 2 -and $raw[0] -eq '"' -and $raw[$raw.Length - 1] -eq '"') {
+        $v = $raw.Substring(1, $raw.Length - 2)
+        # Only the escape sequences Compose defines; unknown ones are left as-is
+        # (matching the helper's decoder). $1 refers to the character after \.
+        $v = [regex]::Replace($v, '\\(["\\nrt])', {
+            param($m)
+            switch ($m.Groups[1].Value) {
+                'n' { "`n" }
+                'r' { "`r" }
+                't' { "`t" }
+                default { $m.Groups[1].Value }
+            }
+        })
+        return $v.Replace('$$', '$')
+    }
+    if ($raw.Length -ge 2 -and $raw[0] -eq "'" -and $raw[$raw.Length - 1] -eq "'") {
+        return $raw.Substring(1, $raw.Length - 2)
+    }
+    return $raw.Replace('$$', '$')
+}
+
 $vars = @{}
 foreach ($line in Get-Content -LiteralPath $envFile -Encoding UTF8) {
     $trimmed = $line.Trim()
     if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
     $idx = $trimmed.IndexOf('=')
     if ($idx -lt 1) { continue }
-    $vars[$trimmed.Substring(0, $idx).Trim()] = $trimmed.Substring($idx + 1).Trim()
+    $vars[$trimmed.Substring(0, $idx).Trim()] = ConvertFrom-DotEnvValue ($trimmed.Substring($idx + 1).Trim())
 }
 
 function Strip-Scheme([string]$v) {

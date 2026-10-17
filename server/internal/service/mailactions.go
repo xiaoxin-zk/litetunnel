@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -95,6 +96,23 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 		return errors.New("验证码缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 找回密码的验证码只对「当前且已验证」的地址有意义。
+		//
+		// 地址被换掉之后（换绑事务可能与本动作交错），旧地址的验证码若照常
+		// 激活，用户在找回页面填新邮箱也查不到它，反倒是旧邮箱持有人拿着
+		// 一个「库里有效」的码——那正是清理之后被反向激活的那条路径。
+		if p.Scene == EmailSceneReset {
+			var bound int64
+			if err := tx.Model(&model.User{}).
+				Where("lower(email) = ? AND email_verified = ?", strings.ToLower(row.To), true).
+				Count(&bound).Error; err != nil {
+				return err
+			}
+			if bound == 0 {
+				return errMailActionObsolete
+			}
+		}
+
 		// 幂等重放：激活成功但写终态失败时，这一步会按原参数再跑一遍。
 		// 凭据仍在（同一摘要，或同一封信激活过——即便它已被用户用掉）
 		// 就直接按成功处理，不重复建记录。
@@ -149,15 +167,20 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return errors.New("重置令牌缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
-		// 账号已被删除：这条链接注定无效，直接作废。
-		// 不检查的话，邮件照样送达、令牌照样落库，用户点开链接会被
-		// 引导去重置一个不存在的账号（见 applyPasswordResetTx 的行数检查）。
-		var alive int64
-		if err := tx.Model(&model.User{}).Where("id = ?", p.UserID).
-			Count(&alive).Error; err != nil {
+		// 收件地址必须仍是该账号**当前且已验证**的邮箱。
+		//
+		// 只查「账号还在」是不够的：换绑邮箱时会把旧地址的待发/待激活邮件
+		// 标成失败，但发送或激活可能与换绑交错——那一步之后若还按 row.To
+		// 激活，就等于在清理之后又把一份指向旧邮箱的令牌写了回来。
+		// 顺带覆盖两种情形：账号已删除、邮箱已被换掉。
+		var bound int64
+		if err := tx.Model(&model.User{}).
+			Where("id = ? AND lower(email) = ? AND email_verified = ?",
+				p.UserID, strings.ToLower(row.To), true).
+			Count(&bound).Error; err != nil {
 			return err
 		}
-		if alive == 0 {
+		if bound == 0 {
 			return errMailActionObsolete
 		}
 		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便

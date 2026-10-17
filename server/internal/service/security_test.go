@@ -1886,7 +1886,8 @@ func TestResetByEmailCodeKeepsCodeWhenPasswordUpdateFails(t *testing.T) {
 	const email = "resetcode@example.com"
 	u := &model.User{
 		Username: "resetcodework", Password: "not-used",
-		Email: email, Status: model.UserStatusActive,
+		// 已验证：找回密码只认已验证的邮箱（未验证的地址从没证明过归属）。
+		Email: email, EmailVerified: true, Status: model.UserStatusActive,
 	}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
@@ -1952,7 +1953,7 @@ func TestWrongEmailCodeStillCountsAttempts(t *testing.T) {
 	const email = "attempts@example.com"
 	u := &model.User{
 		Username: "attemptsuser", Password: "not-used",
-		Email: email, Status: model.UserStatusActive,
+		Email: email, EmailVerified: true, Status: model.UserStatusActive,
 	}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)

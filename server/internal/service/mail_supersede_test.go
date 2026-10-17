@@ -138,7 +138,8 @@ func TestMailActionReplayIdempotent(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	u := &model.User{Username: "replay", Password: "not-used", Status: model.UserStatusActive,
-		Email: "replay@example.com"}
+		// 已验证：重置链接只对账号当前且已验证的邮箱激活（换绑后旧地址的邮件作废）。
+		Email: "replay@example.com", EmailVerified: true}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}

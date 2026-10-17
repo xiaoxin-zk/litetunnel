@@ -84,7 +84,9 @@ func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *servi
 		Username: "forgotuser",
 		Password: "not-used-in-this-test",
 		Email:    "forgot@example.com",
-		Status:   model.UserStatusActive,
+		// 已验证：找回密码只认已验证的邮箱（未验证的地址从没证明过归属）。
+		EmailVerified: true,
+		Status:        model.UserStatusActive,
 	}
 	if err := db.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)

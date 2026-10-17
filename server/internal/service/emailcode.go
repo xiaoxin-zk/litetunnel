@@ -63,8 +63,15 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return ErrMailDisabled
 	}
 
+	// 找回场景只认「已验证」的邮箱：未验证的地址从来没证明过归属，
+	// 不能当作恢复凭据（见 ForgotPassword 的同一条规则）。
+	// 用 lower() 比较：老库里可能存着大小写混写的地址。
+	userQuery := s.DB.Model(&model.User{}).Where("lower(email) = ?", email)
+	if scene == EmailSceneReset {
+		userQuery = userQuery.Where("email_verified = ?", true)
+	}
 	var exists int64
-	if err := s.DB.Model(&model.User{}).Where("email = ?", email).Count(&exists).Error; err != nil {
+	if err := userQuery.Count(&exists).Error; err != nil {
 		return err
 	}
 
@@ -132,7 +139,7 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	//
 	// 投递走异步队列：SMTP 往返可能耗时数秒，
 	// 同步发送会让「邮箱是否存在」通过响应时间泄露出去。
-	if err := s.queueMail(email, subject,
+	row, err := s.queueMail(email, subject,
 		emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())),
 		kind, emailCodePayload{
 			Email:    email,
@@ -144,7 +151,8 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			// 实际上一到手就失效了。
 			TTLSeconds: int(emailCodeTTL.Seconds()),
 			IP:         truncate(ip, 64),
-		}); err != nil {
+		})
+	if err != nil {
 		// 找回场景必须保持「不暴露账号是否存在」：这里已经走完了账号判断，
 		// 返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
 		if scene == EmailSceneReset {
@@ -154,7 +162,71 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
 		return err
 	}
+
+	// 入队后复核：上面的冷却与每日上限都是「先查后写」，并发请求会同时
+	// 读到「还没满」而各自发出。把刚写入的这封也算进去再判一次，
+	// 超了就把它作废——用户收不到，限流才真正生效。
+	if qerr := s.recheckEmailCodeQuota(row); qerr != nil {
+		s.voidMail(row.ID, qerr.Error())
+		if scene == EmailSceneReset {
+			log.Printf("[emailcode] 找回密码验证码超出额度，已作废（邮箱 %s）: %v", maskEmail(email), qerr)
+			return nil
+		}
+		return qerr
+	}
 	return nil
+}
+
+// recheckEmailCodeQuota 在邮件入队之后复核发送额度。
+//
+// 把「刚写入的这一封」纳入统计：冷却窗口内还有前封、或当日总数超过上限，
+// 都说明前置检查与这次写入之间插进了并发请求。返回错误由调用方作废这封。
+//
+// 统计失败一律放行：配额是防滥用手段，不该因为一次计数查询失败
+// 把正常用户挡在门外（与前置检查同一取舍）。
+func (s *Services) recheckEmailCodeQuota(row *model.MailOutbox) error {
+	to := strings.ToLower(strings.TrimSpace(row.To))
+
+	var prev model.MailOutbox
+	err := s.DB.Where("lower(to_addr) = ? AND kind = ? AND id < ?", to, row.Kind, row.ID).
+		Order("id desc").First(&prev).Error
+	if err == nil && time.Since(prev.CreatedAt) < emailCodeResendCooldown {
+		return ErrEmailCodeTooSoon
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	var sent int64
+	if err := s.DB.Model(&model.MailOutbox{}).
+		Where("lower(to_addr) = ? AND created_at >= ?", to, dayStart).
+		Count(&sent).Error; err != nil {
+		return nil
+	}
+	// 含自己在内：正好等于上限是正常的，超过才作废。
+	if sent > int64(emailCodeDailyPerEmail) {
+		return ErrEmailCodeTooMany
+	}
+	return nil
+}
+
+// voidMail 作废一封尚未投递的邮件：不再发送，正文与参数一并清掉。
+//
+// 条件更新（仅 pending）：如果它已经被 worker 取走发出去了，
+// 这里不改状态——那封信的凭据动作会由激活环节按当前账号状态再判一次。
+func (s *Services) voidMail(id uint, reason string) {
+	if err := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND status = ?", id, model.MailPending).
+		Updates(map[string]any{
+			"status":   model.MailFailed,
+			"body":     "",
+			"payload":  "",
+			"last_err": truncate(reason, 255),
+		}).Error; err != nil {
+		log.Printf("[mail] 作废超额邮件失败（id=%d）: %v", id, err)
+	}
 }
 
 // VerifyEmailCode 校验并消费邮箱验证码。

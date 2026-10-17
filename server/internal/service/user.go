@@ -79,11 +79,11 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	skipLimits := trusted && s.Settings.Bool(KeyRegisterTrustedSkipLimits)
 	if !skipLimits {
 		// 单 IP 每日上限：拦住同一台机器批量注册
-		if err := s.checkRegisterRate(in.IP); err != nil {
+		if err := s.checkRegisterRate(s.DB, in.IP, false); err != nil {
 			return nil, err
 		}
 		// 单邮箱域名每日上限：拦住用同一邮箱服务商批量注册
-		if err := s.checkDomainRate(domain); err != nil {
+		if err := s.checkDomainRate(s.DB, domain, false); err != nil {
 			return nil, err
 		}
 	}
@@ -120,7 +120,21 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 				return cerr
 			}
 		}
-		return s.insertUserTx(tx, user)
+		if err := s.insertUserTx(tx, user); err != nil {
+			return err
+		}
+		// 预留式复核：上面的计数与这次写入之间可能插进了并发注册，
+		// 两边都读到「还没满」就会一起写进去。把自己也算进去再判一次，
+		// 超了就让整个事务回滚——用户与验证码都不留下痕迹。
+		if !skipLimits {
+			if err := s.checkRegisterRate(tx, in.IP, true); err != nil {
+				return err
+			}
+			if err := s.checkDomainRate(tx, domain, true); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -135,7 +149,9 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 // 管理员建号是受信操作，不该受这些约束。校验与写入共用，准入各自处理。
 func validateNewUser(username, email, password string) (string, string, error) {
 	username = strings.TrimSpace(username)
-	email = strings.TrimSpace(email)
+	// 邮箱统一小写存库：找回密码按邮箱定位账号，大小写混写会让「同一个地址」
+	// 在库里变成两条不同记录（老数据仍有混写，查询侧统一用 lower(email) 兜住）。
+	email = strings.ToLower(strings.TrimSpace(email))
 	if len(username) < 3 || len(username) > 32 {
 		return "", "", fmt.Errorf("%w: 用户名长度需为 3-32 个字符", ErrInvalidParam)
 	}
@@ -160,18 +176,36 @@ func (s *Services) checkUserUnique(username, email string) error {
 	if exists > 0 {
 		return ErrUsernameTaken
 	}
-	if email == "" {
-		return nil
-	}
-	// 邮箱唯一性：找回密码要靠邮箱定位账号，重复邮箱会让整个流程产生歧义。
-	var emailExists int64
-	if err := s.DB.Model(&model.User{}).Where("email = ?", email).Count(&emailExists).Error; err != nil {
+	taken, err := s.emailTaken(email, 0)
+	if err != nil {
 		return err
 	}
-	if emailExists > 0 {
+	if taken {
 		return ErrEmailTaken
 	}
 	return nil
+}
+
+// emailTaken 判断邮箱是否已被其他账号占用（大小写不敏感）。
+//
+// 必须用 lower(email) 比较：早期版本把邮箱按用户输入原样存库，老数据里
+// 可能存在大小写混写的地址；而数据库上的唯一索引是「尽力而为」的
+// （历史重复时建不起来），这条检查就是它缺席时的唯一防线。
+// exceptID 为 0 表示「不与任何账号比较」（注册场景）。
+func (s *Services) emailTaken(email string, exceptID uint) (bool, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return false, nil
+	}
+	q := s.DB.Model(&model.User{}).Where("lower(email) = ?", email)
+	if exceptID != 0 {
+		q = q.Where("id <> ?", exceptID)
+	}
+	var n int64
+	if err := q.Count(&n).Error; err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // insertUser 写入用户记录：密码哈希、初始 API Key、默认分组。
@@ -292,7 +326,12 @@ func (s *Services) isTrustedEmailDomain(domain string) bool {
 //
 // 与「单 IP 上限」互补：IP 上限挡不住换 IP 的批量注册，
 // 但同一批注册往往共用同一个邮箱服务商，按域名计数能兜住。
-func (s *Services) checkDomainRate(domain string) error {
+//
+// db 由调用方给：前置检查用主连接，事务内复核必须用 tx——
+// SQLite 只开一个连接，事务里再走 s.DB 会自己把自己等死。
+//
+// inclusive 表示统计**包含刚写入的那条**记录，见 overLimit。
+func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) error {
 	if domain == "" {
 		return nil
 	}
@@ -304,22 +343,38 @@ func (s *Services) checkDomainRate(domain string) error {
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	var n int64
-	if err := s.DB.Model(&model.User{}).
+	if err := db.Model(&model.User{}).
 		Where("email_domain = ? AND created_at >= ?", domain, dayStart).
 		Count(&n).Error; err != nil {
 		// 统计失败时放行，理由同 checkRegisterRate。
 		return nil
 	}
-	if n >= int64(limit) {
+	if overLimit(n, limit, inclusive) {
 		return ErrDomainRegisterLimited
 	}
 	return nil
 }
 
+// overLimit 判断计数是否已超出注册上限。
+//
+// inclusive 表示这次统计把**刚写入的这条记录**也算进去了：预留之后，
+// 恰好等于上限是正常的，只有超过才该回滚。两个口径混用会让每天都多放
+// （或误杀）恰好一条记录——这种偏差只看日志根本发现不了。
+func overLimit(n int64, limit int, inclusive bool) bool {
+	if limit <= 0 {
+		return false
+	}
+	if inclusive {
+		return n > int64(limit)
+	}
+	return n >= int64(limit)
+}
+
 // checkRegisterRate 限制单个 IP 在自然日内的注册数量。
 //
 // 按自然日而不是滑动窗口：口径与运营直觉一致，也便于在管理页解释。
-func (s *Services) checkRegisterRate(ip string) error {
+// db / inclusive 的含义见 checkDomainRate。
+func (s *Services) checkRegisterRate(db *gorm.DB, ip string, inclusive bool) error {
 	limit := s.Settings.Int(KeyRegisterMaxPerIP)
 	if limit <= 0 || ip == "" {
 		return nil
@@ -328,13 +383,13 @@ func (s *Services) checkRegisterRate(ip string) error {
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	var n int64
-	if err := s.DB.Model(&model.User{}).
+	if err := db.Model(&model.User{}).
 		Where("register_ip = ? AND created_at >= ?", ip, dayStart).
 		Count(&n).Error; err != nil {
 		// 统计失败时放行：宁可漏拦，也不要因为统计问题挡住正常用户。
 		return nil
 	}
-	if n >= int64(limit) {
+	if overLimit(n, limit, inclusive) {
 		return ErrRegisterLimited
 	}
 	return nil
@@ -473,6 +528,8 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 
 	updates := map[string]any{}
 	renamed := false
+	emailChanged := false
+	var newEmail string
 
 	if in.Username != nil {
 		name := strings.TrimSpace(*in.Username)
@@ -517,28 +574,47 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 			//
 			// 唯一性在这里显式判一次：数据库上有 lower(email) 的唯一索引，
 			// 撞上时 update 会失败，而下面那条错误映射是「用户名已被占用」，
-			// 会把一个邮箱问题报成用户名问题。
-			if email != "" {
-				var taken int64
-				if err := s.DB.Model(&model.User{}).
-					Where("email = ? AND id <> ?", email, userID).
-					Count(&taken).Error; err != nil {
-					return nil, err
-				}
-				if taken > 0 {
-					return nil, ErrEmailTaken
-				}
+			// 会把一个邮箱问题报成用户名问题。用 lower() 比较是为了兜住
+			// 早期存入的大小写混写地址（索引缺失时这条就是唯一防线）。
+			taken, err := s.emailTaken(email, userID)
+			if err != nil {
+				return nil, err
+			}
+			if taken {
+				return nil, ErrEmailTaken
 			}
 			updates["email"] = email
 			updates["email_verified"] = false
-			updates["email_domain"] = truncate(emailDomain(email), 128)
+			emailChanged = true
+			newEmail = email
+			// email_domain 刻意**不**跟着改：它记的是注册来源域名，
+			// 用于「单域名每日注册额度」的统计。跟着改等于用户换一次邮箱
+			// 就把原域名的当日额度退回去，批量注册可以靠换域名无限续杯。
 		}
 	}
 
 	if len(updates) == 0 {
 		return u, nil
 	}
-	if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
+	if emailChanged {
+		// 改邮箱与作废旧地址的凭据必须同一个事务：只改不清理，
+		// 旧邮箱持有人手里的重置链接仍然有效（令牌按用户 ID 生效，
+		// 不核对邮箱），而邮件开关随时可能被重新打开。
+		err := s.DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
+				return err
+			}
+			return purgeEmailCredentialsTx(tx, userID, u.Email)
+		})
+		if err != nil {
+			// 唯一索引冲突（并发改邮箱）按占用处理；前面的显式检查
+			// 已经把绝大多数情况挡在事务之外，这里只是兜住竞态。
+			if taken, _ := s.emailTaken(newEmail, userID); taken {
+				return nil, ErrEmailTaken
+			}
+			return nil, err
+		}
+	} else if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
 		// 唯一索引冲突（并发改名）同样按占用处理。
 		return nil, ErrUsernameTaken
 	}
@@ -600,7 +676,7 @@ func (s *Services) ConfirmEmailChange(userID uint, newEmail, code string) error 
 		// 唯一性在事务里再判一次：两个账号可能同时确认同一个新邮箱。
 		var taken int64
 		if err := tx.Model(&model.User{}).
-			Where("email = ? AND id <> ?", email, userID).
+			Where("lower(email) = ? AND id <> ?", email, userID).
 			Count(&taken).Error; err != nil {
 			return err
 		}
@@ -614,41 +690,56 @@ func (s *Services) ConfirmEmailChange(userID uint, newEmail, code string) error 
 			return err
 		}
 
+		// email_domain 不跟着改：它记的是注册来源域名，用于单域名每日
+		// 注册额度统计。跟着改等于换一次邮箱就把原域名的额度退回去。
 		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
 			"email": email,
 			// 新地址刚刚收到并回填了验证码：标记为已验证。
 			// 旧地址的「已验证」不能沿用到新地址上，这正是这里显式赋值的原因。
 			"email_verified": true,
-			"email_domain":   truncate(emailDomain(email), 128),
 		}).Error; err != nil {
 			return err
 		}
 
 		// 旧地址与旧凭据一并作废：换绑之后，旧邮箱收到的重置链接/验证码
 		// 仍然指向这个账号，留着等于给旧邮箱的主人一条后路。
-		if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
-			return err
-		}
-		if old.Email != "" && !strings.EqualFold(old.Email, email) {
-			if err := tx.Where("email = ?", old.Email).Delete(&model.EmailCode{}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&model.MailOutbox{}).
-				Where("to_addr = ? AND kind IN ? AND status IN ?", old.Email,
-					[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
-						model.MailKindEmailCodeChange},
-					[]string{model.MailPending, model.MailDelivered}).
-				Updates(map[string]any{
-					"status":   model.MailFailed,
-					"body":     "",
-					"payload":  "",
-					"last_err": "邮箱已更换，邮件作废",
-				}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		return purgeEmailCredentialsTx(tx, userID, old.Email)
 	})
+}
+
+// purgeEmailCredentialsTx 作废与某个邮箱地址绑定的恢复凭据。
+//
+// 包括三样：
+//
+//   - 该账号的重置令牌（令牌按 user_id 生效，**不核对邮箱**，
+//     所以换掉邮箱之后旧链接照样能改密码）；
+//   - 发往该地址的验证码记录；
+//   - 已排队或已送达但尚未激活的邮件。
+//
+// 换绑邮箱时必须调用；「未启用邮件时直接改邮箱」也必须调用——
+// 邮件开关随时可能被重新打开，这些历史遗留到那时就是一条后门。
+func purgeEmailCredentialsTx(tx *gorm.DB, userID uint, email string) error {
+	if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
+		return err
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil
+	}
+	if err := tx.Where("lower(email) = ?", email).Delete(&model.EmailCode{}).Error; err != nil {
+		return err
+	}
+	return tx.Model(&model.MailOutbox{}).
+		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", email,
+			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
+				model.MailKindEmailCodeChange},
+			[]string{model.MailPending, model.MailDelivered}).
+		Updates(map[string]any{
+			"status":   model.MailFailed,
+			"body":     "",
+			"payload":  "",
+			"last_err": "邮箱已更换，邮件作废",
+		}).Error
 }
 
 // IsValidEmail 做基础格式校验：恰好一个 @，域名部分为合法主机名。
@@ -719,11 +810,12 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 	if email == "" {
 		return nil
 	}
-	if err := tx.Where("email = ?", email).Delete(&model.EmailCode{}).Error; err != nil {
+	if err := tx.Where("lower(email) = ?", strings.ToLower(email)).
+		Delete(&model.EmailCode{}).Error; err != nil {
 		return err
 	}
 	return tx.Model(&model.MailOutbox{}).
-		Where("to_addr = ? AND kind IN ? AND status IN ?", email,
+		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", strings.ToLower(email),
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
 			[]string{model.MailPending, model.MailDelivered}).

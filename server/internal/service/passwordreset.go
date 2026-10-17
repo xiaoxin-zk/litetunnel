@@ -71,8 +71,12 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	}
 
 	u, err := s.findUserByAccount(account)
-	if err != nil || u.Email == "" || u.Status != model.UserStatusActive {
+	if err != nil || u.Email == "" || !u.EmailVerified || u.Status != model.UserStatusActive {
 		// 静默返回，不区分具体原因。
+		//
+		// 未验证的邮箱一律不发信：它只可能是「邮件关着时随手填的联系方式」，
+		// 从没证明过归属。邮件开关重新打开后若仍按它发重置链接，等于把一个
+		// 随手填的地址变成了恢复入口——而那可能就是别人的邮箱。
 		log.Printf("[reset] 找回密码请求未命中有效账号（输入长度 %d）", len(account))
 		return nil
 	}
@@ -104,7 +108,7 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	// 的判断，此时返回错误会让「已注册 + 入队失败」与「未注册」产生可区分的
 	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
 	// 「重新发送」，也不给枚举留口子。
-	if err := s.queueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
+	if _, err := s.queueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
 		UserID:    u.ID,
 		TokenHash: hash,
 		// 存 TTL 而不是绝对时间：有效期从**送达时刻**起算，否则排队或重试
@@ -254,6 +258,11 @@ func (s *Services) ResetPasswordByEmailCode(account, emailCode, newPassword, ip 
 	if u.Email == "" {
 		return fmt.Errorf("%w: 该账号未绑定邮箱，无法通过邮箱重置，请联系管理员", ErrInvalidParam)
 	}
+	if !u.EmailVerified {
+		// 未验证的邮箱从来没证明过归属，不能当作恢复凭据。
+		// 提示与「验证码不正确」一致：这里不该透露更多账号细节。
+		return ErrEmailCodeWrong
+	}
 	// 先校验验证码，**再**做哈希与密钥生成。
 	//
 	// 顺序很重要：preparePasswordReset 里的 bcrypt 是刻意设计成慢的（防离线
@@ -381,7 +390,10 @@ func (s *Services) finishPasswordReset(userID uint, ip string) {
 // findUserByAccount 支持用用户名或邮箱定位账号。
 func (s *Services) findUserByAccount(account string) (*model.User, error) {
 	var u model.User
-	err := s.DB.Where("username = ? OR email = ?", account, strings.ToLower(account)).First(&u).Error
+	// 邮箱用 lower() 比较：老数据里可能有大小写混写的地址，
+	// 而用户在找回页面填的几乎总是小写。
+	err := s.DB.Where("username = ? OR lower(email) = ?", account, strings.ToLower(account)).
+		First(&u).Error
 	if err != nil {
 		return nil, err
 	}

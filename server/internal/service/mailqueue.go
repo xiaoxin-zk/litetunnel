@@ -62,10 +62,10 @@ func mailRetryDelay(attempts int) time.Duration {
 //
 // 注意「写进发件箱」不等于「已送达」：送达由后台协程负责并带重试，
 // 凭据动作（激活新凭据、作废旧凭据）在**确认送达之后**才执行。
-func (s *Services) queueMail(to, subject, body, kind string, payload any) error {
+func (s *Services) queueMail(to, subject, body, kind string, payload any) (*model.MailOutbox, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rec := model.MailOutbox{
 		To:      to,
@@ -80,10 +80,12 @@ func (s *Services) queueMail(to, subject, body, kind string, payload any) error 
 		// 用「稍后重试」的口径对外：对用户来说这与队列繁忙是一回事，
 		// 而真正的原因（数据库写不进去）已经在日志里。
 		log.Printf("[mail] 写入发件箱失败（收件人 %s）: %v", maskEmail(to), err)
-		return ErrMailQueueFull
+		return nil, ErrMailQueueFull
 	}
 	s.kickMailWorker()
-	return nil
+	// 返回刚写入的记录：调用方要拿它做「入队后复核额度」，
+	// 拿到 ID 才能把超额的那一封作废掉（见 emailcode.go）。
+	return &rec, nil
 }
 
 // kickMailWorker 唤醒发送协程，不必等下一个轮询周期。
@@ -222,9 +224,19 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 		"last_err": "",
 		"body":     "",
 	}
-	if uerr := s.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
-		Updates(updates).Error; uerr != nil {
-		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", row.ID, uerr)
+	// 状态用**条件**更新（仅 pending）：这封信在发送期间可能已经被作废
+	// ——换邮箱会把旧地址的待发邮件标成失败。无条件写回 delivered 会把它
+	// 「复活」，随后激活出一份指向旧邮箱的凭据，清理等于白做。
+	res := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND status = ?", row.ID, model.MailPending).
+		Updates(updates)
+	if res.Error != nil {
+		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", row.ID, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		log.Printf("[mail] 邮件在发送期间已被作废，跳过凭据激活（收件人 %s，类型 %s，id=%d）",
+			maskEmail(row.To), row.Kind, row.ID)
+		return
 	}
 
 	// 本地也同步加一：下面的凭据动作会把尝试次数写回终态，

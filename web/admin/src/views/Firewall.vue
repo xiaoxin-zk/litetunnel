@@ -151,7 +151,11 @@
           {{ pool.pool_start }}-{{ pool.pool_end }}
         </el-descriptions-item>
         <el-descriptions-item label="总容量">{{ pool.total || 0 }}</el-descriptions-item>
-        <el-descriptions-item label="可用">{{ pool.free || 0 }}</el-descriptions-item>
+        <el-descriptions-item label="可用">
+          <!-- 读库失败时空闲量无法计算：显示「未知」而不是一个偏高的数字 -->
+          <span v-if="pool.free_unknown" class="lt-muted">未知</span>
+          <span v-else>{{ pool.free || 0 }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="内核出站端口段">
           <span v-if="pool.ephemeral_start" class="mono">
             {{ pool.ephemeral_start }}-{{ pool.ephemeral_end }}
@@ -164,13 +168,17 @@
         <div class="seg reserved" :style="{ width: pct(pool.reserved?.length) }" />
         <div class="seg system" :style="{ width: pct(pool.system_listening?.length) }" />
         <div class="seg allocated" :style="{ width: pct(pool.allocated?.length) }" />
-        <div class="seg free" :style="{ width: pct(pool.free) }" />
+        <!-- 空闲量未知时不画这一段：按 0 画会与「已占满」混为一谈 -->
+        <div v-if="!pool.free_unknown" class="seg free" :style="{ width: pct(pool.free) }" />
       </div>
       <div class="legend">
         <span><i class="dot reserved" />保留 {{ pool.reserved?.length || 0 }}</span>
         <span><i class="dot system" />系统占用 {{ pool.system_listening?.length || 0 }}</span>
-        <span><i class="dot allocated" />已分配 {{ pool.allocated?.length || 0 }}</span>
-        <span><i class="dot free" />可分配 {{ pool.free || 0 }}</span>
+        <span>
+          <i class="dot allocated" />已分配
+          {{ pool.free_unknown ? '未知' : (pool.allocated?.length || 0) }}
+        </span>
+        <span><i class="dot free" />可分配 {{ pool.free_unknown ? '未知' : (pool.free || 0) }}</span>
         <span class="lt-muted">池范围 {{ pool.pool_start }}-{{ pool.pool_end }}，共 {{ pool.total }} 个</span>
       </div>
 

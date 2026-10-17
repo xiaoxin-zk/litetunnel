@@ -806,8 +806,17 @@ type PortPoolUsage struct {
 	SystemListening []int `json:"system_listening"`
 	// Allocated 是已分配给用户隧道的端口
 	Allocated []int `json:"allocated"`
-	// Free 是仍可分配的端口数量
+	// Free 是仍可分配的端口数量；FreeUnknown 为 true 时它没有意义。
 	Free int `json:"free"`
+	// FreeUnknown 表示「已分配端口读不出来」，空闲量因此无法计算。
+	//
+	// 读库失败时若仍然按「保留 + 系统占用」算一个数出来，管理页会显示一个
+	// 明显偏高的可用量（把已经分配给用户的端口也算成空闲），甚至与「端口
+	// 已经用完」的事实相反——比不显示更糟。此时 Free 置 0 并由这个标记
+	// 表明「未知」，界面据此显示「未知」而不是 0。
+	FreeUnknown bool `json:"free_unknown"`
+	// AllocatedError 是读取已分配端口失败的原因（仅 FreeUnknown 时非空）。
+	AllocatedError string `json:"allocated_error,omitempty"`
 	// Total 是端口池总容量
 	Total int `json:"total"`
 
@@ -858,7 +867,12 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 
 	var used []int
 	if err := s.DB.Model(&model.Tunnel{}).
-		Where("remote_port > 0").Pluck("remote_port", &used).Error; err == nil {
+		Where("remote_port > 0").Pluck("remote_port", &used).Error; err != nil {
+		// 读不出来就**不能**给出空闲数：少了「已分配」这一项，算出来的
+		// 可用量会明显偏高，管理页据此判断「端口还很宽裕」是危险的。
+		u.FreeUnknown = true
+		u.AllocatedError = err.Error()
+	} else {
 		for _, p := range used {
 			if p >= u.PoolStart && p <= u.PoolEnd {
 				u.Allocated = append(u.Allocated, p)
@@ -879,9 +893,15 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 	for _, p := range u.Allocated {
 		usedSet[p] = struct{}{}
 	}
-	u.Free = u.Total - len(usedSet)
-	if u.Free < 0 {
+	if u.FreeUnknown {
+		// 数值没有意义，保持 0 避免老界面把它当成「已用完」之外的怪值；
+		// 是否可信由 FreeUnknown 表达。
 		u.Free = 0
+	} else {
+		u.Free = u.Total - len(usedSet)
+		if u.Free < 0 {
+			u.Free = 0
+		}
 	}
 
 	s.diagnosePortRange(u)
@@ -909,7 +929,15 @@ func (s *Services) diagnosePortRange(u *PortPoolUsage) {
 	}
 
 	// 2. 池内可用端口过少
-	if u.Total > 0 && u.Free*100/u.Total < 10 {
+	//
+	// 空闲量未知时不能判断：按 Free=0 去算只会给出一条「仅剩 0 个」的
+	// 假警报，而真实原因是这次读库失败。如实说明即可。
+	if u.FreeUnknown {
+		u.Advice = append(u.Advice, fmt.Sprintf(
+			"读取已分配端口失败，可用端口数无法确定（%s）。"+
+				"请稍后刷新；这期间「已分配」列表也可能不完整。",
+			u.AllocatedError))
+	} else if u.Total > 0 && u.Free*100/u.Total < 10 {
 		u.Advice = append(u.Advice, fmt.Sprintf(
 			"端口池仅剩 %d 个可用端口（共 %d 个），新建隧道可能因无端口可用而失败",
 			u.Free, u.Total))

@@ -3643,6 +3643,55 @@ func TestPortAllocationSkipsReservedPorts(t *testing.T) {
 	}
 }
 
+// TestPortPoolUsageMarksFreeUnknownOnDBError 覆盖「读库失败仍报空闲端口」。
+//
+// 已分配端口读不出来时，Free 只按「保留 + 系统占用」算：数值明显偏高，
+// 管理页据此以为端口还宽裕，而实际可能早就用完了——比不显示更糟。
+// 此时必须标成未知，并且不能顺手给出「仅剩 0 个」这种由错误本身造成的假警报。
+func TestPortPoolUsageMarksFreeUnknownOnDBError(t *testing.T) {
+	svc := newTestServices(t, &config.Config{PortRangeStart: 31000, PortRangeEnd: 31009})
+	u := &model.User{Username: "poolusage", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 31005,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	usage := svc.PortPoolUsageOf()
+	if usage.FreeUnknown {
+		t.Fatal("读库正常时不该标记为未知")
+	}
+	if usage.Free >= usage.Total {
+		t.Fatalf("已分配 1 个端口，可用数应小于总量 %d，实际 %d", usage.Total, usage.Free)
+	}
+
+	// 让「读已分配端口」失败。
+	if err := svc.DB.Migrator().DropTable(&model.Tunnel{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+	usage = svc.PortPoolUsageOf()
+	if !usage.FreeUnknown {
+		t.Fatal("读已分配端口失败时必须把空闲量标为未知，否则会报出一个偏高的可用量")
+	}
+	if usage.AllocatedError == "" {
+		t.Fatal("应带上失败原因，便于管理员判断这是暂时性故障")
+	}
+	if usage.Free != 0 {
+		t.Fatalf("未知时空闲量应为 0（是否可信由 FreeUnknown 表达），实际 %d", usage.Free)
+	}
+	for _, tip := range usage.Advice {
+		if strings.Contains(tip, "仅剩") {
+			t.Fatalf("空闲量未知时不该给「仅剩 N 个」的结论，实际提示: %s", tip)
+		}
+	}
+}
+
 // TestTrafficResetCrossesInstances 覆盖「清零请求落在别的实例」。
 //
 // 清零标记只存在进程内：多副本时请求落在 B、采集跑在 A，A 看不到那个标记，

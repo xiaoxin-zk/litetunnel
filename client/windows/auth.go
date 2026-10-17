@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,7 +114,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 
 	// 先用 info 接口验证 Key 是否有效，同时拿到账号信息与隧道清单。
 	var info clientInfoData
-	if err := a.getJSON(base+"/api/user/client/info", apiKey, &info); err != nil {
+	if err := a.getJSON(context.Background(), base+"/api/user/client/info", apiKey, &info); err != nil {
 		return a.GetState(), err
 	}
 
@@ -280,7 +281,7 @@ func (a *App) ServerMailEnabled(serverURL string) (bool, error) {
 	var out struct {
 		MailEnabled bool `json:"mail_enabled"`
 	}
-	if err := a.getJSON(base+"/api/public/settings", "", &out); err != nil {
+	if err := a.getJSON(context.Background(), base+"/api/public/settings", "", &out); err != nil {
 		return false, err
 	}
 	return out.MailEnabled, nil
@@ -296,7 +297,7 @@ func (a *App) SendEmailCode(serverURL, email, scene string) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.do(http.MethodPost, base+"/api/user/auth/send-email-code", "", payload)
+	_, err = a.do(context.Background(), http.MethodPost, base+"/api/user/auth/send-email-code", "", payload)
 	return err
 }
 
@@ -322,6 +323,6 @@ func (a *App) ResetPassword(serverURL, account, oldPassword, emailCode, newPassw
 	if err != nil {
 		return err
 	}
-	_, err = a.do(http.MethodPost, base+"/api/user/auth/reset-password", "", payload)
+	_, err = a.do(context.Background(), http.MethodPost, base+"/api/user/auth/reset-password", "", payload)
 	return err
 }

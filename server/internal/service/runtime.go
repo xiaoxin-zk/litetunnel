@@ -57,17 +57,27 @@ type Runtime struct {
 	//
 	// 为什么需要它：清零写的是绝对值（traffic_used = 0），采集写的是增量。
 	// 清零后紧邻一轮的增量是清零**之前**采样的旧流量，照常加回去等于
-	// 「清零完又冒出来」。清零操作在这里登记；flushTraffic 落增量前取走
-	// 标记并在**同一事务**里跳过这些用户——清零时刻之前的增量全部丢弃，
-	// 边界明确。标记先于清零写库登记，因此任何在清零提交后落库的增量
-	// 都会被至少一轮的跳过覆盖住。
+	// 「清零完又冒出来」。清零操作在这里登记；flushTraffic 落增量前对
+	// 标记做快照，并在**同一事务**里跳过这些用户——清零时刻之前的增量
+	// 全部丢弃，边界明确。标记先于清零写库登记，因此任何在清零提交后
+	// 落库的增量都会被至少一轮的跳过覆盖住。
 	//
-	// 两个失败路径都要覆盖：
-	//   - 清零写库失败 → 登记方撤销标记（UnmarkTrafficResetPending），
-	//     否则后续采集会错误丢弃一轮真实用量；
-	//   - 采集事务失败 → flushTraffic 把取走的标记**归还**（Restore...），
-	//     否则基线还停在旧值、标记却没了，下一轮照样把清零前的增量加回。
-	pendingTrafficReset map[uint]bool
+	// 值是**登记代次**（resetSeq 单调递增），而不是布尔值。快照（取走）
+	// 不再把标记从 map 里摘掉：摘掉的话，登记方随后撤销（清零写库失败）
+	// 就只能删到「还没被取走」的标记，采集器手里的旧快照照样按它跳过
+	// ——一次失败的清零仍会丢弃一轮真实用量。现在的做法是快照只读副本，
+	// 事务成功后按代次摘除（consumePendingTrafficResets），失败则原样
+	// 留在 map 里等下一轮，天然不需要「归还」。
+	//
+	// 撤销（UnmarkTrafficResetPending）记录作废代次（resetVoid）：代次
+	// 不大于它的快照一律失效——无论标记还在 map 里、还是已在某次快照
+	// 中，都无法再造成跳过。
+	pendingTrafficReset map[uint]uint64
+
+	// resetSeq 是清零登记的单调代次；resetVoid 记录每个用户最后一次
+	// 撤销时的代次，代次 ≤ 它的快照跳过一律无效（见 pendingTrafficReset）。
+	resetSeq       uint64
+	resetVoidUntil map[uint]uint64
 
 	// guardVer 是准入标记（超额/禁用）的版本号。
 	//
@@ -349,53 +359,74 @@ func (r *Runtime) SetQuotaExceeded(userID uint, v bool) {
 }
 
 // MarkTrafficResetPending 登记一次用量清零（见 pendingTrafficReset）。
+// 重复登记会推进代次：旧快照的跳过对新登记依然成立（跳过只会更保守），
+// 新登记的代次留在 map 里由下一轮快照继续消费。
 func (r *Runtime) MarkTrafficResetPending(userID uint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.resetSeq++
 	if r.pendingTrafficReset == nil {
-		r.pendingTrafficReset = map[uint]bool{}
+		r.pendingTrafficReset = map[uint]uint64{}
 	}
-	r.pendingTrafficReset[userID] = true
+	r.pendingTrafficReset[userID] = r.resetSeq
 }
 
-// takePendingTrafficResets 取走全部待协调的清零标记。
+// takePendingTrafficResets 给清零标记做快照，供 flushTraffic 在事务里
+// 决定跳过谁。
 //
-// 只该被 flushTraffic 在落增量前调用一次：取走即消费，
-// 跳过只作用于紧邻的那一轮采集。
-func (r *Runtime) takePendingTrafficResets() map[uint]bool {
+// 快照**不摘除**标记：摘除的话，事务失败时标记已经不在 map 里，
+// 而登记方随后的撤销（清零写库失败）也拦不住手里的旧快照——两条失败
+// 路径都会漏。现在标记留在原处：事务成功后由 consumePendingTrafficResets
+// 按代次摘除，失败则原样等待下一轮。
+func (r *Runtime) takePendingTrafficResets() map[uint]uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.pendingTrafficReset) == 0 {
 		return nil
 	}
-	out := r.pendingTrafficReset
-	r.pendingTrafficReset = nil
+	out := make(map[uint]uint64, len(r.pendingTrafficReset))
+	for uid, gen := range r.pendingTrafficReset {
+		out[uid] = gen
+	}
 	return out
 }
 
+// resetSkipValid 判断快照里某用户的跳过是否仍然有效：撤销（清零写库失败）
+// 会推进该用户的作废代次，代次不超过它的快照一律失效——否则一次失败的
+// 清零会让采集器丢弃一轮真实用量。
+func (r *Runtime) resetSkipValid(userID uint, gen uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return gen > r.resetVoidUntil[userID]
+}
+
+// consumePendingTrafficResets 在采集事务**成功提交**后摘除已消费的标记。
+// 期间被重新登记的用户（代次已推进）保留新标记，由下一轮继续跳过。
+func (r *Runtime) consumePendingTrafficResets(taken map[uint]uint64) {
+	if len(taken) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for uid, gen := range taken {
+		if r.pendingTrafficReset[uid] == gen {
+			delete(r.pendingTrafficReset, uid)
+		}
+	}
+}
+
 // UnmarkTrafficResetPending 撤销登记：清零写库失败时由登记方调用，
-// 避免后续采集错误丢弃一轮真实用量。
+// 避免后续采集错误丢弃一轮真实用量。撤销同时推进作废代次——
+// 已经被某次快照取走的旧代次一并失效（见 pendingTrafficReset）。
 func (r *Runtime) UnmarkTrafficResetPending(userID uint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.resetSeq++
+	if r.resetVoidUntil == nil {
+		r.resetVoidUntil = map[uint]uint64{}
+	}
+	r.resetVoidUntil[userID] = r.resetSeq
 	delete(r.pendingTrafficReset, userID)
-}
-
-// RestorePendingTrafficResets 归还取走未消费的标记：采集事务失败时由
-// flushTraffic 调用。合并而不是覆盖——归还期间可能有新的清零登记进来。
-func (r *Runtime) RestorePendingTrafficResets(m map[uint]bool) {
-	if len(m) == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.pendingTrafficReset == nil {
-		r.pendingTrafficReset = m
-		return
-	}
-	for uid := range m {
-		r.pendingTrafficReset[uid] = true
-	}
 }
 
 // BumpGuardVer 递增准入标记版本号：管理路径写标记前必须调用，
@@ -716,9 +747,10 @@ func (s *Services) flushTraffic(
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
-	// 在事务**外**取走清零标记：事务失败时要在下面归还。取走即消费
-	// 只对成功提交成立；放在事务回调里的话，回调中途返回错误时标记
-	// 已经不在了，想归还也拿不回来。
+	// 在事务**外**对清零标记做快照：快照只读不摘，事务失败时标记原样
+	// 留在 map 里等下一轮；事务成功后按代次摘除已消费的标记。
+	// （旧实现是「取走即消费、失败再归还」，但归还拦不住登记方紧随其后的
+	// 撤销——一次失败的清零仍会让采集器丢一轮真实用量。）
 	skipUsers := s.Runtime.takePendingTrafficResets()
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
@@ -745,12 +777,16 @@ func (s *Services) flushTraffic(
 
 			// 管理员清零与采集增量的协调（见 pendingTrafficReset）：
 			// 清零后紧邻一轮的增量是清零前采样的旧流量，加回去等于
-			// 「清零完又冒出来」。标记已在事务外取走（skipUsers），
-			// 这里按它跳过——清零时刻之前的增量全部丢弃。
+			// 「清零完又冒出来」。标记已在事务外做快照（skipUsers），
+			// 这里按**仍然有效**的跳过——清零时刻之前的增量全部丢弃。
+			// 登记方撤销（清零写库失败）后快照即刻失效，真实用量照常入账。
 			// 隧道级统计照常累加：清零的是用户的周期用量，
 			// 隧道的累计与日明细不受影响。
 			for uid, delta := range userDeltas {
-				if delta <= 0 || skipUsers[uid] {
+				if delta <= 0 {
+					continue
+				}
+				if gen, ok := skipUsers[uid]; ok && s.Runtime.resetSkipValid(uid, gen) {
 					continue
 				}
 				if err := tx.Model(&model.User{}).Where("id = ?", uid).
@@ -824,12 +860,13 @@ func (s *Services) flushTraffic(
 		return nil
 	})
 	if err != nil {
-		// 事务失败（含提交失败）：基线还停在旧值，标记必须归还，
-		// 否则下一轮把清零前的增量原样加回——「清零完又冒出来」
-		// 正是要防的。合并归还，不覆盖期间新登记的清零。
-		s.Runtime.RestorePendingTrafficResets(skipUsers)
+		// 事务失败（含提交失败）：基线还停在旧值，标记原样留在 map 里，
+		// 下一轮继续按它跳过——「清零完又冒出来」正是要防的。
 		return err
 	}
+	// 成功提交：本轮快照消费完毕。期间被重新登记的用户代次已推进，
+	// consume 只摘除代次未变的，新标记留给下一轮。
+	s.Runtime.consumePendingTrafficResets(skipUsers)
 	return nil
 }
 
@@ -894,28 +931,37 @@ func (s *Services) loadTrafficBaseline() bool {
 // 只查内存，不在这里补齐的话，已禁用的账号在重启后会重新被放行，
 // 直到管理员再动一次那个账号。
 func (s *Services) refreshQuotaFlags() error {
-	// 版本号在**读库之前**取：管理员改动（BumpGuardVer）只要发生在本次
-	// 读库之后，下面的条件写就会识别为「快照已过时」而让路——旧快照
-	// 覆盖掉管理员刚写的超额标记，正是这一版要防的竞态。
-	ver := s.Runtime.GuardVer()
-	var users []model.User
-	if err := s.DB.Preload("Group").Find(&users).Error; err != nil {
-		log.Printf("[quota] 刷新超额标记失败: %v", err)
-		return err
+	// 整轮必须在**版本稳定**的前提下完成：版本号在读库之前取，期间管理员的
+	// 改动（BumpGuardVer）会让剩余的条件写全部让路——那部分用户的标记就
+	// 没刷到，此时绝不能宣告就绪（guardReady），否则插件会按「内存完整」
+	// 放行实际上没有标记的账号。检测到版本变化就换新版本号整轮重试，
+	// 有限次后放弃（不标记就绪，插件继续 fail-closed，下一轮采集再来）。
+	const maxPasses = 3
+	for pass := 0; ; pass++ {
+		ver := s.Runtime.GuardVer()
+		var users []model.User
+		if err := s.DB.Preload("Group").Find(&users).Error; err != nil {
+			log.Printf("[quota] 刷新超额标记失败: %v", err)
+			return err
+		}
+		for i := range users {
+			s.EnsureTrafficPeriod(&users[i])
+			// 快照期间该用户被管理员动过：跳过，内存里保留管理员写的权威值。
+			s.Runtime.SetGuardFlagsIfVer(users[i].ID,
+				s.QuotaExceeded(&users[i]),
+				users[i].Status != model.UserStatusActive,
+				ver)
+		}
+		if s.Runtime.GuardVer() == ver {
+			// 版本全程未变：所有条件写都生效了，整表完整，才能宣告就绪。
+			s.Runtime.markAccessGuardReady()
+			return nil
+		}
+		if pass+1 >= maxPasses {
+			log.Printf("[quota] 配额标记刷新连续 %d 轮被管理操作打断，本轮不宣告就绪（下一轮采集重试）", maxPasses)
+			return nil
+		}
 	}
-	for i := range users {
-		s.EnsureTrafficPeriod(&users[i])
-		// 快照期间该用户被管理员动过：跳过，内存里保留管理员写的权威值，
-		// 下一轮再用新快照覆盖（那时读到的已是新状态）。
-		s.Runtime.SetGuardFlagsIfVer(users[i].ID,
-			s.QuotaExceeded(&users[i]),
-			users[i].Status != model.UserStatusActive,
-			ver)
-	}
-	// 整表刷完才算「状态已知」：中途失败会提前返回，此时只覆盖了一部分账号，
-	// 把剩下那些当成「没超额」正是要防的事。
-	s.Runtime.markAccessGuardReady()
-	return nil
 }
 
 // LoadAccessGuard 从数据库加载准入状态（超额与禁用标记），返回是否成功。
@@ -933,5 +979,9 @@ func (s *Services) LoadAccessGuard() bool {
 		log.Printf("[quota] 加载准入状态失败，在成功加载前将拒绝新建隧道: %v", err)
 		return false
 	}
-	return true
+	// 返回「是否真正就绪」而不是「是否没有报错」：刷新可能被管理操作
+	// 打断而不完整（未标记 guardReady）。返回 false 让采集协程下一轮
+	// 重试，插件侧在这之前继续按「状态未知」拒绝——宁可慢一轮，
+	// 也不能让不完整的标记冒充完整。
+	return s.Runtime.AccessGuardReady()
 }

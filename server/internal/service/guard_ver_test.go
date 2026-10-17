@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -51,12 +52,12 @@ func TestGuardVerBlocksStaleSnapshotWrite(t *testing.T) {
 	}
 }
 
-// TestFlushTrafficRestoresPendingResetOnTxFailure 覆盖「采集事务失败后标记归还」。
+// TestFlushTrafficKeepsMarkOnTxFailure 覆盖「采集事务失败后标记原样保留」。
 //
-// 清零协调标记在事务外取走（skipUsers），事务失败时必须归还：基线还停在
-// 旧值、增量没落库，下一轮会把清零前的旧增量原样加回——「清零完又冒出来」。
-// 归还后紧接着一轮成功采集应继续按标记跳过该用户的旧增量。
-func TestFlushTrafficRestoresPendingResetOnTxFailure(t *testing.T) {
+// 快照（skipUsers）不再摘除标记：事务失败时标记原样留在 map 里，
+// 下一轮继续按它跳过——基线还停在旧值、增量没落库，丢掉标记就会把
+// 清零前的旧增量原样加回（「清零完又冒出来」）。
+func TestFlushTrafficKeepsMarkOnTxFailure(t *testing.T) {
 	svc, _, tun := newEditTestTunnel(t)
 
 	svc.Runtime.MarkTrafficResetPending(tun.UserID)
@@ -75,15 +76,14 @@ func TestFlushTrafficRestoresPendingResetOnTxFailure(t *testing.T) {
 		t.Fatal("日明细表缺失时落库应失败")
 	}
 
-	// 标记必须被归还（取走 → 失败 → 归还），而不是凭空消失。
+	// 标记必须还在（快照不摘除、失败不丢失）。
 	taken := svc.Runtime.takePendingTrafficResets()
-	if !taken[tun.UserID] {
-		t.Fatal("事务失败后清零标记应归还内存，等待下一轮成功采集消费")
+	if len(taken) != 1 {
+		t.Fatalf("事务失败后清零标记应保留在内存，实际 %v", taken)
 	}
-	// 取走归还的那份，模拟下一轮 flushTraffic 的取走动作。
-	svc.Runtime.RestorePendingTrafficResets(taken)
 
-	// 下一轮成功采集：旧增量 500 仍要被跳过——归还的标记继续生效。
+	// 下一轮成功采集：旧增量 500 仍要被跳过；成功后标记按代次摘除，
+	// 之后的轮次恢复正常。
 	if err := svc.flushTraffic(
 		map[uint]*tunnelDelta{},
 		map[uint]int64{tun.UserID: 500},
@@ -92,47 +92,125 @@ func TestFlushTrafficRestoresPendingResetOnTxFailure(t *testing.T) {
 		t.Fatalf("落库失败: %v", err)
 	}
 	if got := userTrafficUsed(t, svc, tun.UserID); got != 0 {
-		t.Fatalf("归还的标记应继续抑制旧增量，实际用量 %d", got)
+		t.Fatalf("保留的标记应继续抑制旧增量，实际用量 %d", got)
+	}
+	if left := svc.Runtime.takePendingTrafficResets(); len(left) != 0 {
+		t.Fatalf("成功提交后标记应被消费摘除，实际 %v", left)
+	}
+	if err := svc.flushTraffic(
+		map[uint]*tunnelDelta{},
+		map[uint]int64{tun.UserID: 300},
+		nil, map[string]trafficPair{}, false,
+	); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+	if got := userTrafficUsed(t, svc, tun.UserID); got != 300 {
+		t.Fatalf("消费后的新增量应正常累加，实际 %d（期望 300）", got)
 	}
 }
 
-// TestRestorePendingTrafficResetsMerges 覆盖「归还与并发登记合并」。
+// TestConsumePreservesRemarkedGeneration 覆盖「消费只摘除代次未变的标记」。
 //
-// 采集事务失败期间可能有新的管理员清零登记进来：归还必须合并而不是
-// 覆盖，否则先登记的那份会被归还操作冲掉。
-func TestRestorePendingTrafficResetsMerges(t *testing.T) {
+// 采集事务进行期间管理员又清零了同一用户（代次推进）：成功提交后，
+// 旧代次被消费，但新登记的代次必须保留——否则第二轮的旧增量会漏掉。
+func TestConsumePreservesRemarkedGeneration(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	svc.Runtime.MarkTrafficResetPending(1)
 	taken := svc.Runtime.takePendingTrafficResets()
 
-	// 归还期间，管理员又清零了另一个用户。
-	svc.Runtime.MarkTrafficResetPending(2)
+	// 事务进行期间，管理员再次清零：代次推进。
+	svc.Runtime.MarkTrafficResetPending(1)
 
-	svc.Runtime.RestorePendingTrafficResets(taken)
+	svc.Runtime.consumePendingTrafficResets(taken)
 
-	// 两份都必须在：先登记的没被覆盖，归还期间新登记的也没丢。
-	merged := svc.Runtime.takePendingTrafficResets()
-	if !merged[1] || !merged[2] {
-		t.Fatalf("合并归还应同时保留旧取走与期间新登记的标记，实际 %v", merged)
+	left := svc.Runtime.takePendingTrafficResets()
+	if len(left) != 1 || !svc.Runtime.resetSkipValid(1, left[1]) {
+		t.Fatalf("新登记的代次应保留且有效，实际 %v", left)
 	}
 }
 
-// TestUnmarkTrafficResetPending 覆盖「登记方写库失败时撤销标记」。
+// TestUnmarkInvalidatesTakenSnapshot 覆盖「撤销同时作废已取走的旧代次」。
 //
-// AdminResetUserTraffic 登记标记后清零写库失败：标记必须撤销，否则后续
-// 采集会错误丢弃一轮**真实**用量（那不是旧增量）。
-func TestUnmarkTrafficResetPending(t *testing.T) {
+// AdminResetUserTraffic 登记标记、清零写库失败后撤销：此时标记可能已被
+// 采集器的快照取走（甚至正在事务里按它跳过）。撤销必须让旧代次的跳过
+// 失效，否则一次失败的清零仍会丢弃一轮**真实**用量——那不是旧增量。
+func TestUnmarkInvalidatesTakenSnapshot(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	svc.Runtime.MarkTrafficResetPending(7)
+	taken := svc.Runtime.takePendingTrafficResets()
+	if !svc.Runtime.resetSkipValid(7, taken[7]) {
+		t.Fatal("前置条件：未撤销时快照的跳过应有效")
+	}
+
+	// 登记方撤销：清零写库失败。
 	svc.Runtime.UnmarkTrafficResetPending(7)
 
+	// 已取走的旧代次即刻失效；map 里的标记也已删除。
+	if svc.Runtime.resetSkipValid(7, taken[7]) {
+		t.Fatal("撤销后旧快照的跳过必须失效，否则会丢弃一轮真实用量")
+	}
 	if taken := svc.Runtime.takePendingTrafficResets(); len(taken) != 0 {
 		t.Fatalf("撤销后不应再有待协调标记，实际 %v", taken)
 	}
 	// 未登记的用户撤销也不报错（幂等）。
 	svc.Runtime.UnmarkTrafficResetPending(999)
+}
+
+// TestRefreshQuotaFlagsYieldsWhenBumped 覆盖「被打断的刷新不得宣告就绪」。
+//
+// 后台刷新逐用户条件写期间，管理操作持续递增版本号：剩余用户的写入全部
+// 让路，整轮不完整。此时若仍标记 guardReady，插件会按「内存完整」放行
+// 实际上没有标记的账号；正确行为是不宣告就绪（插件继续 fail-closed），
+// 并在管理操作停止后的下一轮刷新里恢复正常。
+func TestRefreshQuotaFlagsYieldsWhenBumped(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 用户多一些，拉长单轮耗时，让并发 bump 几乎必然插进每一轮。
+	for i := 0; i < 50; i++ {
+		u := &model.User{Username: fmt.Sprintf("bump%d", i), Password: "not-used",
+			Status: model.UserStatusActive}
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户失败: %v", err)
+		}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				svc.Runtime.BumpGuardVer()
+			}
+		}
+	}()
+
+	err := svc.refreshQuotaFlags()
+	close(stop)
+	<-done
+
+	if err != nil {
+		t.Fatalf("被打断的刷新不返回错误，只是不宣告就绪: %v", err)
+	}
+	if svc.Runtime.AccessGuardReady() {
+		t.Fatal("版本全程被打断的刷新不得宣告就绪，否则插件会按不完整的标记放行")
+	}
+
+	// 管理操作停止后：刷新完整走完，恢复正常就绪。
+	if err := svc.refreshQuotaFlags(); err != nil {
+		t.Fatalf("正常刷新失败: %v", err)
+	}
+	if !svc.Runtime.AccessGuardReady() {
+		t.Fatal("版本稳定的刷新必须宣告就绪")
+	}
+	if !svc.LoadAccessGuard() {
+		t.Fatal("就绪后的加载应报告成功")
+	}
 }
 
 // TestEnsureTrafficPeriodKeepsPreloadedGroup 覆盖「并发重读保留分组关联」。

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"time"
@@ -335,7 +336,13 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 	// 换分组、延长有效期）恰恰是为了让已经超额的账号重新能用——如果 frps
 	// 管理接口恰好不可用，采集刷不动，用户就会看到「兑换成功了，但连接
 	// 依然被拒」，而且等多久都不会恢复。
-	s.refreshQuotaFor(userID)
+	//
+	// 这里**不能**把刷新失败当兑换失败返回：兑换事务已经提交（码已核销、
+	// 权益已发放），报错只会让用户重试一个已作废的码。刷不动就如实记录，
+	// 下一轮采集会纠正标记。
+	if err := s.refreshQuotaFor(userID); err != nil {
+		log.Printf("[redeem] 兑换已成功（用户 %d），但配额标记刷新失败，用户可能要等下一轮采集才能解除拦截: %v", userID, err)
+	}
 	return &result, nil
 }
 

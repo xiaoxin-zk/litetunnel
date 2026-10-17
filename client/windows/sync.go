@@ -38,6 +38,16 @@ const syncInterval = 20 * time.Second
 // 反而更容易触发服务端的限流。
 const configFetchConcurrency = 6
 
+// syncRoundTimeout 是整轮同步中配置拉取阶段的截止时间。
+//
+// 为什么需要它：同步持有 syncMu，启动/停止/退出等手动操作都要等这一轮
+// 跑完。单次请求有 15 秒超时兜底，但「隧道数 × 单次超时 / 并发数」会随
+// 隧道数量无界增长——几十条隧道加一个不通的服务器地址，能把手动操作
+// 挡上几分钟。整轮限时后，超时的部分留给下一轮自动重试（对账本来就是
+// 幂等的，漏掉的隧道下一轮会补上）。
+// 用变量而不是常量：测试里要把它压短来复现超时路径。
+var syncRoundTimeout = 45 * time.Second
+
 // startAutoSync 启动后台自动同步，随应用退出而结束。
 //
 // 为什么必须有它：用户完全可能在网页控制台里加一条隧道，
@@ -128,7 +138,7 @@ func (a *App) applySync() (changed bool, err error) {
 	}
 
 	var data clientInfoData
-	if err := a.getJSON(base+"/api/user/client/info", apiKey, &data); err != nil {
+	if err := a.getJSON(context.Background(), base+"/api/user/client/info", apiKey, &data); err != nil {
 		return false, err
 	}
 	return a.applySyncData(&data)
@@ -327,8 +337,21 @@ func (a *App) applySyncData(data *clientInfoData) (changed bool, err error) {
 		}
 	}
 
-	for res := range a.streamTunnelConfigs(base, apiKey, pending) {
+	// 整轮配置拉取限时：手动操作最多等这么久，超时部分下一轮补齐。
+	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	defer cancel()
+	for res := range a.streamTunnelConfigs(ctx, base, apiKey, pending) {
 		applyCfg(res.tunnel, res.text, res.err)
+	}
+
+	if ctx.Err() != nil {
+		// 超时不算完全成功：SyncErr 要亮出来，否则用户以为同步过了，
+		// 而部分隧道根本没对上账。已处理完的隧道不受影响，保持原状。
+		roundErr := fmt.Errorf("本轮同步超时（超过 %s），未处理的隧道将在下一轮自动重试", syncRoundTimeout)
+		if len(failures) > 0 {
+			roundErr = fmt.Errorf("%w；另有 %d 条隧道同步失败", roundErr, len(failures))
+		}
+		return changed, roundErr
 	}
 
 	if len(failures) > 0 {
@@ -345,10 +368,10 @@ func (a *App) applySyncData(data *clientInfoData) (changed bool, err error) {
 // fetchTunnelConfig 拉取某条隧道专属的配置文本。
 //
 // 只取这一条：配置文件里只有一条 [[proxies]]，进程之间不会互相干扰。
-func (a *App) fetchTunnelConfig(base, apiKey string, id uint) (string, error) {
+func (a *App) fetchTunnelConfig(ctx context.Context, base, apiKey string, id uint) (string, error) {
 	var text string
 	endpoint := fmt.Sprintf("%s/api/user/client/config?tunnel_id=%d", base, id)
-	if err := a.getRaw(endpoint, apiKey, &text); err != nil {
+	if err := a.getRaw(ctx, endpoint, apiKey, &text); err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(text), nil
@@ -374,10 +397,10 @@ type cfgResult struct {
 //
 // 出错也**不中断**：错误作为一条结果流出，由调用方逐条记录，
 // 一条隧道拉取失败不会掩盖其他隧道的对账。
-// 单次请求的超时由 a.http 自己的 Timeout 兜底，这里不再套一层 context：
-// 并发数已经有上限，最坏情况也就是「上限个请求各等一次超时」。
-// 通道在全部结果流出后关闭，调用方 range 到结束即可。
-func (a *App) streamTunnelConfigs(base, apiKey string, tunnels []TunnelVO) <-chan cfgResult {
+// 单次请求的超时由 a.http 自己的 Timeout 兜底；整轮还有 ctx 截止时间
+// （调用方传入），到点后未派发的任务直接放弃，由下一轮同步补上。
+// 通道在全部结果流出（或截止）后关闭，调用方 range 到结束即可。
+func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunnels []TunnelVO) <-chan cfgResult {
 	results := make(chan cfgResult, len(tunnels))
 	if len(tunnels) == 0 {
 		close(results)
@@ -398,20 +421,40 @@ func (a *App) streamTunnelConfigs(base, apiKey string, tunnels []TunnelVO) <-cha
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer wg.Done()
-			for t := range jobs {
-				text, err := a.fetchTunnelConfig(base, apiKey, t.ID)
-				results <- cfgResult{tunnel: t, text: text, err: err}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case t, ok := <-jobs:
+					if !ok {
+						return
+					}
+					text, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
+					select {
+					case results <- cfgResult{tunnel: t, text: text, err: err}:
+					case <-ctx.Done():
+						return
+					}
+				}
 			}
 		}()
 	}
 
 	// 派发与收集分开：派发放在独立协程里，主协程专心收结果。
 	// 若在这里同步派发，jobs 写满时就会和收结果互相卡死。
+	// 派发同样受 ctx 约束：截止后不再派发剩余任务（close(jobs) 让
+	// worker 正常退出，wg.Wait 才不会卡住，results 才能关闭）。
 	go func() {
+		defer close(jobs)
 		for _, t := range tunnels {
-			jobs <- t
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- t:
+			}
 		}
-		close(jobs)
+	}()
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
@@ -470,7 +513,7 @@ func (a *App) startTunnelProcess(t TunnelVO) error {
 	if err != nil {
 		return err
 	}
-	cfgText, err := a.fetchTunnelConfig(base, apiKey, t.ID)
+	cfgText, err := a.fetchTunnelConfig(context.Background(), base, apiKey, t.ID)
 	if err != nil {
 		return err
 	}

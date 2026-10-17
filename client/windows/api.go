@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,16 +88,21 @@ func (a *App) resolveBase(serverURL string) (string, error) {
 	return checkServerURL(serverURL, false)
 }
 
-func (a *App) getJSON(endpoint, token string, out any) error {
-	body, err := a.do(http.MethodGet, endpoint, token, nil)
+// getJSON / getRaw / do 都接受 ctx：同步整轮带截止时间时，
+// 在途的请求也要能被中断——否则截止只是「不再派发新任务」，
+// 已发出的请求仍会等到各自的超时，截止时间形同虚设。
+// 不需要截止时间的调用方传 context.Background()（仍有 http.Client
+// 的 Timeout 兜底）。
+func (a *App) getJSON(ctx context.Context, endpoint, token string, out any) error {
+	body, err := a.do(ctx, http.MethodGet, endpoint, token, nil)
 	if err != nil {
 		return err
 	}
 	return json.Unmarshal(body, out)
 }
 
-func (a *App) getRaw(endpoint, token string, out *string) error {
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+func (a *App) getRaw(ctx context.Context, endpoint, token string, out *string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -119,12 +125,12 @@ func (a *App) getRaw(endpoint, token string, out *string) error {
 	return nil
 }
 
-func (a *App) do(method, endpoint, token string, payload []byte) (json.RawMessage, error) {
+func (a *App) do(ctx context.Context, method, endpoint, token string, payload []byte) (json.RawMessage, error) {
 	var reader io.Reader
 	if payload != nil {
 		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequest(method, endpoint, reader)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return nil, err
 	}

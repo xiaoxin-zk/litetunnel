@@ -37,6 +37,11 @@ type resetLinkPayload struct {
 	IP         string `json:"ip"`
 }
 
+// errMailActionSuperseded 表示该邮件的凭据动作已被**更新的同类凭据**取代，
+// 激活被有意跳过（见 activateEmailCode / activateResetToken 的取代判定）。
+// finishMailAction 据此把记录标成已办结，而不是当成失败去重试。
+var errMailActionSuperseded = errors.New("已被更新的凭据取代")
+
 // applyMailAction 在邮件**确认送达之后**让新凭据生效，并作废同类的旧凭据。
 //
 // # 为什么必须等到送达
@@ -64,6 +69,14 @@ func (s *Services) applyMailAction(row model.MailOutbox) error {
 //
 // 两步放在同一个事务里：中间失败会留下「旧码已废、新码没建」的状态，
 // 与我们要修的问题一模一样。
+//
+// # 顺序问题：只有最新的凭据能生效
+//
+// 较早的邮件送达后激活失败会进退避重试；期间用户又请求了新的验证码，
+// 新邮件可能先一步送达并激活成功。此时旧动作若照常重试，「作废全部旧码」
+// 会把刚生效的新码一起废掉，反而让更早的码活了下来。规则：本邮件入队
+// **之后**创建的、仍未使用的同类记录一律视为更新，旧动作直接放弃
+// （errMailActionSuperseded），以「用户最后一次请求」为准。
 func (s *Services) activateEmailCode(row model.MailOutbox) error {
 	var p emailCodePayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
@@ -73,6 +86,29 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 		return errors.New("验证码缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 幂等重放：激活成功但写终态失败时，这一步会按原参数再跑一遍。
+		// 凭据仍在（未使用、同一摘要）就直接按成功处理，不重复建记录。
+		var same int64
+		if err := tx.Model(&model.EmailCode{}).
+			Where("email = ? AND scene = ? AND code_hash = ? AND used_at IS NULL", p.Email, p.Scene, p.CodeHash).
+			Count(&same).Error; err != nil {
+			return err
+		}
+		if same > 0 {
+			return nil
+		}
+		// 被更新者取代：本邮件入队之后又创建过同类凭据（用户又请求了一次）。
+		// 摘要不同排除了上一步刚查过的自身重放。
+		var newer int64
+		if err := tx.Model(&model.EmailCode{}).
+			Where("email = ? AND scene = ? AND used_at IS NULL AND created_at > ? AND code_hash <> ?",
+				p.Email, p.Scene, row.CreatedAt, p.CodeHash).
+			Count(&newer).Error; err != nil {
+			return err
+		}
+		if newer > 0 {
+			return errMailActionSuperseded
+		}
 		// 同一邮箱同一场景只保留最新一个可用验证码：否则用户连点几次后，
 		// 前面几封邮件里的码也都还能用，等于扩大了攻击面。
 		if err := tx.Model(&model.EmailCode{}).
@@ -92,6 +128,8 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 }
 
 // activateResetToken 创建重置令牌，并作废该账号的旧令牌。
+// 取代判定与幂等重放见 activateEmailCode 的说明——两者的竞态形态一致：
+// 较早邮件的激活重试不得作废较新邮件刚生效的链接。
 func (s *Services) activateResetToken(row model.MailOutbox) error {
 	var p resetLinkPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
@@ -101,6 +139,27 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return errors.New("重置令牌缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 幂等重放：同一令牌仍在（未使用、同一摘要）直接按成功处理。
+		var same int64
+		if err := tx.Model(&model.PasswordResetToken{}).
+			Where("user_id = ? AND token_hash = ? AND used_at IS NULL", p.UserID, p.TokenHash).
+			Count(&same).Error; err != nil {
+			return err
+		}
+		if same > 0 {
+			return nil
+		}
+		// 被更新者取代：本邮件入队之后创建的未使用令牌应当胜出。
+		var newer int64
+		if err := tx.Model(&model.PasswordResetToken{}).
+			Where("user_id = ? AND used_at IS NULL AND created_at > ? AND token_hash <> ?",
+				p.UserID, row.CreatedAt, p.TokenHash).
+			Count(&newer).Error; err != nil {
+			return err
+		}
+		if newer > 0 {
+			return errMailActionSuperseded
+		}
 		// 同一账号只保留一个有效令牌：避免多封邮件里的链接同时可用。
 		if err := tx.Model(&model.PasswordResetToken{}).
 			Where("user_id = ? AND used_at IS NULL", p.UserID).

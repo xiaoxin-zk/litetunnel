@@ -219,6 +219,20 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 // ——用户手里拿着验证码，库里却没有对应记录，谁也救不回来。
 func (s *Services) finishMailAction(row model.MailOutbox) {
 	err := s.applyMailAction(row)
+	if errors.Is(err, errMailActionSuperseded) {
+		// 被更新的同类凭据取代：这是**有意跳过**，不是失败。
+		// 重试没有意义（旧凭据永远不该再压过新凭据），按已办结处理。
+		log.Printf("[mail] 凭据激活已跳过：用户此后又请求了更新的凭据（收件人 %s，类型 %s，id=%d）",
+			maskEmail(row.To), row.Kind, row.ID)
+		s.finishMail(row.ID, mailFinish{
+			status:         model.MailSent,
+			attempts:       row.Attempts,
+			actionAttempts: row.ActionAttempts,
+			lastErr:        "已被更新的凭据取代，未生效",
+			clearSensitive: true,
+		})
+		return
+	}
 	if err == nil {
 		log.Printf("[mail] 凭据已生效（收件人 %s，类型 %s）", maskEmail(row.To), row.Kind)
 		// 凭据已生效：参数（含验证码摘要）也没有保留价值了，一并清掉。

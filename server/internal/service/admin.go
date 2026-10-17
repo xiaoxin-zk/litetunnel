@@ -928,8 +928,7 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
-	s.refreshQuotaFor(id)
-	return nil
+	return s.refreshQuotaFor(id)
 }
 
 // AdminResetUserTraffic 清零用户已用流量。
@@ -1012,8 +1011,7 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) erro
 	// （store.go 里 SetMaxOpenConns(1)）：事务占着那唯一的连接时，
 	// 这次查询永远等不到它释放，而事务又在等查询返回——整个请求就卡死在
 	// 那里。管理后台的表现是「点一下没反应」，日志里什么都没有。
-	s.refreshQuotaFor(id)
-	return nil
+	return s.refreshQuotaFor(id)
 }
 
 // AdminResetUserPassword 重置用户密码。
@@ -1054,13 +1052,18 @@ func (s *Services) AdminResetUserSecret(id uint) (string, error) {
 //
 // 这是管理路径的直写：先递增版本号（见 Runtime.guardVer），
 // 让在途的后台整表刷新识别「快照已过时」并让路。
-func (s *Services) refreshQuotaFor(id uint) {
+//
+// 读取失败必须返回错误：标记留在旧值上（比如「超额」），调用方若把它
+// 当成功上报，管理员会以为调整已生效，而插件还在按旧标记拦截——
+// 「改了配额却没反应」且无处排查。
+func (s *Services) refreshQuotaFor(id uint) error {
 	u, err := s.LoadUser(id)
 	if err != nil {
-		return
+		return fmt.Errorf("刷新配额标记失败（用户 %d）: %w", id, err)
 	}
 	s.Runtime.BumpGuardVer()
 	s.Runtime.SetQuotaExceeded(u.ID, s.QuotaExceeded(u))
+	return nil
 }
 
 // ---- 分组管理 ----
@@ -1184,7 +1187,13 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 	// 而 Runtime.exceeded 是插件实时拦截的依据。不刷新的话要等下一轮成功
 	// 采集才生效——frps 管理接口恰好不可用时，这个标记会一直停在旧值上：
 	// 调低配额后用户还能继续建连接，调高配额后用户仍然被拒。
-	s.refreshQuotaForGroup(id)
+	//
+	// 刷新失败要如实返回：分组本身已更新，但整组标记还停在旧值——
+	// 把它报成成功，管理员不会知道「调低配额后用户仍能建连接」。
+	// 错误信息里点明这一点，管理员重试即可（更新幂等）。
+	if err := s.refreshQuotaForGroup(id); err != nil {
+		return &g, fmt.Errorf("分组已更新，但配额标记刷新失败（本组用户将沿用旧标记，重试本操作或等下一轮采集可纠正）: %w", err)
+	}
 	return &g, nil
 }
 
@@ -1192,19 +1201,21 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 //
 // 一次查询取出该组全部用户（带分组），而不是逐个 LoadUser：
 // 一个分组可能有成百上千个用户，逐个查会把一次管理操作变成一串查询。
-func (s *Services) refreshQuotaForGroup(groupID uint) {
+func (s *Services) refreshQuotaForGroup(groupID uint) error {
 	// 版本号在读库之前取：这是管理路径的直写，同样要让在途的后台
 	// 整表刷新让路（见 Runtime.guardVer）。
 	s.Runtime.BumpGuardVer()
 	var users []model.User
 	if err := s.DB.Preload("Group").Where("group_id = ?", groupID).Find(&users).Error; err != nil {
-		log.Printf("[quota] 刷新分组 %d 的配额标记失败: %v", groupID, err)
-		return
+		// 读取失败必须返回错误：整组标记都停在旧值，调用方不能把这次
+		// 操作当成功上报（见 refreshQuotaFor 的说明）。
+		return fmt.Errorf("刷新分组 %d 的配额标记失败: %w", groupID, err)
 	}
 	for i := range users {
 		s.EnsureTrafficPeriod(&users[i])
 		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
 	}
+	return nil
 }
 
 // DeleteGroup 删除分组。默认分组、仍被占用的分组、仍有未核销升级码的分组

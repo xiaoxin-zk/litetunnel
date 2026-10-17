@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
 )
 
 type clientInfo struct {
@@ -153,7 +152,10 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	// 客户端刻意没有「启动连接」这个步骤——用户已经明确表达过「哪些隧道
 	// 要开着」（隧道自己的开关状态），再让他点一次全局按钮，只会造成
 	// 「开了开关却没连上，还得再点一次」这种状态不一致。
-	if _, err := a.syncLocked(); err != nil {
+	//
+	// 直接复用上面那次 /client/info 的响应：它就是刚取回来的最新状态，
+	// 再请求一次只会白等一个往返（隧道一多，这一等还要串起所有配置请求）。
+	if _, err := a.syncWithData(&info); err != nil {
 		// 同步失败不阻塞接入：凭据已经保存，界面能显示账号信息，
 		// 错误通过 SyncErr 呈现，下一个自动同步周期还会重试。
 		a.setSyncErr(err)

@@ -97,6 +97,14 @@ func (a *App) syncLocked() (changed bool, err error) {
 	return a.applySync()
 }
 
+// syncWithData 与 syncLocked 相同，但接入流程已经拿到过一份 client/info
+// 响应时，直接把它交给同步，省掉一次重复的网络往返。
+func (a *App) syncWithData(data *clientInfoData) (changed bool, err error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	return a.applySyncData(data)
+}
+
 // applySync 拉取隧道清单，并把本机的 frpc 进程对账到服务端说的状态。
 //
 // 对账规则，每条隧道独立判断：
@@ -122,6 +130,22 @@ func (a *App) applySync() (changed bool, err error) {
 	var data clientInfoData
 	if err := a.getJSON(base+"/api/user/client/info", apiKey, &data); err != nil {
 		return false, err
+	}
+	return a.applySyncData(&data)
+}
+
+// applySyncData 执行对账。data 是本轮要采纳的接入信息快照——
+// 正常路径来自刚请求的 /client/info，接入路径来自 Connect 已验证
+// Key 有效的同一次响应。
+func (a *App) applySyncData(data *clientInfoData) (changed bool, err error) {
+	base := a.serverBase()
+
+	a.mu.RLock()
+	apiKey := a.cfg.APIKey
+	a.mu.RUnlock()
+
+	if base == "" || apiKey == "" {
+		return false, errors.New(a.baseReason())
 	}
 
 	a.mu.Lock()
@@ -246,22 +270,23 @@ func (a *App) applySync() (changed bool, err error) {
 		pending = append(pending, t)
 	}
 
-	// 第二遍：并发把要用的配置取回来。
+	// 第二遍起：并发取配置，每收到一条就立刻处理。
 	//
-	// 只并发「取配置」这一件事：后面的写文件、起停进程、记退避、记失败都在改
-	// 同一批共享状态，把它们并发化得把这套状态机重新设计一遍，风险远大于收益。
+	// 只并发「取配置」这一件事：写文件、起停进程、记退避、记失败都在改同一批
+	// 共享状态，把它们并发化得把这套状态机重新设计一遍，风险远大于收益。
 	// 而延迟的大头恰恰是网络往返——逐条串行时整轮耗时约为「隧道数 × 响应时间」，
 	// 隧道一多就会明显拖长，界面上只剩一个「连接中」。
-	cfgs, cfgErrs := a.fetchTunnelConfigs(base, apiKey, pending)
-
-	// 第三遍：按原顺序逐条处理，日志与失败顺序与串行版本保持一致。
-	for _, t := range pending {
-		cfgText := cfgs[t.ID]
-		if err := cfgErrs[t.ID]; err != nil {
+	//
+	// 收到即处理，而不是等全部配置取完再统一启动：单次请求超时可达 15 秒，
+	// 等齐的话最慢的那一条会把已经取到配置的隧道也挡住。所有状态变更
+	// （写文件、起停、记失败）仍然只发生在主协程的这段循环里，
+	// 并发只存在于网络请求。
+	applyCfg := func(t TunnelVO, cfgText string, cfgErr error) {
+		if cfgErr != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
-			failSync(t, "拉取配置失败："+err.Error())
-			continue
+			failSync(t, "拉取配置失败："+cfgErr.Error())
+			return
 		}
 		if cfgText == "" {
 			// 空配置必须当成失败，不能静默跳过。
@@ -270,7 +295,7 @@ func (a *App) applySync() (changed bool, err error) {
 			// 而那条隧道什么都没连上，界面上也没有任何原因——
 			// 用户只能看到一个「连接中」，等多久都不会变。
 			failSync(t, "服务端未返回该隧道的配置")
-			continue
+			return
 		}
 
 		prev := a.appliedConfigOf(t.ID)
@@ -280,7 +305,7 @@ func (a *App) applySync() (changed bool, err error) {
 		case !a.mgr.Running(t.ID):
 			if err := a.writeAndStart(t, cfgText); err != nil {
 				failStart(t, "启动失败："+err.Error())
-				continue
+				return
 			}
 			// 退避已在 writeAndStart 里、启动之前清掉。这里**不能**再清一次：
 			// 进程秒退时退出回调可能已经登记了新退避，这一下会把它抹掉。
@@ -289,14 +314,21 @@ func (a *App) applySync() (changed bool, err error) {
 			// 只重启这一条：其他隧道的连接不受影响。
 			a.emitTunnelLog(t.Name, "配置有变化（"+diffHint(prev, cfgText)+"），正在重连")
 			if err := a.mgr.Stop(t.ID); err != nil {
-				return changed, err
+				// 停不下来属于环境级故障（进程管理器异常）：
+				// 这一条做不了，下一轮同步还会再来。
+				failStart(t, "重连失败：停止旧进程失败："+err.Error())
+				return
 			}
 			if err := a.writeAndStart(t, cfgText); err != nil {
 				failStart(t, "重连失败："+err.Error())
-				continue
+				return
 			}
 			changed = true
 		}
+	}
+
+	for res := range a.streamTunnelConfigs(base, apiKey, pending) {
+		applyCfg(res.tunnel, res.text, res.err)
 	}
 
 	if len(failures) > 0 {
@@ -322,27 +354,34 @@ func (a *App) fetchTunnelConfig(base, apiKey string, id uint) (string, error) {
 	return strings.TrimSpace(text), nil
 }
 
-// fetchTunnelConfigs 并发拉取一批隧道的配置，结果按隧道 ID 回填。
+// cfgResult 是一条隧道的配置拉取结果。
+type cfgResult struct {
+	tunnel TunnelVO
+	text   string
+	err    error
+}
+
+// streamTunnelConfigs 并发拉取一批隧道的配置，结果按**完成顺序**流出。
 //
 // 为什么值得单独做这一步：逐条串行时整轮同步的耗时约等于「隧道数 × 单次往返」，
 // 十几条隧道就能让界面长时间停在「连接中」。而这一步只读网络、不碰本地状态，
 // 是整条链路上唯一能安全并发的一段。
 //
-// 出错也**不中断**：错误按 ID 收集起来，交给调用方按原顺序逐条记录，
-// 这样一条隧道拉取失败不会掩盖其他隧道的对账，日志顺序也和串行版本一致。
+// 返回的是通道而不是汇总好的 map：调用方每收到一条就立刻处理（起进程、记失败），
+// 不必等最慢的那一条。单次请求超时可达 15 秒，先汇总再处理的话，
+// 已经取到配置的隧道会被它挡住整整一个超时周期。代价是处理顺序不再是
+// 隧道清单顺序——日志与失败记录的先后取决于网络快慢，这是可接受的取舍。
+//
+// 出错也**不中断**：错误作为一条结果流出，由调用方逐条记录，
+// 一条隧道拉取失败不会掩盖其他隧道的对账。
 // 单次请求的超时由 a.http 自己的 Timeout 兜底，这里不再套一层 context：
 // 并发数已经有上限，最坏情况也就是「上限个请求各等一次超时」。
-func (a *App) fetchTunnelConfigs(base, apiKey string, tunnels []TunnelVO) (map[uint]string, map[uint]error) {
-	cfgs := make(map[uint]string, len(tunnels))
-	errs := make(map[uint]error, len(tunnels))
+// 通道在全部结果流出后关闭，调用方 range 到结束即可。
+func (a *App) streamTunnelConfigs(base, apiKey string, tunnels []TunnelVO) <-chan cfgResult {
+	results := make(chan cfgResult, len(tunnels))
 	if len(tunnels) == 0 {
-		return cfgs, errs
-	}
-
-	type cfgResult struct {
-		id   uint
-		text string
-		err  error
+		close(results)
+		return results
 	}
 
 	workers := configFetchConcurrency
@@ -353,7 +392,6 @@ func (a *App) fetchTunnelConfigs(base, apiKey string, tunnels []TunnelVO) (map[u
 	jobs := make(chan TunnelVO)
 	// 结果通道带足缓冲：worker 写完就能去领下一个任务，不会因为主协程
 	// 还在处理上一条结果而空等。
-	results := make(chan cfgResult, len(tunnels))
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -362,7 +400,7 @@ func (a *App) fetchTunnelConfigs(base, apiKey string, tunnels []TunnelVO) (map[u
 			defer wg.Done()
 			for t := range jobs {
 				text, err := a.fetchTunnelConfig(base, apiKey, t.ID)
-				results <- cfgResult{id: t.ID, text: text, err: err}
+				results <- cfgResult{tunnel: t, text: text, err: err}
 			}
 		}()
 	}
@@ -378,15 +416,7 @@ func (a *App) fetchTunnelConfigs(base, apiKey string, tunnels []TunnelVO) (map[u
 		close(results)
 	}()
 
-	// 只在主协程写这两个 map，因此不需要锁。
-	for r := range results {
-		if r.err != nil {
-			errs[r.id] = r.err
-			continue
-		}
-		cfgs[r.id] = r.text
-	}
-	return cfgs, errs
+	return results
 }
 
 // writeAndStart 落盘配置并启动该隧道的 frpc 进程。

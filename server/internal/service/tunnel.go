@@ -370,14 +370,32 @@ func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
 	lock.Lock()
 	defer lock.Unlock()
 
+	// 锁内重读：调用方的读发生在取锁之前，删除可能已经先拿到锁并完成。
+	// 不重读的话，随后的零行更新会被当成成功——接口返回 200，
+	// 状态根本没改，用户看到「已停用」的隧道实际还在跑。
+	var cur model.Tunnel
+	if err := s.DB.First(&cur, t.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+	t = &cur
+
 	if err := s.assertTunnelCanEnable(t, status); err != nil {
 		return err
 	}
 
-	if err := s.DB.Model(&model.Tunnel{}).
+	// 零行更新同样不能当成功：重读到更新之间没有数据库级互斥
+	// （用户锁只拦本进程），这条兜底把残余竞态也如实暴露出来。
+	res := s.DB.Model(&model.Tunnel{}).
 		Where("id = ?", t.ID).
-		Update("status", status).Error; err != nil {
-		return err
+		Update("status", status)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
 	}
 
 	if t.RemotePort > 0 {

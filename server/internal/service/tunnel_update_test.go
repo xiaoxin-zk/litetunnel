@@ -93,6 +93,29 @@ func TestUpdateTunnelDoesNotReviveDeletedTunnel(t *testing.T) {
 	}
 }
 
+// TestSetTunnelStatusAfterDeleteIsNotFound 覆盖「状态接口在删除之后到达」。
+//
+// 调用方先读到隧道、再进入用户锁；若删除先拿到锁并完成，状态更新的
+// 零行 UPDATE 原先会被当成成功——接口返回 200，状态根本没改。
+// 现在锁内重读记录，记录已删就返回 NotFound。
+func TestSetTunnelStatusAfterDeleteIsNotFound(t *testing.T) {
+	svc, u, tun := newEditTestTunnel(t)
+
+	// 先手工构造「调用方读到了记录」这一步，再删除。
+	var snapshot model.Tunnel
+	if err := svc.DB.First(&snapshot, tun.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DeleteTunnel(u.ID, tun.ID); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+
+	err := svc.setTunnelStatus(&snapshot, model.TunnelStatusActive)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("对已删除隧道切换状态应返回 NotFound，实际 %v", err)
+	}
+}
+
 // TestTruncateCutsAtRuneBoundary 覆盖「截断不得切断多字节字符」。
 func TestTruncateCutsAtRuneBoundary(t *testing.T) {
 	// 5 个汉字 = 15 字节，上限 7 字节会切在第 3 个字符中间。

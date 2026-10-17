@@ -14,7 +14,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
-	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
@@ -969,7 +968,7 @@ func TestSettingStoreReloadIfChanged(t *testing.T) {
 // 更早的快照只可能应用在更新的写入之前。
 func TestSettingStoreConcurrentReloadKeepsNewest(t *testing.T) {
 	svc := newTestServices(t, &config.Config{})
-	store := svc.Settings
+	settings := svc.Settings
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -982,7 +981,7 @@ func TestSettingStoreConcurrentReloadKeepsNewest(t *testing.T) {
 				return
 			default:
 			}
-			if _, err := store.ReloadIfChanged(); err != nil {
+			if _, err := settings.ReloadIfChanged(); err != nil {
 				return
 			}
 		}
@@ -991,7 +990,7 @@ func TestSettingStoreConcurrentReloadKeepsNewest(t *testing.T) {
 	last := ""
 	for i := 0; i < 30; i++ {
 		last = fmt.Sprintf("%d", 30000+i)
-		if err := store.SetMany(map[SettingKey]string{KeyPortReserved: last}); err != nil {
+		if err := settings.SetMany(map[SettingKey]string{KeyPortReserved: last}); err != nil {
 			close(stop)
 			wg.Wait()
 			t.Fatalf("写入配置失败: %v", err)
@@ -1000,7 +999,7 @@ func TestSettingStoreConcurrentReloadKeepsNewest(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	if got := store.Get(KeyPortReserved); got != last {
+	if got := settings.Get(KeyPortReserved); got != last {
 		t.Fatalf("缓存被更早的快照覆盖了：期望 %q，实际 %q", last, got)
 	}
 }

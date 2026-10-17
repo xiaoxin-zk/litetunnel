@@ -27,13 +27,16 @@ type groupLimit struct {
 
 type clientInfoData struct {
 	clientInfo
-	Username     string      `json:"username"`
-	Nickname     string      `json:"nickname"`
-	Tunnels      []TunnelVO  `json:"tunnels"`
-	TrafficUsed  int64       `json:"traffic_used"`
-	TrafficQuota int64       `json:"traffic_quota"`
-	Exceeded     bool        `json:"exceeded"`
-	Group        *groupLimit `json:"group,omitempty"`
+	Username     string     `json:"username"`
+	Nickname     string     `json:"nickname"`
+	Tunnels      []TunnelVO `json:"tunnels"`
+	TrafficUsed  int64      `json:"traffic_used"`
+	TrafficQuota int64      `json:"traffic_quota"`
+	Exceeded     bool       `json:"exceeded"`
+	// TunnelTotal 是账号的隧道总数（不受分页影响）。
+	// 新服务端才有这个字段；老服务端不返回（0），此时按「一页就是全部」处理。
+	TunnelTotal int64       `json:"tunnel_total"`
+	Group       *groupLimit `json:"group,omitempty"`
 	// BalanceCents 与 PaymentEnabled 一起使用：
 	// 站点未启用支付时客户端不展示任何余额相关内容。
 	BalanceCents   int64 `json:"balance_cents"`
@@ -113,8 +116,12 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	}
 
 	// 先用 info 接口验证 Key 是否有效，同时拿到账号信息与隧道清单。
-	var info clientInfoData
-	if err := a.getJSON(context.Background(), base+"/api/user/client/info", apiKey, &info); err != nil {
+	// 走分页版本：只取一页就把不完整的清单当全量，随后的对账会把
+	// 后面几页的隧道当成「服务端已删除」而停掉本机进程。
+	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	defer cancel()
+	info, err := a.fetchClientInfo(ctx, base, apiKey)
+	if err != nil {
 		return a.GetState(), err
 	}
 
@@ -178,7 +185,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	//
 	// 直接复用上面那次 /client/info 的响应：它就是刚取回来的最新状态，
 	// 再请求一次只会白等一个往返（隧道一多，这一等还要串起所有配置请求）。
-	if _, err := a.syncWithData(&info); err != nil {
+	if _, err := a.syncWithData(info); err != nil {
 		// 同步失败不阻塞接入：凭据已经保存，界面能显示账号信息，
 		// 错误通过 SyncErr 呈现，下一个自动同步周期还会重试。
 		a.setSyncErr(err)

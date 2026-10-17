@@ -101,6 +101,12 @@ func (a *App) getJSON(ctx context.Context, endpoint, token string, out any) erro
 	return json.Unmarshal(body, out)
 }
 
+// maxResponseBytes 是单次响应的读取上限。
+//
+// 超限必须显式报错而不是静默截断：截断后的 JSON 解析会失败，错误信息
+// 只是一句「响应格式异常」，看不出真正原因是「响应太大」。
+const maxResponseBytes = 4 << 20
+
 func (a *App) getRaw(ctx context.Context, endpoint, token string, out *string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -117,12 +123,63 @@ func (a *App) getRaw(ctx context.Context, endpoint, token string, out *string) e
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("服务器返回状态码 %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// 多读一个字节用于判断是否超限。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return err
 	}
+	if len(data) > maxResponseBytes {
+		return fmt.Errorf("服务器响应超过客户端上限（%d MiB）", maxResponseBytes>>20)
+	}
 	*out = string(data)
 	return nil
+}
+
+// clientInfoPageSize 是隧道清单的分页大小。
+//
+// 单页控制在几十 KB：与服务端约定的上限（500）留出余量，也让一次
+// 分页失败的代价尽量小。隧道总数再多，单页大小也不变。
+// 用变量而不是常量：测试里要把它压小来覆盖跨页取全的路径。
+var clientInfoPageSize = 200
+
+// fetchClientInfo 拉取接入信息与**完整**隧道清单。
+//
+// 服务端支持 offset/limit 分页并返回 tunnel_total；老服务端不认这两个
+// 参数、也不返回总数（0），此时等同于「一次取全部」，行为与升级前一致。
+// 只按一页取会漏掉隧道：对账会把「没取到的」当成「服务端已删除」，
+// 进而停掉本机进程、删掉本地配置。
+func (a *App) fetchClientInfo(ctx context.Context, base, apiKey string) (*clientInfoData, error) {
+	var first clientInfoData
+	endpoint := fmt.Sprintf("%s/api/user/client/info?offset=0&limit=%d", base, clientInfoPageSize)
+	if err := a.getJSON(ctx, endpoint, apiKey, &first); err != nil {
+		return nil, err
+	}
+	if first.TunnelTotal <= int64(len(first.Tunnels)) || len(first.Tunnels) == 0 {
+		if first.Tunnels == nil {
+			first.Tunnels = []TunnelVO{}
+		}
+		return &first, nil
+	}
+
+	all := make([]TunnelVO, 0, first.TunnelTotal)
+	all = append(all, first.Tunnels...)
+	for int64(len(all)) < first.TunnelTotal {
+		var page clientInfoData
+		endpoint := fmt.Sprintf("%s/api/user/client/info?offset=%d&limit=%d",
+			base, len(all), clientInfoPageSize)
+		if err := a.getJSON(ctx, endpoint, apiKey, &page); err != nil {
+			// 取到一半失败也必须报错：拿着不完整的清单去对账，
+			// 会把后面几页的隧道当成已删除。
+			return nil, fmt.Errorf("拉取隧道清单第 %d 页失败: %w", len(all)/clientInfoPageSize+1, err)
+		}
+		if len(page.Tunnels) == 0 {
+			// 服务端说还有、这一页却是空的：以拿到的为准，避免死循环。
+			break
+		}
+		all = append(all, page.Tunnels...)
+	}
+	first.Tunnels = all
+	return &first, nil
 }
 
 func (a *App) do(ctx context.Context, method, endpoint, token string, payload []byte) (json.RawMessage, error) {
@@ -148,9 +205,14 @@ func (a *App) do(ctx context.Context, method, endpoint, token string, payload []
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(raw) > maxResponseBytes {
+		// 不截断着往下解析：报「格式异常」会把真正的原因（响应太大）
+		// 藏起来，用户与日志都无从排查。
+		return nil, fmt.Errorf("服务器响应超过客户端上限（%d MiB）", maxResponseBytes>>20)
 	}
 
 	var env envelope

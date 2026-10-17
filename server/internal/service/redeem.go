@@ -340,6 +340,10 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 	// 这里**不能**把刷新失败当兑换失败返回：兑换事务已经提交（码已核销、
 	// 权益已发放），报错只会让用户重试一个已作废的码。刷不动就如实记录，
 	// 下一轮采集会纠正标记。
+	//
+	// 先递增版本号：兑换改变了生效配额，在途的旧快照必须让路，
+	// 否则刚兑换完可能又被旧结果置回「超额」。
+	s.Runtime.BumpGuardVer()
 	if err := s.refreshQuotaFor(userID); err != nil {
 		log.Printf("[redeem] 兑换已成功（用户 %d），但配额标记刷新失败，用户可能要等下一轮采集才能解除拦截: %v", userID, err)
 	}

@@ -138,14 +138,14 @@ func TestConsumePreservesRemarkedGeneration(t *testing.T) {
 func TestUnmarkInvalidatesTakenSnapshot(t *testing.T) {
 	svc := newTestServices(t, nil)
 
-	svc.Runtime.MarkTrafficResetPending(7)
+	gen := svc.Runtime.MarkTrafficResetPending(7)
 	taken := svc.Runtime.takePendingTrafficResets()
 	if !svc.Runtime.resetSkipValid(7, taken[7]) {
 		t.Fatal("前置条件：未撤销时快照的跳过应有效")
 	}
 
-	// 登记方撤销：清零写库失败。
-	svc.Runtime.UnmarkTrafficResetPending(7)
+	// 登记方撤销：清零写库失败（撤销自己那一笔）。
+	svc.Runtime.UnmarkTrafficResetPending(7, gen)
 
 	// 已取走的旧代次即刻失效；map 里的标记也已删除。
 	if svc.Runtime.resetSkipValid(7, taken[7]) {
@@ -155,7 +155,64 @@ func TestUnmarkInvalidatesTakenSnapshot(t *testing.T) {
 		t.Fatalf("撤销后不应再有待协调标记，实际 %v", taken)
 	}
 	// 未登记的用户撤销也不报错（幂等）。
-	svc.Runtime.UnmarkTrafficResetPending(999)
+	svc.Runtime.UnmarkTrafficResetPending(999, 0)
+}
+
+// TestUnmarkOnlyRevokesOwnGeneration 覆盖「失败的那一笔不撤销别人的登记」。
+//
+// 同一用户可能有并发的两笔清零：A（代次 5）与 B（代次 6，成功登记）。
+// A 的写库失败只应作废代次 5——按用户整体撤销会把 B 的标记一起删掉，
+// 于是 B 清零前的旧增量又会被加回。
+func TestUnmarkOnlyRevokesOwnGeneration(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	genA := svc.Runtime.MarkTrafficResetPending(1)
+	takenA := svc.Runtime.takePendingTrafficResets()
+	genB := svc.Runtime.MarkTrafficResetPending(1)
+	if genB <= genA {
+		t.Fatalf("前置条件：后登记的代次应更大（%d ≤ %d）", genB, genA)
+	}
+
+	// A 失败撤销：只作废代次 A。
+	svc.Runtime.UnmarkTrafficResetPending(1, genA)
+
+	if svc.Runtime.resetSkipValid(1, takenA[1]) {
+		t.Fatal("A 的快照跳过必须失效（它自己的清零没写进去）")
+	}
+	left := svc.Runtime.takePendingTrafficResets()
+	if left[1] != genB {
+		t.Fatalf("B 的登记必须保留，实际 %v（期望代次 %d）", left, genB)
+	}
+	if !svc.Runtime.resetSkipValid(1, genB) {
+		t.Fatal("B 的跳过必须仍然有效，否则 B 清零前的旧增量会被加回")
+	}
+}
+
+// TestSetQuotaExceededIfVer 覆盖「管理侧配额标记的版本条件写」。
+//
+// 管理侧刷新同样是「读库 → 算超额 → 写标记」：先发起的请求可能读到旧配额、
+// 后完成，用旧结果覆盖新标记。版本条件写让旧结果整笔作废。
+func TestSetQuotaExceededIfVer(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 较早的请求取版本号，期间另一笔调整推进了版本。
+	stale := svc.Runtime.GuardVer()
+	svc.Runtime.BumpGuardVer()
+
+	if ok := svc.Runtime.SetQuotaExceededIfVer(1, false, stale); ok {
+		t.Fatal("旧版本号的条件写应被拒绝")
+	}
+	if svc.Runtime.IsQuotaExceeded(1) {
+		t.Fatal("被拒绝的写入不应改动标记")
+	}
+
+	// 新版本下照常生效。
+	if ok := svc.Runtime.SetQuotaExceededIfVer(1, true, svc.Runtime.GuardVer()); !ok {
+		t.Fatal("当前版本号的条件写应成功")
+	}
+	if !svc.Runtime.IsQuotaExceeded(1) {
+		t.Fatal("条件写成功后标记应生效")
+	}
 }
 
 // TestRefreshQuotaFlagsYieldsWhenBumped 覆盖「被打断的刷新不得宣告就绪」。

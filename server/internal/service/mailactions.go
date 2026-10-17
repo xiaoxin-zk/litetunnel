@@ -75,8 +75,13 @@ func (s *Services) applyMailAction(row model.MailOutbox) error {
 // 较早的邮件送达后激活失败会进退避重试；期间用户又请求了新的验证码，
 // 新邮件可能先一步送达并激活成功。此时旧动作若照常重试，「作废全部旧码」
 // 会把刚生效的新码一起废掉，反而让更早的码活了下来。规则：本邮件入队
-// **之后**创建的、仍未使用的同类记录一律视为更新，旧动作直接放弃
+// **之后**激活的同类凭据一律视为更新，旧动作直接放弃
 // （errMailActionSuperseded），以「用户最后一次请求」为准。
+//
+// 先后关系用凭据上的 MailID（发件箱记录 ID）判定，不用 created_at：
+// 秒级精度下同一秒的两封信分不出先后；而且比较的是「已激活的凭据」，
+// 与它有没有被用掉无关——较新的链接被用户用掉之后，旧邮件的延迟重试
+// 仍然必须放弃，否则会把旧链接重新激活成有效凭据。
 func (s *Services) activateEmailCode(row model.MailOutbox) error {
 	var p emailCodePayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
@@ -87,22 +92,22 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
 		// 幂等重放：激活成功但写终态失败时，这一步会按原参数再跑一遍。
-		// 凭据仍在（未使用、同一摘要）就直接按成功处理，不重复建记录。
-		var same int64
+		// 凭据仍在（同一摘要，或同一封信激活过——即便它已被用户用掉）
+		// 就直接按成功处理，不重复建记录。
+		var activated int64
 		if err := tx.Model(&model.EmailCode{}).
-			Where("email = ? AND scene = ? AND code_hash = ? AND used_at IS NULL", p.Email, p.Scene, p.CodeHash).
-			Count(&same).Error; err != nil {
+			Where("email = ? AND scene = ? AND code_hash = ? AND (mail_id = ? OR used_at IS NULL)",
+				p.Email, p.Scene, p.CodeHash, row.ID).
+			Count(&activated).Error; err != nil {
 			return err
 		}
-		if same > 0 {
+		if activated > 0 {
 			return nil
 		}
-		// 被更新者取代：本邮件入队之后又创建过同类凭据（用户又请求了一次）。
-		// 摘要不同排除了上一步刚查过的自身重放。
+		// 被更新者取代：本邮件之后激活的同类凭据胜出（含已使用的）。
 		var newer int64
 		if err := tx.Model(&model.EmailCode{}).
-			Where("email = ? AND scene = ? AND used_at IS NULL AND created_at > ? AND code_hash <> ?",
-				p.Email, p.Scene, row.CreatedAt, p.CodeHash).
+			Where("email = ? AND scene = ? AND mail_id > ?", p.Email, p.Scene, row.ID).
 			Count(&newer).Error; err != nil {
 			return err
 		}
@@ -123,6 +128,7 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 			// 有效期从**现在**（送达时刻）起算。
 			ExpireAt: time.Now().Add(time.Duration(p.TTLSeconds) * time.Second),
 			IP:       p.IP,
+			MailID:   row.ID,
 		}).Error
 	})
 }
@@ -139,21 +145,22 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return errors.New("重置令牌缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
-		// 幂等重放：同一令牌仍在（未使用、同一摘要）直接按成功处理。
-		var same int64
+		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便
+		// 已被用户用掉）直接按成功处理，不会因唯一索引冲突误判失败。
+		var activated int64
 		if err := tx.Model(&model.PasswordResetToken{}).
-			Where("user_id = ? AND token_hash = ? AND used_at IS NULL", p.UserID, p.TokenHash).
-			Count(&same).Error; err != nil {
+			Where("user_id = ? AND token_hash = ? AND (mail_id = ? OR used_at IS NULL)",
+				p.UserID, p.TokenHash, row.ID).
+			Count(&activated).Error; err != nil {
 			return err
 		}
-		if same > 0 {
+		if activated > 0 {
 			return nil
 		}
-		// 被更新者取代：本邮件入队之后创建的未使用令牌应当胜出。
+		// 被更新者取代：本邮件之后激活的令牌胜出（含已使用的）。
 		var newer int64
 		if err := tx.Model(&model.PasswordResetToken{}).
-			Where("user_id = ? AND used_at IS NULL AND created_at > ? AND token_hash <> ?",
-				p.UserID, row.CreatedAt, p.TokenHash).
+			Where("user_id = ? AND mail_id > ?", p.UserID, row.ID).
 			Count(&newer).Error; err != nil {
 			return err
 		}
@@ -172,6 +179,7 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 			// 有效期从**现在**（送达时刻）起算。
 			ExpireAt: time.Now().Add(time.Duration(p.TTLSeconds) * time.Second),
 			IP:       p.IP,
+			MailID:   row.ID,
 		}).Error
 	})
 }

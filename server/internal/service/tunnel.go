@@ -31,9 +31,34 @@ type TunnelInput struct {
 
 // ListTunnels 返回用户全部隧道。
 func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
-	var list []model.Tunnel
-	err := s.DB.Where("user_id = ?", userID).Order("id desc").Find(&list).Error
+	list, _, err := s.ListTunnelsPage(userID, 0, 0)
 	return list, err
+}
+
+// ListTunnelsPage 分页取某用户的隧道，limit<=0 表示不分页（全部）。
+//
+// 为什么要分页：客户端接入信息接口原先一次返回该账号的全部隧道，
+// 隧道一多响应就能顶到客户端 4 MiB 的读取上限，截断后 JSON 解析失败，
+// 表现为「同步一直失败、界面上什么都没变」。分页后单页大小可控，
+// 客户端按 offset 逐页取全。
+//
+// 同时返回总数，客户端据此判断还有没有下一页——只看「本页是否取满」
+// 在最后一页恰好整页时会多打一次空请求。
+func (s *Services) ListTunnelsPage(userID uint, offset, limit int) ([]model.Tunnel, int64, error) {
+	var total int64
+	if err := s.DB.Model(&model.Tunnel{}).Where("user_id = ?", userID).
+		Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	q := s.DB.Where("user_id = ?", userID).Order("id desc")
+	if limit > 0 {
+		q = q.Offset(offset).Limit(limit)
+	} else if offset > 0 {
+		q = q.Offset(offset)
+	}
+	var list []model.Tunnel
+	err := q.Find(&list).Error
+	return list, total, err
 }
 
 // GetTunnel 按 ID 与归属校验后取隧道。

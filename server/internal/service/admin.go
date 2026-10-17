@@ -905,9 +905,9 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 不管，就要等到下一次采集成功才会恢复；而采集依赖 frps 管理接口，
 	// 它恰好不可用（或采集持续报错）时，用户会看到「账号已启用，但新建
 	// 连接一律被拒」，且没有任何地方说明原因。
-	if u, err := s.LoadUser(id); err == nil {
-		s.Runtime.SetQuotaExceeded(id, s.QuotaExceeded(u))
-	} else {
+	// 走与配额调整相同的版本条件写：并发的配额调整若在读取后发生，
+	// 这里基于旧快照算出的结果会被拒绝并重读，不会把新标记覆盖回去。
+	if err := s.refreshQuotaFor(id); err != nil {
 		// 取不到用户（理论上不会走到）时保守放行：
 		// 账号状态已经是 active，宁可让下一轮采集再纠正，
 		// 也不要因为一次读取失败把用户挡在门外。
@@ -928,6 +928,9 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
+	// 先递增版本号再刷新：让在途的旧快照（后台整表刷新、并发的另一笔
+	// 配额调整）让路，随后的读取必然看到刚提交的配额。
+	s.Runtime.BumpGuardVer()
 	return s.refreshQuotaFor(id)
 }
 
@@ -939,7 +942,10 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 // 顺序反过来（先清零后登记）会有一个窗口：增量恰好插在两步之间落库，
 // 标记拦不住它。
 func (s *Services) AdminResetUserTraffic(id uint) error {
-	s.Runtime.MarkTrafficResetPending(id)
+	// 记下本次登记的代次：撤销只能作用于这一笔。同一用户可能有并发的
+	// 另一笔清零已成功登记，按用户整体撤销会把它的标记一并作废，
+	// 那一笔清零前的旧增量随后就会被加回。
+	gen := s.Runtime.MarkTrafficResetPending(id)
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(map[string]any{
 		"traffic_used":     0,
 		"traffic_reset_at": time.Now().AddDate(0, 1, 0),
@@ -947,11 +953,11 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 	if res.Error != nil {
 		// 清零没写进去，登记的标记必须撤销：留着它，后续采集会错误地
 		// 丢弃一轮**真实**用量。
-		s.Runtime.UnmarkTrafficResetPending(id)
+		s.Runtime.UnmarkTrafficResetPending(id, gen)
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		s.Runtime.UnmarkTrafficResetPending(id)
+		s.Runtime.UnmarkTrafficResetPending(id, gen)
 		return ErrNotFound
 	}
 	s.Runtime.BumpGuardVer()
@@ -1011,6 +1017,9 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) erro
 	// （store.go 里 SetMaxOpenConns(1)）：事务占着那唯一的连接时，
 	// 这次查询永远等不到它释放，而事务又在等查询返回——整个请求就卡死在
 	// 那里。管理后台的表现是「点一下没反应」，日志里什么都没有。
+	//
+	// 同样先递增版本号：改组会改变生效配额，在途的旧快照必须让路。
+	s.Runtime.BumpGuardVer()
 	return s.refreshQuotaFor(id)
 }
 
@@ -1050,20 +1059,32 @@ func (s *Services) AdminResetUserSecret(id uint) (string, error) {
 
 // refreshQuotaFor 刷新单个用户的超额标记。
 //
-// 这是管理路径的直写：先递增版本号（见 Runtime.guardVer），
-// 让在途的后台整表刷新识别「快照已过时」并让路。
+// 读库与写标记之间存在窗口：并发的两笔配额调整，先发起的那笔可能读到
+// 旧配额、却后完成写入，用旧结果覆盖新标记（用户被错误放行或被错误
+// 拦截）。因此版本号在**读库之前**取，写入用 SetQuotaExceededIfVer
+// 条件写；版本变了就说明期间有别的管理操作（或后台刷新）动过，重读重试。
+//
+// 调用方必须在**自己的数据库写入提交之后**先 BumpGuardVer，再调用本方法：
+// 递增让在途的旧快照让路，之后的读取必然看到刚提交的新状态。
 //
 // 读取失败必须返回错误：标记留在旧值上（比如「超额」），调用方若把它
 // 当成功上报，管理员会以为调整已生效，而插件还在按旧标记拦截——
 // 「改了配额却没反应」且无处排查。
 func (s *Services) refreshQuotaFor(id uint) error {
-	u, err := s.LoadUser(id)
-	if err != nil {
-		return fmt.Errorf("刷新配额标记失败（用户 %d）: %w", id, err)
+	const maxPasses = 3
+	for pass := 0; pass < maxPasses; pass++ {
+		ver := s.Runtime.GuardVer()
+		u, err := s.LoadUser(id)
+		if err != nil {
+			return fmt.Errorf("刷新配额标记失败（用户 %d）: %w", id, err)
+		}
+		exceeded := s.QuotaExceeded(u)
+		if s.Runtime.SetQuotaExceededIfVer(u.ID, exceeded, ver) {
+			return nil
+		}
+		// 版本在读取期间被推进：这次算出的结果基于旧快照，丢弃重读。
 	}
-	s.Runtime.BumpGuardVer()
-	s.Runtime.SetQuotaExceeded(u.ID, s.QuotaExceeded(u))
-	return nil
+	return fmt.Errorf("刷新配额标记失败（用户 %d）：并发调整过于频繁，未能稳定写入", id)
 }
 
 // ---- 分组管理 ----
@@ -1191,6 +1212,9 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 	// 刷新失败要如实返回：分组本身已更新，但整组标记还停在旧值——
 	// 把它报成成功，管理员不会知道「调低配额后用户仍能建连接」。
 	// 错误信息里点明这一点，管理员重试即可（更新幂等）。
+	//
+	// 先递增版本号：让在途的旧快照让路，随后的整组读取看到刚提交的新配额。
+	s.Runtime.BumpGuardVer()
 	if err := s.refreshQuotaForGroup(id); err != nil {
 		return &g, fmt.Errorf("分组已更新，但配额标记刷新失败（本组用户将沿用旧标记，重试本操作或等下一轮采集可纠正）: %w", err)
 	}
@@ -1201,21 +1225,36 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 //
 // 一次查询取出该组全部用户（带分组），而不是逐个 LoadUser：
 // 一个分组可能有成百上千个用户，逐个查会把一次管理操作变成一串查询。
+//
+// 与 refreshQuotaFor 同样的版本协调：版本号在读库之前取，逐个条件写；
+// 中途版本被推进（另一笔管理操作/后台刷新）就整组重读重试——否则
+// 先发起的旧快照会用旧配额覆盖后完成的新标记。调用方必须已在自己
+// 的数据库写入提交之后 BumpGuardVer。
 func (s *Services) refreshQuotaForGroup(groupID uint) error {
-	// 版本号在读库之前取：这是管理路径的直写，同样要让在途的后台
-	// 整表刷新让路（见 Runtime.guardVer）。
-	s.Runtime.BumpGuardVer()
-	var users []model.User
-	if err := s.DB.Preload("Group").Where("group_id = ?", groupID).Find(&users).Error; err != nil {
-		// 读取失败必须返回错误：整组标记都停在旧值，调用方不能把这次
-		// 操作当成功上报（见 refreshQuotaFor 的说明）。
-		return fmt.Errorf("刷新分组 %d 的配额标记失败: %w", groupID, err)
+	const maxPasses = 3
+	for pass := 0; pass < maxPasses; pass++ {
+		ver := s.Runtime.GuardVer()
+		var users []model.User
+		if err := s.DB.Preload("Group").Where("group_id = ?", groupID).Find(&users).Error; err != nil {
+			// 读取失败必须返回错误：整组标记都停在旧值，调用方不能把这次
+			// 操作当成功上报（见 refreshQuotaFor 的说明）。
+			return fmt.Errorf("刷新分组 %d 的配额标记失败: %w", groupID, err)
+		}
+		stable := true
+		for i := range users {
+			s.EnsureTrafficPeriod(&users[i])
+			if !s.Runtime.SetQuotaExceededIfVer(users[i].ID, s.QuotaExceeded(&users[i]), ver) {
+				// 版本已推进：本组这一轮的结果基于旧快照，剩下的人
+				// 不再写，整组重来（否则同一组里会出现新旧混杂）。
+				stable = false
+				break
+			}
+		}
+		if stable {
+			return nil
+		}
 	}
-	for i := range users {
-		s.EnsureTrafficPeriod(&users[i])
-		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
-	}
-	return nil
+	return fmt.Errorf("刷新分组 %d 的配额标记失败：并发调整过于频繁，未能稳定写入", groupID)
 }
 
 // DeleteGroup 删除分组。默认分组、仍被占用的分组、仍有未核销升级码的分组

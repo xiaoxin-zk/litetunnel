@@ -112,7 +112,9 @@ func (a *App) syncLocked() (changed bool, err error) {
 func (a *App) syncWithData(data *clientInfoData) (changed bool, err error) {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
-	return a.applySyncData(data)
+	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	defer cancel()
+	return a.applySyncData(ctx, data)
 }
 
 // applySync 拉取隧道清单，并把本机的 frpc 进程对账到服务端说的状态。
@@ -137,17 +139,24 @@ func (a *App) applySync() (changed bool, err error) {
 		return false, errors.New(a.baseReason())
 	}
 
-	var data clientInfoData
-	if err := a.getJSON(context.Background(), base+"/api/user/client/info", apiKey, &data); err != nil {
+	// 整轮共用一个截止上下文：接入信息（可能还要分页）与后续的配置拉取
+	// 都在同一笔预算里。只给配置拉取限时的话，前面那几次请求仍可各自
+	// 等满超时，手动操作被挡的总时长并没有真正封顶。
+	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	defer cancel()
+
+	data, err := a.fetchClientInfo(ctx, base, apiKey)
+	if err != nil {
 		return false, err
 	}
-	return a.applySyncData(&data)
+	return a.applySyncData(ctx, data)
 }
 
 // applySyncData 执行对账。data 是本轮要采纳的接入信息快照——
 // 正常路径来自刚请求的 /client/info，接入路径来自 Connect 已验证
-// Key 有效的同一次响应。
-func (a *App) applySyncData(data *clientInfoData) (changed bool, err error) {
+// Key 有效的同一次响应。ctx 是本轮的截止上下文（见 syncRoundTimeout），
+// 已消耗的时间计入同一笔预算。
+func (a *App) applySyncData(ctx context.Context, data *clientInfoData) (changed bool, err error) {
 	base := a.serverBase()
 
 	a.mu.RLock()
@@ -337,9 +346,6 @@ func (a *App) applySyncData(data *clientInfoData) (changed bool, err error) {
 		}
 	}
 
-	// 整轮配置拉取限时：手动操作最多等这么久，超时部分下一轮补齐。
-	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
-	defer cancel()
 	for res := range a.streamTunnelConfigs(ctx, base, apiKey, pending) {
 		applyCfg(res.tunnel, res.text, res.err)
 	}

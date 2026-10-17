@@ -358,10 +358,33 @@ func (r *Runtime) SetQuotaExceeded(userID uint, v bool) {
 	}
 }
 
-// MarkTrafficResetPending 登记一次用量清零（见 pendingTrafficReset）。
-// 重复登记会推进代次：旧快照的跳过对新登记依然成立（跳过只会更保守），
-// 新登记的代次留在 map 里由下一轮快照继续消费。
-func (r *Runtime) MarkTrafficResetPending(userID uint) {
+// SetQuotaExceededIfVer 按版本号条件写入超额标记（只动超额，不碰禁用）。
+//
+// 管理侧的配额刷新同样存在「读库 → 算超额 → 写标记」的窗口：两个并发的
+// 配额调整，先发起的那笔可能读到旧配额、后完成，用旧结果覆盖新标记。
+// 版本号在**读库之前**取，写入时代次不一致就放弃，由调用方重读重试——
+// 与后台整表刷新用的是同一套协调机制。
+func (r *Runtime) SetQuotaExceededIfVer(userID uint, v bool, ver uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.guardVer != ver {
+		return false
+	}
+	if v {
+		r.exceeded[userID] = true
+	} else {
+		delete(r.exceeded, userID)
+	}
+	return true
+}
+
+// MarkTrafficResetPending 登记一次用量清零（见 pendingTrafficReset），
+// 返回本次登记的**代次**。
+//
+// 代次必须由登记方持有并原样传给撤销：同一用户可能有多笔并发清零，
+// 按用户整体撤销会把别人刚登记成功的标记一并作废——那一笔的旧增量
+// 随后就会被加回（「清零完又冒出来」）。按代次撤销只作废自己那一笔。
+func (r *Runtime) MarkTrafficResetPending(userID uint) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.resetSeq++
@@ -369,6 +392,7 @@ func (r *Runtime) MarkTrafficResetPending(userID uint) {
 		r.pendingTrafficReset = map[uint]uint64{}
 	}
 	r.pendingTrafficReset[userID] = r.resetSeq
+	return r.resetSeq
 }
 
 // takePendingTrafficResets 给清零标记做快照，供 flushTraffic 在事务里
@@ -415,18 +439,25 @@ func (r *Runtime) consumePendingTrafficResets(taken map[uint]uint64) {
 	}
 }
 
-// UnmarkTrafficResetPending 撤销登记：清零写库失败时由登记方调用，
-// 避免后续采集错误丢弃一轮真实用量。撤销同时推进作废代次——
-// 已经被某次快照取走的旧代次一并失效（见 pendingTrafficReset）。
-func (r *Runtime) UnmarkTrafficResetPending(userID uint) {
+// UnmarkTrafficResetPending 撤销**指定代次**的登记：清零写库失败时由
+// 登记方调用，避免后续采集错误丢弃一轮真实用量。
+//
+// 只作用于自己那一笔：同一用户可能还有别人登记成功的更新代次，
+// 按用户整体删除会把它们一起作废。作废边界取该代次本身而不是新的
+// 全局代次——快照里代次 ≤ 本代次的跳过失效，更大的（并发的成功登记）
+// 依然有效。
+func (r *Runtime) UnmarkTrafficResetPending(userID uint, gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.resetSeq++
 	if r.resetVoidUntil == nil {
 		r.resetVoidUntil = map[uint]uint64{}
 	}
-	r.resetVoidUntil[userID] = r.resetSeq
-	delete(r.pendingTrafficReset, userID)
+	if r.resetVoidUntil[userID] < gen {
+		r.resetVoidUntil[userID] = gen
+	}
+	if cur, ok := r.pendingTrafficReset[userID]; ok && cur == gen {
+		delete(r.pendingTrafficReset, userID)
+	}
 }
 
 // BumpGuardVer 递增准入标记版本号：管理路径写标记前必须调用，

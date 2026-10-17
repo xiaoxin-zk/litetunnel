@@ -280,11 +280,11 @@ const (
 
 // 登录结果
 const (
-	LoginResultSuccess   = "success"
-	LoginResultBadCred   = "bad_credentials"
-	LoginResultDisabled  = "disabled"
-	LoginResultLocked    = "locked"
-	LoginResultTOTPFail  = "totp_failed"
+	LoginResultSuccess  = "success"
+	LoginResultBadCred  = "bad_credentials"
+	LoginResultDisabled = "disabled"
+	LoginResultLocked   = "locked"
+	LoginResultTOTPFail = "totp_failed"
 )
 
 // LoginLog 记录每一次登录尝试，用户与管理员共用一张表。
@@ -328,6 +328,12 @@ type EmailCode struct {
 	ExpireAt  time.Time  `gorm:"index" json:"-"`
 	IP        string     `gorm:"size:64" json:"-"`
 	CreatedAt time.Time  `json:"-"`
+	// MailID 是激活这条验证码的发件箱记录 ID，用于「最新凭据胜出」判定：
+	// 入队更晚（ID 更大）的邮件产生的凭据优先。必须持久化而不是靠
+	// created_at 比较——SQLite 的时间精度是秒级，同一秒内的两封信
+	// 分不出先后；而且凭据被使用后行仍然保留（只置 used_at），
+	// 这条「谁更新」的关系才不会随消费而消失。
+	MailID uint `gorm:"index" json:"-"`
 }
 
 // TableName 固定表名。
@@ -345,6 +351,10 @@ type PasswordResetToken struct {
 	IP        string     `gorm:"size:64" json:"ip"`
 
 	CreatedAt time.Time `json:"created_at"`
+	// MailID 是激活这条令牌的发件箱记录 ID，语义见 EmailCode.MailID：
+	// 用持久化的先后关系（而不是秒级的 created_at）判定最新凭据，
+	// 且该关系在令牌被使用后仍然保留。
+	MailID uint `gorm:"index" json:"-"`
 }
 
 // TableName 固定表名。
@@ -439,8 +449,8 @@ type TrafficBaseline struct {
 	// Date 是基线所属日期（本地时区 YYYY-MM-DD）。
 	Date string `gorm:"size:10;not null;index" json:"date"`
 	// InBytes / OutBytes 是采样时刻 frps 上报的当日累计值。
-	InBytes  int64     `gorm:"not null;default:0" json:"in_bytes"`
-	OutBytes int64     `gorm:"not null;default:0" json:"out_bytes"`
+	InBytes   int64     `gorm:"not null;default:0" json:"in_bytes"`
+	OutBytes  int64     `gorm:"not null;default:0" json:"out_bytes"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

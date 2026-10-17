@@ -124,12 +124,17 @@ type clientInfoResp struct {
 	*service.ClientInfo
 	// 客户端只持有 API Key，因此账号信息必须由服务端下发，
 	// 不能像以前那样依赖用户在登录框里填的用户名。
-	Username     string   `json:"username"`
-	Nickname     string   `json:"nickname"`
+	Username     string  `json:"username"`
+	Nickname     string  `json:"nickname"`
 	Tunnels      []gin.H `json:"tunnels"`
-	TrafficUsed  int64    `json:"traffic_used"`
-	TrafficQuota int64    `json:"traffic_quota"`
-	Exceeded     bool     `json:"exceeded"`
+	TrafficUsed  int64   `json:"traffic_used"`
+	TrafficQuota int64   `json:"traffic_quota"`
+	Exceeded     bool    `json:"exceeded"`
+
+	// TunnelTotal 是该账号的隧道总数（不受分页影响）。
+	// 客户端据此判断是否还有下一页：只看「本页是否取满」在最后一页
+	// 恰好整页时会多打一次空请求；老客户端不认识这个字段，忽略即可。
+	TunnelTotal int64 `json:"tunnel_total"`
 
 	// Group 是分组限制。客户端要能自己建隧道，就必须知道
 	// 「允许哪些协议」「最多几条隧道」——否则表单会放行注定被拒的提交，
@@ -152,7 +157,22 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	tunnels, err := h.svc.ListTunnels(u.ID)
+	// 分页：?offset=0&limit=200。不带 limit 时返回全部——
+	// 老客户端不知道分页参数，必须保持原行为。
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	// 单页上限：防止客户端传一个巨大的 limit 把分页变成全量。
+	const maxClientPageSize = 500
+	if limit > maxClientPageSize {
+		limit = maxClientPageSize
+	}
+	tunnels, total, err := h.svc.ListTunnelsPage(u.ID, offset, limit)
 	if err != nil {
 		shared.Fail(c, err)
 		return
@@ -185,6 +205,7 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		Username:       u.Username,
 		Nickname:       u.Nickname,
 		Tunnels:        out,
+		TunnelTotal:    total,
 		TrafficUsed:    u.TrafficUsed,
 		TrafficQuota:   h.svc.EffectiveQuota(u),
 		Exceeded:       h.svc.QuotaExceeded(u),

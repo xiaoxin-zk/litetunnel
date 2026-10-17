@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -62,7 +63,15 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		in.MaxUses = 1
 	}
 
-	batchNo := fmt.Sprintf("B%s", time.Now().Format("20060102150405"))
+	// 批次号带随机后缀：秒级时间戳在同一秒内两次生成会撞号，而管理页
+	// 正是按批次号筛选的——两批码混在一个批次里，批次维度就失去了意义。
+	// 6 个随机十六进制字符（crypto/rand），同秒撞上 2^24 分之一的概率
+	// 在这里完全可以接受；即便真撞了也只是批次展示合并，不影响兑换。
+	suffix, err := randomHex(3)
+	if err != nil {
+		return nil, err
+	}
+	batchNo := fmt.Sprintf("B%s-%s", time.Now().Format("20060102150405"), suffix)
 	codes := make([]model.RedeemCode, 0, in.Count)
 	seen := make(map[string]struct{}, in.Count)
 	for len(codes) < in.Count {
@@ -192,8 +201,16 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 				Message: fmt.Sprintf("余额已增加 %.2f 元", float64(c.Value)/100)}
 
 		case model.RedeemTypeGroup:
+			// FOR UPDATE 锁住分组行：与 DeleteGroup 的事务互斥。
+			// 不锁的话有个窄窗口——这里读到分组存在，删除分组随后提交，
+			// 我们再把 group_id 写上去：用户拿到一个指向已删除分组的悬空
+			// 引用，运行期只能回落到默认分组，界面上却显示「已升级」。
+			// Postgres 下 FOR UPDATE 会让 DeleteGroup 的删除等到本事务提交；
+			// SQLite 全库锁，天然串行。分组确实已删时仍按「码无效」处理，
+			// 核销随事务回滚，码还能用。
 			var g model.Group
-			if err := tx.First(&g, c.GroupID).Error; err != nil {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&g, c.GroupID).Error; err != nil {
 				return ErrCodeInvalid
 			}
 			updates["group_id"] = g.ID

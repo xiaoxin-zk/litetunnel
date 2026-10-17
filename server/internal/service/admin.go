@@ -1136,30 +1136,57 @@ func (s *Services) refreshQuotaForGroup(groupID uint) {
 	}
 }
 
-// DeleteGroup 删除分组。默认分组与仍被占用的分组不允许删除。
+// DeleteGroup 删除分组。默认分组、仍被占用的分组、仍有未核销升级码的分组
+// 不允许删除。
+//
+// 检查未核销兑换码的原因：GenerateCodes 允许生成指向任意现存分组的升级码，
+// 而分组一删，这些码就成了废纸——兑换时按 group_id 找不到分组，
+// 返回「兑换码无效」，用户拿着一张永远用不掉的码。管理员删分组时
+// 看不到这层关联，必须由这里拦下来：先停用/删除这些码，或迁移到别的分组。
+//
+// 检查与删除放进同一事务：分开的话，「检查通过 → 删除」之间仍可能插进
+// 一次兑换（见 Redeem 里对分组行的 FOR UPDATE），事务至少保证
+// 这两个步骤看到的是同一个数据库状态。
 func (s *Services) DeleteGroup(id uint) error {
-	var g model.Group
-	if err := s.DB.First(&g, id).Error; err != nil {
-		return ErrNotFound
-	}
-	if g.IsDefault {
-		return fmt.Errorf("%w: 默认分组不允许删除", ErrInvalidParam)
-	}
-	var used int64
-	if err := s.DB.Model(&model.User{}).Where("group_id = ?", id).Count(&used).Error; err != nil {
-		return err
-	}
-	if used > 0 {
-		return fmt.Errorf("%w: 仍有 %d 个用户属于该分组，请先迁移", ErrInvalidParam, used)
-	}
-	res := s.DB.Delete(&model.Group{}, id)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		var g model.Group
+		if err := tx.First(&g, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if g.IsDefault {
+			return fmt.Errorf("%w: 默认分组不允许删除", ErrInvalidParam)
+		}
+		var used int64
+		if err := tx.Model(&model.User{}).Where("group_id = ?", id).Count(&used).Error; err != nil {
+			return err
+		}
+		if used > 0 {
+			return fmt.Errorf("%w: 仍有 %d 个用户属于该分组，请先迁移", ErrInvalidParam, used)
+		}
+		// 只看未核销的：已用尽/已停用的码本来就不能再兑换，
+		// 指向已删除分组对它们没有影响。
+		var pending int64
+		if err := tx.Model(&model.RedeemCode{}).
+			Where("group_id = ? AND status = ?", id, model.RedeemStatusUnused).
+			Count(&pending).Error; err != nil {
+			return err
+		}
+		if pending > 0 {
+			return fmt.Errorf("%w: 还有 %d 张指向该分组的未核销升级码，请先停用或删除它们",
+				ErrInvalidParam, pending)
+		}
+		res := tx.Delete(&model.Group{}, id)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // ---- 隧道管理（管理侧）----

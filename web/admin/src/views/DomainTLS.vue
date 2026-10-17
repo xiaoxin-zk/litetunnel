@@ -363,7 +363,13 @@ const pendingText = computed(() => {
   if ((d.https_mode || '') !== (a.https_mode || '')) {
     parts.push(`HTTPS 模式 ${modeText(a.https_mode)} → ${modeText(d.https_mode)}`)
   }
-  const detail = parts.length ? `待切换：${parts.join('；')}。` : ''
+  // pending 也可能是由「不进 DomainAppliedSet」的字段引起的：DNS 服务商、
+  // DNS 参数、凭据、ACME 邮箱都会改变渲染结果，同样需要一次下发才生效。
+  // 此时上面三项完全相同，若只说「待切换」却不列出任何一项，管理员会以为
+  // 是页面误报。
+  const detail = parts.length
+    ? `待切换：${parts.join('；')}。`
+    : '证书相关参数（ACME 邮箱 / DNS 服务商 / 凭据 / 参数）与已生效的那一份不同。'
   return `宿主机上仍在用：${appliedText.value}。${detail}配置要等下发出成功（渲染、校验、写盘并重建容器）之后才会切换。`
 })
 

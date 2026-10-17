@@ -2,10 +2,12 @@ package service
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,11 +22,14 @@ import (
 // 两者的处置方式完全不同，混在一起只会让管理员去改本来正确的字段。
 var ErrDomainApply = errors.New("配置下发失败")
 
-// DomainAppliedSet 是「域名与证书」这一组里真正影响运行期的三个值。
+// DomainAppliedSet 是「域名与证书」这一组里真正影响**运行期行为**的三个值。
 //
-// 只有这三个：其余项（ACME 邮箱、DNS 服务商与凭据）只影响渲染出的文件内容，
-// 不影响面板按什么域名放行、按什么模式拼地址。把它们也纳入比较，只会让
-// 「待下发」在无关改动上也亮起来。
+// 只有这三个：ACME 邮箱、DNS 服务商/参数/凭据只影响渲染出的文件内容，
+// 不参与运行期判权（按哪个域名放行、按什么模式拼地址），塞进来只会让
+// 「宿主机实际在用」那一栏显示出与运行期无关的东西。
+//
+// 但它们仍然决定「磁盘上跑的是不是你刚保存的那一份」，所以不能因此就不管：
+// 完整的下发输入由 DomainPending 用摘要比较（见 KeyDomainAppliedDigest）。
 type DomainAppliedSet struct {
 	Panel     string `json:"panel"`
 	Tunnel    string `json:"tunnel"`
@@ -59,9 +64,61 @@ func (s *Services) DomainApplied() DomainAppliedSet {
 }
 
 // DomainPending 表示磁盘/容器上跑的还是上一份配置。
+//
+// 两层判断缺一不可：
+//
+//	前三项（面板域名 / 隧道域名 / 模式）决定**运行期行为**，比较的是归一化后
+//	的取值，差异要能直接讲给管理员听（界面上会逐项列出）；
+//	摘要覆盖**全部下发输入**，包括 DNS 服务商、DNS 参数、凭据与 ACME 邮箱。
+//	只保存这些字段同样需要一次下发才生效，而它们不在前三项里——不比摘要的话，
+//	页面会显示「与期望一致」，磁盘上跑的却还是旧配置。
 func (s *Services) DomainPending() bool {
 	d, a := s.DomainDesired(), s.DomainApplied()
-	return d.Panel != a.Panel || d.Tunnel != a.Tunnel || d.HTTPSMode != a.HTTPSMode
+	if d.Panel != a.Panel || d.Tunnel != a.Tunnel || d.HTTPSMode != a.HTTPSMode {
+		return true
+	}
+	return s.DomainDesiredDigest() != s.DomainAppliedDigest()
+}
+
+// domainDigest 对完整下发变量集取摘要。
+//
+// 用定长摘要而不是把值逐项存一份：变量集里有 DNS API 凭据，存明文等于把密钥
+// 复制到设置表里，多一处泄漏面。摘要只用于判等，不参与渲染。
+//
+// 序列化必须是确定的：按 key 排序后逐对写入，并用分隔符隔开，避免
+// ("ab","c") 与 ("a","bc") 拼出同一个字节串。
+func domainDigest(vars map[string]string) string {
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(vars[k]))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// DomainDesiredDigest 是「界面上保存的那一份」的摘要。
+func (s *Services) DomainDesiredDigest() string {
+	return domainDigest(s.domainVars(false))
+}
+
+// DomainAppliedDigest 是「宿主机上实际生效的那一份」的摘要。
+//
+// 没有任何下发记录时取 .env 基线：那才是实际在跑的配置，而不是「还没生效的
+// 期望值」。与 DomainApplied 用同一套回落口径，否则从未进过后台的部署会被
+// 判成「待下发」。
+func (s *Services) DomainAppliedDigest() string {
+	if s.Settings.hasRow(KeyDomainAppliedDigest) {
+		return s.Settings.Get(KeyDomainAppliedDigest)
+	}
+	return domainDigest(s.domainVars(true))
 }
 
 // DomainStatus 是「域名与证书」页的状态总览。
@@ -99,12 +156,23 @@ func (s *Services) DomainConfigVars() (map[string]string, error) {
 	if err := checkDomain(panel); err != nil {
 		return nil, fmt.Errorf("%w: 面板域名 %s", ErrInvalidParam, err.Error())
 	}
+	return s.domainVars(false), nil
+}
+
+// domainVars 组装一次下发的**完整**变量集：helper 渲染 Caddyfile 与 frps.toml
+// 的全部输入都在这里。摘要比较也用同一个函数，两处必须同源——各写一份的话，
+// 漏掉的字段恰好就是「待下发」判不出来的那些。
+//
+// fromEnv 为 true 时取「.env 基线」：域名与模式来自面板启动时的环境变量，
+// 渲染类字段取空。它代表从未下发过的部署**实际在跑**的那一份（手工部署时
+// 域名就写在 .env 里），用来与期望值做同口径比较。
+func (s *Services) domainVars(fromEnv bool) map[string]string {
 	// 只发「面板对外地址」而不是站点地址：站点地址（LT_USER_DOMAIN）由 helper
 	// 从它派生，这样「面板域名」在这一套里只有一个来源。
 	//
 	// 这一份是**要下发**的配置，因此取期望值而不是已生效值。
 	vars := map[string]string{
-		tlscfg.VarUserPublicURL: "https://" + panel,
+		tlscfg.VarUserPublicURL: "https://" + s.DesiredPanelDomain(),
 		tlscfg.VarTunnelDomain:  s.DesiredTunnelDomain(),
 		tlscfg.VarACMEEmail:     strings.TrimSpace(s.Settings.Get(KeyDomainACMEEmail)),
 		tlscfg.VarDNSProvider:   strings.TrimSpace(s.Settings.Get(KeyDomainDNSProvider)),
@@ -112,7 +180,19 @@ func (s *Services) DomainConfigVars() (map[string]string, error) {
 		tlscfg.VarDNSCredential: s.Settings.Get(KeyDomainDNSCredential),
 		tlscfg.VarHTTPSMode:     s.DesiredDomainHTTPSMode(),
 	}
-	return vars, nil
+	if !fromEnv {
+		return vars
+	}
+	vars[tlscfg.VarUserPublicURL] = "https://" + normalizeDomainValue(s.Cfg.UserPublicURL)
+	vars[tlscfg.VarTunnelDomain] = normalizeDomainValue(s.Cfg.TunnelDomain)
+	vars[tlscfg.VarHTTPSMode] = s.envHTTPSMode()
+	// 渲染类字段没有 .env 来源（helper 从它自己的 .env 读），面板侧的默认值就是
+	// 空串；与期望值一侧「未配置」的写法一致，两边才能比较。
+	vars[tlscfg.VarACMEEmail] = ""
+	vars[tlscfg.VarDNSProvider] = ""
+	vars[tlscfg.VarDNSArgs] = ""
+	vars[tlscfg.VarDNSCredential] = ""
+	return vars
 }
 
 // DesiredPanelDomain 返回界面上保存的面板域名（期望值，未必已生效）。
@@ -225,6 +305,9 @@ func (s *Services) markDomainApplied(vars map[string]string) error {
 		KeyDomainAppliedPanel:  normalizeDomainValue(vars[tlscfg.VarUserPublicURL]),
 		KeyDomainAppliedTunnel: normalizeDomainValue(vars[tlscfg.VarTunnelDomain]),
 		KeyDomainAppliedMode:   mode,
+		// 摘要与前三项一起提交：它们描述的是同一次下发的结果，分开写会出现
+		// 「域名已生效、摘要还是上一份」的中间态，页面据此误报「待下发」。
+		KeyDomainAppliedDigest: domainDigest(vars),
 	})
 }
 

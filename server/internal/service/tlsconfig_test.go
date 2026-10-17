@@ -305,6 +305,83 @@ func TestEmptyTunnelDomainMeansDisabled(t *testing.T) {
 	}
 }
 
+// TestDomainPendingCoversCertificateSettings 覆盖「只保存证书参数时页面不报待下发」。
+//
+// DomainPending 曾经只比较面板域名 / 隧道域名 / HTTPS 模式。但 DNS 服务商、
+// DNS 参数、凭据与 ACME 邮箱同样会改变渲染出的 Caddyfile 与 Caddy 的运行
+// 配置：只保存它们、还没下发时，磁盘上跑的还是旧配置，而页面显示「与期望
+// 一致」——这正是这一页存在的意义所在。
+func TestDomainPendingCoversCertificateSettings(t *testing.T) {
+	svc := newTestServices(t, &config.Config{
+		TunnelDomain:  "tunnel.example.com",
+		UserPublicURL: "https://panel.example.com",
+	})
+
+	// 从未用过这个页面：期望值与 .env 同口径，不该报待下发。
+	if svc.DomainPending() {
+		t.Fatal("只用 .env 配好的部署不该显示「待下发」")
+	}
+
+	steps := []struct {
+		name  string
+		key   SettingKey
+		value string
+	}{
+		{"ACME 邮箱", KeyDomainACMEEmail, "ops@example.com"},
+		{"DNS 服务商", KeyDomainDNSProvider, "cloudflare"},
+		{"DNS 参数", KeyDomainDNSArgs, "{env.LT_CADDY_DNS_CREDENTIAL}"},
+		{"DNS 凭据", KeyDomainDNSCredential, "super-secret-token"},
+	}
+	for _, st := range steps {
+		if err := svc.Settings.SetMany(map[SettingKey]string{st.key: st.value}); err != nil {
+			t.Fatalf("写入 %s 失败: %v", st.name, err)
+		}
+		if !svc.DomainPending() {
+			t.Fatalf("只保存了「%s」，页面必须显示「待下发」", st.name)
+		}
+		// 下发一次回到一致状态，让下一轮从干净状态开始。
+		applyDomain(t, svc)
+		if svc.DomainPending() {
+			t.Fatalf("「%s」下发之后不该仍是「待下发」", st.name)
+		}
+	}
+
+	// 摘要只记哈希：凭据明文不能被复制到设置表里。
+	var row model.Setting
+	if err := svc.DB.Where("key = ?", string(KeyDomainAppliedDigest)).First(&row).Error; err != nil {
+		t.Fatalf("读取已应用摘要失败: %v", err)
+	}
+	if row.Value == "" {
+		t.Fatal("下发之后必须记下摘要，否则下一轮比较恒为「待下发」")
+	}
+	if strings.Contains(row.Value, "super-secret-token") {
+		t.Fatal("已应用摘要里不能出现凭据明文")
+	}
+}
+
+// TestDomainPendingIgnoresUnrelatedSettings 是上一条的反面。
+//
+// 摘要必须只覆盖「下发输入」。把所有设置项都算进去的话，改个站点公告、
+// SMTP 端口都会让「待下发」亮起来，管理员很快就会学会无视这个提示。
+func TestDomainPendingIgnoresUnrelatedSettings(t *testing.T) {
+	svc := newTestServices(t, &config.Config{
+		TunnelDomain:  "tunnel.example.com",
+		UserPublicURL: "https://panel.example.com",
+	})
+
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeySMTPHost:         "smtp.example.com",
+		KeySMTPPort:         "465",
+		KeySiteAnnouncement: "维护通知",
+		KeyRegisterEnabled:  "false",
+	}); err != nil {
+		t.Fatalf("写入无关配置失败: %v", err)
+	}
+	if svc.DomainPending() {
+		t.Fatal("与下发无关的配置不该让「待下发」亮起来")
+	}
+}
+
 // TestTunnelWriteErrorClassification 覆盖「隧道名冲突被当成端口撞车」。
 //
 // 误判的代价不只是多试 5 次：日志里会出现 5 行「端口分配撞车」，

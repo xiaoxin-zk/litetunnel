@@ -146,6 +146,18 @@ const (
 	KeyDomainAppliedPanel  SettingKey = "domain.applied_panel"
 	KeyDomainAppliedTunnel SettingKey = "domain.applied_tunnel"
 	KeyDomainAppliedMode   SettingKey = "domain.applied_https_mode"
+
+	// KeyDomainAppliedDigest 是「已下发那一份配置」的摘要。
+	//
+	// 前三项只覆盖决定**运行期行为**的输入（按哪个域名放行、按什么模式拼地址），
+	// 但下发的输入不止这些：DNS 服务商、DNS 参数、凭据与 ACME 邮箱同样会改变
+	// 渲染出的 Caddyfile 与 Caddy 的运行配置。只比较前三项的话，单独保存这些
+	// 字段时页面会显示「与期望一致」，而磁盘上跑的还是旧配置——正是这一页要
+	// 防的那件事。
+	//
+	// 存摘要而不是逐项存明文：凭据是密钥，复制一份到设置表等于多一处泄漏面。
+	// 摘要只用于判等，不参与渲染。
+	KeyDomainAppliedDigest SettingKey = "domain.applied_digest"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -275,6 +287,7 @@ var settingSpecs = []settingSpec{
 	{Key: KeyDomainAppliedPanel, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedTunnel, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedMode, Internal: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainAppliedDigest, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。

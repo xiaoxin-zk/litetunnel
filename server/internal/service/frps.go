@@ -125,8 +125,30 @@ func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 			return nil, err
 		}
 		all = append(all, out.Items...)
-		if len(out.Items) < pageSize || len(all) >= out.Total {
+
+		// 完整性判定只认 total：累计数量达到它才算读全了。
+		//
+		// 「当前页不足一整页即成功」有两个漏洞：
+		//   - frps 报 total=350，但接口在 250 条处开始提前截断——短页被当成
+		//     「读完了」，剩下的 100 条凭空消失；
+		//   - total 缺失时被解码成 0，任何短页都会「满足完成条件」。
+		// 这不是普通的坏响应：采集器拿这份列表重建在线状态（setOnlineTunnels），
+		// 没读到的代理会被判成离线，正在连接的用户直接「掉线」，还要等下一轮
+		// 采集才恢复。所以宁可报错保住上一次的在线状态，也不采信残缺的列表。
+		if out.Total > 0 && len(all) >= out.Total {
 			return all, nil
+		}
+
+		if len(out.Items) < pageSize {
+			// 走到这里说明 total 没被满足。特例：total 为 0 且一页为空，
+			// 是 frps 明确的「没有任何代理」——这是真实状态，不是残缺响应；
+			// 除此之外的短页一律不采信。
+			if out.Total == 0 && len(out.Items) == 0 && page == 1 {
+				return all, nil
+			}
+			return nil, fmt.Errorf(
+				"frps 代理列表不完整：已取 %d 条，上报 total=%d，第 %d 页仅返回 %d 条（每页 %d）",
+				len(all), out.Total, page, len(out.Items), pageSize)
 		}
 	}
 	// 取满 maxPages 页后仍有数据：宁可报错，也不返回一份不完整的列表。

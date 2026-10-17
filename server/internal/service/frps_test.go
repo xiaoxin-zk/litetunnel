@@ -227,6 +227,45 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 }
 
+// TestListProxiesRejectsShortPageWithRemainingTotal 覆盖「短页但 total 未满足」。
+//
+// frps 报 total=350 却在第 100 条处提前结束：短页原先会被当成「读完了」，
+// 没读到的 250 条凭空消失，采集器把那些隧道判成离线。必须报错，
+// 让调用方保住上一轮的在线状态。
+func TestListProxiesRejectsShortPageWithRemainingTotal(t *testing.T) {
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		items := make([]string, 0, 100)
+		for i := 0; i < 100; i++ {
+			items = append(items, `{"name":"lt_u1.x","status":{"phase":"online"}}`)
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":350,"page":1,"pageSize":200,"items":[%s]}}`,
+			strings.Join(items, ","))
+	})
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("短页且 total 未满足应报错，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("结果不完整时不应返回代理列表")
+	}
+	if !strings.Contains(err.Error(), "不完整") {
+		t.Fatalf("错误信息应说明列表不完整，实际: %v", err)
+	}
+}
+
+// TestListProxiesRejectsMissingTotalWithShortPage 覆盖「total 缺失 + 短页」。
+//
+// total 缺失会被解码成 0，任何短页原先都「满足完成条件」。
+// 除「total=0 且整页为空」这个明确的空列表外，一律不采信。
+func TestListProxiesRejectsMissingTotalWithShortPage(t *testing.T) {
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":200,"msg":"success","data":{"page":1,"pageSize":200,"items":[{"name":"lt_u1.mc","status":{"phase":"online"}}]}}`))
+	})
+	if _, err := c.ListProxies(context.Background()); err == nil {
+		t.Fatal("total 缺失且页面非满时应报错")
+	}
+}
+
 // TestListProxiesRejectsPageCapOverflow 覆盖分页上限。
 //
 // 取满上限仍有数据时必须报错：悄悄返回一份不完整的列表，会让没读到的

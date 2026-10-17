@@ -4,14 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// mailSendTimeout 是单封邮件的发送超时。
-const mailSendTimeout = 30 * time.Second
+// mailSendTimeout 是单封邮件的**总**预算：拨号与会话读写共享同一个截止。
+//
+// 必须覆盖邮件客户端的最长执行时间（拨号 10 秒 + 会话读写 30 秒）：
+// 两层各算各的预算时，外层（30 秒）会早于 SMTP 会话（最多 40 秒）放弃，
+// 慢连接上「队列已排了重试、这封信稍后却真的送到」同时发生——用户会
+// 收到一封凭据尚未生效的邮件，再收到一封重复的。
+const MailSendTimeout = 45 * time.Second
 
 // mailRetryInterval 是发件箱的轮询间隔：等待重试的信与启动时遗留的信都靠它。
 const mailRetryInterval = 30 * time.Second
@@ -170,16 +176,22 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 // deliverMail 发送一封邮件；送达后再执行凭据动作。
 func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 	sender := s.mailSender()
+	// 发送预算通过 ctx 传给客户端：拨号与会话读写共用同一个截止，
+	// 不会再出现「外层判超时、实际稍后送达」的重复投递。
+	sendCtx, cancel := context.WithTimeout(ctx, MailSendTimeout)
+	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- sender.Send(row.To, row.Subject, row.Body) }()
+	go func() { done <- sender.Send(sendCtx, row.To, row.Subject, row.Body) }()
 
 	var err error
 	select {
 	case err = <-done:
-	case <-time.After(mailSendTimeout):
-		err = errors.New("发送超时")
-	case <-ctx.Done():
-		return
+	case <-sendCtx.Done():
+		if ctx.Err() != nil {
+			// 服务停止：本轮直接放弃，不发失败记录（下次启动重试）。
+			return
+		}
+		err = fmt.Errorf("发送超时（%s）", MailSendTimeout)
 	}
 
 	if err != nil {

@@ -6,6 +6,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -260,8 +261,11 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 }
 
 // mailSender 是发信器的最小接口，便于测试注入替身。
+//
+// ctx 携带发送总预算：拨号与会话读写都要服从同一个截止，否则队列
+// 判超时之后邮件仍可能送达（见 mailSendTimeout 的说明）。
 type mailSender interface {
-	Send(to, subject, body string) error
+	Send(ctx context.Context, to, subject, body string) error
 }
 
 // mailSender 返回实际用于发信的对象。
@@ -459,32 +463,49 @@ func (s *Services) ResolveCredential(plain string) (uint, string, error) {
 // 用于每次请求时校验令牌持有者：仅验签无法发现账号已被禁用，
 // 也无法发现密码已被重置（此时令牌版本自增，旧令牌必须失效）。
 func (s *Services) ResolveUserIdentity(id uint) (active bool, tokenVersion int) {
-	if a, v, ok := s.Runtime.CachedIdentity(IdentityKindUser, id); ok {
-		return a, v
+	for attempt := 0; attempt < 2; attempt++ {
+		if a, v, ok := s.Runtime.CachedIdentity(IdentityKindUser, id); ok {
+			return a, v
+		}
+		// 读库前取代次：回填时要确认期间没有发生失效（禁用/删号/改密）。
+		gen := s.Runtime.IdentityGen(IdentityKindUser, id)
+		u, err := s.LoadUser(id)
+		if err != nil {
+			if s.Runtime.SetCachedIdentityIfGen(IdentityKindUser, id, false, 0, gen) {
+				return false, 0
+			}
+			continue
+		}
+		a := u.Status == model.UserStatusActive
+		if s.Runtime.SetCachedIdentityIfGen(IdentityKindUser, id, a, u.TokenVersion, gen) {
+			return a, u.TokenVersion
+		}
+		// 期间被失效：这次读到的可能是旧状态，重读一次再判断。
 	}
-	u, err := s.LoadUser(id)
-	if err != nil {
-		s.Runtime.SetCachedIdentity(IdentityKindUser, id, false, 0)
-		return false, 0
-	}
-	active = u.Status == model.UserStatusActive
-	s.Runtime.SetCachedIdentity(IdentityKindUser, id, active, u.TokenVersion)
-	return active, u.TokenVersion
+	// 连续两轮都被失效打断（极罕见）：保守按无效处理，下一次请求重新解析。
+	return false, 0
 }
 
 // ResolveAdminIdentity 返回管理员的实时状态。
 func (s *Services) ResolveAdminIdentity(id uint) (active bool, tokenVersion int) {
-	if a, v, ok := s.Runtime.CachedIdentity(IdentityKindAdmin, id); ok {
-		return a, v
+	for attempt := 0; attempt < 2; attempt++ {
+		if a, v, ok := s.Runtime.CachedIdentity(IdentityKindAdmin, id); ok {
+			return a, v
+		}
+		gen := s.Runtime.IdentityGen(IdentityKindAdmin, id)
+		adm, err := s.LoadAdmin(id)
+		if err != nil {
+			if s.Runtime.SetCachedIdentityIfGen(IdentityKindAdmin, id, false, 0, gen) {
+				return false, 0
+			}
+			continue
+		}
+		a := adm.Status == "active"
+		if s.Runtime.SetCachedIdentityIfGen(IdentityKindAdmin, id, a, adm.TokenVersion, gen) {
+			return a, adm.TokenVersion
+		}
 	}
-	adm, err := s.LoadAdmin(id)
-	if err != nil {
-		s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, false, 0)
-		return false, 0
-	}
-	active = adm.Status == "active"
-	s.Runtime.SetCachedIdentity(IdentityKindAdmin, id, active, adm.TokenVersion)
-	return active, adm.TokenVersion
+	return false, 0
 }
 
 // AllowedProtocols 解析分组允许的协议集合。

@@ -54,7 +54,15 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	}
 	// 建完立刻同步：新建的隧道会带上下发的公网地址，
 	// 让用户马上看到「该发给朋友哪个地址」。
-	return a.Refresh()
+	//
+	// 同步失败**不**把创建判为失败：POST 已经成功，隧道在服务端建好了。
+	// 报失败会让用户重试，遇到「名称已存在」或重复资源；错误通过
+	// SyncErr 呈现，下一轮自动同步会把列表补齐——与批量创建同一语义。
+	state, rerr := a.Refresh()
+	if rerr != nil {
+		return a.GetState(), nil
+	}
+	return state, nil
 }
 
 // BatchFailure 记录批量创建中一条失败。

@@ -610,6 +610,10 @@ func (s *Services) FirewallManualOpen(port int, proto string) error {
 }
 
 // FirewallManualClose 管理员手工关闭端口。
+//
+// 端口仍被**启用中**的隧道占用时拒绝关闭：全量对齐会按活跃隧道把它重新
+// 放行（见 ReconcileFirewall），管理员看到的是「关掉了又自己开了」，还会
+// 误以为防火墙坏了。要让端口真正关闭，先停用/删除对应的隧道。
 func (s *Services) FirewallManualClose(port int, proto string) error {
 	be, err := s.requireWritableBackend()
 	if err != nil {
@@ -618,7 +622,29 @@ func (s *Services) FirewallManualClose(port int, proto string) error {
 	if err := s.FirewallGuard().CheckRemove(port); err != nil {
 		return err
 	}
+	n, err := s.activeTunnelPortCount(port, proto)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("%w: 端口 %d 仍有 %d 条启用中的隧道，全量对齐会自动把它重新放行；请先停用这些隧道", ErrInvalidParam, port, n)
+	}
 	return be.RemovePort(port, proto)
+}
+
+// activeTunnelPortCount 统计仍占用该端口的启用中隧道数。
+//
+// 全量对齐按「status = active 的隧道」放行端口，所以这里用同一口径判断：
+// 只要还有活跃隧道占着，手工关闭就会被下一轮对齐撤销。
+func (s *Services) activeTunnelPortCount(port int, proto string) (int64, error) {
+	q := s.DB.Model(&model.Tunnel{}).
+		Where("remote_port = ? AND status = ?", port, model.TunnelStatusActive)
+	if proto == "tcp" || proto == "udp" {
+		q = q.Where("type = ?", proto)
+	}
+	var n int64
+	err := q.Count(&n).Error
+	return n, err
 }
 
 // requireWritableBackend 取一个「确实能写」的后端，取不到时说明原因。

@@ -31,7 +31,7 @@ type TunnelInput struct {
 
 // ListTunnels 返回用户全部隧道。
 func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
-	list, _, err := s.ListTunnelsPage(userID, 0, 0)
+	list, _, _, err := s.ListTunnelsPage(userID, 0, 0)
 	return list, err
 }
 
@@ -48,14 +48,28 @@ func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
 // 「服务端已删除」而停掉本机进程、删掉本地配置。游标只依赖 id 的
 // 单调性，增删都不会让分页错位。
 //
-// 同时返回总数，客户端据此做一致性校验（取到的条数与总数不符时
-// 说明清单在分页期间发生了变化，应当重取而不是拿不完整清单去对账）。
-func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) ([]model.Tunnel, int64, error) {
-	var total int64
-	if err := s.DB.Model(&model.Tunnel{}).Where("user_id = ?", userID).
-		Count(&total).Error; err != nil {
-		return nil, 0, err
+// 同时返回总数与**清单版本**：只比条数会漏过「数量相抵」的并发变更
+// （分页期间删掉一条已取到的、同时新增一条 id 更大的：总数不变，但
+// 新隧道落在游标之前，永远取不到）。版本用「总数 + 最大 id」概括——
+// 新增必然推高最大 id，删除必然减少总数，客户端逐页比对，不一致就
+// 整轮重取。
+//
+// 不用 MAX(updated_at) 参与版本：SQLite 把它当作文本返回、Postgres
+// 返回时间，跨库扫描类型不一致；而「改个名字」本就不影响清单完整性，
+// 下一轮同步自然会带上。
+func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []model.Tunnel, total int64, version string, err error) {
+	var agg struct {
+		Total int64
+		MaxID uint
 	}
+	if err = s.DB.Model(&model.Tunnel{}).Where("user_id = ?", userID).
+		Select("COUNT(*) AS total, COALESCE(MAX(id), 0) AS max_id").
+		Scan(&agg).Error; err != nil {
+		return nil, 0, "", err
+	}
+	total = agg.Total
+	version = fmt.Sprintf("%d:%d", total, agg.MaxID)
+
 	q := s.DB.Where("user_id = ?", userID).Order("id desc")
 	if beforeID > 0 {
 		q = q.Where("id < ?", beforeID)
@@ -63,9 +77,8 @@ func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) ([]model.Tu
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
-	var list []model.Tunnel
-	err := q.Find(&list).Error
-	return list, total, err
+	err = q.Find(&list).Error
+	return list, total, version, err
 }
 
 // GetTunnel 按 ID 与归属校验后取隧道。

@@ -225,6 +225,13 @@ func (a *App) fetchClientInfoOnce(ctx context.Context, base, apiKey string) (*cl
 			// 会把后面几页的隧道当成已删除。
 			return nil, fmt.Errorf("拉取隧道清单第 %d 页失败: %w", len(all)/clientInfoPageSize+1, err)
 		}
+		// 版本校验：分页期间删一条、又新增一条 id 更大的，总数不变，
+		// 新隧道却落在游标之前永远取不到——只比条数发现不了。
+		// 老服务端没有版本字段（空串），跳过这项校验。
+		if first.ListVersion != "" && page.ListVersion != first.ListVersion {
+			return nil, fmt.Errorf("%w：列表版本由 %s 变为 %s",
+				errTunnelListChanged, first.ListVersion, page.ListVersion)
+		}
 		if len(page.Tunnels) == 0 {
 			// 服务端说还有、这一页却是空的：不能静默当成取全了，
 			// 交给下面的一致性校验去重取/报错。

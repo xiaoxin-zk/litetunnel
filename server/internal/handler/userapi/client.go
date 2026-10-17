@@ -136,6 +136,13 @@ type clientInfoResp struct {
 	// 恰好整页时会多打一次空请求；老客户端不认识这个字段，忽略即可。
 	TunnelTotal int64 `json:"tunnel_total"`
 
+	// ListVersion 是清单版本（总数 + 最大 id + 最近更新时间）。
+	//
+	// 只比条数会漏过「数量相抵」的并发变更：分页期间删掉一条已取到的、
+	// 同时新增一条 id 更大的，总数不变，但新隧道落在游标之前永远取不到。
+	// 客户端逐页比对版本，不一致就整轮重取。老客户端忽略此字段。
+	ListVersion string `json:"list_version,omitempty"`
+
 	// Group 是分组限制。客户端要能自己建隧道，就必须知道
 	// 「允许哪些协议」「最多几条隧道」——否则表单会放行注定被拒的提交，
 	// 用户填完才收到「协议不允许」的报错。
@@ -174,7 +181,7 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 	if limit > maxClientPageSize {
 		limit = maxClientPageSize
 	}
-	tunnels, total, err := h.svc.ListTunnelsPage(u.ID, uint(beforeID), limit)
+	tunnels, total, version, err := h.svc.ListTunnelsPage(u.ID, uint(beforeID), limit)
 	if err != nil {
 		shared.Fail(c, err)
 		return
@@ -208,6 +215,7 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		Nickname:       u.Nickname,
 		Tunnels:        out,
 		TunnelTotal:    total,
+		ListVersion:    version,
 		TrafficUsed:    u.TrafficUsed,
 		TrafficQuota:   h.svc.EffectiveQuota(u),
 		Exceeded:       h.svc.QuotaExceeded(u),

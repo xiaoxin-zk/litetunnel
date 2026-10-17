@@ -887,7 +887,7 @@ type fakeMailer struct {
 	sent []string
 }
 
-func (f *fakeMailer) Send(to, subject, body string) error {
+func (f *fakeMailer) Send(ctx context.Context, to, subject, body string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail {

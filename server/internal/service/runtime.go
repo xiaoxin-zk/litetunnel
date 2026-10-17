@@ -118,7 +118,9 @@ type Runtime struct {
 	// 所以把「状态未知」变成一个可查询的事实，由插件显式拒绝（fail-closed）。
 	guardReady bool
 
-	identities map[identityKey]identityState // 账号有效性短缓存
+	identities map[identityKey]identityState
+	// identityGen 是每个身份的失效代次，见 InvalidateIdentity 的说明。
+	identityGen map[identityKey]uint64 // 账号有效性短缓存
 }
 
 // 账号有效性缓存的命名空间。
@@ -149,13 +151,14 @@ type identityState struct {
 // NewRuntime 构造内存态。
 func NewRuntime() *Runtime {
 	return &Runtime{
-		sessions:   make(map[string]sessionInfo),
-		exceeded:   make(map[uint]bool),
-		blocked:    make(map[uint]bool),
-		online:     make(map[uint]bool),
-		lastStat:   make(map[string]trafficPair),
-		touchAt:    make(map[string]time.Time),
-		identities: make(map[identityKey]identityState),
+		sessions:    make(map[string]sessionInfo),
+		exceeded:    make(map[uint]bool),
+		blocked:     make(map[uint]bool),
+		online:      make(map[uint]bool),
+		lastStat:    make(map[string]trafficPair),
+		touchAt:     make(map[string]time.Time),
+		identities:  make(map[identityKey]identityState),
+		identityGen: make(map[identityKey]uint64),
 	}
 }
 
@@ -172,6 +175,9 @@ func (r *Runtime) CachedIdentity(kind uint8, id uint) (bool, int, bool) {
 }
 
 // SetCachedIdentity 写入账号状态缓存。
+//
+// 仅用于「不关心失效竞态」的场合（测试、显式覆盖）。业务路径应使用
+// SetCachedIdentityIfGen，见下面的说明。
 func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool, version int) {
 	key := identityKey{kind: kind, id: id}
 	r.mu.Lock()
@@ -179,12 +185,45 @@ func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool, version in
 	r.identities[key] = identityState{active: active, version: version, at: time.Now()}
 }
 
-// InvalidateIdentity 立即失效某个账号的缓存。
-// 禁用 / 删除账号时必须调用，否则最长会有 identityTTL 的生效延迟。
+// IdentityGen 取某个身份的当前失效代次。
+//
+// 解析流程是「读库 → 算状态 → 回填缓存」，中间可能被禁用/删号/改密打断
+// （InvalidateIdentity 递增代次并清缓存）。回填时只要代次变了，就说明
+// 读到的是旧状态——那份结果既不能写进缓存（否则旧的有效状态会再存活
+// 最多 identityTTL），也不该直接返回给这次请求。
+func (r *Runtime) IdentityGen(kind uint8, id uint) uint64 {
+	key := identityKey{kind: kind, id: id}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.identityGen[key]
+}
+
+// SetCachedIdentityIfGen 按代次条件回填缓存：代次一致才写入。
+// 返回 false 表示期间发生了失效，调用方的读取结果已经过时。
+func (r *Runtime) SetCachedIdentityIfGen(kind uint8, id uint, active bool, version int, gen uint64) bool {
+	key := identityKey{kind: kind, id: id}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.identityGen[key] != gen {
+		return false
+	}
+	r.identities[key] = identityState{active: active, version: version, at: time.Now()}
+	return true
+}
+
+// InvalidateIdentity 立即失效某个账号的缓存，并递增失效代次。
+//
+// 禁用 / 删除账号 / 重置密码时必须调用，否则最长会有 identityTTL 的
+// 生效延迟。递增代次是为了拦住「在途的解析」：它在失效之前读的库，
+// 回填时会被 SetCachedIdentityIfGen 拒绝，旧状态不会重新住进缓存。
 func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
 	key := identityKey{kind: kind, id: id}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.identityGen == nil {
+		r.identityGen = map[identityKey]uint64{}
+	}
+	r.identityGen[key]++
 	delete(r.identities, key)
 }
 

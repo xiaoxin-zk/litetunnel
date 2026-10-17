@@ -5,6 +5,7 @@
 package mailer
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -35,8 +36,14 @@ func (m *Mailer) From() string { return m.cfg.From }
 
 // Send 发送一封 HTML 邮件。
 //
-// 连接与读写都设置了超时，避免 SMTP 服务器无响应时把调用方协程挂死。
-func (m *Mailer) Send(to, subject, htmlBody string) error {
+// ctx 的截止时间覆盖**拨号与会话读写全程**：队列层据此判定「这次没发出去」，
+// 两层若各算各的预算，就会出现「队列已判超时并安排重试，SMTP 那边稍后
+// 却真的送达了」——用户先收到一封凭据尚未生效的邮件，再收到一封重复的。
+// 因此拨号用 DialContext（或把拨号截止对齐到同一个 deadline），连接建立后
+// 的读写截止也直接取这个 deadline。
+//
+// 没有 deadline 的 ctx（例如手工调用）退化为「拨号 10 秒、会话读写 30 秒」。
+func (m *Mailer) Send(ctx context.Context, to, subject, htmlBody string) error {
 	if !m.Enabled() {
 		return errors.New("邮件服务未配置")
 	}
@@ -48,22 +55,33 @@ func (m *Mailer) Send(to, subject, htmlBody string) error {
 	addr := net.JoinHostPort(m.cfg.Host, strconv.Itoa(m.cfg.Port))
 	tlsConf := &tls.Config{ServerName: m.cfg.Host, MinVersion: tls.VersionTLS12}
 
+	deadline, hasDeadline := ctx.Deadline()
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	if hasDeadline {
+		dialer.Deadline = deadline
+	}
+
 	var (
 		conn net.Conn
 		err  error
 	)
 	if m.cfg.TLS == "ssl" {
 		// 465：隐式 TLS，连上就是加密的。
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
 		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
 	} else {
-		conn, err = net.DialTimeout("tcp", addr, 10*time.Second)
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return fmt.Errorf("连接邮件服务器失败: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if hasDeadline {
+		// 会话读写与拨号共用同一个截止：外层超时即整体中止，
+		// 不会再出现「队列判失败、连接仍在慢慢写」的情况。
+		_ = conn.SetDeadline(deadline)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	}
 
 	client, err := smtp.NewClient(conn, m.cfg.Host)
 	if err != nil {

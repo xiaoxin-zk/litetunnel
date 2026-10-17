@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -67,7 +68,11 @@ func (h *Handler) TestMail(c *gin.Context) {
   <p style="color:#9ca3af;font-size:12px">发送时间：%s</p>
 </div>`, siteName, time.Now().Format("2006-01-02 15:04:05"))
 
-	if err := h.svc.Mailer().Send(req.To, fmt.Sprintf("【%s】邮件配置测试", siteName), body); err != nil {
+	// 测试发送同样受总预算约束：拨号与会话读写共用一个截止，
+	// 避免「界面报超时、邮件稍后却送到」。
+	sendCtx, cancel := context.WithTimeout(c.Request.Context(), service.MailSendTimeout)
+	defer cancel()
+	if err := h.svc.Mailer().Send(sendCtx, req.To, fmt.Sprintf("【%s】邮件配置测试", siteName), body); err != nil {
 		h.audit(c, "settings.test_mail_failed", "settings", "", err.Error())
 		httpx.Fail(c, http.StatusBadGateway, "发送失败："+err.Error())
 		return

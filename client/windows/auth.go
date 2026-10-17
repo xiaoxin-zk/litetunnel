@@ -35,7 +35,10 @@ type clientInfoData struct {
 	Exceeded     bool       `json:"exceeded"`
 	// TunnelTotal 是账号的隧道总数（不受分页影响）。
 	// 新服务端才有这个字段；老服务端不返回（0），此时按「一页就是全部」处理。
-	TunnelTotal int64       `json:"tunnel_total"`
+	TunnelTotal int64 `json:"tunnel_total"`
+	// ListVersion 是清单版本，只用来自校验分页期间清单有没有变过
+	// （只比条数会漏过「删一条 + 增一条」这种数量相抵的变更）。
+	ListVersion string      `json:"list_version,omitempty"`
 	Group       *groupLimit `json:"group,omitempty"`
 	// BalanceCents 与 PaymentEnabled 一起使用：
 	// 站点未启用支付时客户端不展示任何余额相关内容。

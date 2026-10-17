@@ -764,7 +764,7 @@ func purgeEmailCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", email,
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailDelivered}).
+			[]string{model.MailPending, model.MailSending, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",
@@ -849,7 +849,7 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", strings.ToLower(email),
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailDelivered}).
+			[]string{model.MailPending, model.MailSending, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",

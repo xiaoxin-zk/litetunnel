@@ -124,12 +124,44 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		log.Printf("[store] 邮箱唯一索引未建立（历史数据可能存在重复邮箱，请人工清理后重启）：%v", err)
 	}
 
+	// 清理旧版本遗留的邮件草稿，见 purgeLegacyMailDrafts 的说明。
+	if err := purgeLegacyMailDrafts(db); err != nil {
+		// 不阻断启动：这些行最多是「多占一点额度、多留一段敏感内容」，
+		// 而启动失败是整个服务不可用。下次启动会再试一次（幂等）。
+		log.Printf("[store] 清理遗留邮件草稿失败（下次启动重试）：%v", err)
+	}
+
 	// 隧道清单修订号由触发器维护，见 ensureTunnelListRevTriggers 的说明。
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)
 	}
 
 	return db, nil
+}
+
+// purgeLegacyMailDrafts 把旧版本遗留的邮件草稿按失败处理，并清空敏感内容。
+//
+// 某个中间版本用 status='draft' 表示「已写好、待复核额度」：复核通过转
+// pending，超限则作废。进程若在两步之间崩溃，库里就会留下这种行——正文与
+// 参数里是**明文验证码或重置链接**，而清理任务只回收 failed / sent，
+// 这些内容会永久留在库里；同时它们还会被发信额度统计算进去。
+//
+// 现在的流程已不再写 draft（复核在写入之前），所以这是一次性的数据订正：
+// 升级后第一次启动清掉，之后每次启动匹配不到任何行。幂等。
+func purgeLegacyMailDrafts(db *gorm.DB) error {
+	res := db.Exec(
+		`UPDATE lt_mail_outbox
+		    SET status = ?, body = '', payload = '', last_err = ?
+		  WHERE status = ?`,
+		model.MailFailed, "升级遗留的草稿邮件，已作废", model.MailDraft,
+	)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("[store] 已作废 %d 封升级遗留的邮件草稿（清空正文与参数）", res.RowsAffected)
+	}
+	return nil
 }
 
 // tunnelListRevColumns 是参与清单版本的隧道字段，必须与客户端对账时

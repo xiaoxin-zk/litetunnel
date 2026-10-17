@@ -142,8 +142,13 @@ func (s *Services) lockMailRecipient(tx *gorm.DB, to string) error {
 
 // checkMailQuota 复核某个收件地址的发信额度。
 //
-// 只统计**有效**记录：草稿与已作废的尝试不算。它们没有送达、没有凭据生效，
-// 把它们计入额度的话，一次并发突发就会把当日额度用失败记录填满。
+// 统计**全部**记录，不看投递状态：额度约束的是「请求次数」，不是「成功送达
+// 的次数」。只统计成功的话，SMTP 故障期间可以无限重新排队，把队列与重试
+// 都打满；投递结果不确定时还会重复发信。
+//
+// 「失败记录吃掉额度」这个问题在别处解决：配额不足的请求根本不会被写入
+// （见 enqueueMail 的「先复核、后写入」），所以额度里的每一条都对应一次
+// 真实的发送请求。
 //
 // 统计口径是「不含自己」（调用方尚未写入），所以达到上限即拒绝。
 // 统计失败一律放行：额度是防滥用手段，不该因为一次计数失败挡住正常用户。
@@ -152,8 +157,7 @@ func checkMailQuota(tx *gorm.DB, to, kind string, q mailQuota) error {
 
 	if q.cooldown > 0 {
 		var prev model.MailOutbox
-		err := tx.Where("lower(to_addr) = ? AND kind = ? AND status NOT IN ?",
-			to, kind, []string{model.MailFailed}).
+		err := tx.Where("lower(to_addr) = ? AND kind = ?", to, kind).
 			Order("id desc").First(&prev).Error
 		if err == nil && time.Since(prev.CreatedAt) < q.cooldown {
 			return errMailQuotaCooldown
@@ -167,8 +171,7 @@ func checkMailQuota(tx *gorm.DB, to, kind string, q mailQuota) error {
 		now := time.Now()
 		dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 		qry := tx.Model(&model.MailOutbox{}).
-			Where("lower(to_addr) = ? AND created_at >= ? AND status NOT IN ?",
-				to, dayStart, []string{model.MailFailed})
+			Where("lower(to_addr) = ? AND created_at >= ?", to, dayStart)
 		if !q.dailyAllKinds {
 			qry = qry.Where("kind = ?", kind)
 		}
@@ -256,8 +259,11 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		s.finishMailAction(row)
 	}
 
+	// 待发 + 租约已过期的「发送中」：后者是某个实例在发送途中崩溃留下的，
+	// 租约到期后由任意实例接手（至多重复投递一次，方向安全）。
 	var toSend []model.MailOutbox
-	if err := s.DB.Where("status = ? AND next_at <= ?", model.MailPending, now).
+	if err := s.DB.Where("status IN ? AND next_at <= ?",
+		[]string{model.MailPending, model.MailSending}, now).
 		Order("id asc").Limit(mailBatchSize).Find(&toSend).Error; err != nil {
 		log.Printf("[mail] 读取发件箱失败: %v", err)
 		return
@@ -266,8 +272,42 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if !s.claimMail(row.ID, now) {
+			// 被别的实例抢先领走了。多实例共用一个库时这是常态，
+			// 不是异常——安静跳过即可。
+			continue
+		}
 		s.deliverMail(ctx, row)
 	}
+}
+
+// mailSendLease 是「发送中」的租约时长。
+//
+// 领取时把 next_at 推后这么久：租约内别的实例不会再取到这一行；
+// 持有者若在发送途中崩溃，到期后可以被重新领取。取值要覆盖一次发送的
+// 最坏耗时（MailSendTimeout + 一点余量），否则正常发送中的信会被重复领取。
+const mailSendLease = MailSendTimeout + 30*time.Second
+
+// claimMail 原子领取一封待发邮件：pending（或租约过期的 sending）→ sending。
+//
+// 多实例共用 PostgreSQL 时，每个实例都有自己的发件协程。直接读 pending 就发
+// 会让同一行被两个实例各发一次——收件人会收到两封、凭据被激活两次。
+// 条件更新把「谁能发」收敛成一个原子动作：只有 RowsAffected=1 的那个实例发。
+//
+// SQLite 单连接下天然串行，这一步同样没有副作用。
+func (s *Services) claimMail(id uint, now time.Time) bool {
+	res := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND status IN ? AND next_at <= ?",
+			id, []string{model.MailPending, model.MailSending}, now).
+		Updates(map[string]any{
+			"status":  model.MailSending,
+			"next_at": now.Add(mailSendLease),
+		})
+	if res.Error != nil {
+		log.Printf("[mail] 领取邮件失败（id=%d）: %v", id, res.Error)
+		return false
+	}
+	return res.RowsAffected == 1
 }
 
 // deliverMail 发送一封邮件；送达后再执行凭据动作。
@@ -319,11 +359,11 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 		"last_err": "",
 		"body":     "",
 	}
-	// 状态用**条件**更新（仅 pending）：这封信在发送期间可能已经被作废
-	// ——换邮箱会把旧地址的待发邮件标成失败。无条件写回 delivered 会把它
-	// 「复活」，随后激活出一份指向旧邮箱的凭据，清理等于白做。
+	// 状态用**条件**更新（仅 sending，即本实例领取时写入的状态）：
+	// 这封信在发送期间可能已经被作废——换邮箱会把旧地址的待发邮件标成失败。
+	// 无条件写回 delivered 会把它「复活」，随后激活出一份指向旧邮箱的凭据。
 	res := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status = ?", row.ID, model.MailPending).
+		Where("id = ? AND status = ?", row.ID, model.MailSending).
 		Updates(updates)
 	if res.Error != nil {
 		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", row.ID, res.Error)

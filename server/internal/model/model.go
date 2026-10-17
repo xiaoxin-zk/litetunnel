@@ -393,6 +393,19 @@ func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens"
 const (
 	// MailPending 待发送（含等待重试）。
 	MailPending = "pending"
+	// MailSending 已被某个实例领取、正在发送。
+	//
+	// 领取是条件更新（pending → sending，并把 next_at 写成租约到期时间）：
+	// 多实例共用一个库时，同一封信只会被一个实例取走；实例在发送途中崩溃，
+	// 租约到期后另一个实例可以重新领取（至多重复投递一次，方向安全）。
+	MailSending = "sending"
+	// MailDraft 是**已废弃**的状态，仅为升级清理保留。
+	//
+	// 某个中间版本用它表示「已写好、待复核额度」，进程若在复核与释放之间
+	// 崩溃就会留下这种行：正文里是明文验证码/重置链接，而清理任务只回收
+	// failed / sent。启动时会统一把它们按失败处理并清空敏感内容
+	// （见 store.purgeLegacyMailDrafts），代码里不应再写入这个状态。
+	MailDraft = "draft"
 	// MailDelivered 邮件已送达，但凭据动作还没完成。
 	//
 	// 必须与 MailSent 分开：凭据激活是数据库操作，可能瞬时失败。若把它和

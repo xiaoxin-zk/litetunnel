@@ -55,26 +55,71 @@ func TestEnqueueMailRejectsBeforeWrite(t *testing.T) {
 	}
 }
 
-// TestCheckMailQuotaIgnoresFailedRows 覆盖「失败记录不算额度」。
-func TestCheckMailQuotaIgnoresFailedRows(t *testing.T) {
+// TestClaimMailPreventsDoubleSend 覆盖「多实例重复发信」。
+//
+// 每个实例都有自己的发件协程。直接读 pending 就发的话，同一行会被两个实例
+// 各发一次（收件人收到两封、凭据被激活两次）。领取是条件更新：
+// 只有 RowsAffected=1 的实例继续发。实例在发送途中崩溃时，租约到期后
+// 另一个实例可以接手。
+func TestClaimMailPreventsDoubleSend(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	row := &model.MailOutbox{
+		To: "claim@example.com", Subject: "s", Kind: model.MailKindResetLink,
+		Status: model.MailPending, NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(row).Error; err != nil {
+		t.Fatalf("建待发邮件失败: %v", err)
+	}
+
+	now := time.Now()
+	if !svc.claimMail(row.ID, now) {
+		t.Fatal("第一次领取应成功")
+	}
+	if svc.claimMail(row.ID, now) {
+		t.Fatal("租约内不该被再次领取（多实例会重复发信）")
+	}
+
+	// 租约到期：崩溃恢复，允许重新领取。
+	if !svc.claimMail(row.ID, now.Add(mailSendLease+time.Second)) {
+		t.Fatal("租约到期后应可重新领取（实例崩溃恢复）")
+	}
+
+	// 已作废的邮件不该被领取。
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+		Update("status", model.MailFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if svc.claimMail(row.ID, now.Add(2*mailSendLease)) {
+		t.Fatal("已作废的邮件不该被领取")
+	}
+}
+
+// TestCheckMailQuotaCountsFailedAttempts 覆盖「额度约束请求而不是投递结果」。
+//
+// 失败的信同样是一次真实的发送请求：SMTP 故障期间若不计入额度，
+// 分散来源可以无限重新排队，把队列与重试都打满。
+// 「失败记录吃掉额度」的问题由「先复核、后写入」解决——配额不足的请求
+// 根本不会留下记录。
+func TestCheckMailQuotaCountsFailedAttempts(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	const to = "failedcount@example.com"
 	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	for i := 0; i < 5; i++ {
 		row := &model.MailOutbox{
 			To: to, Subject: "s", Kind: model.MailKindResetLink,
-			Status: model.MailFailed, NextAt: now, CreatedAt: now,
+			Status: model.MailFailed, NextAt: now, CreatedAt: dayStart.Add(time.Minute),
 		}
 		if err := svc.DB.Create(row).Error; err != nil {
 			t.Fatalf("建失败邮件失败: %v", err)
 		}
 	}
 
-	// 五条失败记录不该占额度：额度只统计真正会送达（或已送达）的信。
 	if err := checkMailQuota(svc.DB, to, model.MailKindResetLink,
-		mailQuota{cooldown: time.Minute, dailyLimit: 5}); err != nil {
-		t.Fatalf("失败记录不该计入额度，实际 %v", err)
+		mailQuota{dailyLimit: 5}); !errors.Is(err, errMailQuotaDaily) {
+		t.Fatalf("失败记录也应计入额度，实际 %v", err)
 	}
 }
 

@@ -13,6 +13,8 @@
 // （见 cmd/lt-fw 的包注释）。渲染留在宿主机侧，面板只负责「说要什么」。
 package tlscfg
 
+import "strings"
+
 // 模板变量名，与 deploy/caddy/Caddyfile.template 和
 // deploy/frps/frps.toml.template 里的 ${...} 占位符一一对应。
 const (
@@ -80,6 +82,47 @@ func IsOverridable(name string) bool {
 		}
 	}
 	return false
+}
+
+// HasControlChars 报告字符串里是否含有控制字符（含 CR 与 LF）。
+//
+// 为什么这是安全判定而不是格式洁癖：这些值最终会被拼成 .env 的 key=value 行，
+// 由 helper 写盘、由 Compose 读取插值。值里混进一个换行，就等于往 .env 里
+// 追加整整一行——而 Compose 的插值（image: ${LT_CADDY_IMAGE:-caddy:2-alpine}）
+// 接受任何来自 .env 的键。于是「面板无权覆盖 LT_CADDY_IMAGE」这条边界可以靠
+// 一个换行绕过：helper 拿旧镜像校验通过，Compose 却用注入的新镜像重建。
+//
+// 所以两侧都拒绝而不是「过滤掉」：过滤会让人以为改动生效了，实际被悄悄改成
+// 了别的值；拒绝则留下一条明确的错误。
+//
+// U+2028 / U+2029 一并拒绝：它们在不少工具里会被当成换行，留着只会让
+// 「到底断没断行」变成一个取决于解析器的悬案。
+func HasControlChars(v string) bool {
+	for _, r := range v {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return true
+		case r == '\u2028' || r == '\u2029':
+			return true
+		}
+	}
+	return false
+}
+
+// ComposeCaddyImage 返回 deploy/docker-compose.yml 实际会用来重建 caddy 的镜像。
+//
+// 取值口径必须与 compose 的插值逐字一致：
+//
+//	image: ${LT_CADDY_IMAGE:-caddy:2-alpine}
+//
+// 即「.env 里的 LT_CADDY_IMAGE，缺省回落到 caddy:2-alpine」。校验用的镜像
+// 若不是这一个，那么「校验通过」只对另一个镜像成立——官方镜像没有 dns 插件，
+// 自建镜像有，两者的指令集不同。
+func ComposeCaddyImage(envVars map[string]string) string {
+	if v := strings.TrimSpace(envVars["LT_CADDY_IMAGE"]); v != "" {
+		return v
+	}
+	return "caddy:2-alpine"
 }
 
 // Health 是 helper 的健康状态。

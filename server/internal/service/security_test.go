@@ -572,6 +572,42 @@ func TestLastSuperAdminDeleteIsAtomic(t *testing.T) {
 	}
 }
 
+// TestDomainSettingsRejectLineBreaks 覆盖「凭换行绕过 helper 的变量白名单」。
+//
+// 面板保存的这几个值会被拼成 .env 的 key=value 交给 helper 写盘，而 Compose
+// 的插值（image: ${LT_CADDY_IMAGE:-caddy:2-alpine}）接受任何来自 .env 的键。
+// 于是 DNS 凭据里的一个换行就能追加 LT_CADDY_IMAGE，把「面板只能改域名与证书」
+// 这条边界整个绕开——helper 用旧镜像校验通过，Compose 却用注入的镜像重建。
+func TestDomainSettingsRejectLineBreaks(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	targets := []SettingKey{
+		KeyDomainPanel, KeyDomainTunnel, KeyDomainACMEEmail, KeyDomainDNSProvider,
+		KeyDomainDNSArgs, KeyDomainDNSCredential, KeyDomainHTTPSMode,
+		KeyDomainExpectedIP, KeyDomainHelperAddr, KeyDomainHelperToken,
+	}
+	for _, k := range targets {
+		err := svc.Settings.SetMany(map[SettingKey]string{
+			k: "value\nLT_CADDY_IMAGE=evil:latest",
+		})
+		if !errors.Is(err, ErrInvalidParam) {
+			t.Fatalf("%s 允许了换行注入，err=%v", k, err)
+		}
+		if got := svc.Settings.Get(k); strings.Contains(got, "evil") {
+			t.Fatalf("%s 的注入值被写进了缓存", k)
+		}
+	}
+
+	// 正常值不受影响：这条守卫不该把功能本身弄坏。
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyDomainDNSProvider: "cloudflare"}); err != nil {
+		t.Fatalf("正常值不该被拒绝: %v", err)
+	}
+	// 多行文本类配置不该被这条规则波及（例如注册须知）。
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyRegisterTerms: "第一行\n第二行"}); err != nil {
+		t.Fatalf("多行文本不该被 SingleLine 规则拦住: %v", err)
+	}
+}
+
 // TestAdminSetUserGroupDoesNotDeadlock 覆盖 SQLite 单连接下的自锁。
 //
 // AdminSetUserGroup 曾经在事务里调用 refreshQuotaFor，而后者要用**主连接**

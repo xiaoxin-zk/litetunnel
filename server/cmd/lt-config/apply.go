@@ -46,7 +46,14 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 		if !tlscfg.IsOverridable(k) {
 			return res, fmt.Errorf("不允许覆盖变量 %s", k)
 		}
-		vars[k] = strings.TrimSpace(req.Vars[k])
+		v := strings.TrimSpace(req.Vars[k])
+		// 值会被拼成 .env 的一行（见 envfile.go 的 set）。带换行就能追加额外的
+		// 键——包括白名单之外的 LT_CADDY_IMAGE。面板侧已经拒绝，这里是第二道：
+		// helper 是独立的信任边界，不能假定调用方一定校验过。
+		if tlscfg.HasControlChars(v) {
+			return res, fmt.Errorf("变量 %s 的值含有换行或其他控制字符：写进 .env 会变成额外的配置行", k)
+		}
+		vars[k] = v
 	}
 	// 留一条不含密钥的快照：事后回答「当时到底下发了什么」时，
 	// 唯一的依据就是这行日志与磁盘上的文件。
@@ -54,6 +61,21 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 
 	// 2) 派生值，与 deploy/scripts/render.* 保持一致。
 	deriveVars(vars)
+
+	// 2.5) 校验用的镜像必须就是 Compose 会用的那个。
+	//
+	// compose 的写法是 image: ${LT_CADDY_IMAGE:-caddy:2-alpine}，读的是 .env；
+	// 而 LT_CADDY_IMAGE 不在面板可覆盖的白名单里，所以它只可能来自 .env 本身。
+	// 若 LT_CFG_CADDY_IMAGE 指定了另一个镜像，这次「校验通过」就只对那个镜像
+	// 成立——官方镜像没有 dns 插件、自建镜像有，两者的指令集不同，校验等于
+	// 自我安慰。宁可当场报错，也不要留下「校验过的东西不是要上线的东西」。
+	caddyImage := s.effectiveCaddyImage(vars)
+	if composeImage := tlscfg.ComposeCaddyImage(vars); !strings.EqualFold(caddyImage, composeImage) {
+		return res, fmt.Errorf(
+			"校验用的 Caddy 镜像（%s）与 Compose 实际会使用的镜像（%s）不一致："+
+				"请让 LT_CFG_CADDY_IMAGE 与 .env 的 LT_CADDY_IMAGE 相同，或取消前者",
+			caddyImage, composeImage)
+	}
 
 	// 3) 校验合并后的变量。这一步在渲染之前，报错信息才能指向具体字段。
 	if err := s.validateVars(vars, &res); err != nil {
@@ -78,10 +100,9 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 		return res, fmt.Errorf("渲染 frps.toml 失败: %w", err)
 	}
 
-	// 5) 校验：用将要上线的那个镜像，而不是随便一个。
+	// 5) 校验：用将要上线的那个镜像（已在上一步确认与 Compose 一致）。
 	//    官方镜像没有 dns 插件，拿它校验「带 DNS Challenge 的自建镜像配置」
 	//    会误报 unrecognized directive: dns。
-	caddyImage := s.effectiveCaddyImage(vars)
 	validateOut, err := s.validateContainers(caddyText, caddyImage, frpsText, vars)
 	if err != nil {
 		return res, err
@@ -99,7 +120,11 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	// 7) 同步 .env：compose 靠它把 DNS 凭据注入 Caddy 容器。
 	if req.WriteEnv {
 		for _, k := range sortedKeys(req.Vars) {
-			if env.set(k, vars[k]) {
+			changed, err := env.set(k, vars[k])
+			if err != nil {
+				return res, err
+			}
+			if changed {
 				res.EnvUpdated = append(res.EnvUpdated, k)
 			}
 		}

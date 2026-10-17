@@ -28,10 +28,14 @@ func TestEnvFileSetKeepsComments(t *testing.T) {
 		t.Fatalf("解析结果不对: %v", vars)
 	}
 
-	if !env.set("LT_TUNNEL_DOMAIN", "tunnel.example.com") {
+	if changed, err := env.set("LT_TUNNEL_DOMAIN", "tunnel.example.com"); err != nil {
+		t.Fatal(err)
+	} else if !changed {
 		t.Fatal("值变化时应返回 true")
 	}
-	if !env.set("LT_HTTPS_TUNNEL_MODE", "e2e") {
+	if changed, err := env.set("LT_HTTPS_TUNNEL_MODE", "e2e"); err != nil {
+		t.Fatal(err)
+	} else if !changed {
 		t.Fatal("新键应被追加")
 	}
 	if err := env.write(); err != nil {
@@ -62,6 +66,98 @@ func TestEnvFileSetKeepsComments(t *testing.T) {
 		if info.Mode().Perm() != 0o600 {
 			t.Errorf("权限应为 0600，实际 %v", info.Mode().Perm())
 		}
+	}
+}
+
+// TestEnvFileSetRejectsLineBreaks 覆盖「靠换行往 .env 追加变量」。
+//
+// .env 是逐行 key=value，值是直接拼在 '=' 后面的。于是 DNS 凭据里混进一个
+// 换行，就等于往 .env 追加一整行——比如 LT_CADDY_IMAGE。而 compose 的
+// image: ${LT_CADDY_IMAGE:-caddy:2-alpine} 接受任何来自 .env 的键，
+// helper 却又用旧镜像校验过：校验的和实际重建的不是同一个镜像。
+func TestEnvFileSetRejectsLineBreaks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	if err := os.WriteFile(path, []byte("LT_CADDY_IMAGE=ghcr.io/ok/caddy:1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env, _, err := readEnvFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []string{
+		"token\nLT_CADDY_IMAGE=evil:latest",
+		"token\rLT_CADDY_IMAGE=evil:latest",
+		"token\r\nLT_CADDY_IMAGE=evil:latest",
+		"token\x00suffix",
+	} {
+		if _, err := env.set(tlscfg.VarDNSCredential, bad); err == nil {
+			t.Fatalf("含控制字符的值必须被拒绝，实际接受了 %q", bad)
+		}
+	}
+
+	if err := env.write(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "evil") {
+		t.Fatalf(".env 被注入了额外的配置行:\n%s", raw)
+	}
+}
+
+// TestRenderAndApplyRejectsControlCharsInVars 覆盖 helper 侧的第二道校验：
+// 即使面板漏了检查，也不该把带换行的值写进 .env。
+//
+// helper 是独立的信任边界——它能写部署目录、能重建容器，因此不能假定
+// 调用方一定做过校验。
+func TestRenderAndApplyRejectsControlCharsInVars(t *testing.T) {
+	s, p := newRenderOnlyService(t)
+
+	_, err := s.renderAndApply(tlscfg.RenderRequest{
+		Vars: map[string]string{
+			tlscfg.VarUserPublicURL: "https://panel.example.com",
+			tlscfg.VarDNSProvider:   "cloudflare",
+			tlscfg.VarDNSCredential: "token\nLT_CADDY_IMAGE=evil:latest",
+		},
+		WriteEnv: true,
+		Apply:    false,
+	})
+	if err == nil {
+		t.Fatal("带换行的变量值必须被拒绝")
+	}
+	if !strings.Contains(err.Error(), "控制字符") {
+		t.Fatalf("错误信息应指明原因，实际 %v", err)
+	}
+	if raw, rerr := os.ReadFile(p.envFile); rerr == nil && strings.Contains(string(raw), "evil") {
+		t.Fatalf(".env 被写入了注入内容:\n%s", raw)
+	}
+}
+
+// TestRenderAndApplyRejectsCaddyImageMismatch 覆盖「校验的镜像不是要上线的镜像」。
+//
+// LT_CFG_CADDY_IMAGE 是给运维用的校验镜像覆盖。一旦它与 .env 的
+// LT_CADDY_IMAGE（compose 插值实际取的那个）不同，这次「校验通过」就只对
+// 另一个镜像成立：官方镜像没有 dns 插件、自建镜像有，结果毫无参考价值。
+func TestRenderAndApplyRejectsCaddyImageMismatch(t *testing.T) {
+	s, _ := newRenderOnlyService(t)
+	// .env 里是 ghcr.io/example/caddy-dns:latest，这里故意换一个。
+	s.caddyImage = "caddy:2-alpine"
+
+	_, err := s.renderAndApply(tlscfg.RenderRequest{
+		Vars: map[string]string{
+			tlscfg.VarUserPublicURL: "https://panel.example.com",
+			tlscfg.VarDNSProvider:   "cloudflare",
+		},
+	})
+	if err == nil {
+		t.Fatal("校验镜像与 Compose 实际镜像不一致时必须报错")
+	}
+	if !strings.Contains(err.Error(), "不一致") {
+		t.Fatalf("错误信息应说明镜像不一致，实际 %v", err)
 	}
 }
 

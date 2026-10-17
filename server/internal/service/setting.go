@@ -176,6 +176,11 @@ type settingSpec struct {
 	// 用它而不是直接把这类项排除在白名单外：它们需要参与内存缓存
 	// （运行期要高频读取），而缓存是按 settingSpecs 建的。
 	Internal bool
+	// SingleLine 表示这个值会被拼成配置文件里的一行（.env 的 key=value），
+	// 因此不允许出现 CR、LF 或其他控制字符。
+	//
+	// 只在真正拼行的字段上打开：注册须知这类多行文本不在其列。
+	SingleLine bool
 	// Default 是数据库无记录时的回落值，通常来自环境变量。
 	Default func(cfg *config.Config) string
 }
@@ -259,13 +264,17 @@ var settingSpecs = []settingSpec{
 	// 默认值全部来自环境变量：这样「手工部署时在 .env 里填的域名」会
 	// 自动成为界面上的初始值，第一次进后台就看到当前实际生效的配置，
 	// 而不是一片空白。
-	{Key: KeyDomainPanel, Default: func(c *config.Config) string { return normalizeDomainValue(c.UserPublicURL) }},
-	{Key: KeyDomainTunnel, Default: func(c *config.Config) string { return normalizeDomainValue(c.TunnelDomain) }},
-	{Key: KeyDomainACMEEmail, Default: func(*config.Config) string { return "" }},
-	{Key: KeyDomainDNSProvider, Default: func(*config.Config) string { return "" }},
-	{Key: KeyDomainDNSCredential, Secret: true, Default: func(*config.Config) string { return "" }},
-	{Key: KeyDomainDNSArgs, Default: func(*config.Config) string { return "" }},
-	{Key: KeyDomainHTTPSMode, Default: func(c *config.Config) string {
+	//
+	// 这一组全部是 SingleLine：它们要么被拼成 .env 的 key=value 行交给 helper
+	// 写盘，要么被拼进 HTTP 请求头（helper 地址与令牌）。一个换行就能往 .env
+	// 里追加额外的配置行，把「面板无权覆盖某些变量」这条边界整个绕开。
+	{Key: KeyDomainPanel, SingleLine: true, Default: func(c *config.Config) string { return normalizeDomainValue(c.UserPublicURL) }},
+	{Key: KeyDomainTunnel, SingleLine: true, Default: func(c *config.Config) string { return normalizeDomainValue(c.TunnelDomain) }},
+	{Key: KeyDomainACMEEmail, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSProvider, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSCredential, Secret: true, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainDNSArgs, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainHTTPSMode, SingleLine: true, Default: func(c *config.Config) string {
 		// 初始值跟随 .env 里的 LT_HTTPS_TUNNEL_MODE：手工部署时怎么配的，
 		// 后台第一次打开就显示什么，而不是一律显示默认值。
 		if strings.EqualFold(strings.TrimSpace(c.HTTPSProxyMode), tlscfg.HTTPSModeE2E) {
@@ -273,9 +282,9 @@ var settingSpecs = []settingSpec{
 		}
 		return tlscfg.HTTPSModeEdge
 	}},
-	{Key: KeyDomainExpectedIP, Default: func(*config.Config) string { return "" }},
-	{Key: KeyDomainHelperAddr, Default: func(*config.Config) string { return "http://127.0.0.1:7850" }},
-	{Key: KeyDomainHelperToken, Secret: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainExpectedIP, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyDomainHelperAddr, SingleLine: true, Default: func(*config.Config) string { return "http://127.0.0.1:7850" }},
+	{Key: KeyDomainHelperToken, Secret: true, SingleLine: true, Default: func(*config.Config) string { return "" }},
 
 	// 已生效的域名配置。
 	//
@@ -448,6 +457,13 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 		}
 		if spec.Secret && v == SecretMask {
 			continue
+		}
+		// 会被拼成配置文件一行的字段，值里不能有换行或控制字符。
+		//
+		// 拒绝而不是过滤：这些值由 helper 拼进 .env 的 key=value，多一个换行
+		// 就等于多一整行——「面板只能改这一小块」的边界可以被这样绕开。
+		if spec.SingleLine && tlscfg.HasControlChars(v) {
+			return fmt.Errorf("%w: %s 的值不能包含换行或其他控制字符", ErrInvalidParam, k)
 		}
 		stored := v
 		if spec.Secret {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
 // 产物文件的权限。集中在这里定义，避免「某处 0644、某处 0600」这种
@@ -72,7 +74,16 @@ func readEnvFile(path string) (*envFile, map[string]string, error) {
 //
 // 同名键全部更新：解析时是「后者胜」，只改最后一个会让文件里留下一个
 // 与生效值不一致的旧行，将来谁读到它都会得出错误结论。
-func (e *envFile) set(key, value string) bool {
+func (e *envFile) set(key, value string) (bool, error) {
+	// 值里出现换行，就等于往 .env 里追加额外的一行配置——包括白名单之外的键
+	// （LT_CADDY_IMAGE 这类），而 Compose 的插值接受任何来自 .env 的键。
+	//
+	// 调用方 renderAndApply 已经校验过一次；这里是真正落笔的那一处，再挡一次：
+	// 将来新增调用方时，漏掉校验的代价是整个权限边界。
+	if tlscfg.HasControlChars(key) || tlscfg.HasControlChars(value) {
+		return false, fmt.Errorf("拒绝写入 %s：键或值含有换行或其他控制字符", key)
+	}
+
 	changed := false
 	found := false
 	for i, line := range e.lines {
@@ -93,9 +104,9 @@ func (e *envFile) set(key, value string) bool {
 	}
 	if !found {
 		e.lines = append(e.lines, key+"="+value)
-		return true
+		return true, nil
 	}
-	return changed
+	return changed, nil
 }
 
 // content 返回写回磁盘的完整内容。

@@ -37,6 +37,14 @@ func (r *Runtime) markAccessGuardReady() {
 // 这里只负责跨实例的收敛。
 const guardRefreshInterval = 30 * time.Second
 
+// guardMaxAge 是会话准入快照的最长有效期。
+//
+// 刷新失败（数据库不可用）时快照会停在旧值上：不设上限的话，别的实例
+// 撤销会话/禁用账号之后，本实例会一直按「允许」放行——数据库故障越久，
+// 这个窗口越大。5 分钟约等于 10 个刷新周期，足够熬过常见的抖动；超过
+// 它就按「拒绝」处理（见 SessionGuard）。
+const guardMaxAge = 5 * time.Minute
+
 // RefreshSessionGuard 按需从库里刷新会话的准入快照。
 //
 // 只在 Ping 路径调用：那是周期性事件，不是每次新建连接。
@@ -89,6 +97,14 @@ func (s *Services) SessionGuard(runID string) (blocked, exceeded, ok bool) {
 	sess, found := s.Runtime.LookupSession(runID)
 	if !found || sess.GuardAt.IsZero() {
 		return false, false, false
+	}
+	// 快照超过最长有效期，说明这些轮刷新一直没成功（数据库不可用）。
+	// 此时旧的「允许」不能继续生效：别的实例可能已经撤销了会话或禁用了
+	// 账号，而本实例拿着一个再也刷不新的快照在放行新连接。
+	// 方向取拒绝——数据库故障期间牺牲一点可用性，好过让已撤销的会话
+	// 无限期有效。
+	if time.Since(sess.GuardAt) > guardMaxAge {
+		return true, sess.Exceeded, true
 	}
 	return sess.Blocked, sess.Exceeded, true
 }

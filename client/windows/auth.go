@@ -147,6 +147,14 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	//
 	// 所以候选配置先写盘，成功了再一次性发布——「内存状态以磁盘为准」
 	// 这条不变量就不需要靠回滚去补。
+	// 凭据的写入与发布必须与退出登录互斥：Logout 会停进程并清空配置，
+	// 若接入流程在它执行到一半时写盘、发布状态，就会出现「界面已登录、
+	// 磁盘上没有凭据」的状态——重启后凭空丢号。
+	//
+	// 这里用 authMu 而不是 syncMu：syncWithData 自己会取 syncMu，在它外面
+	// 再加一把会造成自锁。锁序固定为「Logout：syncMu → authMu」、
+	// 「Connect：authMu →（释放后）syncMu」，不会形成环。
+	a.authMu.Lock()
 	a.mu.RLock()
 	var candidate Config
 	if a.cfg != nil {
@@ -159,6 +167,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		a.mu.Lock()
 		a.lastError = "接入信息保存失败：" + err.Error()
 		a.mu.Unlock()
+		a.authMu.Unlock()
 		return a.GetState(), err
 	}
 
@@ -185,6 +194,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		a.tunnels = []TunnelVO{}
 	}
 	a.mu.Unlock()
+	a.authMu.Unlock()
 
 	// 接入之后立刻同步一次：所有「已启用」的隧道会各自拉起一个 frpc 进程。
 	//
@@ -218,6 +228,9 @@ func (a *App) Logout() (State, error) {
 		return a.GetState(), fmt.Errorf("停止隧道失败，未退出登录: %w", err)
 	}
 
+	// 与接入流程的「写盘 + 发布」互斥（见 Connect）：否则清空凭据与
+	// 发布新凭据可能交错，出现界面已登录而磁盘上什么都没有的状态。
+	a.authMu.Lock()
 	a.mu.Lock()
 	a.cfg.APIKey = ""
 	a.cfg.ServerURL = ""
@@ -243,6 +256,7 @@ func (a *App) Logout() (State, error) {
 	// 留着只会让新账号的隧道显示一段不属于它的等待时长。
 	a.connectAt = map[uint]time.Time{}
 	a.mu.Unlock()
+	a.authMu.Unlock()
 
 	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。
 	//

@@ -179,6 +179,15 @@ type App struct {
 	// 「刚停掉又被拉起来」的反复闪断。
 	syncMu sync.Mutex
 
+	// authMu 串行化「凭据的写盘与发布」：接入（Connect）与退出（Logout）
+	// 都会改 a.cfg 并写配置文件，交错执行会出现「界面已登录、磁盘上没有
+	// 凭据」——重启后凭空丢号。
+	//
+	// 与 syncMu 分开：syncWithData 自己会取 syncMu，Connect 若在它外面
+	// 再加一把就会自锁。锁序固定为 Logout「syncMu → authMu」、
+	// Connect「authMu（释放后）→ syncMu」，不会形成环。
+	authMu sync.Mutex
+
 	// syncStart 是下一轮同步从清单的哪个位置开始处理（见 applySyncData）。
 	//
 	// 服务端清单按 id 倒序返回，配置又是「并发 6 条 + 整轮 45 秒截止」：

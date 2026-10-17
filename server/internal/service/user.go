@@ -290,9 +290,30 @@ func (s *Services) prepareNewUser(username, email, password, ip string, emailVer
 // 「用户名未占用」的检查，最终由数据库裁决。
 func (s *Services) insertUserTx(db *gorm.DB, user *model.User) error {
 	if err := db.Create(user).Error; err != nil {
-		return ErrUsernameTaken
+		// 只有唯一约束冲突才映射成「已被占用」：数据库故障、字段超长之类的
+		// 错误必须原样返回，否则用户会得到一个与事实不符的结论（去换用户名），
+		// 而真实原因是服务端故障，怎么改都注册不上。
+		if isUniqueConflict(err) {
+			if strings.Contains(strings.ToLower(err.Error()), "email") {
+				return ErrEmailTaken
+			}
+			return ErrUsernameTaken
+		}
+		return err
 	}
 	return nil
+}
+
+// isUniqueConflict 判断错误是否来自唯一约束冲突。
+//
+// 两个驱动的报错文本不同：SQLite 是 UNIQUE constraint failed: ...，
+// PostgreSQL 是 duplicate key value violates unique constraint "..."
+func isUniqueConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate key")
 }
 
 // emailDomainBlocked 判断邮箱域名是否命中黑名单。
@@ -644,8 +665,13 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 			return nil, err
 		}
 	} else if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
-		// 唯一索引冲突（并发改名）同样按占用处理。
-		return nil, ErrUsernameTaken
+		// 只有唯一索引冲突（并发改名）按占用处理。昵称等普通字段写失败也
+		// 报「用户名已被占用」会把排查方向直接带偏——用户会去改名，而真实
+		// 原因是一次写库失败。
+		if isUniqueConflict(err) {
+			return nil, ErrUsernameTaken
+		}
+		return nil, err
 	}
 	if renamed {
 		// 会话表里的用户名仅用于后台展示，改名后同步，避免显示旧值。

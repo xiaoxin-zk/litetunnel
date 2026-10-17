@@ -94,6 +94,17 @@
       </el-descriptions>
     </div>
 
+    <div class="lt-card" style="margin-top: 16px">
+      <div class="lt-card-title">账号恢复请求（当前实例）</div>
+      <el-descriptions :column="3" border size="small">
+        <el-descriptions-item label="等待处理 / 容量">{{ metrics.recovery?.queued ?? '未知' }} / {{ metrics.recovery?.capacity ?? '未知' }}</el-descriptions-item>
+        <el-descriptions-item label="队满拒绝累计">{{ metrics.recovery?.rejected ?? '未知' }}</el-descriptions-item>
+        <el-descriptions-item label="处理失败累计">{{ metrics.recovery?.failed ?? '未知' }}</el-descriptions-item>
+      </el-descriptions>
+      <div class="lt-muted" style="margin-top: 10px">计数在进程重启后清零。预处理队列尚未持久化，重启或处理失败可能需要用户重新申请；受理不代表邮件已送达。</div>
+      <el-alert v-if="metrics.recovery?.failed || metrics.recovery?.rejected" type="warning" :closable="false" title="恢复请求出现拒绝或处理失败，请检查邮件配置、对外地址及服务日志。" style="margin-top: 10px" />
+    </div>
+
     <!-- ============ 业务指标 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">平台业务数据</div>

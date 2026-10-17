@@ -1,6 +1,9 @@
 package firewall
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDockerNATCompatibilityByPort(t *testing.T) {
 	const raw = `{"nftables":[{"chain":{"family":"ip","table":"nat","name":"PREROUTING","type":"nat","hook":"prerouting","policy":"accept"}},{"rule":{"family":"ip","table":"nat","chain":"PREROUTING","expr":[{"jump":{"target":"DOCKER"}}]}},{"rule":{"family":"ip","table":"nat","chain":"DOCKER","expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8080}},{"dnat":{"addr":"172.17.0.2","port":80}}]}}]}`
@@ -9,6 +12,17 @@ func TestDockerNATCompatibilityByPort(t *testing.T) {
 	}
 	if err := checkNftInputCompatibility([]byte(raw), 8080); err == nil {
 		t.Fatal("DNAT 命中的端口必须拒绝")
+	}
+	withPostrouting := strings.TrimSuffix(raw, "]}") + `,{"chain":{"family":"ip","table":"nat","name":"POSTROUTING","type":"nat","hook":"postrouting","policy":"accept"}},{"rule":{"family":"ip","table":"nat","chain":"POSTROUTING","expr":[{"masquerade":null}]}}]}`
+	if err := checkNftInputCompatibility([]byte(withPostrouting), 20001); err != nil {
+		t.Fatalf("独立 POSTROUTING MASQUERADE 不应影响入站检查: %v", err)
+	}
+	if err := checkNftInputCompatibility([]byte(withPostrouting), 8080); err == nil {
+		t.Fatal("忽略出站链后仍须拒绝入站 DNAT 冲突")
+	}
+	reachable := strings.Replace(withPostrouting, `"target":"DOCKER"`, `"target":"POSTROUTING"`, 1)
+	if err := checkNftInputCompatibility([]byte(reachable), 20001); err == nil {
+		t.Fatal("PREROUTING 可达的 MASQUERADE 仍须拒绝")
 	}
 	const unknown = `{"nftables":[{"chain":{"family":"ip","table":"nat","name":"PREROUTING","type":"nat","hook":"prerouting","policy":"accept"}},{"rule":{"family":"ip","table":"nat","chain":"PREROUTING","expr":[{"vmap":{}}]}}]}`
 	if err := checkNftInputCompatibility([]byte(unknown), 20001); err == nil {

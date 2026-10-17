@@ -95,10 +95,36 @@ func checkNftInputCompatibility(raw []byte, target ...int) error {
 		}
 		if c.Type == "nat" && c.Hook == "prerouting" && c.Policy == "accept" && (c.Family == "ip" || c.Family == "ip6" || c.Family == "inet") {
 			if len(target) > 0 {
-				for _, object := range dump.Objects {
-					r := object.Rule
-					if r != nil && r.Family == c.Family && r.Table == c.Table && !nftNATRuleSafe(r.Expr, target[0]) {
-						return fmt.Errorf("nftables NAT 表 %s/%s 可能改写或拦截端口 %d，未修改规则", c.Family, c.Table, target[0])
+				visited := make(map[string]bool)
+				pending := []string{c.Name}
+				for len(pending) > 0 {
+					chain := pending[0]
+					pending = pending[1:]
+					if visited[chain] {
+						continue
+					}
+					visited[chain] = true
+					for _, object := range dump.Objects {
+						r := object.Rule
+						if r == nil || r.Family != c.Family || r.Table != c.Table || r.Chain != chain {
+							continue
+						}
+						if !nftNATRuleSafe(r.Expr, target[0]) {
+							return fmt.Errorf("nftables NAT 链 %s/%s/%s 可能改写或拦截端口 %d，未修改规则", c.Family, c.Table, chain, target[0])
+						}
+						for _, statement := range r.Expr {
+							for _, kind := range []string{"jump", "goto"} {
+								if raw, ok := statement[kind]; ok {
+									var dest struct {
+										Target string `json:"target"`
+									}
+									if json.Unmarshal(raw, &dest) != nil || dest.Target == "" {
+										return fmt.Errorf("nftables NAT 跳转目标无法解析，未修改规则")
+									}
+									pending = append(pending, dest.Target)
+								}
+							}
+						}
 					}
 				}
 			}

@@ -3,7 +3,7 @@ package firewall
 import "encoding/json"
 
 // nftNATRuleSafe 仅证明端口不匹配或规则没有改写/丢包动作，不求值任意 nft 表达式。
-// 调用方检查同一 NAT 表内所有链，因此 jump/goto 的目标规则也会被检查。
+// 调用方仅遍历 PREROUTING 经 jump/goto 可达的链，不包含独立出站链。
 func nftNATRuleSafe(expr []map[string]json.RawMessage, port int) bool {
 scanMatches:
 	for _, statement := range expr {

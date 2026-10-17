@@ -10,6 +10,14 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestRecoveryMissingPublicURLCountsFailure(t *testing.T) {
+	svc, _ := newMailTestServices(t)
+	svc.processRecovery(recoveryRequest{account: "any-account"})
+	if svc.RecoveryStats()["failed"] != 1 {
+		t.Fatal("缺少对外地址必须计为全局配置失败")
+	}
+}
+
 func TestRecoveryPublicRequestsDoNotQueryAccounts(t *testing.T) {
 	svc, _ := newMailTestServices(t)
 	u := model.User{Username: "recoverasync", Password: "unused", Email: "recoverasync@example.com", EmailVerified: true, Status: model.UserStatusActive}

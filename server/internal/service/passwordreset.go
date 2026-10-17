@@ -74,6 +74,7 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 	// 这里是第二道防线：调用方本来就会检查配置，但凭据链接的地址只能来自
 	// 服务端配置，不能靠「调用方记得传对」来保证。
 	if strings.TrimSpace(baseURL) == "" {
+		s.recordRecoveryFailure()
 		log.Printf("[reset] 缺少对外地址，无法生成重置链接，本次不发信")
 		return nil
 	}

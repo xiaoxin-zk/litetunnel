@@ -130,6 +130,10 @@ func (a *App) nextSyncSeq() uint64 {
 func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err error) {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
+	return a.syncWithDataLocked(data, seq)
+}
+
+func (a *App) syncWithDataLocked(data *clientInfoData, seq uint64) (changed bool, err error) {
 	if seq <= a.appliedSyncSeq {
 		return a.applySync()
 	}

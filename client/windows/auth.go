@@ -109,6 +109,9 @@ func (a *App) baseReason() string {
 //
 // serverURL 仅在构建未注入地址时使用（本地调试构建）。
 func (a *App) Connect(apiKey, serverURL string) (State, error) {
+	a.mu.RLock()
+	generation := a.authGeneration
+	a.mu.RUnlock()
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return a.GetState(), errors.New("请填写 API Key")
@@ -151,11 +154,18 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	// 若接入流程在它执行到一半时写盘、发布状态，就会出现「界面已登录、
 	// 磁盘上没有凭据」的状态——重启后凭空丢号。
 	//
-	// 这里用 authMu 而不是 syncMu：syncWithData 自己会取 syncMu，在它外面
-	// 再加一把会造成自锁。锁序固定为「Logout：syncMu → authMu」、
-	// 「Connect：authMu →（释放后）syncMu」，不会形成环。
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
 	a.authMu.Lock()
+	defer a.authMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return a.GetState(), err
+	}
 	a.mu.RLock()
+	if generation != a.authGeneration {
+		a.mu.RUnlock()
+		return a.GetState(), errors.New("登录状态已变化，请重新接入")
+	}
 	var candidate Config
 	if a.cfg != nil {
 		candidate = *a.cfg // 复制现有配置，避免丢掉将来新增的字段
@@ -167,7 +177,6 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		a.mu.Lock()
 		a.lastError = "接入信息保存失败：" + err.Error()
 		a.mu.Unlock()
-		a.authMu.Unlock()
 		return a.GetState(), err
 	}
 
@@ -193,8 +202,8 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	if a.tunnels == nil {
 		a.tunnels = []TunnelVO{}
 	}
+	a.authGeneration++
 	a.mu.Unlock()
-	a.authMu.Unlock()
 
 	// 接入之后立刻同步一次：所有「已启用」的隧道会各自拉起一个 frpc 进程。
 	//
@@ -204,7 +213,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	//
 	// 直接复用上面那次 /client/info 的响应：它就是刚取回来的最新状态，
 	// 再请求一次只会白等一个往返（隧道一多，这一等还要串起所有配置请求）。
-	if _, err := a.syncWithData(info, seq); err != nil {
+	if _, err := a.syncWithDataLocked(info, seq); err != nil {
 		// 同步失败不阻塞接入：凭据已经保存，界面能显示账号信息，
 		// 错误通过 SyncErr 呈现，下一个自动同步周期还会重试。
 		a.setSyncErr(err)
@@ -221,6 +230,10 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 //  2. 必须确认进程都停了再清凭据。停止失败还照样清除登录状态的话，
 //     界面上是「已退出」，而 frpc 还在后台占着端口、继续转发。
 func (a *App) Logout() (State, error) {
+	return a.logout(clearConfig, removeAllFrpcConfigs)
+}
+
+func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 
@@ -231,7 +244,9 @@ func (a *App) Logout() (State, error) {
 	// 与接入流程的「写盘 + 发布」互斥（见 Connect）：否则清空凭据与
 	// 发布新凭据可能交错，出现界面已登录而磁盘上什么都没有的状态。
 	a.authMu.Lock()
+	defer a.authMu.Unlock()
 	a.mu.Lock()
+	a.authGeneration++
 	a.cfg.APIKey = ""
 	a.cfg.ServerURL = ""
 	a.username = ""
@@ -256,7 +271,6 @@ func (a *App) Logout() (State, error) {
 	// 留着只会让新账号的隧道显示一段不属于它的等待时长。
 	a.connectAt = map[uint]time.Time{}
 	a.mu.Unlock()
-	a.authMu.Unlock()
 
 	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。
 	//
@@ -267,8 +281,8 @@ func (a *App) Logout() (State, error) {
 	//
 	// 不能一处失败就返回：主配置与隧道配置是两份独立的凭据（API Key vs
 	// 接入密钥），一处删不掉不该让另一处也留着——能清掉一个是一个。
-	cfgErr := clearConfig()
-	frpcErr := removeAllFrpcConfigs()
+	cfgErr := clearMain()
+	frpcErr := clearTunnels()
 
 	if cfgErr != nil || frpcErr != nil {
 		// 内存里的凭据已经清了，但磁盘上还有残留——下次启动可能重新读到它。

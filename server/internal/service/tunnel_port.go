@@ -87,12 +87,20 @@ func describeTunnelWriteError(err error) error {
 // 或明确保留的端口发出去——用户建完隧道却绑不上（frpc 报 bind failed），
 // 而面板上一切正常，排查成本极高。展示页的空闲数也按它去重，避免同一个
 // 端口被「保留 + 监听 + 已分配」重复扣减。
-func (s *Services) unavailablePorts() map[int]struct{} {
+//
+// 第二个返回值是系统监听端口**扫描失败**的错误。此时返回的集合里只有保留
+// 端口（那部分来自配置，不依赖扫描）：调用方既不能把它当成完整的排除集合，
+// 也不能把 nil 当成「没有端口被占用」——必须明确拒绝分配并让用户稍后重试。
+func (s *Services) unavailablePorts() (map[int]struct{}, error) {
 	out := make(map[int]struct{})
 	for p := range ParsePortList(s.Settings.Get(KeyPortReserved)) {
 		out[p] = struct{}{}
 	}
-	for key := range firewall.ListeningPortSet() {
+	listening, err := firewall.ListeningPortSet()
+	if err != nil {
+		return out, err
+	}
+	for key := range listening {
 		// key 形如 "tcp|8080" / "udp|53"。
 		i := strings.IndexByte(key, '|')
 		if i < 0 {
@@ -102,7 +110,7 @@ func (s *Services) unavailablePorts() map[int]struct{} {
 			out[p] = struct{}{}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // allocatePort 从端口池中**随机**分配一个未占用端口。
@@ -130,7 +138,14 @@ func (s *Services) allocatePort(tx *gorm.DB, userID uint) (int, error) {
 		set[p] = struct{}{}
 	}
 	// 保留端口与系统正在监听的端口同样不能分配。
-	for p := range s.unavailablePorts() {
+	blocked, scanErr := s.unavailablePorts()
+	if scanErr != nil {
+		// 扫描失败时不能「当作没有端口在监听」继续挑：系统占用的端口会被
+		// 分配出去，用户建完隧道也绑不上，而面板上一切正常。明确报错，
+		// 等扫描恢复后再分配。
+		return 0, fmt.Errorf("%w: %v", ErrPortScanUnavailable, scanErr)
+	}
+	for p := range blocked {
 		set[p] = struct{}{}
 	}
 
@@ -174,8 +189,16 @@ func (s *Services) assertPortFree(tx *gorm.DB, port int) error {
 	}
 	// 保留端口与系统正在监听的端口不能手工指定：这类端口即使没被隧道占用，
 	// 绑定时也会失败，必须在这里就拒绝并说清原因。
-	if _, blocked := s.unavailablePorts()[port]; blocked {
+	//
+	// 保留端口来自配置，扫描失败时依然可信，所以先判它：命中就给出准确结论。
+	blocked, scanErr := s.unavailablePorts()
+	if _, hit := blocked[port]; hit {
 		return fmt.Errorf("%w: 端口 %d 为保留端口或已被系统占用，请换一个", ErrPortInUse, port)
+	}
+	if scanErr != nil {
+		// 扫描失败时无法确认这个端口是否被系统占用：既不能放行（可能绑不上），
+		// 也不能说成「已被占用」（用户会以为是别人占了，反复换端口也没用）。
+		return fmt.Errorf("%w: %v", ErrPortScanUnavailable, scanErr)
 	}
 	var n int64
 	if err := tx.Model(&model.Tunnel{}).Where("remote_port = ?", port).Count(&n).Error; err != nil {

@@ -165,21 +165,24 @@
       </el-descriptions>
 
       <div class="pool-bar">
-        <div class="seg reserved" :style="{ width: pct(pool.reserved?.length) }" />
-        <div class="seg system" :style="{ width: pct(pool.system_listening?.length) }" />
-        <div class="seg allocated" :style="{ width: pct(pool.allocated?.length) }" />
+        <div class="seg reserved" :style="{ width: pct(poolSeg.reserved) }" />
+        <div class="seg system" :style="{ width: pct(poolSeg.listening) }" />
+        <div class="seg allocated" :style="{ width: pct(poolSeg.allocated) }" />
         <!-- 空闲量未知时不画这一段：按 0 画会与「已占满」混为一谈 -->
-        <div v-if="!pool.free_unknown" class="seg free" :style="{ width: pct(pool.free) }" />
+        <div v-if="!pool.free_unknown" class="seg free" :style="{ width: pct(poolSeg.free) }" />
       </div>
       <div class="legend">
-        <span><i class="dot reserved" />保留 {{ pool.reserved?.length || 0 }}</span>
-        <span><i class="dot system" />系统占用 {{ pool.system_listening?.length || 0 }}</span>
+        <span><i class="dot reserved" />保留 {{ poolSeg.reserved }}</span>
+        <span><i class="dot system" />系统占用 {{ poolSeg.listening }}</span>
         <span>
           <i class="dot allocated" />已分配
-          {{ pool.free_unknown ? '未知' : (pool.allocated?.length || 0) }}
+          {{ pool.free_unknown ? '未知' : poolSeg.allocated }}
         </span>
-        <span><i class="dot free" />可分配 {{ pool.free_unknown ? '未知' : (pool.free || 0) }}</span>
-        <span class="lt-muted">池范围 {{ pool.pool_start }}-{{ pool.pool_end }}，共 {{ pool.total }} 个</span>
+        <span><i class="dot free" />可分配 {{ pool.free_unknown ? '未知' : poolSeg.free }}</span>
+        <span class="lt-muted">
+          池范围 {{ pool.pool_start }}-{{ pool.pool_end }}，共 {{ pool.total }} 个
+          <template v-if="poolSeg.overlap">；同一端口只计入靠前的一类</template>
+        </span>
       </div>
 
       <el-alert
@@ -327,7 +330,7 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Plus } from '@element-plus/icons-vue'
 import { firewallApi } from '../api'
@@ -346,6 +349,32 @@ function pct(n) {
   const v = ((n || 0) / total) * 100
   return `${Math.max(v, v > 0 ? 1 : 0)}%`
 }
+
+// 端口可能同时属于多个类别（既被保留、又在监听、还被分配）。色段必须按
+// 「互斥」拆分，否则各段相加会超过总量、图示比例失真（后端算 Free 时
+// 就是按集合去重的，两边口径要一致）：
+//   保留 → 系统占用（去掉保留）→ 已分配（去掉前两者）→ 空闲
+const poolSeg = computed(() => {
+  const reserved = new Set(pool.value.reserved || [])
+  const listening = new Set((pool.value.system_listening || []).filter((p) => !reserved.has(p)))
+  const allocated = new Set(
+    (pool.value.allocated || []).filter((p) => !reserved.has(p) && !listening.has(p)),
+  )
+  const used = new Set([...reserved, ...listening, ...allocated])
+  const raw =
+    (pool.value.reserved?.length || 0) +
+    (pool.value.system_listening?.length || 0) +
+    (pool.value.allocated?.length || 0)
+  return {
+    reserved: reserved.size,
+    listening: listening.size,
+    allocated: allocated.size,
+    free: Math.max((pool.value.total || 0) - used.size, 0),
+    // 有重叠时图例要说明「同一端口只计入靠前的一类」，否则数字对不上会让
+    // 管理员以为统计出错了。
+    overlap: raw > used.size,
+  }
+})
 
 async function load() {
   loading.value = true

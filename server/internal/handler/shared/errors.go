@@ -118,6 +118,11 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrMailQueueFull):
 		httpx.Fail(c, http.StatusTooManyRequests, err.Error())
 
+	// 系统监听端口读不到时无法安全判断端口是否可用：这是服务端暂时性
+	// 故障，既不是用户填错了，也不该让用户去换端口或找管理员。
+	case errors.Is(err, service.ErrPortScanUnavailable):
+		httpx.Fail(c, http.StatusServiceUnavailable, err.Error())
+
 	case errors.Is(err, service.ErrQuotaExceeded),
 		errors.Is(err, service.ErrTunnelLimit),
 		errors.Is(err, service.ErrPortLimit),

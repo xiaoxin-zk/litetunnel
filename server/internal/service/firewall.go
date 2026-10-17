@@ -791,6 +791,14 @@ func (s *Services) FirewallStatusOf() *FirewallStatus {
 
 	if ports, err := firewall.ScanListening(); err == nil {
 		st.Listening = ports
+	} else {
+		// 扫不到不等于没有：把原因带出去，否则界面显示「0 个端口被占用」
+		// 而实际只是这次没读成，管理员会据此误判端口池还很宽裕。
+		if st.Error == "" {
+			st.Error = "读取系统监听端口失败：" + err.Error()
+		} else {
+			st.Error += "；读取系统监听端口失败：" + err.Error()
+		}
 	}
 	return st
 }
@@ -817,6 +825,13 @@ type PortPoolUsage struct {
 	FreeUnknown bool `json:"free_unknown"`
 	// AllocatedError 是读取已分配端口失败的原因（仅 FreeUnknown 时非空）。
 	AllocatedError string `json:"allocated_error,omitempty"`
+	// ListeningUnknown 表示「系统监听端口扫描失败」，系统占用列表因此不完整。
+	//
+	// 与 AllocatedError 同样必须标出来：少算系统占用会让空闲量偏高，
+	// 而管理员可能据此把端口池调小、或误以为还有余量。
+	ListeningUnknown bool `json:"listening_unknown"`
+	// ListeningError 是扫描失败的原因（仅 ListeningUnknown 时非空）。
+	ListeningError string `json:"listening_error,omitempty"`
 	// Total 是端口池总容量
 	Total int `json:"total"`
 
@@ -857,11 +872,18 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 	}
 
 	// 系统占用：只统计落在端口池范围内的，池外的不关心
-	listening := firewall.ListeningPortSet()
-	for p := u.PoolStart; p <= u.PoolEnd; p++ {
-		key := strconv.Itoa(p)
-		if listening["tcp|"+key] || listening["udp|"+key] {
-			u.SystemListening = append(u.SystemListening, p)
+	//
+	// 扫描失败时同样不能按「没有端口被占用」继续算：那会让空闲量偏高，
+	// 而实际可能一个端口都不剩。标记为未知，由界面明确展示。
+	if listening, err := firewall.ListeningPortSet(); err != nil {
+		u.ListeningUnknown = true
+		u.ListeningError = err.Error()
+	} else {
+		for p := u.PoolStart; p <= u.PoolEnd; p++ {
+			key := strconv.Itoa(p)
+			if listening["tcp|"+key] || listening["udp|"+key] {
+				u.SystemListening = append(u.SystemListening, p)
+			}
 		}
 	}
 
@@ -893,9 +915,11 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 	for _, p := range u.Allocated {
 		usedSet[p] = struct{}{}
 	}
-	if u.FreeUnknown {
-		// 数值没有意义，保持 0 避免老界面把它当成「已用完」之外的怪值；
-		// 是否可信由 FreeUnknown 表达。
+	if u.FreeUnknown || u.ListeningUnknown {
+		// 任一来源缺失都算不出可信的空闲量（少算系统占用会偏高，少算已分配
+		// 同样偏高）。数值没有意义，保持 0 避免老界面把它当成「已用完」之外
+		// 的怪值；是否可信统一由 FreeUnknown 表达。
+		u.FreeUnknown = true
 		u.Free = 0
 	} else {
 		u.Free = u.Total - len(usedSet)
@@ -933,10 +957,17 @@ func (s *Services) diagnosePortRange(u *PortPoolUsage) {
 	// 空闲量未知时不能判断：按 Free=0 去算只会给出一条「仅剩 0 个」的
 	// 假警报，而真实原因是这次读库失败。如实说明即可。
 	if u.FreeUnknown {
+		var reasons []string
+		if u.AllocatedError != "" {
+			reasons = append(reasons, "读取已分配端口失败："+u.AllocatedError)
+		}
+		if u.ListeningError != "" {
+			reasons = append(reasons, "读取系统监听端口失败："+u.ListeningError)
+		}
 		u.Advice = append(u.Advice, fmt.Sprintf(
-			"读取已分配端口失败，可用端口数无法确定（%s）。"+
-				"请稍后刷新；这期间「已分配」列表也可能不完整。",
-			u.AllocatedError))
+			"可用端口数无法确定（%s）。请稍后刷新；"+
+				"这期间「已分配 / 系统占用」列表也可能不完整。",
+			strings.Join(reasons, "；")))
 	} else if u.Total > 0 && u.Free*100/u.Total < 10 {
 		u.Advice = append(u.Advice, fmt.Sprintf(
 			"端口池仅剩 %d 个可用端口（共 %d 个），新建隧道可能因无端口可用而失败",

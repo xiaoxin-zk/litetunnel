@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -55,14 +56,23 @@ type ListeningPort struct {
 //   - 容器镜像里不保证装了 iproute2 或 net-tools
 //   - /proc 在所有 Linux 上都存在，且读取不需要任何特权
 //   - 避免为一次端口扫描引入外部依赖
-var procNetFiles = []struct {
+type procNetFile struct {
 	path  string
 	proto string
-}{
-	{"/proc/net/tcp", "tcp"},
-	{"/proc/net/tcp6", "tcp"},
-	{"/proc/net/udp", "udp"},
-	{"/proc/net/udp6", "udp"},
+	// required 标记「这张表读不到就不能下结论」。
+	//
+	// IPv6 的表可以缺失：内核编译时没开 IPv6 时 /proc/net/tcp6 就不存在，
+	// 那与「没有 IPv6 监听」是同一件事。而 tcp / udp 是排除端口的唯一依据，
+	// 读不到就意味着「系统占用」整块信息缺失——继续按空集合处理，会把
+	// 系统正在监听的端口分配给用户隧道（frpc 绑不上，面板却显示正常）。
+	required bool
+}
+
+var procNetFiles = []procNetFile{
+	{"/proc/net/tcp", "tcp", true},
+	{"/proc/net/tcp6", "tcp", false},
+	{"/proc/net/udp", "udp", true},
+	{"/proc/net/udp6", "udp", false},
 }
 
 // ScanListening 扫描当前主机正在监听的端口。
@@ -70,14 +80,27 @@ var procNetFiles = []struct {
 // 用途有二：
 //  1. 端口池分配时排除已被其他服务占用的端口，避免把 3306 这类端口分给用户隧道；
 //  2. 管理页展示「哪些端口被系统占了」，让管理员一眼看清可用区间。
+//
+// 关键表（tcp / udp）读取失败时返回错误，而不是「没扫到端口」：调用方据此
+// 排除端口与计算空闲量，一个空集合会把系统占用的端口发出去，也会让管理页
+// 显示一个偏高的可用数。错误必须被调用方当回事。
 func ScanListening() ([]ListeningPort, error) {
+	// /proc 是 Linux 专有接口。其他平台（本地开发、跑测试）没有这份数据，
+	// 返回空集合是唯一合理的语义——不能因此让端口分配整体不可用。
+	if runtime.GOOS != "linux" {
+		return nil, nil
+	}
+
 	seen := make(map[string]bool)
 	var out []ListeningPort
 
 	for _, f := range procNetFiles {
 		ports, err := parseProcNet(f.path, f.proto)
 		if err != nil {
-			// 单个文件读不到（如 IPv6 未启用）不应中断整体扫描
+			if f.required {
+				return nil, fmt.Errorf("读取 %s 失败: %w", f.path, err)
+			}
+			// 可选表（IPv6）读不到不影响结论
 			continue
 		}
 		for _, p := range ports {
@@ -93,16 +116,18 @@ func ScanListening() ([]ListeningPort, error) {
 }
 
 // ListeningPortSet 返回「协议|端口」集合，供端口池快速排除。
-func ListeningPortSet() map[string]bool {
+//
+// 返回错误时集合为 nil：调用方不能把 nil 当成「没有任何端口被占用」。
+func ListeningPortSet() (map[string]bool, error) {
 	ports, err := ScanListening()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	set := make(map[string]bool, len(ports))
 	for _, p := range ports {
 		set[p.Proto+"|"+strconv.Itoa(p.Port)] = true
 	}
-	return set
+	return set, nil
 }
 
 // parseProcNet 解析 /proc/net/{tcp,tcp6,udp,udp6}。

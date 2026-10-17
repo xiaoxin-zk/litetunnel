@@ -44,6 +44,10 @@ var (
 	ErrPortLimit       = errors.New("已达到当前分组的端口数量上限")
 	ErrNoPortAvailable = errors.New("端口池已耗尽，请稍后重试")
 	ErrPortInUse       = errors.New("该远程端口已被占用")
+	// ErrPortScanUnavailable 表示「系统监听端口扫描失败」，此时无法判断端口
+	// 是否真的可用。它与「端口池耗尽」「端口被占用」都不是一回事：前两者
+	// 让用户换端口/找管理员，而这里只能等扫描恢复后重试。
+	ErrPortScanUnavailable = errors.New("暂时无法读取系统端口占用情况，请稍后重试")
 	ErrProtocolDenied  = errors.New("当前分组不允许使用该协议")
 	ErrDomainDenied    = errors.New("当前分组不允许使用自定义域名")
 	ErrCodeInvalid     = errors.New("兑换码无效")

@@ -49,6 +49,91 @@ func TestBuildFrpcConfigLogsToConsole(t *testing.T) {
 	}
 }
 
+// TestFrpcConfigRevTracksEveryInput 覆盖配置摘要的**完整性**。
+//
+// 客户端靠这个摘要跳过没变化的配置请求(见 handler ClientInfo 里的 config_rev)。
+// 摘要若漏掉某个输入,客户端就会一直拿旧配置跑下去——而且没有任何报错,
+// 用户看到的只是「改了配置但不生效」。所以摘要取的是渲染结果本身:
+// 任何影响输出字节的东西变了,它就必须变。
+func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "revuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	base := model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20001,
+		Status: model.TunnelStatusActive,
+	}
+
+	revOf := func(tun model.Tunnel) string {
+		t.Helper()
+		info, err := svc.BuildClientInfo(u)
+		if err != nil {
+			t.Fatalf("组装接入信息失败: %v", err)
+		}
+		return FrpcConfigRev(svc.FrpcConfigHeader(info) + svc.FrpcConfigProxy(u, tun))
+	}
+
+	origin := revOf(base)
+
+	// 摘要必须与「完整配置」中的同一条隧道段一致:客户端拿到的
+	// config_rev 描述的正是它随后会下载到的那段字节。
+	full, err := svc.BuildFrpcConfig(u, []model.Tunnel{base})
+	if err != nil {
+		t.Fatalf("生成配置失败: %v", err)
+	}
+	if !strings.Contains(full, svc.FrpcConfigProxy(u, base)) {
+		t.Fatal("单条隧道的渲染结果必须与完整配置里的那一段逐字节相同")
+	}
+
+	// 逐个字段改一遍:任何一个不影响摘要的字段都是漏网的口子。
+	changes := map[string]func(t *model.Tunnel){
+		"停用":    func(t *model.Tunnel) { t.Status = model.TunnelStatusDisabled },
+		"改名":    func(t *model.Tunnel) { t.Name = "mc2" },
+		"改本地端口": func(t *model.Tunnel) { t.LocalPort = 25566 },
+		"改本地地址": func(t *model.Tunnel) { t.LocalIP = "10.0.0.2" },
+		"改远程端口": func(t *model.Tunnel) { t.RemotePort = 20002 },
+		"开加密":   func(t *model.Tunnel) { t.UseEncryption = true },
+		"开压缩":   func(t *model.Tunnel) { t.UseCompression = true },
+		"改协议":   func(t *model.Tunnel) { t.Type = model.ProxyTypeUDP },
+	}
+	for name, mutate := range changes {
+		tun := base
+		mutate(&tun)
+		if got := revOf(tun); got == origin {
+			t.Errorf("%s 之后摘要没变:客户端会跳过拉取,一直跑旧配置", name)
+		}
+	}
+
+	// 域名与子域名只对 HTTP/HTTPS 隧道渲染(TCP 隧道写进去也没用),
+	// 所以单独覆盖一遍——包括「有域名就不写子域名」这条取值优先级。
+	httpBase := base
+	httpBase.Type = model.ProxyTypeHTTP
+	httpBase.RemotePort = 0
+	httpBase.Domain = "a.example.com"
+	httpOrigin := revOf(httpBase)
+
+	httpChanged := map[string]func(t *model.Tunnel){
+		"改域名":    func(t *model.Tunnel) { t.Domain = "b.example.com" },
+		"域名换子域名": func(t *model.Tunnel) { t.Domain, t.Subdomain = "", "sub" },
+	}
+	for name, mutate := range httpChanged {
+		tun := httpBase
+		mutate(&tun)
+		if got := revOf(tun); got == httpOrigin {
+			t.Errorf("HTTP 隧道%s之后摘要没变:客户端会跳过拉取,一直跑旧配置", name)
+		}
+	}
+
+	// 没变就不该变:否则每轮都要重拉,摘要就白设了。
+	if again := revOf(base); again != origin {
+		t.Fatalf("同一个输入算出的摘要必须稳定:第一次 %s,第二次 %s", origin, again)
+	}
+}
+
 // TestAllocatePortIsRandom 覆盖「端口按固定顺序分配、外部可预测」。
 //
 // 从前的起点由用户 ID 派生、然后顺序向后扫：同一用户每次都拿到池里靠前的

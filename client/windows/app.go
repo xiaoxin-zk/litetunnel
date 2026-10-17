@@ -53,6 +53,14 @@ type TunnelVO struct {
 	// 报的错摆出来，才能立刻区分是配置问题还是网络问题。
 	LastError   string     `json:"last_error"`
 	LastErrorAt *time.Time `json:"last_error_at"`
+
+	// ConfigRev 是服务端为该隧道配置算出的摘要(渲染结果的哈希)。
+	//
+	// 客户端用它跳过没变化的配置请求:摘要一致就说明服务端此刻会生成的字节
+	// 与本地缓存的一模一样,再发一次请求只是白等一个往返。隧道一多,这些
+	// 逐条隧道的 GET 正是每轮同步耗时的主要部分。
+	// 老服务端不下发这个字段(空串),此时按「不知道」处理,照常拉取。
+	ConfigRev string `json:"config_rev,omitempty"`
 }
 
 // State 是前端渲染所需的完整状态。
@@ -151,6 +159,14 @@ type App struct {
 	applied    map[uint]string
 	lastSyncAt time.Time
 	syncErr    string
+
+	// cfgRev 记录 applied 里那份文本对应的服务端配置摘要(见 TunnelVO.ConfigRev)。
+	//
+	// 两者必须一起记账:只存文本的话,下一轮无法判断「服务端现在会生成的
+	// 字节是否还是这一份」,只能照旧为每条隧道发一次请求。摘要与文本同源
+	// (来自同一次响应),所以「摘要相同」等价于「文本相同」。
+	// 与 applied 一样由 a.mu 保护。
+	cfgRev map[uint]string
 
 	// syncMu 串行化同步操作。后台定时同步与用户的开关操作可能同时发生，
 	// 两者都会写配置文件、起停进程；重叠执行会让同一时刻出现
@@ -290,6 +306,7 @@ func NewApp() *App {
 		syncRoot:     syncCtx,
 		syncCancel:   syncCancel,
 		applied:      map[uint]string{},
+		cfgRev:       map[uint]string{},
 		tunnelErrs:   map[uint]tunnelErr{},
 		retries:      map[uint]*retryState{},
 		registered:   map[uint]bool{},

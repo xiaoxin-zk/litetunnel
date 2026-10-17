@@ -762,37 +762,70 @@ func (s *Services) collectTraffic(ctx context.Context) {
 		return
 	}
 
-	// 一次性载入映射表。单机部署下规模有限，用内存换掉 N+1 查询。
-	var users []model.User
-	if err := s.DB.Find(&users).Error; err != nil {
-		log.Printf("[traffic] 载入用户失败: %v", err)
-		return
+	// 先把代理名解析成 (用户, 隧道名)，只查这一轮真正用得到的记录。
+	//
+	// 以前是两张表的全量读取：每轮采集把全部用户与全部隧道读进内存建对象，
+	// 而实际用到的只有 frps 当前报告的那些。默认 30 秒一轮，用户与隧道规模
+	// 上来之后这些全表扫描纯属浪费——按代理集合收敛后，代价只与在线隧道数
+	// 相关，与库里总共多少用户/隧道无关。
+	type proxyRef struct {
+		idx        int // 在 proxies 里的下标，避免重复解析代理名
+		userID     uint
+		tunnelName string
 	}
-	userByID := make(map[uint]*model.User, len(users))
-	for i := range users {
-		userByID[users[i].ID] = &users[i]
+	refs := make([]proxyRef, 0, len(proxies))
+	userIDs := make([]uint, 0, len(proxies))
+	seenUser := make(map[uint]bool, len(proxies))
+	for i, p := range proxies {
+		frpUser, tunnelName, ok := ParseProxyName(p.Name)
+		if !ok {
+			continue
+		}
+		userID, ok := UserIDFromFrpUser(frpUser)
+		if !ok {
+			continue
+		}
+		refs = append(refs, proxyRef{idx: i, userID: userID, tunnelName: tunnelName})
+		if !seenUser[userID] {
+			seenUser[userID] = true
+			userIDs = append(userIDs, userID)
+		}
 	}
 
-	var tunnels []model.Tunnel
-	if err := s.DB.Find(&tunnels).Error; err != nil {
-		log.Printf("[traffic] 载入隧道失败: %v", err)
-		return
-	}
 	// 用不可变的用户 ID 建索引：frp 的 user 字段是 lt_u<id>，与用户名无关。
 	type tunnelKey struct {
 		userID uint
 		tunnel string
 	}
-	tunnelByKey := make(map[tunnelKey]*model.Tunnel, len(tunnels))
-	tunnelOwner := make(map[uint]uint, len(tunnels))
-	for i := range tunnels {
-		tunnelByKey[tunnelKey{userID: tunnels[i].UserID, tunnel: tunnels[i].Name}] = &tunnels[i]
-		tunnelOwner[tunnels[i].ID] = tunnels[i].UserID
+	userByID := make(map[uint]*model.User, len(userIDs))
+	tunnelByKey := make(map[tunnelKey]*model.Tunnel, len(refs))
+	tunnelOwner := make(map[uint]uint, len(refs))
+	if len(userIDs) > 0 {
+		var users []model.User
+		if err := s.DB.Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+			log.Printf("[traffic] 载入用户失败: %v", err)
+			return
+		}
+		for i := range users {
+			userByID[users[i].ID] = &users[i]
+		}
+
+		// 隧道按用户收敛，再在内存里按名字匹配：单个用户的隧道数有限，
+		// 比把全表读进来便宜得多。
+		var tunnels []model.Tunnel
+		if err := s.DB.Where("user_id IN ?", userIDs).Find(&tunnels).Error; err != nil {
+			log.Printf("[traffic] 载入隧道失败: %v", err)
+			return
+		}
+		for i := range tunnels {
+			tunnelByKey[tunnelKey{userID: tunnels[i].UserID, tunnel: tunnels[i].Name}] = &tunnels[i]
+			tunnelOwner[tunnels[i].ID] = tunnels[i].UserID
+		}
 	}
 
-	tunnelDeltas := make(map[uint]*tunnelDelta, len(tunnels))
-	userDeltas := make(map[uint]int64)
-	onlineNow := make(map[uint]bool, len(tunnels))
+	tunnelDeltas := make(map[uint]*tunnelDelta, len(refs))
+	userDeltas := make(map[uint]int64, len(userIDs))
+	onlineNow := make(map[uint]bool, len(refs))
 
 	s.Runtime.mu.Lock()
 	lastStat := s.Runtime.lastStat
@@ -806,20 +839,13 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	// 攒在一边之后，失败只是「这一轮不提交」：下一轮仍用旧基线算增量，
 	// 期间的流量会在下次成功时一起补记。
 	nextStat := make(map[string]trafficPair, len(proxies))
-	for _, p := range proxies {
-		frpUser, tunnelName, ok := ParseProxyName(p.Name)
+	for _, ref := range refs {
+		p := proxies[ref.idx]
+		u, ok := userByID[ref.userID]
 		if !ok {
 			continue
 		}
-		userID, ok := UserIDFromFrpUser(frpUser)
-		if !ok {
-			continue
-		}
-		u, ok := userByID[userID]
-		if !ok {
-			continue
-		}
-		t, ok := tunnelByKey[tunnelKey{userID: userID, tunnel: tunnelName}]
+		t, ok := tunnelByKey[tunnelKey{userID: ref.userID, tunnel: ref.tunnelName}]
 		if !ok {
 			continue
 		}

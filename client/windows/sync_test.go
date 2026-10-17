@@ -61,6 +61,7 @@ func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
 		cfg:        &Config{APIKey: "test-key", ServerURL: srv.URL},
 		mgr:        frpc.New(filepath.Join(t.TempDir(), "no-such-frpc.exe")),
 		applied:    map[uint]string{},
+		cfgRev:     map[uint]string{},
 		tunnelErrs: map[uint]tunnelErr{},
 		retries:    map[uint]*retryState{},
 		http:       &http.Client{Timeout: 5 * time.Second},
@@ -447,6 +448,77 @@ func TestWriteAndStartClearsBackoffBeforeStarting(t *testing.T) {
 	a.noteStartFailure(1, "mc", "启动失败")
 	if got := a.retries[1].attempts; got != 1 {
 		t.Fatalf("失败计数 = %d，期望 1：说明清退避发生在启动**之前**（旧代码在启动之后，计数会继续累加到 4）", got)
+	}
+}
+
+// TestApplySyncSkipsUnchangedConfig 覆盖「配置没变还每轮重拉一遍」。
+//
+// 隧道一多,每轮同步「每条隧道一个 GET」就是主要的耗时与请求量来源。
+// 服务端在清单里下发配置摘要(config_rev):摘要一致说明它此刻会生成的字节
+// 与本地落盘的那份完全相同,这一轮就不必再拉。
+func TestApplySyncSkipsUnchangedConfig(t *testing.T) {
+	if defaultServerURL() != "" {
+		t.Skip("当前构建注入了服务端地址,本用例需要自己控制服务端")
+	}
+	withTempConfigDir(t)
+
+	var cfgRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			cfgRequests.Add(1)
+			_, _ = w.Write([]byte("serverAddr = \"127.0.0.1\"\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[` +
+			`{"id":1,"name":"mc","type":"tcp","status":"active","config_rev":"rev-1"}]}}`))
+	}))
+	defer srv.Close()
+
+	a := newSyncTestApp(t, srv)
+
+	// 测试环境里没有 frpc.exe,启动必然失败并进入退避;那一轮之后隧道就不在
+	// 「待处理」里了,请求计数也就无从观察。本用例只关心请求次数,所以每轮
+	// 之前清掉退避——退避本身有别的用例守着。
+	syncOnce := func() {
+		a.clearRetry(1)
+		_, _ = a.applySync()
+	}
+
+	// 第一轮:本地没有缓存,必须拉一次。
+	syncOnce()
+	if got := cfgRequests.Load(); got != 1 {
+		t.Fatalf("第一轮应拉取 1 次配置,实际 %d", got)
+	}
+
+	// 摘要记账只发生在配置**真的落盘**之后(启动失败则两边都不记),
+	// 这里直接构造「已经成功应用过一次」的状态——真实路径下一轮成功同步
+	// 之后就是这样。
+	a.mu.Lock()
+	a.applied[1] = "serverAddr = \"127.0.0.1\"\n"
+	a.cfgRev[1] = "rev-1"
+	a.mu.Unlock()
+
+	// 摘要没变:这一轮不该再发配置请求。
+	syncOnce()
+	if got := cfgRequests.Load(); got != 1 {
+		t.Fatalf("摘要未变时不该再拉配置,实际请求 %d 次", got)
+	}
+
+	// 摘要变了:必须重新拉,否则会把旧配置一直跑下去。
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			cfgRequests.Add(1)
+			_, _ = w.Write([]byte("serverAddr = \"127.0.0.1\"\n# changed\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[` +
+			`{"id":1,"name":"mc","type":"tcp","status":"active","config_rev":"rev-2"}]}}`))
+	})
+	syncOnce()
+	if got := cfgRequests.Load(); got != 2 {
+		t.Fatalf("摘要变化后必须重新拉取,实际请求 %d 次", got)
 	}
 }
 

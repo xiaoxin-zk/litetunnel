@@ -190,9 +190,17 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 	}
 	// 限速以分组当前值为准（不在循环里逐条查库）。
 	bl := h.svc.EffectiveBandwidth(u)
+	// 配置头部只渲染一次：每条隧道的 config_rev 是「头部 + 该隧道段」的摘要，
+	// 与 /api/user/client/config?tunnel_id= 实际返回的字节一一对应。
+	header := h.svc.FrpcConfigHeader(info)
 	out := make([]gin.H, 0, len(tunnels))
 	for i := range tunnels {
-		out = append(out, h.tunnelVO(&tunnels[i], bl))
+		vo := h.tunnelVO(&tunnels[i], bl)
+		// config_rev 让客户端跳过没变化的配置请求：它的值由渲染结果算出，
+		// 隧道字段、分组限速、站点设置、客户端密钥只要有一处变化，摘要就会变，
+		// 客户端因此不会漏掉变更，也不会为没变的隧道反复发请求。
+		vo["config_rev"] = service.FrpcConfigRev(header + h.svc.FrpcConfigProxy(u, tunnels[i]))
+		out = append(out, vo)
 	}
 	// 分组信息：客户端据此限制建隧道表单的可选项
 	var groupVO *gin.H

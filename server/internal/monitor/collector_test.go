@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -126,6 +127,56 @@ func TestSelfCPUPercent(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s: got %.1f, want %.1f", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestParseCPUStatCountsHostCores 验证核数取自 cpuN 行，且 guest 不重复累加。
+//
+// 核数必须来自同一份 /proc/stat：cpu 汇总行是**宿主机**口径（procfs 的 CPU
+// 计数不受 cgroup 限制），而 runtime.NumCPU() 在设了 cpuset 的容器里返回的
+// 是可用核数。混用会让进程 CPU 偏低、管理页用过小的核数判断宿主机负载。
+func TestParseCPUStatCountsHostCores(t *testing.T) {
+	// guest / guest_nice（最后两列）已包含在 user / nice 里，不能再加一遍。
+	stat := strings.Join([]string{
+		"cpu  100 0 100 800 0 0 0 0 50 50",
+		"cpu0 50 0 50 400 0 0 0 0 50 50",
+		"cpu1 50 0 50 400 0 0 0 0 0 0",
+		"intr 12345 0 0",
+		"ctxt 67890",
+		"btime 1700000000",
+		"processes 42",
+		"procs_running 1",
+	}, "\n")
+
+	total, idle, cores, err := parseCPUStat(strings.NewReader(stat))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	// user+nice+system+idle+iowait+irq+softirq+steal = 100+0+100+800 = 1000
+	if total != 1000 {
+		t.Errorf("总量错误：got %d, want 1000（guest 不得重复累加）", total)
+	}
+	// idle + iowait = 800
+	if idle != 800 {
+		t.Errorf("空闲量错误：got %d, want 800（iowait 计入空闲）", idle)
+	}
+	if cores != 2 {
+		t.Errorf("核数错误：got %d, want 2", cores)
+	}
+}
+
+// TestParseCPUStatRejectsMissingSummary 验证没有汇总行时报错而不是给假 0。
+func TestParseCPUStatRejectsMissingSummary(t *testing.T) {
+	if _, _, _, err := parseCPUStat(strings.NewReader("intr 1\nctxt 2\n")); err == nil {
+		t.Fatal("缺少 cpu 汇总行时应返回错误")
+	}
+	// 只有汇总行、没有 cpuN：核数退回运行时值，但不该是 0。
+	total, _, cores, err := parseCPUStat(strings.NewReader("cpu 10 0 10 80 0 0 0 0\n"))
+	if err != nil || total == 0 {
+		t.Fatalf("汇总行应能解析：total=%d err=%v", total, err)
+	}
+	if cores != runtime.NumCPU() {
+		t.Errorf("无 cpuN 行时应退回 runtime.NumCPU()，got %d want %d", cores, runtime.NumCPU())
 	}
 }
 

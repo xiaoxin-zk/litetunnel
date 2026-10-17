@@ -30,7 +30,9 @@ package monitor
 import (
 	"bufio"
 	"errors"
+	"io"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -117,7 +119,18 @@ type counters struct {
 	diskWrite uint64
 }
 
-// readCPUCounters 解析 /proc/stat 的第一行 `cpu` 汇总行。
+// readCPUCounters 解析 /proc/stat，返回汇总计数与**宿主机**核数。
+func readCPUCounters() (total, idle uint64, cores int, err error) {
+	f, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	return parseCPUStat(f)
+}
+
+// parseCPUStat 从 /proc/stat 的内容里取汇总计数与核数。
 //
 // 各字段含义（顺序固定，内核从未变更）：
 //
@@ -125,21 +138,34 @@ type counters struct {
 //
 // 注意 guest / guest_nice 已包含在 user / nice 里，**不能重复累加**，
 // 否则总量偏大、使用率偏低。这是实现里最常见的错误。
-func readCPUCounters() (total, idle uint64, err error) {
-	f, err := os.Open("/proc/stat")
-	if err != nil {
-		return 0, 0, err
-	}
-	defer func() { _ = f.Close() }()
-
-	sc := bufio.NewScanner(f)
+//
+// 核数取自 cpuN 行的**个数**，而不是 runtime.NumCPU()：
+//
+//   - 上面的 cpu 汇总行是**宿主机**口径（procfs 只对进程与网络命名空间敏感，
+//     CPU 计数不受 cgroup 限制）；
+//   - runtime.NumCPU() 返回的是本进程**可用**核数，容器设了 cpuset / CPU
+//     affinity 时会少于宿主机核数。
+//
+// 两者混用会让进程 CPU 的分母凭空变大或变小（显示偏低），也会让管理页拿
+// 错误的核数去判断宿主机负载（过早标红）。分子分母必须同源。
+//
+// 抽成接受 io.Reader 的纯函数是为了可测：cpuset 生效时的输出与宿主机不同，
+// 只有能喂固定输入才验证得了「按 cpuN 行数」这件事。
+func parseCPUStat(r io.Reader) (total, idle uint64, cores int, err error) {
+	sc := bufio.NewScanner(r)
+	foundTotal := false
 	for sc.Scan() {
 		line := sc.Text()
+		// cpuN（每个逻辑 CPU 一行）先判：它们与 "cpu " 汇总行的前缀只差空格。
+		if len(line) > 3 && strings.HasPrefix(line, "cpu") && line[3] >= '0' && line[3] <= '9' {
+			cores++
+			continue
+		}
 		if !strings.HasPrefix(line, "cpu ") {
 			continue
 		}
+
 		fields := strings.Fields(line)[1:] // 去掉 "cpu"
-		var sum uint64
 		for i, v := range fields {
 			// 只取前 8 个字段（user..steal）。
 			// guest 与 guest_nice 已计入 user 与 nice，重复累加会让
@@ -151,7 +177,7 @@ func readCPUCounters() (total, idle uint64, err error) {
 			if perr != nil {
 				continue
 			}
-			sum += n
+			total += n
 			// 第 4 个（索引 3）是 idle，第 5 个（索引 4）是 iowait。
 			// iowait 期间 CPU 实际是空闲的，必须算进 idle，
 			// 否则磁盘等待会被误报成 CPU 繁忙。
@@ -159,9 +185,20 @@ func readCPUCounters() (total, idle uint64, err error) {
 				idle += n
 			}
 		}
-		return sum, idle, nil
+		foundTotal = true
 	}
-	return 0, 0, errNoCPUStat
+	if err := sc.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	if !foundTotal {
+		return 0, 0, 0, errNoCPUStat
+	}
+	if cores == 0 {
+		// 理论上 cpu 汇总行必定伴随 cpuN 行；真没有时退回运行时值，
+		// 总比显示 0 核好（那样负载阈值会永远标红）。
+		cores = runtime.NumCPU()
+	}
+	return total, idle, cores, nil
 }
 
 // readProcSelfStat 读取本进程的 /proc/self/stat 原始内容。

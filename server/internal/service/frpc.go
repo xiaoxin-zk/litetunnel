@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 
@@ -125,14 +126,14 @@ func VerifyClientSecret(expected, got string) bool {
 
 // ClientInfo 下发给客户端/控制台的接入信息。
 type ClientInfo struct {
-	ServerAddr     string `json:"server_addr"`
-	ServerPort     int    `json:"server_port"`
-	User           string `json:"user"`
-	Token          string `json:"token"`
-	FrpsToken      string `json:"frps_token"`
-	TunnelDomain   string `json:"tunnel_domain"`
-	ProxyNameFmt   string `json:"proxy_name_format"`
-	BandwidthUnit  string `json:"bandwidth_unit"`
+	ServerAddr    string `json:"server_addr"`
+	ServerPort    int    `json:"server_port"`
+	User          string `json:"user"`
+	Token         string `json:"token"`
+	FrpsToken     string `json:"frps_token"`
+	TunnelDomain  string `json:"tunnel_domain"`
+	ProxyNameFmt  string `json:"proxy_name_format"`
+	BandwidthUnit string `json:"bandwidth_unit"`
 }
 
 // BuildClientInfo 组装客户端接入信息。
@@ -142,11 +143,11 @@ func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 		return nil, err
 	}
 	return &ClientInfo{
-		ServerAddr:    s.Cfg.GatewayHost,
-		ServerPort:    s.Cfg.GatewayPort,
-		User:          FrpUserOf(u.ID),
-		Token:         secret,
-		FrpsToken: s.Cfg.FrpsToken,
+		ServerAddr: s.Cfg.GatewayHost,
+		ServerPort: s.Cfg.GatewayPort,
+		User:       FrpUserOf(u.ID),
+		Token:      secret,
+		FrpsToken:  s.Cfg.FrpsToken,
 		// 用 TunnelDomain()（数据库设置优先）：管理端改完域名后 frps 与
 		// Caddy 已按新域名重建，而面板容器不会重启——这里返回旧域名的话，
 		// 客户端就会把子域名的访问地址拼成已经不存在的那个域名。
@@ -166,6 +167,25 @@ func (s *Services) BuildFrpcConfig(u *model.User, tunnels []model.Tunnel) (strin
 		return "", err
 	}
 
+	var b strings.Builder
+	b.WriteString(s.FrpcConfigHeader(info))
+
+	if len(tunnels) == 0 {
+		b.WriteString("\n# 当前账号还没有可用隧道，请先在控制台创建。\n")
+		return b.String(), nil
+	}
+
+	for _, t := range tunnels {
+		b.WriteString(s.FrpcConfigProxy(u, t))
+	}
+	return b.String(), nil
+}
+
+// FrpcConfigHeader 渲染配置的公共头部（服务端地址、鉴权、日志设置）。
+//
+// 拆出来是为了让「单条隧道的配置摘要」与「完整配置」用**同一份**渲染代码
+// （见 FrpcConfigRev）：两处各写一遍，迟早会有一处忘了同步。
+func (s *Services) FrpcConfigHeader(info *ClientInfo) string {
 	var b strings.Builder
 	b.WriteString("# ============================================================\n")
 	b.WriteString("# LiteTunnel 客户端配置（由控制台自动生成）\n")
@@ -196,51 +216,62 @@ func (s *Services) BuildFrpcConfig(u *model.User, tunnels []model.Tunnel) (strin
 	// maxDays 只对文件输出有意义，改成 console 后一并去掉。
 	b.WriteString("log.to = \"console\"\n")
 	b.WriteString("log.level = \"info\"\n")
+	return b.String()
+}
 
-	if len(tunnels) == 0 {
-		b.WriteString("\n# 当前账号还没有可用隧道，请先在控制台创建。\n")
-		return b.String(), nil
+// FrpcConfigProxy 渲染单条隧道的 [[proxies]] 段；未启用时返回空串。
+func (s *Services) FrpcConfigProxy(u *model.User, t model.Tunnel) string {
+	if t.Status != model.TunnelStatusActive {
+		return ""
 	}
 
-	for _, t := range tunnels {
-		if t.Status != model.TunnelStatusActive {
-			continue
-		}
-		b.WriteString("\n[[proxies]]\n")
-		fmt.Fprintf(&b, "name = %s\n", tomlString(t.Name))
-		fmt.Fprintf(&b, "type = %s\n", tomlString(t.Type))
-		fmt.Fprintf(&b, "localIP = %s\n", tomlString(t.LocalIP))
-		fmt.Fprintf(&b, "localPort = %d\n", t.LocalPort)
+	var b strings.Builder
+	b.WriteString("\n[[proxies]]\n")
+	fmt.Fprintf(&b, "name = %s\n", tomlString(t.Name))
+	fmt.Fprintf(&b, "type = %s\n", tomlString(t.Type))
+	fmt.Fprintf(&b, "localIP = %s\n", tomlString(t.LocalIP))
+	fmt.Fprintf(&b, "localPort = %d\n", t.LocalPort)
 
-		switch t.Type {
-		case model.ProxyTypeTCP, model.ProxyTypeUDP:
-			fmt.Fprintf(&b, "remotePort = %d\n", t.RemotePort)
-		case model.ProxyTypeHTTP, model.ProxyTypeHTTPS:
-			if t.Domain != "" {
-				fmt.Fprintf(&b, "customDomains = [%s]\n", tomlString(t.Domain))
-			} else if t.Subdomain != "" {
-				fmt.Fprintf(&b, "subdomain = %s\n", tomlString(t.Subdomain))
-			}
-		}
-
-		if t.UseEncryption {
-			b.WriteString("transport.useEncryption = true\n")
-		}
-		if t.UseCompression {
-			b.WriteString("transport.useCompression = true\n")
-		}
-		// 限速取分组当前值，与强制下发（onNewProxy）和界面展示同一来源。
-		//
-		// 虽然服务端会在 NewProxy 时覆盖这个声明、改错了也不影响实际生效，
-		// 但生成的文件要给用户看——里面写着一个旧值会让人以为限制就是那样。
-		// EffectiveGroup 用的是已预加载的 u.Group，这里不产生额外查询。
-		if limit := FormatBandwidth(s.EffectiveBandwidth(u)); limit != "" {
-			fmt.Fprintf(&b, "transport.bandwidthLimit = %s\n", tomlString(limit))
-			// 由服务端强制限速，客户端侧无法通过改配置绕过。
-			b.WriteString("transport.bandwidthLimitMode = \"server\"\n")
+	switch t.Type {
+	case model.ProxyTypeTCP, model.ProxyTypeUDP:
+		fmt.Fprintf(&b, "remotePort = %d\n", t.RemotePort)
+	case model.ProxyTypeHTTP, model.ProxyTypeHTTPS:
+		if t.Domain != "" {
+			fmt.Fprintf(&b, "customDomains = [%s]\n", tomlString(t.Domain))
+		} else if t.Subdomain != "" {
+			fmt.Fprintf(&b, "subdomain = %s\n", tomlString(t.Subdomain))
 		}
 	}
-	return b.String(), nil
+
+	if t.UseEncryption {
+		b.WriteString("transport.useEncryption = true\n")
+	}
+	if t.UseCompression {
+		b.WriteString("transport.useCompression = true\n")
+	}
+	// 限速取分组当前值，与强制下发（onNewProxy）和界面展示同一来源。
+	//
+	// 虽然服务端会在 NewProxy 时覆盖这个声明、改错了也不影响实际生效，
+	// 但生成的文件要给用户看——里面写着一个旧值会让人以为限制就是那样。
+	// EffectiveGroup 用的是已预加载的 u.Group，这里不产生额外查询。
+	if limit := FormatBandwidth(s.EffectiveBandwidth(u)); limit != "" {
+		fmt.Fprintf(&b, "transport.bandwidthLimit = %s\n", tomlString(limit))
+		// 由服务端强制限速，客户端侧无法通过改配置绕过。
+		b.WriteString("transport.bandwidthLimitMode = \"server\"\n")
+	}
+	return b.String()
+}
+
+// FrpcConfigRev 返回配置文本的短摘要，供客户端跳过没变化的配置请求。
+//
+// 摘要取的是**渲染结果**本身，而不是「隧道行的 updated_at + 设置版本」这类
+// 推断：任何影响输出字节的输入（隧道字段、分组限速、站点设置、客户端密钥、
+// 服务端地址）变化都会让摘要变化，不存在「漏了某个字段，客户端一直用旧配置」
+// 的风险。客户端拿到的 config_rev 与它本地缓存的文本一一对应。
+func FrpcConfigRev(configText string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(configText))
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 // tomlString 输出安全的 TOML 基本字符串。

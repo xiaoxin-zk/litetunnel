@@ -359,6 +359,30 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		}
 	}
 
+	// 清单里带了每条隧道配置的摘要(config_rev):与本地缓存一致,就说明服务端
+	// 此刻会生成的字节和我们已经落盘的那份**一模一样**,再发一次请求只是白等
+	// 一个往返。
+	//
+	// 这是「每轮请求数随隧道数增长」的解法——变了才拉。摘要由服务端按渲染结果
+	// 算出,隧道字段、分组限速、站点设置、客户端密钥任何一处变化都会让它变化,
+	// 不存在「摘要没变、配置其实变了」。
+	// 老服务端不下发摘要(空串),那些隧道照旧逐条拉取。
+	type cachedCfg struct {
+		t    TunnelVO
+		text string
+	}
+	var cached []cachedCfg
+	needFetch := make([]TunnelVO, 0, len(pending))
+	for _, t := range pending {
+		if text, ok := a.cachedConfig(t.ID, t.ConfigRev); ok {
+			cached = append(cached, cachedCfg{t: t, text: text})
+			continue
+		}
+		needFetch = append(needFetch, t)
+	}
+	// 刻意不为「跳过」写日志:每 20 秒一条会把真正有用的行挤出队列,
+	// 而这件事本身没有任何需要用户知道的信息。
+
 	// 第二遍起：并发取配置，每收到一条就立刻处理。
 	//
 	// 只并发「取配置」这一件事：写文件、起停进程、记退避、记失败都在改同一批
@@ -390,6 +414,18 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		prev := a.appliedConfigOf(t.ID)
 		cfgChanged := cfgText != prev
 
+		// 摘要只在「这次拿到的文本与磁盘上那份一致」时记账。
+		//
+		// 摘要必须始终描述 applied 里的那份文本(cachedConfig 靠这个等式),
+		// 所以不能在文本不同时就更新它:那样下一轮会拿旧的 applied 去命中
+		// 新的摘要,悄悄把隧道跑在旧配置上。文本不同时分两种情况——
+		// 启动成功由 writeAndStart 一起记账,启动失败则两边都不动。
+		if !cfgChanged && t.ConfigRev != "" {
+			a.mu.Lock()
+			a.cfgRev[t.ID] = t.ConfigRev
+			a.mu.Unlock()
+		}
+
 		switch {
 		case !a.mgr.Running(t.ID):
 			if err := a.writeAndStart(t, cfgText); err != nil {
@@ -416,15 +452,21 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		}
 	}
 
-	results, dispatched := a.streamTunnelConfigs(ctx, base, apiKey, pending)
+	results, dispatched := a.streamTunnelConfigs(ctx, base, apiKey, needFetch)
 	for res := range results {
 		applyCfg(res.tunnel, res.text, res.err)
+	}
+	// 命中缓存的隧道同样要走一遍应用逻辑：进程可能没在跑、配置可能还没落盘。
+	// 它们不产生网络请求，所以放在拉取之后处理——先完成要等网络的，
+	// 不需要等网络的立刻跟上。
+	for _, c := range cached {
+		applyCfg(c.t, c.text, nil)
 	}
 	// 记下续传位置：派发是从本轮起点开始、按顺序进行的，派发到哪儿就意味着
 	// 这一轮走到哪儿。下一轮从那里接着来，被截止时间砍掉的尾部排到最前。
 	// 全派发完时它会回到本次的起点（rot + 条数 ≡ rot），顺序保持不变。
 	if n := len(pending); n > 0 {
-		done := int(dispatched.Load())
+		done := int(dispatched.Load()) + len(cached)
 		if done > n {
 			done = n
 		}
@@ -589,8 +631,14 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 
 	// 记下这次写入的原文。下一次同步据此判断「配置有没有变」——
 	// 不记的话每次同步都会判定为变化并重启一遍，连接会一直抖。
+	// 服务端摘要(ConfigRev)一并记下:下一次同步据此判断「要不要重新拉」。
+	// 只有配置**真的写进磁盘了**才记这笔账——失败路径上什么都不记,所以
+	// 下一轮仍会重新拉取,而不是拿「服务端说没变」跳过一次没写成的配置。
 	a.mu.Lock()
 	a.applied[t.ID] = cfgText
+	if t.ConfigRev != "" {
+		a.cfgRev[t.ID] = t.ConfigRev
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -610,9 +658,14 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 	if err != nil {
 		return err
 	}
-	cfgText, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
-	if err != nil {
-		return err
+	// 摘要与本地记账一致时直接用缓存的那份:用户手动点连接时不该再为一个
+	// 已知没变的配置等一次往返(见 cachedConfig)。
+	cfgText, hit := a.cachedConfig(t.ID, t.ConfigRev)
+	if !hit {
+		cfgText, err = a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
+		if err != nil {
+			return err
+		}
 	}
 	if cfgText == "" {
 		return errors.New("服务端未返回该隧道的配置")
@@ -793,6 +846,13 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 			delete(a.applied, id)
 		}
 	}
+	// 摘要与配置原文是一对，必须同生共死：只清文本会留下一个孤儿摘要，
+	// 它会让下一次同 id 的隧道（id 不会复用，但地图会一直长）永远命中不了。
+	for id := range a.cfgRev {
+		if !alive[id] {
+			delete(a.cfgRev, id)
+		}
+	}
 	for id := range a.cleanupWarned {
 		if !alive[id] {
 			delete(a.cleanupWarned, id)
@@ -839,6 +899,29 @@ func (a *App) appliedConfigOf(id uint) string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.applied[id]
+}
+
+// cachedConfig 在服务端摘要与本地记账一致时返回缓存的配置原文。
+//
+// 摘要由服务端按**渲染结果**算出（见 service.FrpcConfigRev），所以
+// 「摘要相同」就是「服务端此刻会生成的字节与本地这份完全相同」——
+// 不依赖任何「哪些字段会影响配置」的推断。
+//
+// 摘要为空（老服务端）或与记账不符时返回 false，调用方照旧拉取。
+func (a *App) cachedConfig(id uint, rev string) (string, bool) {
+	if rev == "" {
+		return "", false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.cfgRev[id] != rev {
+		return "", false
+	}
+	text := a.applied[id]
+	if text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 func writeFrpcConfig(tunnelID uint, text string) error {

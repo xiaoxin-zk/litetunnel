@@ -98,7 +98,7 @@ func (c *Collector) Series(limit int) []Sample {
 func (c *Collector) collect() {
 	now := time.Now()
 
-	total, idle, err := readCPUCounters()
+	total, idle, cores, err := readCPUCounters()
 	if err != nil {
 		// 读不到就保持上一次的值，不把 0 写进序列——
 		// 序列里的假 0 会让图表出现莫名其妙的凹陷，比空缺更误导人。
@@ -117,7 +117,10 @@ func (c *Collector) collect() {
 		UptimeSeconds: readUptime(),
 		NetRxTotal:    netRx,
 		NetTxTotal:    netTx,
-		CPUCores:      runtime.NumCPU(),
+		// 核数取自 /proc/stat 的 cpuN 行（宿主机口径），与上面的 CPU/负载
+		// 同源。用 runtime.NumCPU() 在设了 cpuset 的容器里会偏小：
+		// 进程 CPU 的分母被缩小后显示偏低，管理页也会过早把负载标红。
+		CPUCores: cores,
 	}
 
 	if mt, ma, st, sf, err := readMemInfo(); err == nil {
@@ -168,7 +171,7 @@ func (c *Collector) collect() {
 	c.prevAt = now
 	c.havePrev = true
 
-	s.Self = c.collectSelf(prevTotal, total)
+	s.Self = c.collectSelf(prevTotal, total, cores)
 
 	c.mu.Lock()
 	c.latest = s
@@ -183,9 +186,10 @@ func (c *Collector) collect() {
 
 // collectSelf 采集面板进程自身的运行时指标。
 //
-// prevTotal / curTotal 是**系统**CPU 总计数（前后两次采样），
-// 用于把进程占用换算成百分比，见 selfCPUPercent。
-func (c *Collector) collectSelf(prevTotal, curTotal uint64) *RuntimeStats {
+// prevTotal / curTotal 是**系统**CPU 总计数（前后两次采样），cores 是同一次
+// /proc/stat 读到的宿主机核数，两者一起把进程占用换算成百分比，
+// 见 selfCPUPercent。
+func (c *Collector) collectSelf(prevTotal, curTotal uint64, cores int) *RuntimeStats {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -206,7 +210,7 @@ func (c *Collector) collectSelf(prevTotal, curTotal uint64) *RuntimeStats {
 	// 排查「面板内存涨了」时最需要看的。
 	cpu, rss := readSelfStat()
 	out.RSSBytes = rss
-	out.CPUPercent = selfCPUPercent(c.prevSelf.cpu, cpu, prevTotal, curTotal, runtime.NumCPU())
+	out.CPUPercent = selfCPUPercent(c.prevSelf.cpu, cpu, prevTotal, curTotal, cores)
 	c.prevSelf = processSample{cpu: cpu}
 	return out
 }

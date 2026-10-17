@@ -939,7 +939,154 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	}
 	// 配额标记无论落库成败都要重算：它读的是库里**已有**的用量，
 	// 与这一次写入是否成功无关。跳过它只会让超额状态更久不收敛。
-	s.refreshQuotaFlags()
+	// 常规轮次只刷新受影响的用户，全量校准低频执行（见 refreshGuardAfterTraffic）。
+	s.refreshGuardAfterTraffic(userDeltas)
+}
+
+// quotaFullRefresh 是全量准入标记校准的间隔。
+//
+// 常规采集轮只刷新「本轮有流量」与「计费周期到期」的用户；每 30 秒把所有
+// 用户连分组一起读进内存在用户规模上来之后是纯浪费。
+//
+// 低频全量兜住的是那些**没有写入可挂钩**的变化，主要是分组过期：
+// GroupExpireAt 到点后配额与限速回落到默认分组，数据库里没有任何一行被改。
+// 代价是最多延迟这么久才纠正。
+const quotaFullRefresh = 10 * time.Minute
+
+// refreshGuardAfterTraffic 是流量采集每轮结束时的准入标记刷新。
+//
+// 只刷新两类用户：
+//
+//   - 本轮产生流量的：超额与否只可能因用量变化；
+//   - 计费周期刚到期、需要清零的：这类用户往往**没有流量**（超额后连接被拦），
+//     不专门把到期的人找出来，他们会永远卡在「超额」上——流量不走、周期不清、
+//     标记不动，是个死循环。
+//
+// 其余变化由低频全量校准兜住；准入状态尚未就绪时（启动时数据库不可用）
+// 每轮都走全量，避免数据库恢复后还要再干等一个校准周期。
+func (s *Services) refreshGuardAfterTraffic(userDeltas map[uint]int64) {
+	ids := make([]uint, 0, len(userDeltas))
+	for id := range userDeltas {
+		ids = append(ids, id)
+	}
+
+	due, err := s.dueGuardUsers()
+	if err != nil {
+		log.Printf("[quota] 查询到期用户失败（本轮照常刷新有流量的用户）: %v", err)
+	}
+	ids = append(ids, due...)
+
+	// 去重：有流量的用户也可能正好到期，同一轮不必查两遍。
+	seen := make(map[uint]bool, len(ids))
+	uniq := ids[:0]
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+
+	if len(uniq) > 0 {
+		if err := s.refreshQuotaFlagsFor(uniq); err != nil {
+			log.Printf("[quota] 刷新超额标记失败: %v", err)
+		}
+	}
+
+	if !s.Runtime.AccessGuardReady() || s.guardFullRefreshDue() {
+		// 失败时内部已记日志，这里不重复。
+		_ = s.refreshQuotaFlags()
+	}
+}
+
+// dueGuardUsers 返回本轮到期的用户 ID：计费周期结束需要清零的，
+// 以及分组到期需要回落到默认分组的。
+//
+// 两类变化的共同点是「没有写入可挂钩」——都是时间到了才生效，任何业务路径
+// 都不会主动通知。只能靠调度按「已到期」筛出来重算，所以这两列都建了索引：
+// 代价与到期用户数相关，与总用户数无关。
+//
+// traffic_reset_at 为初始零值的用户同样会命中——那正是需要初始化周期起点的人。
+func (s *Services) dueGuardUsers() ([]uint, error) {
+	now := time.Now()
+
+	var periodDue []uint
+	if err := s.DB.Model(&model.User{}).
+		Where("traffic_reset_at <= ?", now).
+		Pluck("id", &periodDue).Error; err != nil {
+		return nil, err
+	}
+
+	var groupDue []uint
+	if err := s.DB.Model(&model.User{}).
+		Where("group_expire_at IS NOT NULL AND group_expire_at <= ?", now).
+		Pluck("id", &groupDue).Error; err != nil {
+		return periodDue, err
+	}
+	return append(periodDue, groupDue...), nil
+}
+
+// guardFullRefreshDue 报告是否到了全量校准的时点；到点则顺手记下本次时刻。
+//
+// 先记账再执行：校准失败就等下一个周期再试，而不是每轮都去撞一次可能已经
+// 挂掉的数据库（「尚未就绪」由调用方单独判断，那条路径每轮重试）。
+func (s *Services) guardFullRefreshDue() bool {
+	now := time.Now().UnixNano()
+	last := s.guardFullAt.Load()
+	if last != 0 && now-last < int64(quotaFullRefresh) {
+		return false
+	}
+	return s.guardFullAt.CompareAndSwap(last, now)
+}
+
+// refreshQuotaFlagsFor 只刷新指定用户的条件标记。
+//
+// 语义与全量版本一致：先取版本号、再查询、再按版本条件写；期间版本变了说明
+// 有管理员动过这些账号，内存里是权威值，不能用旧快照覆盖，于是整轮重试。
+//
+// 与全量版本的唯一区别是**不置 guardReady**：这份快照只覆盖一部分用户，
+// 不能冒充「整表已加载」——插件会据此放行没被覆盖到的账号。
+func (s *Services) refreshQuotaFlagsFor(userIDs []uint) error {
+	const maxPasses = 3
+	for pass := 0; ; pass++ {
+		ver := s.Runtime.GuardVer()
+
+		users := make([]model.User, 0, len(userIDs))
+		for start := 0; start < len(userIDs); start += inQueryBatch {
+			end := start + inQueryBatch
+			if end > len(userIDs) {
+				end = len(userIDs)
+			}
+			var batch []model.User
+			if err := s.DB.Preload("Group").
+				Where("id IN ?", userIDs[start:end]).Find(&batch).Error; err != nil {
+				return err
+			}
+			users = append(users, batch...)
+		}
+
+		s.applyGuardFlags(users, ver)
+
+		if s.Runtime.GuardVer() == ver {
+			return nil
+		}
+		if pass+1 >= maxPasses {
+			log.Printf("[quota] 配额标记刷新连续 %d 轮被管理操作打断，本轮放弃（下一轮重试）", maxPasses)
+			return nil
+		}
+	}
+}
+
+// applyGuardFlags 为一批用户重算并条件写入准入标记。
+func (s *Services) applyGuardFlags(users []model.User, ver uint64) {
+	for i := range users {
+		s.EnsureTrafficPeriod(&users[i])
+		// 快照期间该用户被管理员动过：跳过，内存里保留管理员写的权威值。
+		s.Runtime.SetGuardFlagsIfVer(users[i].ID,
+			s.QuotaExceeded(&users[i]),
+			users[i].Status != model.UserStatusActive,
+			ver)
+	}
 }
 
 // flushTraffic 将本轮增量与采样基线一并写库。
@@ -1170,17 +1317,13 @@ func (s *Services) refreshQuotaFlags() error {
 			log.Printf("[quota] 刷新超额标记失败: %v", err)
 			return err
 		}
-		for i := range users {
-			s.EnsureTrafficPeriod(&users[i])
-			// 快照期间该用户被管理员动过：跳过，内存里保留管理员写的权威值。
-			s.Runtime.SetGuardFlagsIfVer(users[i].ID,
-				s.QuotaExceeded(&users[i]),
-				users[i].Status != model.UserStatusActive,
-				ver)
-		}
+		s.applyGuardFlags(users, ver)
 		if s.Runtime.GuardVer() == ver {
 			// 版本全程未变：所有条件写都生效了，整表完整，才能宣告就绪。
 			s.Runtime.markAccessGuardReady()
+			// 记下这次全量校准的时刻：否则启动加载完之后，紧接着的第一轮
+			// 采集还会再全量扫一遍——白白多一次。
+			s.guardFullAt.Store(time.Now().UnixNano())
 			return nil
 		}
 		if pass+1 >= maxPasses {

@@ -54,15 +54,22 @@ type User struct {
 	Group   *Group `gorm:"foreignKey:GroupID" json:"group,omitempty"`
 
 	// 流量：本计费周期已用/配额（字节）。配额为 0 时回落到分组配额。
-	TrafficUsed    int64     `json:"traffic_used"`
-	TrafficQuota   int64     `json:"traffic_quota"`
-	TrafficResetAt time.Time `json:"traffic_reset_at"`
+	TrafficUsed  int64 `json:"traffic_used"`
+	TrafficQuota int64 `json:"traffic_quota"`
+	// TrafficResetAt 是周期结束时刻，流量采集每轮按「已到期」筛出需要清零的用户。
+	//
+	// 必须建索引：不筛的话每轮都得把全部用户读出来才能发现谁到期了，
+	// 而那正是要避免的全表成本（见 refreshGuardAfterTraffic）。
+	TrafficResetAt time.Time `gorm:"index" json:"traffic_reset_at"`
 
 	// 余额（单位：分）
 	Balance int64 `json:"balance"`
 
-	// 分组到期时间，nil 表示不过期
-	GroupExpireAt *time.Time `json:"group_expire_at"`
+	// 分组到期时间，nil 表示不过期。
+	//
+	// 同样要索引：到期之后配额与限速回落到默认分组，而数据库里没有任何
+	// 写入可挂钩（是时间到了），只能靠调度按「已到期」筛出来重算。
+	GroupExpireAt *time.Time `gorm:"index" json:"group_expire_at"`
 
 	// API Key：仅存哈希用于校验；加密密文用于控制台回显；明文只在生成时返回一次
 	APIKeyHash      string     `gorm:"size:64;index" json:"-"`

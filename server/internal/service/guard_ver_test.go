@@ -11,6 +11,144 @@ import (
 // 这个文件守的是「后台刷新与管理员直写内存准入标记之间的竞态」，
 // 以及「清零协调标记必须与数据库事务同生共死」。
 
+// TestRefreshGuardAfterTrafficOnlyTouchesAffected 覆盖「每轮全表刷新」的成本。
+//
+// 常规采集轮只该刷新本轮有流量（或周期到期）的用户。全量读所有用户连分组
+// 一起进内存，在用户规模上来之后是每 30 秒一次的纯浪费。
+// 这里同时守住反面：没被刷新的用户**不能**被顺手改成「未超额」——
+// 那等于用一份不完整的快照覆盖事实。
+func TestRefreshGuardAfterTrafficOnlyTouchesAffected(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	mkUser := func(name string, used int64) *model.User {
+		u := &model.User{
+			Username: name, Password: "not-used", Status: model.UserStatusActive,
+			TrafficUsed: used, TrafficQuota: 100,
+			TrafficResetAt: time.Now().AddDate(0, 1, 0), // 周期未到期
+		}
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户 %s 失败: %v", name, err)
+		}
+		return u
+	}
+	active := mkUser("activeuser", 200) // 已超额，本轮有流量
+	other := mkUser("otheruser", 200)   // 也已超额，但本轮没有它的流量
+
+	// 就绪 + 刚校准过：模拟稳态（否则会触发一次全量校准，正是要避免每轮发生的事）。
+	svc.Runtime.markAccessGuardReady()
+	svc.guardFullAt.Store(time.Now().UnixNano())
+
+	svc.refreshGuardAfterTraffic(map[uint]int64{active.ID: 10})
+
+	if !svc.Runtime.IsQuotaExceeded(active.ID) {
+		t.Fatal("本轮有流量的超额用户必须被标成超额")
+	}
+	if svc.Runtime.IsQuotaExceeded(other.ID) {
+		t.Fatal("没有流量的用户不该被本轮增量刷新写入；这里被写说明仍在扫全表")
+	}
+}
+
+// TestRefreshGuardAfterTrafficResetsDuePeriod 覆盖「到期用户没有流量就永远解不开」。
+//
+// 超额用户的连接会被拦，于是不再产生流量；若只刷新「有流量的用户」，
+// 他的计费周期永远不会清零，标记也就一直停在超额上——死循环。
+// 到期用户必须被单独找出来清零并重算。
+func TestRefreshGuardAfterTrafficResetsDuePeriod(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{
+		Username: "dueuser", Password: "not-used", Status: model.UserStatusActive,
+		TrafficUsed: 500, TrafficQuota: 100,
+		TrafficResetAt: time.Now().Add(-time.Hour), // 周期已到期
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	svc.Runtime.markAccessGuardReady()
+	svc.guardFullAt.Store(time.Now().UnixNano())
+
+	// 本轮没有任何流量。
+	svc.refreshGuardAfterTraffic(nil)
+
+	var fresh model.User
+	if err := svc.DB.First(&fresh, u.ID).Error; err != nil {
+		t.Fatalf("重读用户失败: %v", err)
+	}
+	if fresh.TrafficUsed != 0 {
+		t.Fatalf("到期用户的已用流量必须清零，实际 %d", fresh.TrafficUsed)
+	}
+	if !fresh.TrafficResetAt.After(time.Now()) {
+		t.Fatalf("到期后应顺延到下一个周期，实际 %v", fresh.TrafficResetAt)
+	}
+	if svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("清零之后不应再是超额状态（否则该账号永远连不上）")
+	}
+}
+
+// TestDueGuardUsersIncludesExpiredGroup 覆盖「分组到期没有任何写入可挂钩」。
+//
+// 分组到期后配额与限速回落到默认分组，但数据库里没有一行被改——只有时间到了。
+// 不专门筛出来的话，这类账号要等下一次全量校准才纠正（最多 10 分钟）。
+func TestDueGuardUsersIncludesExpiredGroup(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	future := time.Now().AddDate(0, 1, 0)
+	past := time.Now().Add(-time.Hour)
+
+	mk := func(name string, expire *time.Time) *model.User {
+		u := &model.User{
+			Username: name, Password: "not-used", Status: model.UserStatusActive,
+			TrafficResetAt: future, // 周期未到期，排除干扰
+			GroupExpireAt:  expire,
+		}
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户 %s 失败: %v", name, err)
+		}
+		return u
+	}
+	expired := mk("groupexpired", &past)
+	fresh := mk("groupfresh", &future)
+	never := mk("groupnever", nil)
+
+	ids, err := svc.dueGuardUsers()
+	if err != nil {
+		t.Fatalf("查询到期用户失败: %v", err)
+	}
+
+	got := make(map[uint]bool, len(ids))
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got[expired.ID] {
+		t.Fatal("分组已到期的用户必须被筛出来")
+	}
+	if got[fresh.ID] || got[never.ID] {
+		t.Fatal("分组未到期的用户不该被筛出来（否则每轮又变成全量）")
+	}
+}
+
+// TestGuardFullRefreshDue 覆盖全量校准的节流。
+//
+// 每轮都全量校准等于把优化取消；永远不校准则分组过期这类「没有写入可挂钩」
+// 的变化永远纠正不过来。第一次必须校准（启动时可能没加载成功），
+// 之后按间隔节流。
+func TestGuardFullRefreshDue(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	if !svc.guardFullRefreshDue() {
+		t.Fatal("首次调用应触发全量校准")
+	}
+	if svc.guardFullRefreshDue() {
+		t.Fatal("刚校准过不该再次触发（否则等于每轮全表）")
+	}
+
+	// 伪造「上一次校准在很久以前」。
+	svc.guardFullAt.Store(time.Now().Add(-quotaFullRefresh - time.Minute).UnixNano())
+	if !svc.guardFullRefreshDue() {
+		t.Fatal("超过校准间隔后应重新触发")
+	}
+}
+
 // TestGuardVerBlocksStaleSnapshotWrite 覆盖「旧快照不得覆盖管理员刚写的标记」。
 //
 // 后台刷新按「取版本号 → 读库 → 逐个写标记」三步走；管理员（调低配额、

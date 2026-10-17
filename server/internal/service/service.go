@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -185,6 +186,13 @@ type Services struct {
 	// fwKick 用于在设置里打开防火墙时**立刻**触发一次对齐与重试，
 	// 而不是等下一个轮询周期。
 	fwKick chan struct{}
+
+	// guardFullAt 是上一次**全量**准入标记校准的时刻（UnixNano）。
+	//
+	// 常规采集轮次只刷新「本轮有流量」与「计费周期到期」的用户，
+	// 全量校准低频执行（见 refreshGuardAfterTraffic）。
+	// 用原子变量而不是普通字段：写入在采集协程，读取可能来自启动路径。
+	guardFullAt atomic.Int64
 }
 
 // portLockShards 是端口锁的分片数。

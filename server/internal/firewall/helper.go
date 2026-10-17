@@ -3,6 +3,7 @@ package firewall
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,9 +73,13 @@ func (h *HelperBackend) Name() string { return "helper" }
 const probeCacheTTL = 5 * time.Second
 
 type probeEntry struct {
-	at  time.Time
-	ok  bool
+	at time.Time
+	ok bool
+	// err 是传输层失败（连不上、超时、非 200）。
 	err error
+	// reason 是 helper 自报的「为什么不可用」（没有可用后端等）。
+	// 传输层没失败但 helper 说不可用时，界面要靠它给出准确原因。
+	reason string
 }
 
 var probeCache = struct {
@@ -92,10 +97,25 @@ func (h *HelperBackend) probe() (bool, error) {
 	}
 	var out helperHealth
 	err := h.get("/health", &out)
+	// 请求成功不等于 helper 可用：helper 可能在线、但自报没有可用的防火墙
+	// 后端（available=false）。把它当成可用的话，面板会照常派发写操作，
+	// 每次都以 ErrNoBackend 失败，而界面显示的是「后端已接管」。
+	ok := err == nil && out.Available
+	reason := out.Reason
+	if err == nil && !out.Available && reason == "" {
+		reason = "宿主机 helper 报告没有可用的防火墙后端"
+	}
 	probeCache.Lock()
-	probeCache.m[h.base] = probeEntry{at: time.Now(), ok: err == nil, err: err}
+	probeCache.m[h.base] = probeEntry{at: time.Now(), ok: ok, err: err, reason: reason}
 	probeCache.Unlock()
-	return err == nil, err
+	return ok, err
+}
+
+// probeReason 返回最近一次探测里 helper 给出的原因（没有则空）。
+func (h *HelperBackend) probeReason() string {
+	probeCache.Lock()
+	defer probeCache.Unlock()
+	return probeCache.m[h.base].reason
 }
 
 // Available 判断 helper 是否可达。
@@ -115,6 +135,11 @@ func (h *HelperBackend) Status() (bool, error) {
 	var out helperHealth
 	if err := h.get("/health", &out); err != nil {
 		return false, err
+	}
+	if out.Error != "" {
+		// helper 在线但底层查询失败：这不是「未启用」，必须把错误抛上去，
+		// 让调用方标成「未知」，而不是显示成一个明确的 false。
+		return false, errors.New(out.Error)
 	}
 	return out.Enabled, nil
 }
@@ -150,8 +175,17 @@ func (h *HelperBackend) Reason() string {
 		return "未配置 helper 访问令牌，请在「系统设置 → 端口与防火墙」中填写"
 	}
 	// 复用缓存：调用方几乎总是刚调过 Available()，这里不应再探一次。
-	if _, err := h.probe(); err != nil {
+	ok, err := h.probe()
+	if err != nil {
 		return fmt.Sprintf("无法连接宿主机 helper（%s），请确认 lt-fw 服务已启动（%v）", h.base, err)
+	}
+	if !ok {
+		// helper 在线但自报不可用：原因由 helper 给出（例如宿主机没有可用的
+		// 防火墙后端），不要用「连不上」这种会把排查方向带错的措辞。
+		if r := h.probeReason(); r != "" {
+			return r
+		}
+		return "宿主机 helper 报告没有可用的防火墙后端"
 	}
 	return ""
 }
@@ -161,6 +195,9 @@ type helperHealth struct {
 	Available bool   `json:"available"`
 	Enabled   bool   `json:"enabled"`
 	Reason    string `json:"reason"`
+	// Error 是 helper 读取底层状态失败的原因（例如 iptables 查询失败）。
+	// 它与「未启用」是两回事，必须能传到面板。
+	Error string `json:"error"`
 }
 
 func (h *HelperBackend) get(path string, out any) error {

@@ -37,6 +37,14 @@ type resetLinkPayload struct {
 	TokenHash  string `json:"token_hash"`
 	TTLSeconds int    `json:"ttl_seconds"`
 	IP         string `json:"ip"`
+	// TokenVersion 是**入队时**用户的令牌版本。
+	//
+	// 令牌是在邮件送达时才创建的（见 activateResetToken），所以「改密发生在
+	// 入队与送达之间」这条路径上，撤销令牌是撤不到它的——那时它还不存在。
+	// 激活时比对这个版本：不一致说明期间改过密码，这封信里的链接必须作废。
+	//
+	// 指针是为了兼容升级前入队的邮件：老载荷没有这个字段（nil），按原行为处理。
+	TokenVersion *int `json:"token_version,omitempty"`
 }
 
 // errMailActionSuperseded 表示该邮件的凭据动作已被**更新的同类凭据**取代，
@@ -230,6 +238,15 @@ func (s *Services) activateResetToken(row model.MailOutbox, token string) error 
 			return err
 		}
 		if !u.EmailVerified || !strings.EqualFold(u.Email, row.To) {
+			return errMailActionObsolete
+		}
+		// 改密会递增 TokenVersion：排队期间用户改过密码的话，这封信里的
+		// 链接必须作废——否则用户（或拿到旧链接的人）能在改密之后再改一次，
+		// 而改密的前提通常正是「账号可能已被他人控制」。
+		//
+		// 这里必须在**锁住用户行之后**判断：撤销令牌与插入令牌都以此为序，
+		// 早一步判断会漏掉「改密事务正在提交」的窗口。
+		if p.TokenVersion != nil && u.TokenVersion != *p.TokenVersion {
 			return errMailActionObsolete
 		}
 		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便

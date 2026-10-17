@@ -828,10 +828,25 @@ func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
-		"password":      hashed,
-		"token_version": gorm.Expr("token_version + 1"),
-	}).Error; err != nil {
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁用户行：改密与「重置邮件送达后激活」都以这一行为序。
+		var locked model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&locked, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+			"password":      hashed,
+			"token_version": gorm.Expr("token_version + 1"),
+		}).Error; err != nil {
+			return err
+		}
+		// 旧的重置链接与排队中的重置邮件一并作废：改密之后它们不该还能用。
+		return revokePasswordResetTx(tx, userID, locked.Email)
+	}); err != nil {
 		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)

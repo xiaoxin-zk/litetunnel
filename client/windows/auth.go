@@ -122,7 +122,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	// 先用 info 接口验证 Key 是否有效，同时拿到账号信息与隧道清单。
 	// 走分页版本：只取一页就把不完整的清单当全量，随后的对账会把
 	// 后面几页的隧道当成「服务端已删除」而停掉本机进程。
-	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	// 用应用根上下文而不是 Background：退出时这个请求要能立刻被取消，
+	// 否则退出流程会卡在等这次接入校验上（最长一个同步周期）。
+	ctx, cancel := context.WithTimeout(a.rootContext(), syncRoundTimeout)
 	defer cancel()
 	info, err := a.fetchClientInfo(ctx, base, apiKey)
 	if err != nil {
@@ -139,18 +141,31 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 
 	// 先落盘、成功后再发布内存状态。
 	//
-	// 原先顺序相反：内存先改成「已登录」，saveConfig 失败时只返回错误、
-	// 不回滚——界面显示已登录，后台自动同步还拿着这个 API Key 启动隧道，
-	// 而凭据并没有保存下来，重启后全部消失。回滚虽然啰嗦，但「内存状态
-	// 必须以磁盘为准」这条不变量值得用代码守着。
-	a.mu.Lock()
-	oldKey, oldURL := a.cfg.APIKey, a.cfg.ServerURL
-	oldUser, oldMask := a.username, a.apiKeyMask
-	oldHost, oldPort, oldDomain := a.gatewayHost, a.gatewayPort, a.tunnelDomain
-	oldTunnels := a.tunnels
-	oldUsed, oldQuota, oldExceeded := a.trafficUsed, a.trafficQuota, a.exceeded
-	oldGroup, oldPay, oldBal := a.group, a.paymentEnabled, a.balanceCents
+	// 顺序不能反：a.cfg 是后台同步读取的**共享**状态。先改内存再写盘的话，
+	// 写盘失败的那一瞬间，自动同步可能已经拿着这个还没保存的 Key 拉起了
+	// 隧道；回滚只恢复字段，不会停掉那些进程，而重启后凭据又不存在。
+	//
+	// 所以候选配置先写盘，成功了再一次性发布——「内存状态以磁盘为准」
+	// 这条不变量就不需要靠回滚去补。
+	a.mu.RLock()
+	var candidate Config
+	if a.cfg != nil {
+		candidate = *a.cfg // 复制现有配置，避免丢掉将来新增的字段
+	}
+	a.mu.RUnlock()
+	candidate.APIKey = apiKey
+	candidate.ServerURL = base
+	if err := saveConfig(&candidate); err != nil {
+		a.mu.Lock()
+		a.lastError = "接入信息保存失败：" + err.Error()
+		a.mu.Unlock()
+		return a.GetState(), err
+	}
 
+	a.mu.Lock()
+	if a.cfg == nil {
+		a.cfg = &Config{}
+	}
 	a.cfg.APIKey = apiKey
 	a.cfg.ServerURL = base
 	a.username = username
@@ -170,19 +185,6 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		a.tunnels = []TunnelVO{}
 	}
 	a.mu.Unlock()
-
-	if err := saveConfig(a.cfg); err != nil {
-		a.mu.Lock()
-		a.cfg.APIKey, a.cfg.ServerURL = oldKey, oldURL
-		a.username, a.apiKeyMask = oldUser, oldMask
-		a.gatewayHost, a.gatewayPort, a.tunnelDomain = oldHost, oldPort, oldDomain
-		a.tunnels = oldTunnels
-		a.trafficUsed, a.trafficQuota, a.exceeded = oldUsed, oldQuota, oldExceeded
-		a.group, a.paymentEnabled, a.balanceCents = oldGroup, oldPay, oldBal
-		a.lastError = "接入信息保存失败：" + err.Error()
-		a.mu.Unlock()
-		return a.GetState(), err
-	}
 
 	// 接入之后立刻同步一次：所有「已启用」的隧道会各自拉起一个 frpc 进程。
 	//

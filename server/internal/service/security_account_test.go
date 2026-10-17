@@ -1,6 +1,9 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -8,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
@@ -1024,5 +1028,116 @@ func TestAdminDeleteUserRemovesResetMark(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("删号后不该残留清零代次标记，实际 %d 条", n)
+	}
+}
+
+// TestPasswordChangeRevokesPendingResetLinks 覆盖「改密后旧重置链接仍可用」。
+//
+// ResetPassword 校验的是令牌自己的 used_at/expire_at，不看 TokenVersion，
+// 所以改密时必须显式撤销未使用的令牌；排队中的重置邮件也要一起作废——
+// 它的令牌是送达时才创建的，撤销时还不存在。
+func TestPasswordChangeRevokesPendingResetLinks(t *testing.T) {
+	svc := newTestServices(t, &config.Config{})
+
+	hashed, err := auth.HashPassword("OldPass123")
+	if err != nil {
+		t.Fatalf("生成密码哈希失败: %v", err)
+	}
+	u := &model.User{
+		Username: "pwdrevoke", Password: hashed, Status: model.UserStatusActive,
+		Email: "pwdrevoke@example.com", EmailVerified: true,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	sum := sha256.Sum256([]byte("old-link-token"))
+	tok := &model.PasswordResetToken{
+		UserID: u.ID, TokenHash: hex.EncodeToString(sum[:]),
+		ExpireAt: time.Now().Add(time.Hour),
+	}
+	if err := svc.DB.Create(tok).Error; err != nil {
+		t.Fatalf("建重置令牌失败: %v", err)
+	}
+	mail := &model.MailOutbox{
+		To: u.Email, Subject: "reset", Kind: model.MailKindResetLink,
+		Status: model.MailPending, NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(mail).Error; err != nil {
+		t.Fatalf("建重置邮件失败: %v", err)
+	}
+
+	if err := svc.UpdatePassword(u.ID, "OldPass123", "NewPass456"); err != nil {
+		t.Fatalf("改密失败: %v", err)
+	}
+
+	var got model.PasswordResetToken
+	if err := svc.DB.First(&got, tok.ID).Error; err != nil {
+		t.Fatalf("读令牌失败: %v", err)
+	}
+	if got.UsedAt == nil {
+		t.Fatal("改密后未使用的重置令牌必须作废，否则旧链接还能再改一次密码")
+	}
+
+	var m model.MailOutbox
+	if err := svc.DB.First(&m, mail.ID).Error; err != nil {
+		t.Fatalf("读邮件失败: %v", err)
+	}
+	if m.Status != model.MailFailed {
+		t.Fatalf("排队中的重置邮件应作废，实际状态 %q", m.Status)
+	}
+	if m.Payload != "" {
+		t.Fatal("作废的邮件必须清掉载荷里的凭据参数")
+	}
+
+	if err := svc.ResetPassword("old-link-token", "Another123"); !errors.Is(err, ErrResetTokenInvalid) {
+		t.Fatalf("旧链接必须失效，实际 %v", err)
+	}
+}
+
+// TestResetActivationRejectsAfterPasswordChange 覆盖「排队邮件在改密后才激活」。
+//
+// 令牌是送达时才创建的，改密时的撤销够不到它。载荷里记着入队时的
+// TokenVersion，激活时在**用户行锁内**复核，不一致即作废。
+func TestResetActivationRejectsAfterPasswordChange(t *testing.T) {
+	svc := newTestServices(t, &config.Config{})
+
+	u := &model.User{
+		Username: "activationstale", Password: "not-used", Status: model.UserStatusActive,
+		Email: "activationstale@example.com", EmailVerified: true, TokenVersion: 2,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	queuedVersion := 1 // 入队时的版本；之后用户改过密码，版本已变成 2
+	payload, err := json.Marshal(resetLinkPayload{
+		UserID: u.ID, TokenHash: "deadbeef", TTLSeconds: 600,
+		TokenVersion: &queuedVersion,
+	})
+	if err != nil {
+		t.Fatalf("序列化载荷失败: %v", err)
+	}
+	row := &model.MailOutbox{
+		To: u.Email, Subject: "reset", Kind: model.MailKindResetLink,
+		Status: model.MailActivating, ClaimToken: "claim-1",
+		Payload: string(payload), NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(row).Error; err != nil {
+		t.Fatalf("建邮件失败: %v", err)
+	}
+
+	err = svc.activateResetToken(*row, "claim-1")
+	if !errors.Is(err, errMailActionObsolete) {
+		t.Fatalf("入队后改过密码的邮件必须作废，实际 %v", err)
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.PasswordResetToken{}).
+		Where("user_id = ?", u.ID).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("作废的邮件不该创建令牌，实际 %d 条", n)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -118,6 +119,7 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 	// 的判断，此时返回错误会让「已注册 + 入队失败」与「未注册」产生可区分的
 	// 响应，接口就退化成账号枚举工具了。这是刻意的取舍——宁可用户多点一次
 	// 「重新发送」，也不给枚举留口子。
+	tokenVersion := u.TokenVersion
 	if _, err := s.enqueueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
 		UserID:    u.ID,
 		TokenHash: hash,
@@ -125,6 +127,8 @@ func (s *Services) RequestPasswordReset(account, ip, baseURL string) error {
 		// 拖久了，用户点开链接时它已经过期。
 		TTLSeconds: int(resetTokenTTL.Seconds()),
 		IP:         truncate(ip, 64),
+		// 入队时的令牌版本：送达后激活时要拿它复核「期间有没有改过密码」。
+		TokenVersion: &tokenVersion,
 	}, mailQuota{cooldown: resetLinkCooldown, dailyLimit: resetLinkDailyPerEmail}); err != nil {
 		log.Printf("[reset] 重置邮件未发出（账号 %d），原有令牌未受影响: %v", u.ID, err)
 		return nil
@@ -379,7 +383,19 @@ func (s *Services) preparePasswordReset(newPassword string) (hashed, newSecret s
 //
 // 拆出来是为了让调用方能把它和别的操作（例如消费验证码）放进同一个事务。
 func (s *Services) applyPasswordResetTx(tx *gorm.DB, userID uint, hashed, newSecret string) error {
-	// 影响行数为 0 说明账号已不存在（例如邮件发出后被管理员删除）。
+	// 先锁住用户行：撤销重置令牌与「送达后激活」都以此为序（见
+	// activateResetToken），否则撤销与激活交错时仍会留下一条可用令牌。
+	var u model.User
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&u, userID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// 账号可能在邮件发出之后被管理员删除：返回凭据无效让事务整体回滚，
+			// 验证码/令牌不会被白白消费。
+			return ErrResetTokenInvalid
+		}
+		return err
+	}
+
+	// 影响行数为 0 说明账号已不存在（与上面的 First 重复，但保留一道保险）。
 	// 不看的话：验证码/令牌已被标记为使用、接口返回「重置成功」，
 	// 而密码根本没有更新——用户以为账号还在、密码已重置。
 	// 返回错误让事务整体回滚，调用方按「凭据无效」处理。
@@ -394,7 +410,46 @@ func (s *Services) applyPasswordResetTx(tx *gorm.DB, userID uint, hashed, newSec
 	if res.RowsAffected == 0 {
 		return ErrResetTokenInvalid
 	}
-	return revokeClientSessionsTx(tx, userID)
+	if err := revokeClientSessionsTx(tx, userID); err != nil {
+		return err
+	}
+	return revokePasswordResetTx(tx, userID, u.Email)
+}
+
+// revokePasswordResetTx 撤销「尚未使用」的重置令牌，并作废排队中的重置邮件。
+//
+// 改密之后旧链接必须立刻失效：ResetPassword 校验的是令牌自己的 used_at 与
+// expire_at，不看 TokenVersion，所以不显式撤销的话，改密前发出的链接在
+// 有效期内还能再改一次密码。
+//
+// 排队中的邮件更隐蔽——令牌是**送达时**才创建的（见 activateResetToken），
+// 这里撤销时它还不存在。所以两条一起做：能撤销的撤销，还没生成的靠
+// 载荷里的 TokenVersion 在激活时拦下（见 resetLinkPayload.TokenVersion）。
+//
+// 调用方必须已在同一事务里锁住用户行：activateResetToken 同样先锁这一行，
+// 于是两边只剩先后关系，不会出现「撤销之后又插入一条可用令牌」。
+func revokePasswordResetTx(tx *gorm.DB, userID uint, email string) error {
+	if err := tx.Model(&model.PasswordResetToken{}).
+		Where("user_id = ? AND used_at IS NULL", userID).
+		Update("used_at", time.Now()).Error; err != nil {
+		return err
+	}
+	if email == "" {
+		return nil
+	}
+	// 只动「重置链接」这一类，且只动还没走完的：已送达的邮件记录保留，
+	// 它对应的令牌已在上面撤销，用户点开只会看到「链接无效」。
+	return tx.Model(&model.MailOutbox{}).
+		Where("lower(to_addr) = ? AND kind = ? AND status IN ?",
+			strings.ToLower(email), model.MailKindResetLink,
+			[]string{model.MailPending, model.MailSending, model.MailActivating}).
+		Updates(map[string]any{
+			"status":      model.MailFailed,
+			"claim_token": "",
+			"body":        "",
+			"payload":     "",
+			"last_err":    "密码已修改，重置邮件作废",
+		}).Error
 }
 
 // finishPasswordReset 做提交之后的收尾：内存态同步与日志。

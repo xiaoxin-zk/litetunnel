@@ -156,12 +156,26 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 GET"})
 		return
 	}
-	enabled, _ := s.backend.Status()
+	enabled, statusErr := s.backend.Status()
+	available := s.backend.Available()
+	if _, isNone := s.backend.(*firewall.None); isNone {
+		// None 是占位实现，它的 Available() 恒为 true；但对面板来说
+		// 「没有可用的防火墙后端」就是不可用——否则面板会拿它当正常后端，
+		// 每次操作都以 ErrNoBackend 失败，而不是走「后端不可用」的提示。
+		available = false
+	}
 	resp := map[string]any{
 		"backend":   s.backend.Name(),
-		"available": s.backend.Available(),
+		"available": available,
 		"enabled":   enabled,
 		"protected": s.guard.Protected(),
+	}
+	if statusErr != nil {
+		// 查询失败不是「未启用」：带上可区分的原因，面板据此把状态标成
+		// 「未知」。丢掉这个错误的话，helper 在线但底层查询失败时，
+		// 面板拿到的仍是 active=false、err=nil，看起来一切正常。
+		resp["enabled"] = false
+		resp["error"] = "读取防火墙状态失败：" + statusErr.Error()
 	}
 	if n, ok := s.backend.(*firewall.None); ok {
 		resp["reason"] = n.Reason()

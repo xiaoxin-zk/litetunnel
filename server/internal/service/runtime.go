@@ -1022,9 +1022,22 @@ func (s *Services) migrateExpiredGroups(ids []uint) error {
 	if g == nil {
 		return errors.New("没有默认分组，无法把到期用户落回默认分组")
 	}
-	return s.DB.Model(&model.User{}).
-		Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", ids, time.Now()).
-		Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error
+	// 分批更新：一次到期一大批用户（比如统一发过一批 30 天试用，集体到期）
+	// 时，单条 IN (...) 的绑定参数会撞上驱动上限（SQLite 32766 /
+	// PostgreSQL 65535），而失败后每轮调度都会原样重试一次，永远迁不完。
+	now := time.Now()
+	for start := 0; start < len(ids); start += inQueryBatch {
+		end := start + inQueryBatch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := s.DB.Model(&model.User{}).
+			Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", ids[start:end], now).
+			Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dueGuardUsers 返回本轮到期的用户 ID：计费周期结束需要清零的，

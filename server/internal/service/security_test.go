@@ -633,7 +633,7 @@ func TestAdminSetUserGroupDoesNotDeadlock(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- svc.AdminSetUserGroup(u.ID, g.ID, nil) }()
+	go func() { done <- svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{}) }()
 
 	select {
 	case err := <-done:
@@ -661,7 +661,7 @@ func TestAdminSetUserGroupRejectsUnknownUser(t *testing.T) {
 		t.Fatalf("建分组失败: %v", err)
 	}
 
-	if err := svc.AdminSetUserGroup(999999, g.ID, nil); err == nil {
+	if err := svc.AdminSetUserGroup(999999, g.ID, GroupExpiry{}); err == nil {
 		t.Fatal("用户不存在时必须报错，而不是静默成功")
 	}
 }

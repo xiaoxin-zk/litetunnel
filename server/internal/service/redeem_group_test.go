@@ -18,6 +18,127 @@ import (
 //  2. 批次号在同一秒内两次生成不得撞号——管理页按批次号筛选，
 //     撞号的两批码在批次维度就失去了意义。
 
+// TestGroupCodeRefusedWhenMembershipExpired 覆盖「分组码对已过期用户白烧」。
+//
+// 分组码只切换分组、不带时长；而分组已过期时用户此刻实际按默认分组生效。
+// 这时若照常写入 group_id，到期调度马上会把它迁回默认组——码被核销、
+// 界面还提示「升级成功」。所以要在核销之前拒绝，让用户先兑换时长码。
+func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	oldGroup := &model.Group{Name: "rg-old", AllowProtocols: "tcp"}
+	newGroup := &model.Group{Name: "rg-new", AllowProtocols: "tcp"}
+	for _, g := range []*model.Group{oldGroup, newGroup} {
+		if err := svc.DB.Create(g).Error; err != nil {
+			t.Fatalf("建分组失败: %v", err)
+		}
+	}
+	past := time.Now().Add(-time.Hour)
+	u := &model.User{
+		Username: "expiredredeem", Password: "not-used", Status: model.UserStatusActive,
+		GroupID: oldGroup.ID, GroupExpireAt: &past,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	code := &model.RedeemCode{
+		Code: "GRPEXPIRED1", BatchNo: "B1", Type: model.RedeemTypeGroup,
+		GroupID: newGroup.ID, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	if err := svc.DB.Create(code).Error; err != nil {
+		t.Fatalf("建码失败: %v", err)
+	}
+
+	_, err := svc.Redeem(u.ID, code.Code, "127.0.0.1")
+	if err == nil {
+		t.Fatal("分组有效期已过时兑换分组码应被拒绝（否则码被核销、用户仍被回落默认组）")
+	}
+	if !strings.Contains(err.Error(), "过期") {
+		t.Fatalf("错误信息应说明有效期已过，实际: %v", err)
+	}
+
+	// 关键：码不能被核销，用户先兑换时长码之后还能用它。
+	var after model.RedeemCode
+	if err := svc.DB.First(&after, code.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.UsedCount != 0 || after.Status != model.RedeemStatusUnused {
+		t.Fatalf("被拒绝的兑换不得核销码：used=%d status=%s", after.UsedCount, after.Status)
+	}
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupID != oldGroup.ID {
+		t.Fatal("被拒绝时不应改动分组")
+	}
+}
+
+// TestDurationThenGroupCodeApplies 覆盖「先时长码、再分组码」的完整流程。
+//
+// 这是「分组码 + 时长码分开兑换」模型下用户应当走的路径：
+// 过期用户先买时长（把有效期续上），再兑换分组码切换分组；
+// 期间到期调度不得把刚升上去的分组迁回默认组。
+func TestDurationThenGroupCodeApplies(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	oldGroup := &model.Group{Name: "rg2-old", AllowProtocols: "tcp"}
+	newGroup := &model.Group{Name: "rg2-new", AllowProtocols: "tcp"}
+	for _, g := range []*model.Group{oldGroup, newGroup} {
+		if err := svc.DB.Create(g).Error; err != nil {
+			t.Fatalf("建分组失败: %v", err)
+		}
+	}
+	past := time.Now().Add(-time.Hour)
+	u := &model.User{
+		Username: "renewfirst", Password: "not-used", Status: model.UserStatusActive,
+		GroupID: oldGroup.ID, GroupExpireAt: &past,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	dur := &model.RedeemCode{
+		Code: "DUR30FIRST", BatchNo: "B1", Type: model.RedeemTypeDuration,
+		Value: 30, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	grp := &model.RedeemCode{
+		Code: "GRPAFTERDUR", BatchNo: "B1", Type: model.RedeemTypeGroup,
+		GroupID: newGroup.ID, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	for _, c := range []*model.RedeemCode{dur, grp} {
+		if err := svc.DB.Create(c).Error; err != nil {
+			t.Fatalf("建码失败: %v", err)
+		}
+	}
+
+	if _, err := svc.Redeem(u.ID, dur.Code, "127.0.0.1"); err != nil {
+		t.Fatalf("兑换时长码失败: %v", err)
+	}
+	// 到期调度此时不该迁走用户（有效期已在未来）。
+	svc.refreshGuardDue()
+
+	if _, err := svc.Redeem(u.ID, grp.Code, "127.0.0.1"); err != nil {
+		t.Fatalf("续期后兑换分组码应成功: %v", err)
+	}
+	svc.refreshGuardDue()
+
+	var got model.User
+	// 必须预加载分组：EffectiveGroup 读的是关联对象，没预加载会回落到默认分组。
+	if err := svc.DB.Preload("Group").First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupID != newGroup.ID {
+		t.Fatalf("分组码应已生效，实际 group_id=%d", got.GroupID)
+	}
+	if got.GroupExpireAt == nil || !got.GroupExpireAt.After(time.Now()) {
+		t.Fatalf("有效期应保持在未来，实际 %v", got.GroupExpireAt)
+	}
+	if g := svc.EffectiveGroup(&got); g == nil || g.ID != newGroup.ID {
+		t.Fatal("生效分组必须是新分组（不能被回落成默认组）")
+	}
+}
+
 func TestDeleteGroupRefusedWhileUnusedGroupCodesExist(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -229,7 +350,7 @@ func TestAdminSetUserGroupWithMissingGroupFails(t *testing.T) {
 		t.Fatalf("删除分组失败: %v", err)
 	}
 
-	err := svc.AdminSetUserGroup(u.ID, g.ID, nil)
+	err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{})
 	if !errors.Is(err, ErrInvalidParam) {
 		t.Fatalf("向已删除分组分配用户应被拒绝，实际 %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -236,7 +237,9 @@ func TestListProxiesRejectsShortPageWithRemainingTotal(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		items := make([]string, 0, 100)
 		for i := 0; i < 100; i++ {
-			items = append(items, `{"name":"lt_u1.x","status":{"phase":"online"}}`)
+			// 名字必须互不相同：重复项属于另一类「结果不可信」，
+			// 本用例要验证的是短页判定，别让重复检测抢先命中。
+			items = append(items, fmt.Sprintf(`{"name":"lt_u1.x%d","status":{"phase":"online"}}`, i))
 		}
 		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":350,"page":1,"pageSize":200,"items":[%s]}}`,
 			strings.Join(items, ","))
@@ -266,11 +269,12 @@ func TestListProxiesRejectsMissingTotalWithShortPage(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsPageCapOverflow 覆盖分页上限。
+// TestListProxiesRejectsOversizedTotalReport 覆盖「对端报了荒谬的 total」。
 //
-// 取满上限仍有数据时必须报错：悄悄返回一份不完整的列表，会让没读到的
-// 那些隧道被判成离线，而日志里看不出是分页被截断导致的。
-func TestListProxiesRejectsPageCapOverflow(t *testing.T) {
+// 上限本身按 total 推算（默认 500 页 × 200 条 = 10 万），超过就提前报错，
+// 不必真的翻满 500 页。旧实现是写死 50 页：代理数一过一万，采集就永久失败，
+// 而表现只是「在线状态停在旧值」。
+func TestListProxiesRejectsOversizedTotalReport(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
 
@@ -279,10 +283,9 @@ func TestListProxiesRejectsPageCapOverflow(t *testing.T) {
 		requests++
 		mu.Unlock()
 
-		// 每一页都返回满页，total 远大于能取到的数量。
 		items := make([]string, 0, 200)
 		for i := 0; i < 200; i++ {
-			items = append(items, `{"name":"lt_u1.x","status":{"phase":"online"}}`)
+			items = append(items, fmt.Sprintf(`{"name":"lt_u1.x%d","status":{"phase":"online"}}`, i))
 		}
 		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":999999,"page":1,"pageSize":200,"items":[%s]}}`,
 			strings.Join(items, ","))
@@ -290,17 +293,127 @@ func TestListProxiesRejectsPageCapOverflow(t *testing.T) {
 
 	proxies, err := c.ListProxies(context.Background())
 	if err == nil {
-		t.Fatalf("超过分页上限应返回错误，实际拿到 %d 条且无错误", len(proxies))
+		t.Fatalf("total 超出采集上限应返回错误，实际拿到 %d 条且无错误", len(proxies))
 	}
 	if proxies != nil {
-		t.Fatal("超过分页上限时不应返回（不完整的）代理列表")
+		t.Fatal("超限时不应返回（不完整的）代理列表")
 	}
-	if !strings.Contains(err.Error(), "分页上限") {
-		t.Fatalf("错误信息应说明是分页上限，实际: %v", err)
+	if !strings.Contains(err.Error(), "采集上限") {
+		t.Fatalf("错误信息应说明是采集上限，实际: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if requests != 50 {
-		t.Fatalf("请求了 %d 页，期望取满 50 页后再报错", requests)
+	if requests != 1 {
+		t.Fatalf("请求了 %d 页，期望第一页看清 total 后立刻放弃", requests)
+	}
+}
+
+// TestListProxiesSupportsManyPages 覆盖「代理数超过旧的一万条上限」。
+//
+// 页数必须按 total 推算：12000 条（60 页）应当能完整取回。
+// 旧实现取满 50 页就报错，规模一过线采集永久失效。
+func TestListProxiesSupportsManyPages(t *testing.T) {
+	const total = 12000
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		start := (page - 1) * frpsPageSize
+		end := start + frpsPageSize
+		if end > total {
+			end = total
+		}
+		items := make([]string, 0, end-start)
+		for i := start; i < end; i++ {
+			items = append(items, fmt.Sprintf(`{"name":"lt_u1.t%d","status":{"phase":"online"}}`, i))
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%d,"pageSize":%d,"items":[%s]}}`,
+			total, page, frpsPageSize, strings.Join(items, ","))
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err != nil {
+		t.Fatalf("分页抓取失败: %v", err)
+	}
+	if len(proxies) != total {
+		t.Fatalf("代理数 = %d，期望 %d", len(proxies), total)
+	}
+}
+
+// TestListProxiesRejectsDuplicateNames 覆盖「同一代理在两页里各出现一次」。
+//
+// 重复项不能「尽力去重」了事：runtime 是按条累加流量的，同一条代理出现两次
+// 就会把同一段流量计两遍。整轮结果一律作废（重取一次后仍重复就报错），
+// 调用方保住上一轮的在线状态与采样基线。
+func TestListProxiesRejectsDuplicateNames(t *testing.T) {
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		name := "lt_u1.mc"
+		if page == "2" {
+			name = "lt_u1.nas"
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":3,"page":%s,"pageSize":200,"items":[`+
+			`{"name":"%s","status":{"phase":"online"}},{"name":"lt_u1.mc","status":{"phase":"online"}}]}}`, page, name)
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("重复代理应报错，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("结果不可信时不应返回代理列表")
+	}
+	if !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("错误信息应指出重复，实际: %v", err)
+	}
+}
+
+// TestListProxiesDetectsTotalChangeMidPagination 覆盖「翻页期间 total 变了」。
+//
+// 说明这两页看到的不是同一份集合：可能漏、也可能重。整轮作废重取，
+// 仍然不稳定就报错（宁可这一轮不采，也不能拿它去重建在线状态）。
+func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		round := (requests - 1) / 2 // 每轮两页
+		mu.Unlock()
+
+		page := r.URL.Query().Get("page")
+		// 第一页说 201 条，第二页却说 202 条：这两页看到的不是同一份集合。
+		total := 201
+		if page == "2" {
+			total = 202
+		}
+		// 名字按轮次+页次区分，避免「重复」抢先命中。
+		items := make([]string, 0, frpsPageSize)
+		count := frpsPageSize
+		if page == "2" {
+			count = 1
+		}
+		for i := 0; i < count; i++ {
+			items = append(items, fmt.Sprintf(`{"name":"lt_u1.r%d.p%s.%d","status":{"phase":"online"}}`,
+				round, page, i))
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%s,"pageSize":%d,"items":[%s]}}`,
+			total, page, frpsPageSize, strings.Join(items, ","))
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("分页期间 total 变化应报错，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("结果不稳定时不应返回代理列表")
+	}
+	if !strings.Contains(err.Error(), "分页期间") {
+		t.Fatalf("错误信息应说明分页期间发生变化，实际: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests < frpsListAttempts*2 {
+		t.Fatalf("请求了 %d 次，期望重取一次（两轮 × 两页）", requests)
 	}
 }

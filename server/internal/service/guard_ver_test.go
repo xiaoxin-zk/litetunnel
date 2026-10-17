@@ -182,6 +182,56 @@ func TestRefreshGuardDueMigratesExpiredGroup(t *testing.T) {
 	}
 }
 
+// TestMigrateExpiredGroupsInBatches 覆盖「同时到期一大批用户」。
+//
+// 单条 IN 的绑定参数有上限（SQLite 32766 / PostgreSQL 65535），
+// 一批 30 天试用到期的用户很容易超；失败后每轮调度都会原样重试，永远迁不完。
+func TestMigrateExpiredGroupsInBatches(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	def := &model.Group{Name: "batch默认", IsDefault: true}
+	paid := &model.Group{Name: "batch付费"}
+	if err := svc.DB.Create(def).Error; err != nil {
+		t.Fatalf("建默认分组失败: %v", err)
+	}
+	if err := svc.DB.Create(paid).Error; err != nil {
+		t.Fatalf("建付费分组失败: %v", err)
+	}
+
+	past := time.Now().Add(-time.Hour)
+	future := time.Now().AddDate(0, 1, 0)
+	ids := make([]uint, 0, 5)
+	for i := 0; i < 5; i++ {
+		u := &model.User{
+			Username: fmt.Sprintf("batchdue%d", i), Password: "not-used",
+			Status: model.UserStatusActive, GroupID: paid.ID,
+			GroupExpireAt: &past, TrafficResetAt: future,
+		}
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户失败: %v", err)
+		}
+		ids = append(ids, u.ID)
+	}
+
+	old := inQueryBatch
+	inQueryBatch = 2 // 逼出 3 批
+	t.Cleanup(func() { inQueryBatch = old })
+
+	if err := svc.migrateExpiredGroups(ids); err != nil {
+		t.Fatalf("分批迁移失败: %v", err)
+	}
+
+	var migrated int64
+	if err := svc.DB.Model(&model.User{}).
+		Where("group_id = ? AND group_expire_at IS NULL", def.ID).
+		Count(&migrated).Error; err != nil {
+		t.Fatal(err)
+	}
+	if migrated != int64(len(ids)) {
+		t.Fatalf("应迁移 %d 名用户，实际 %d（批次边界漏了尾部）", len(ids), migrated)
+	}
+}
+
 // TestGuardFullRefreshDue 覆盖全量校准的节流。
 //
 // 每轮都全量校准等于把优化取消；永远不校准则分组过期这类「没有写入可挂钩」

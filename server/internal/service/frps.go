@@ -112,19 +112,75 @@ type frpsEnvelope struct {
 //
 // 任何格式不符都走第一条，绝不退化成空列表。
 func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
-	const (
-		pageSize = 200
-		// maxPages 是分页上限，防止对端给出异常分页信息时无限抓取。
-		maxPages = 50
-	)
+	var lastErr error
+	for attempt := 1; attempt <= frpsListAttempts; attempt++ {
+		list, err := c.listProxiesOnce(ctx)
+		if err == nil {
+			return list, nil
+		}
+		lastErr = err
+		if !errors.Is(err, errFrpsListUnstable) {
+			// 格式错误 / 网络错误：重试没有意义，直接返回。
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// errFrpsListUnstable 表示分页期间代理集合发生了变化（总数变了或出现重复项）。
+//
+// 这类结果既不能采信也不能「尽力去重」：总量变化说明翻页期间有代理增删，
+// 重复项会让同一份流量在 runtime 里被累加两次。规则很简单——整轮重取一次，
+// 仍不稳定就报错，让调用方保住上一轮的在线状态与采样基线。
+var errFrpsListUnstable = errors.New("frps 代理列表在分页期间发生变化")
+
+const (
+	// frpsPageSize 是 frps 管理接口的单页条数。
+	frpsPageSize = 200
+	// frpsMaxPages 是绝对上限（200 × 500 = 10 万条）。
+	//
+	// 实际页数按第一页上报的 total 推算，所以几千、上万条都能完整取回；
+	// 这个上限只用来挡住「对端报了一个荒谬的 total，让我们一直翻下去」。
+	// 之前写死 50 页（1 万条），规模一过线采集就永久失败——而失败的表现是
+	// 「在线状态停在旧值」，日志里只有一行拉取失败，很难联想到是上限。
+	frpsMaxPages = 500
+	// frpsListAttempts 是集合不稳定时的整轮重取次数。
+	frpsListAttempts = 2
+)
+
+// listProxiesOnce 做一轮完整分页抓取，并校验各页之间的一致性。
+func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 	var all []FrpsProxy
-	for page := 1; page <= maxPages; page++ {
-		endpoint := fmt.Sprintf("%s/api/v2/proxies?page=%d&pageSize=%d", c.baseURL, page, pageSize)
+	seen := make(map[string]struct{}, 256)
+	total := -1
+
+	for page := 1; page <= frpsMaxPages; page++ {
+		endpoint := fmt.Sprintf("%s/api/v2/proxies?page=%d&pageSize=%d", c.baseURL, page, frpsPageSize)
 		var out frpsPage[FrpsProxy]
 		if err := c.getJSON(ctx, endpoint, &out); err != nil {
 			return nil, err
 		}
-		all = append(all, out.Items...)
+
+		if total < 0 {
+			total = out.Total
+			// 提前判上限：total 明摆着超出能力时，不必真翻满 500 页再报错。
+			if total > frpsMaxPages*frpsPageSize {
+				return nil, fmt.Errorf("frps 报告代理数 %d 条，超过采集上限 %d 条",
+					total, frpsMaxPages*frpsPageSize)
+			}
+		} else if out.Total != total {
+			return nil, fmt.Errorf("%w：第 %d 页 total=%d，第 1 页是 %d",
+				errFrpsListUnstable, page, out.Total, total)
+		}
+
+		for _, p := range out.Items {
+			if _, dup := seen[p.Name]; dup {
+				return nil, fmt.Errorf("%w：代理 %q 重复出现（重复会让同一段流量被计两次）",
+					errFrpsListUnstable, p.Name)
+			}
+			seen[p.Name] = struct{}{}
+			all = append(all, p)
+		}
 
 		// 完整性判定只认 total：累计数量达到它才算读全了。
 		//
@@ -135,27 +191,31 @@ func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 		// 这不是普通的坏响应：采集器拿这份列表重建在线状态（setOnlineTunnels），
 		// 没读到的代理会被判成离线，正在连接的用户直接「掉线」，还要等下一轮
 		// 采集才恢复。所以宁可报错保住上一次的在线状态，也不采信残缺的列表。
-		if out.Total > 0 && len(all) >= out.Total {
+		if total > 0 && len(all) >= total {
+			if len(all) > total {
+				return nil, fmt.Errorf("%w：已取 %d 条，超过上报的 total=%d",
+					errFrpsListUnstable, len(all), total)
+			}
 			return all, nil
 		}
 
-		if len(out.Items) < pageSize {
+		if len(out.Items) < frpsPageSize {
 			// 走到这里说明 total 没被满足。特例：total 为 0 且一页为空，
 			// 是 frps 明确的「没有任何代理」——这是真实状态，不是残缺响应；
 			// 除此之外的短页一律不采信。
-			if out.Total == 0 && len(out.Items) == 0 && page == 1 {
+			if total == 0 && len(out.Items) == 0 && page == 1 {
 				return all, nil
 			}
 			return nil, fmt.Errorf(
 				"frps 代理列表不完整：已取 %d 条，上报 total=%d，第 %d 页仅返回 %d 条（每页 %d）",
-				len(all), out.Total, page, len(out.Items), pageSize)
+				len(all), total, page, len(out.Items), frpsPageSize)
 		}
 	}
-	// 取满 maxPages 页后仍有数据：宁可报错，也不返回一份不完整的列表。
+	// 取满 frpsMaxPages 页后仍有数据：宁可报错，也不返回一份不完整的列表。
 	// 悄悄截断的后果是「没读到的那些隧道被判成离线」，而日志里看不出
 	// 是分页被截断导致的——正是这次故障那种最难查的形态。
 	return nil, fmt.Errorf("frps 代理数超过分页上限（%d 页 × %d 条），拒绝返回不完整列表",
-		maxPages, pageSize)
+		frpsMaxPages, frpsPageSize)
 }
 
 // getJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。

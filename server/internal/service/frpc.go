@@ -43,6 +43,14 @@ func UserIDFromFrpUser(frpUser string) (uint, bool) {
 }
 
 // EnsureClientSecret 确保用户拥有客户端接入凭据。
+//
+// 写入必须是**条件**的（仅当字段仍为空）：
+//
+// 两个「首次接入」请求并发时，无条件写会让后到的覆盖先到的。先到那个请求
+// 已经把密钥写进了响应，客户端拿它去连，结果库里是被另一个覆盖后的值——
+// 表现为「第一次登录失败，重试一次就好」，而且日志里没有任何异常。
+//
+// 条件更新没命中说明别人已经写好了：以库里的值为准返回，本轮生成的随机值丢弃。
 func (s *Services) EnsureClientSecret(u *model.User) (string, error) {
 	if u.ClientSecret != "" {
 		return u.ClientSecret, nil
@@ -51,12 +59,29 @@ func (s *Services) EnsureClientSecret(u *model.User) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
-		Update("client_secret", secret).Error; err != nil {
+
+	res := s.DB.Model(&model.User{}).
+		Where("id = ? AND (client_secret IS NULL OR client_secret = '')", u.ID).
+		Update("client_secret", secret)
+	if res.Error != nil {
+		return "", res.Error
+	}
+	if res.RowsAffected > 0 {
+		u.ClientSecret = secret
+		return secret, nil
+	}
+
+	// 被并发方抢先写入：读回最终值。
+	var fresh model.User
+	if err := s.DB.Select("id", "client_secret").First(&fresh, u.ID).Error; err != nil {
 		return "", err
 	}
-	u.ClientSecret = secret
-	return secret, nil
+	if fresh.ClientSecret == "" {
+		// 条件更新没命中、读回来却还是空：只可能是用户不存在或并发删除。
+		return "", ErrNotFound
+	}
+	u.ClientSecret = fresh.ClientSecret
+	return fresh.ClientSecret, nil
 }
 
 // ResetClientSecret 重置客户端接入凭据，旧客户端会立即失效。

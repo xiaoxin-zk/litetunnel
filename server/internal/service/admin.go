@@ -997,13 +997,26 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 	return nil
 }
 
+// GroupExpiry 描述这次操作要对「分组有效期」做什么，共三态：
+//
+//	Set=false          → 不修改（请求里没带这个字段）
+//	Set=true, Value=nil → 清除（请求里显式给了 null）
+//	Set=true, Value!=nil → 设为该时刻
+//
+// 必须区分三态：只有「非 nil 才更新」的写法会让「清空有效期」变成空操作，
+// 旧值残留后到期调度会把刚改派的用户迁回默认分组。
+type GroupExpiry struct {
+	Set   bool
+	Value *time.Time
+}
+
 // AdminSetUserGroup 调整用户分组与到期时间。
 //
 // 分组的存在性检查、用户行的更新放进同一事务，并按全局锁序
 // （用户行 → 分组行，与 Redeem 一致）对两张行加 FOR UPDATE：
 // 只在事务外查一下分组的话，「检查通过 → 更新用户」之间分组可能被删，
 // 写出一个悬空的 group_id。
-func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) error {
+func (s *Services) AdminSetUserGroup(id, groupID uint, expiry GroupExpiry) error {
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		var u model.User
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -1023,8 +1036,13 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) erro
 		}
 
 		updates := map[string]any{"group_id": groupID}
-		if expireAt != nil {
-			updates["group_expire_at"] = *expireAt
+		if expiry.Set {
+			if expiry.Value == nil {
+				// 显式清除：写成 NULL，到期调度之后就不会再把这名用户迁走。
+				updates["group_expire_at"] = nil
+			} else {
+				updates["group_expire_at"] = *expiry.Value
+			}
 		}
 		res := tx.Model(&model.User{}).Where("id = ?", id).Updates(updates)
 		if res.Error != nil {

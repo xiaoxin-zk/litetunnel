@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -147,6 +148,54 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 	// 没变就不该变:否则每轮都要重拉,摘要就白设了。
 	if again := revOf(base); again != origin {
 		t.Fatalf("同一个输入算出的摘要必须稳定:第一次 %s,第二次 %s", origin, again)
+	}
+}
+
+// TestEnsureClientSecretConcurrent 覆盖「首次接入并发各自拿到不同密钥」。
+//
+// 无条件写库时，后到的请求会覆盖先到的：先到那个请求已经把密钥写进了响应，
+// 客户端拿它去连却被拒——表现为「第一次接入失败，重试一次就好」，
+// 日志里没有任何异常。条件更新（仅当字段仍为空）之后，所有并发方拿到的
+// 一定是库里最终生效的那一个。
+func TestEnsureClientSecretConcurrent(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "secretrace", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const n = 8
+	results := make([]string, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			// 每个请求持有自己的用户副本（真实路径也是各读各的）。
+			local := *u
+			s, err := svc.EnsureClientSecret(&local)
+			if err != nil {
+				results[i] = "ERR: " + err.Error()
+				return
+			}
+			results[i] = s
+		}(i)
+	}
+	wg.Wait()
+
+	var db model.User
+	if err := svc.DB.First(&db, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if db.ClientSecret == "" {
+		t.Fatal("并发首次接入后库里必须有凭据")
+	}
+	for i, got := range results {
+		if got != db.ClientSecret {
+			t.Fatalf("第 %d 个并发请求拿到 %q，库里生效的是 %q：拿到的密钥会立刻失效",
+				i, got, db.ClientSecret)
+		}
 	}
 }
 

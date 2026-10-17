@@ -38,7 +38,7 @@ func TestCreateTunnelUsesCurrentGroup(t *testing.T) {
 	}
 
 	// 请求处理期间，管理员把用户改到了 g2（只允许 tcp）。
-	if err := svc.AdminSetUserGroup(u.ID, g2.ID, nil); err != nil {
+	if err := svc.AdminSetUserGroup(u.ID, g2.ID, GroupExpiry{}); err != nil {
 		t.Fatalf("改组失败: %v", err)
 	}
 

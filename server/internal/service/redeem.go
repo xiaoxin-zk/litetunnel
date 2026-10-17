@@ -284,14 +284,34 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 				First(&g, c.GroupID).Error; err != nil {
 				return ErrCodeInvalid
 			}
+			// 分组码与时长码是两种权益：分组码只切换分组、不延长有效期。
+			//
+			// 若当前有效期**已经过期**，用户此刻实际按默认分组生效——这时写
+			// group_id 会被到期调度立刻迁回默认组（见 migrateExpiredGroups），
+			// 码被核销、界面上还显示「升级成功」。所以直接拒绝、不核销，
+			// 让用户先兑换时长码再回来兑换：这种情况下报错才是对用户有利的。
+			now := time.Now()
+			if u.GroupExpireAt != nil && !u.GroupExpireAt.After(now) {
+				return fmt.Errorf("当前分组有效期已于 %s 过期，请先兑换时长码，再兑换本分组码",
+					u.GroupExpireAt.Format("2006-01-02"))
+			}
+
 			updates["group_id"] = g.ID
 			// 升级分组时同步刷新该用户所有隧道的限速快照。
 			if err := tx.Model(&model.Tunnel{}).Where("user_id = ?", u.ID).
 				Update("bandwidth_limit", g.BandwidthLimit).Error; err != nil {
 				return err
 			}
-			result = RedeemResult{Type: c.Type, Value: int64(g.ID),
-				Message: fmt.Sprintf("已升级到分组「%s」", g.Name)}
+			// 提示里写明这次升级之后的有效期：分组码本身不带时长，
+			// 不说清楚的话，用户会以为「升级 = 永久」，到期回落时才发现。
+			msg := fmt.Sprintf("已升级到分组「%s」", g.Name)
+			if u.GroupExpireAt == nil {
+				msg += "（当前无有效期限制；如需设有效期可兑换时长码）"
+			} else {
+				msg += fmt.Sprintf("，有效期至 %s（到期后回落默认分组，可兑换时长码延长）",
+					u.GroupExpireAt.Format("2006-01-02"))
+			}
+			result = RedeemResult{Type: c.Type, Value: int64(g.ID), Message: msg}
 
 		case model.RedeemTypeDuration:
 			// 从「现有到期时间」顺延：读的是加锁后的最新快照，
@@ -300,9 +320,11 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			if u.GroupExpireAt != nil && u.GroupExpireAt.After(base) {
 				base = *u.GroupExpireAt
 			}
-			updates["group_expire_at"] = base.AddDate(0, 0, int(c.Value))
+			next := base.AddDate(0, 0, int(c.Value))
+			updates["group_expire_at"] = next
 			result = RedeemResult{Type: c.Type, Value: c.Value,
-				Message: fmt.Sprintf("分组有效期已延长 %d 天", c.Value)}
+				Message: fmt.Sprintf("分组有效期已延长 %d 天，有效期至 %s",
+					c.Value, next.Format("2006-01-02"))}
 
 		default:
 			return ErrCodeInvalid

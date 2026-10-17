@@ -15,6 +15,67 @@ import (
 // 启用账号不得顺带放行超额用户、并发状态切换不得让内存与数据库背离、
 // 清零撤销与采集提交不得交错、删除账号后遗留凭据不得继续工作。
 
+// TestAdminSetUserGroupClearsExpireAt 覆盖「管理页清空有效期不生效」。
+//
+// 管理页把有效期清空时发的是 "expire_at": null，而字段缺失表示「这次不改」。
+// 只按「非 nil 才更新」处理的话，清空会变成空操作：旧到期时间残留，
+// 到期调度随后把刚改派的用户迁回默认分组——管理员看到的是「改好了，
+// 过一会儿又自己变回去了」。
+func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	g := &model.Group{Name: "clear-expire", AllowProtocols: "tcp"}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+	future := time.Now().AddDate(0, 1, 0)
+	u := &model.User{
+		Username: "clearexpire", Password: "not-used", Status: model.UserStatusActive,
+		GroupID: g.ID, GroupExpireAt: &future,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 1) 显式 null：清除。
+	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: nil}); err != nil {
+		t.Fatalf("清空有效期失败: %v", err)
+	}
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupExpireAt != nil {
+		t.Fatalf("显式 null 必须清除到期时间，实际仍是 %v", got.GroupExpireAt)
+	}
+
+	// 2) 字段缺失：不修改。
+	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: &future}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupExpireAt == nil {
+		t.Fatal("字段缺失时不该改动到期时间")
+	}
+
+	// 3) 清除之后，到期调度不得再把这名用户迁走。
+	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: nil}); err != nil {
+		t.Fatal(err)
+	}
+	svc.refreshGuardDue()
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupID != g.ID {
+		t.Fatalf("没有到期时间的用户不该被迁回默认分组，实际 group_id=%d", got.GroupID)
+	}
+}
+
 // TestEnableUserKeepsExceededWhenRefreshFails 覆盖「启用失败时不放行超额用户」。
 //
 // 账号启用只是恢复登录资格，并不代表获得额外流量。刷新配额标记失败时

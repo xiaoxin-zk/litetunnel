@@ -1,8 +1,10 @@
 package adminapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -33,24 +35,24 @@ func (h *Handler) ListUsers(c *gin.Context) {
 
 func (h *Handler) userVO(u *model.User) gin.H {
 	vo := gin.H{
-		"id":               u.ID,
-		"username":         u.Username,
-		"email":            u.Email,
-		"nickname":         u.Nickname,
-		"status":           u.Status,
-		"group_id":         u.GroupID,
-		"traffic_used":     u.TrafficUsed,
-		"traffic_quota":    u.TrafficQuota,
-		"effective_quota":  h.svc.EffectiveQuota(u),
-		"traffic_reset_at": u.TrafficResetAt,
-		"balance":          u.Balance,
-		"group_expire_at":  u.GroupExpireAt,
-		"remark":           u.Remark,
-		"api_key_prefix":   u.APIKeyPrefix,
+		"id":                u.ID,
+		"username":          u.Username,
+		"email":             u.Email,
+		"nickname":          u.Nickname,
+		"status":            u.Status,
+		"group_id":          u.GroupID,
+		"traffic_used":      u.TrafficUsed,
+		"traffic_quota":     u.TrafficQuota,
+		"effective_quota":   h.svc.EffectiveQuota(u),
+		"traffic_reset_at":  u.TrafficResetAt,
+		"balance":           u.Balance,
+		"group_expire_at":   u.GroupExpireAt,
+		"remark":            u.Remark,
+		"api_key_prefix":    u.APIKeyPrefix,
 		"has_client_secret": u.ClientSecret != "",
-		"last_login_at":    u.LastLoginAt,
-		"last_login_ip":    u.LastLoginIP,
-		"created_at":       u.CreatedAt,
+		"last_login_at":     u.LastLoginAt,
+		"last_login_ip":     u.LastLoginIP,
+		"created_at":        u.CreatedAt,
 	}
 	if u.Group != nil {
 		vo["group_name"] = u.Group.Name
@@ -174,9 +176,34 @@ func (h *Handler) ResetUserTraffic(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已清零"})
 }
 
+// nullableTime 解析可空的时间字段，并区分「字段缺失」与「显式 null」。
+//
+// 管理页把有效期清空时发的是 "expire_at": null，而这个字段缺失表示
+// 「这次不改有效期」。用 *time.Time 解出来的都是 nil，两者无法区分——
+// 于是「清空」会被当成「不修改」，旧到期时间残留，到期调度随后把刚改派的
+// 用户迁回默认分组：管理员看到的是「改好了，过一会儿又自己变回去了」。
+type nullableTime struct {
+	Set   bool
+	Value *time.Time
+}
+
+func (n *nullableTime) UnmarshalJSON(b []byte) error {
+	n.Set = true
+	if strings.TrimSpace(string(b)) == "null" {
+		n.Value = nil
+		return nil
+	}
+	var t time.Time
+	if err := json.Unmarshal(b, &t); err != nil {
+		return err
+	}
+	n.Value = &t
+	return nil
+}
+
 type groupReq struct {
-	GroupID  uint       `json:"group_id" binding:"required"`
-	ExpireAt *time.Time `json:"expire_at"`
+	GroupID  uint         `json:"group_id" binding:"required"`
+	ExpireAt nullableTime `json:"expire_at"`
 }
 
 // SetUserGroup 调整用户分组。
@@ -191,7 +218,8 @@ func (h *Handler) SetUserGroup(c *gin.Context) {
 		httpx.BadRequest(c, "参数格式不正确")
 		return
 	}
-	if err := h.svc.AdminSetUserGroup(id, req.GroupID, req.ExpireAt); err != nil {
+	expiry := service.GroupExpiry{Set: req.ExpireAt.Set, Value: req.ExpireAt.Value}
+	if err := h.svc.AdminSetUserGroup(id, req.GroupID, expiry); err != nil {
 		shared.Fail(c, err)
 		return
 	}

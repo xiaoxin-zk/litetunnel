@@ -451,7 +451,17 @@ func (h *Handler) onNewProxy(req *request) response {
 	if u.Status != model.UserStatusActive {
 		return deny("账号已被禁用")
 	}
-	if h.svc.Runtime.IsQuotaExceeded(u.ID) {
+	// 配额与会话撤销的判定要与 NewUserConn 一致：那边优先用会话级快照，
+	// 这边若只看本机全局缓存，多副本下会出现「配额已放宽仍拒注册」或
+	// 「会话已撤销却注册成功、后续连接全被拒」这种自相矛盾的结果。
+	if blocked, exceeded, ok := h.svc.SessionGuard(content.User.RunID); ok {
+		if blocked {
+			return deny("账号已被禁用")
+		}
+		if exceeded {
+			return deny("流量额度已用尽，请兑换流量或联系管理员")
+		}
+	} else if h.svc.Runtime.IsQuotaExceeded(u.ID) {
 		return deny("流量额度已用尽，请兑换流量或联系管理员")
 	}
 
@@ -610,12 +620,12 @@ func (h *Handler) onNewUserConn(req *request) response {
 			//
 			// 会话里有一份按 Ping 周期刷新的快照：多副本时账号可能在别的实例
 			// 被禁用，本地内存标记要等重启才会变，而快照最多落后一个 Ping 周期。
-			// 快照还没建立（刚登录）时回落到本地标记。
-			if !s.GuardAt.IsZero() {
-				if s.Blocked {
+			// 与代理注册路径共用同一份判断（见 SessionGuard），避免两边结论不一致。
+			if blocked, exceeded, ok := h.svc.SessionGuard(content.User.RunID); ok {
+				if blocked {
 					return deny("账号已被禁用")
 				}
-				if s.Exceeded {
+				if exceeded {
 					return deny("流量额度已用尽")
 				}
 				return allow()

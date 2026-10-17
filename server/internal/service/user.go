@@ -913,6 +913,10 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		if err := tx.Where("user_id = ?", userID).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
+		// 清零代次标记同样是按用户 ID 保存的，随账号一起清掉。
+		if err := tx.Where("user_id = ?", userID).Delete(&model.TrafficResetMark{}).Error; err != nil {
+			return err
+		}
 		// 凭据类数据（重置令牌、邮箱验证码、待发凭据邮件）与管理员
 		// 删除路径共用同一套清理，避免两条路径各行其是、漏掉其中一类。
 		if err := purgeAccountCredentialsTx(tx, userID, u.Email); err != nil {

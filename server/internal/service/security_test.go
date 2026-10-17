@@ -3529,6 +3529,99 @@ func TestResetPasswordByLinkDropsSessions(t *testing.T) {
 	}
 }
 
+// TestSessionGuardRevokedWhenUserDeleted 覆盖「账号在别的实例被删」。
+//
+// 用户记录查询失败时若直接返回、保持原判，旧客户端会一直 Ping，本机就一直
+// 留着这个会话，已有隧道继续接受新连接。这里要区分「用户不存在」（立即拒绝）
+// 与「数据库暂时不可用」（保持原判）。
+func TestSessionGuardRevokedWhenUserDeleted(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "deleteduser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-deleted"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID,
+		Online: true, LastSeenAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("建客户端会话失败: %v", err)
+	}
+	svc.PrimeSessionGuard(runID, u)
+	if blocked, _, _ := svc.SessionGuard(runID); blocked {
+		t.Fatal("前置条件：正常账号不该被拦")
+	}
+
+	// 模拟另一个实例删号（只动数据库，本机内存会话还在）。
+	if err := svc.DB.Delete(&model.ClientSession{}, "user_id = ?", u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DB.Delete(&model.User{}, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 把快照时间拨回过去，触发一次刷新。
+	svc.Runtime.mu.Lock()
+	s := svc.Runtime.sessions[runID]
+	s.GuardAt = time.Now().Add(-time.Minute)
+	svc.Runtime.sessions[runID] = s
+	svc.Runtime.mu.Unlock()
+
+	svc.RefreshSessionGuard(runID)
+	if blocked, _, ok := svc.SessionGuard(runID); !ok || !blocked {
+		t.Fatal("账号已被删除时必须立即拒绝该会话，不能保持原判")
+	}
+}
+
+// TestSessionGuardSharedByBothPaths 覆盖「代理注册与新连接各查各的」。
+//
+// 两条路径共用同一份会话快照，否则多副本下会出现「配额已放宽仍拒注册」
+// 或「会话已撤销却注册成功、后续连接全被拒」这种自相矛盾的结果。
+func TestSessionGuardSharedByBothPaths(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const runID = "run-shared"
+	svc.Runtime.RecordLogin(runID, 42, "shareduser")
+	if _, _, ok := svc.SessionGuard(runID); ok {
+		t.Fatal("快照未建立时应返回 ok=false，由调用方回落到本机标记")
+	}
+
+	svc.Runtime.SetSessionGuard(runID, true, true)
+	blocked, exceeded, ok := svc.SessionGuard(runID)
+	if !ok || !blocked || !exceeded {
+		t.Fatalf("应读到会话快照：blocked=%v exceeded=%v ok=%v", blocked, exceeded, ok)
+	}
+}
+
+// TestAdminDeleteUserRemovesResetMark 覆盖「清零代次标记残留」。
+func TestAdminDeleteUserRemovesResetMark(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "markorphan", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	if err := svc.DB.Create(&model.TrafficResetMark{UserID: u.ID, Gen: 3}).Error; err != nil {
+		t.Fatalf("写标记失败: %v", err)
+	}
+
+	if err := svc.AdminDeleteUser(u.ID); err != nil {
+		t.Fatalf("删除用户失败: %v", err)
+	}
+
+	var n int64
+	if err := svc.DB.Model(&model.TrafficResetMark{}).
+		Where("user_id = ?", u.ID).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("删号后不该残留清零代次标记，实际 %d 条", n)
+	}
+}
+
 // TestTunnelOnlineFromDatabase 覆盖「多副本下非采集实例显示离线」。
 //
 // 进程内的在线集合只有持有采集租约的实例会更新；接口改读 last_online_at，

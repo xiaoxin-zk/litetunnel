@@ -834,6 +834,11 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Where("user_id = ?", id).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
+		// 清零代次标记按用户 ID 保存：不删的话会留下永久孤儿行
+		// （用户 ID 可能被复用，旧标记还会干扰新用户的代次判断）。
+		if err := tx.Where("user_id = ?", id).Delete(&model.TrafficResetMark{}).Error; err != nil {
+			return err
+		}
 		// 重置令牌、验证码与待发凭据邮件一并清理（与自助注销共用）。
 		if err := purgeAccountCredentialsTx(tx, id, u.Email); err != nil {
 			return err

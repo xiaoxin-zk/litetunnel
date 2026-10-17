@@ -563,7 +563,16 @@ func (s *Services) RefreshSessionGuard(runID string) {
 		return
 	}
 	var u model.User
-	if err := s.DB.Preload("Group").First(&u, sess.UserID).Error; err != nil {
+	err := s.DB.Preload("Group").First(&u, sess.UserID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// 账号在别的实例被删掉了：数据库会话与用户记录一起没了，而本机内存
+		// 会话还在。这时不能「保持原判」——旧客户端会一直 Ping，本机就一直
+		// 留着这个会话，已有隧道继续接受新连接。
+		s.Runtime.SetSessionGuard(runID, true, true)
+		return
+	}
+	if err != nil {
+		// 数据库暂时不可用：保持原判。此时「已知但略旧」比「未知」安全。
 		return
 	}
 	// 数据库里的会话状态也要复核：别的实例重置密码/注销会话后会把这里标成
@@ -576,6 +585,22 @@ func (s *Services) RefreshSessionGuard(runID string) {
 	s.Runtime.SetSessionGuard(runID,
 		u.Status != model.UserStatusActive,
 		s.QuotaExceeded(&u))
+}
+
+// SessionGuard 返回会话级准入快照，ok=false 表示快照尚未建立。
+//
+// 代理注册与新连接两条路径共用它：两边各查各的（一个看全局缓存、一个看快照）
+// 会让多副本下的决策互相矛盾——配额刚放宽时代理注册仍被拒，或会话已撤销却
+// 注册成功、后续连接全被拒。
+func (s *Services) SessionGuard(runID string) (blocked, exceeded, ok bool) {
+	if runID == "" {
+		return false, false, false
+	}
+	sess, found := s.Runtime.LookupSession(runID)
+	if !found || sess.GuardAt.IsZero() {
+		return false, false, false
+	}
+	return sess.Blocked, sess.Exceeded, true
 }
 
 // PrimeSessionGuard 用刚读到的用户数据初始化会话的准入快照。

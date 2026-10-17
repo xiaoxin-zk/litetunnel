@@ -771,10 +771,22 @@ async function submitRedeem() {
 
 
 const statusText = computed(() => {
-  // 说清「几条在跑」：只有一条隧道开着时，笼统的「已连接」会让用户
-  // 以为所有隧道都通了。
-  const running = (props.state.tunnels || []).filter((t) => t.running).length
-  if (running > 0) return `已连接，${running} 条隧道运行中`
+  // 顶部文案说的是「连上没有」，所以要用**已注册/在线**的条数，而不是
+  // 「进程起没起」：frpc 进程起来了、代理还在握手时，行内标签是「连接中」，
+  // 顶部若按进程数显示「已连接」就自相矛盾了。
+  const tunnels = props.state.tunnels || []
+  const connected = tunnels.filter((t) => t.status === 'active' && (t.registered || t.online)).length
+  const started = tunnels.filter((t) => t.running).length
+
+  if (connected > 0) {
+    // 进程数多于已连接数时说明还有隧道在握手，一并说明，避免用户以为
+    // 「顶部说连上了、为什么行内还在转」。
+    if (started > connected) {
+      return `已连接 ${connected} 条，${started - connected} 条连接中`
+    }
+    return `已连接，${connected} 条隧道运行中`
+  }
+  if (started > 0) return `正在连接（${started} 条隧道）`
   if (props.state.exceeded) return '流量已用尽'
   return '未连接'
 })
@@ -799,7 +811,12 @@ watch(
 )
 
 const dotClass = computed(() => {
-  if (props.state.running) return 'on'
+  // 与顶部文案同源：绿点 = 至少有一条隧道真正连上了；黄点 = 进程起来了
+  // 但还在握手；红点 = 流量用尽。只看 state.running 的话，进程刚起来、
+  // 代理还没注册时会显示绿灯，与行内的「连接中」矛盾。
+  const tunnels = props.state.tunnels || []
+  if (tunnels.some((t) => t.status === 'active' && (t.registered || t.online))) return 'on'
+  if (tunnels.some((t) => t.running)) return 'warn'
   if (props.state.exceeded) return 'err'
   return 'off'
 })
@@ -958,6 +975,12 @@ watch(
 .dot.off {
   background: #cbd5e1;
   box-shadow: 0 0 0 4px rgba(203, 213, 225, 0.2);
+}
+
+/* 进程已启动、代理还在握手：与行内「连接中」的黄色标签保持一致。 */
+.dot.warn {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.18);
 }
 
 .dot.err {

@@ -201,6 +201,8 @@ func TestNotExistErrOnlyClassifiesMissingObjects(t *testing.T) {
 		want bool
 	}{
 		{"执行 iptables 失败: iptables: No chain/target/match by that name.", true},
+		// iptables -C 检查 INPUT 跳转：规则不存在时是这条措辞，属于「确实没接入」。
+		{"执行 iptables 失败: iptables: Bad rule (does a matching rule exist in that chain?).", true},
 		{"执行 nft 失败: Error: No such file or directory", true},
 		{"执行 firewall-cmd 失败: not running", true},
 		{"执行 iptables 超时（可能 iptables 锁被占用）", false},

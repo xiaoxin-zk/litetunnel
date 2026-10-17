@@ -1122,8 +1122,51 @@ func TestPasswordChangeRevokesPendingResetLinks(t *testing.T) {
 		t.Fatalf("排队中的找回验证码邮件应作废，实际状态 %q", cm.Status)
 	}
 
-	if err := svc.ResetPassword("old-link-token", "Another123"); !errors.Is(err, ErrResetTokenInvalid) {
+	if err := svc.ResetPassword("old-link-token", "Another123", "127.0.0.1"); !errors.Is(err, ErrResetTokenInvalid) {
 		t.Fatalf("旧链接必须失效，实际 %v", err)
+	}
+}
+
+// TestResetCodeActivationRejectsLegacyPayload 覆盖「升级遗留队列绕过改密保护」。
+//
+// 升级前入队的找回验证码载荷没有版本快照。账号改过密码（版本 > 1）时，
+// 无法证明「期间没改过密码」，必须拒绝激活——缺快照不能成为绕过口。
+func TestResetCodeActivationRejectsLegacyPayload(t *testing.T) {
+	svc := newTestServices(t, &config.Config{})
+
+	u := &model.User{
+		Username: "legacycode", Password: "not-used", Status: model.UserStatusActive,
+		Email: "legacycode@example.com", EmailVerified: true, TokenVersion: 3,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 旧版载荷：没有 token_version 字段。
+	payload, err := json.Marshal(emailCodePayload{
+		Email: u.Email, Scene: EmailSceneReset, CodeHash: "legacy-code", TTLSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("序列化载荷失败: %v", err)
+	}
+	row := &model.MailOutbox{
+		To: u.Email, Subject: "code", Kind: model.MailKindEmailCodeReset,
+		Status: model.MailActivating, ClaimToken: "claim-legacy",
+		Payload: string(payload), NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(row).Error; err != nil {
+		t.Fatalf("建邮件失败: %v", err)
+	}
+
+	if err := svc.activateEmailCode(*row, "claim-legacy"); !errors.Is(err, errMailActionObsolete) {
+		t.Fatalf("改过密码的账号，旧载荷必须作废，实际 %v", err)
+	}
+	var n int64
+	if err := svc.DB.Model(&model.EmailCode{}).Where("email = ?", u.Email).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("作废的邮件不该创建验证码，实际 %d 条", n)
 	}
 }
 

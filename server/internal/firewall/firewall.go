@@ -237,7 +237,10 @@ func notExistErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{
-		"no chain/target/match",     // iptables：链不存在
+		"no chain/target/match", // iptables：链不存在
+		// iptables -C 在规则不存在时的固定措辞（INPUT 还没跳进专属链）。
+		// 漏掉它会把「确实没接入」当成查询错误，界面上变成「未知」。
+		"bad rule",
 		"does not exist",            // nft：表/链不存在
 		"no such file or directory", // nft 在部分版本上的措辞
 		"not running",               // firewalld：守护进程没起来

@@ -160,7 +160,15 @@ func (s *Services) activateEmailCode(row model.MailOutbox, token string) error {
 			// 改密会递增 TokenVersion：排队期间用户改过密码的话，这个找回
 			// 验证码必须作废——否则改密后旧码还能再改一次密码。
 			// 判断放在用户行锁内，与改密事务（同样先锁这一行）只剩先后关系。
-			if p.TokenVersion != nil && u.TokenVersion != *p.TokenVersion {
+			//
+			// 没有版本快照（升级前入队的邮件）：版本仍为初始值 1 说明这个
+			// 账号从未改过密码，按原行为放行；否则无法证明期间没改过密码，
+			// 一律作废——与重置链接同一策略，缺快照不能成为绕过口。
+			if p.TokenVersion == nil {
+				if u.TokenVersion > 1 {
+					return errMailActionObsolete
+				}
+			} else if u.TokenVersion != *p.TokenVersion {
 				return errMailActionObsolete
 			}
 		}

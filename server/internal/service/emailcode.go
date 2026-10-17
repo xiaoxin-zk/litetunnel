@@ -97,16 +97,21 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 
 	// 找回场景额外记下当前的令牌版本：验证码是送达后才创建的，改密时
 	// 撤销不到它；激活时比对版本才能拦住「改密后旧码仍可用」。
+	//
+	// 读不到版本就**不入队**：没有快照的载荷在激活时无法证明「期间没改过
+	// 密码」，而放它过去等于给这条恢复通道留一个永久的绕过口。宁可让用户
+	// 稍后重试一次，也不能发出一封无法校验的找回邮件。
 	var resetVersion *int
 	if scene == EmailSceneReset {
 		var u model.User
 		if err := s.DB.Model(&model.User{}).
 			Select("id", "token_version").
 			Where("lower(email) = ? AND email_verified = ?", strings.ToLower(email), true).
-			First(&u).Error; err == nil {
-			v := u.TokenVersion
-			resetVersion = &v
+			First(&u).Error; err != nil {
+			return fmt.Errorf("读取账号版本失败，暂不发送找回验证码: %w", err)
 		}
+		v := u.TokenVersion
+		resetVersion = &v
 	}
 
 	code, err := newNumericCode(6)

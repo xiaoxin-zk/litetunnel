@@ -10,7 +10,6 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -96,7 +95,7 @@ func (s *Services) unavailablePorts() (map[int]struct{}, error) {
 	for p := range ParsePortList(s.Settings.Get(KeyPortReserved)) {
 		out[p] = struct{}{}
 	}
-	listening, err := firewall.ListeningPortSet()
+	listening, err := listeningPortSet()
 	if err != nil {
 		return out, err
 	}

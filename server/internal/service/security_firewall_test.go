@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -777,5 +778,115 @@ func TestPortAllocationSkipsReservedPorts(t *testing.T) {
 		if p >= 30000 && p <= 30003 {
 			t.Fatalf("自动分配不应返回保留端口 %d", p)
 		}
+	}
+}
+
+// failingBackend 是「查询一律失败」的后端，用来覆盖状态采集的错误分支。
+type failingBackend struct{}
+
+func (failingBackend) Name() string                        { return "fake" }
+func (failingBackend) Available() bool                     { return true }
+func (failingBackend) Status() (bool, error)               { return false, errors.New("status boom") }
+func (failingBackend) ListRules() ([]firewall.Rule, error) { return nil, errors.New("rules boom") }
+func (failingBackend) AddPort(int, string) error           { return nil }
+func (failingBackend) RemovePort(int, string) error        { return nil }
+
+// TestFirewallStatusKeepsQueryErrors 覆盖「查询失败被当成正常状态」。
+//
+// 状态查询失败时若保持 Active=false，界面会显示「未生效」，管理员于是去
+// 排查规则；真实原因只是这次没读到。两个查询要各自记录，一个失败不该
+// 让另一个的结果也丢掉。
+func TestFirewallStatusKeepsQueryErrors(t *testing.T) {
+	st := &FirewallStatus{}
+	fillBackendState(st, failingBackend{})
+
+	if !st.ActiveUnknown {
+		t.Fatal("状态查询失败时必须标为未知，不能默认 false（那会被显示成「未生效」）")
+	}
+	if st.Active {
+		t.Fatal("未知时不应给出「生效中」的结论")
+	}
+	for _, want := range []string{"status boom", "rules boom"} {
+		if !strings.Contains(st.Error, want) {
+			t.Fatalf("错误原因应包含 %q，实际 %q", want, st.Error)
+		}
+	}
+}
+
+// TestFirewallStatusOfReportsRuleReadFailure 覆盖接口层接线。
+//
+// 假 helper 只实现了 /health 与端口操作，/rules 返回 404：生效状态读得到，
+// 规则读不到。这种情况必须写进 fw.error 并保留 Active，而不是把两者混为一谈。
+func TestFirewallStatusOfReportsRuleReadFailure(t *testing.T) {
+	helper := newFakeFirewallHelper(t)
+	svc := newTestServices(t, nil)
+	enableTestFirewall(t, svc, helper)
+
+	st := svc.FirewallStatusOf()
+	if st.ActiveUnknown {
+		t.Fatal("/health 可用，生效状态应能读到，不该标为未知")
+	}
+	if !st.Active {
+		t.Fatal("假 helper 的 /health 报告 enabled=true，生效状态应为真")
+	}
+	if !strings.Contains(st.Error, "读取防火墙规则失败") {
+		t.Fatalf("规则读取失败必须写进 fw.error，实际 %q", st.Error)
+	}
+}
+
+// withScanFailure 让「系统监听端口扫描」一律失败，返回恢复函数。
+func withScanFailure(t *testing.T) {
+	t.Helper()
+	orig := listeningPortSet
+	listeningPortSet = func() (map[string]bool, error) { return nil, errors.New("scan boom") }
+	t.Cleanup(func() { listeningPortSet = orig })
+}
+
+// TestPortPoolUsageMarksListeningUnknown 覆盖「扫描失败仍报系统占用 0」。
+//
+// 少算系统占用会让空闲量偏高，管理页据此以为端口还很宽裕。此时占用与
+// 空闲都必须标为未知，而不是拿空列表当结论。
+func TestPortPoolUsageMarksListeningUnknown(t *testing.T) {
+	svc := newTestServices(t, &config.Config{PortRangeStart: 32100, PortRangeEnd: 32109})
+	withScanFailure(t)
+
+	u := svc.PortPoolUsageOf()
+	if !u.ListeningUnknown {
+		t.Fatal("扫描失败时必须标记系统占用未知")
+	}
+	if !u.FreeUnknown {
+		t.Fatal("系统占用未知时空闲量也必须未知，否则会报出一个偏高的可用量")
+	}
+	if u.Free != 0 {
+		t.Fatalf("未知时空闲量应为 0（由 FreeUnknown 表明不可信），实际 %d", u.Free)
+	}
+	if !strings.Contains(u.ListeningError, "scan boom") {
+		t.Fatalf("应带上扫描失败原因，实际 %q", u.ListeningError)
+	}
+	if !strings.Contains(strings.Join(u.Advice, " "), "系统监听") {
+		t.Fatalf("提示里应说明是系统监听端口读取失败，实际 %v", u.Advice)
+	}
+}
+
+// TestAllocatePortRejectsWhenScanFails 覆盖「扫描失败仍然分配端口」。
+//
+// 分配时把扫描失败当成「没有端口在监听」，会把系统占用的端口发出去：
+// 用户建完隧道绑不上，而面板上一切正常。保留端口来自配置，仍应给出准确结论。
+func TestAllocatePortRejectsWhenScanFails(t *testing.T) {
+	svc := newTestServices(t, &config.Config{PortRangeStart: 32200, PortRangeEnd: 32209})
+	withScanFailure(t)
+
+	if _, err := svc.allocatePort(svc.DB, 1); !errors.Is(err, ErrPortScanUnavailable) {
+		t.Fatalf("扫描失败时必须拒绝分配并说明原因，实际 %v", err)
+	}
+
+	if err := svc.Settings.SetMany(map[SettingKey]string{KeyPortReserved: "32205"}); err != nil {
+		t.Fatalf("设置保留端口失败: %v", err)
+	}
+	tx := svc.DB.Begin()
+	err := svc.assertPortFree(tx, 32205)
+	tx.Rollback()
+	if !errors.Is(err, ErrPortInUse) {
+		t.Fatalf("保留端口不依赖扫描，命中时仍应报「已被占用」，实际 %v", err)
 	}
 }

@@ -55,6 +55,14 @@ func (s *Services) FirewallBackend() firewall.Backend {
 	return h
 }
 
+// 端口扫描的间接引用：生产环境就是 firewall 包的实现，没有额外分支；
+// 测试用它们覆盖「扫描失败」这条路径——那是最容易静默退化的分支
+// （失败被当成「没有端口被监听」，于是把系统占用的端口分配给用户）。
+var (
+	scanListeningPorts = firewall.ScanListening
+	listeningPortSet   = firewall.ListeningPortSet
+)
+
 // FirewallGuard 按当前设置构造安全护栏。
 func (s *Services) FirewallGuard() *firewall.Guard {
 	return firewall.NewGuard(
@@ -722,14 +730,21 @@ func (s *Services) ReconcileFirewall() bool {
 
 // FirewallStatus 是管理页需要的防火墙运行态。
 type FirewallStatus struct {
-	Enabled   bool   `json:"enabled"`
-	AutoOpen  bool   `json:"auto_open"`
-	Backend   string `json:"backend"`
-	Reason    string `json:"reason,omitempty"`
-	Active    bool   `json:"active"`
-	Protected []int  `json:"protected_ports"`
-	PoolStart int    `json:"pool_start"`
-	PoolEnd   int    `json:"pool_end"`
+	Enabled  bool   `json:"enabled"`
+	AutoOpen bool   `json:"auto_open"`
+	Backend  string `json:"backend"`
+	Reason   string `json:"reason,omitempty"`
+	// Active 是后端报告的「防火墙是否处于启用状态」。
+	Active bool `json:"active"`
+	// ActiveUnknown 表示这次**没查成**，Active 不可信。
+	//
+	// 必须与 Active=false 区分：后者是后端明确说「没启用」，前者只是查询失败。
+	// 界面把「未知」显示成「未生效」，管理员会去排查一个并不存在的问题
+	// （以为是规则没生效，实际只是这次没读到）。
+	ActiveUnknown bool  `json:"active_unknown"`
+	Protected     []int `json:"protected_ports"`
+	PoolStart     int   `json:"pool_start"`
+	PoolEnd       int   `json:"pool_end"`
 
 	// ManagedRules 是本面板专属链/表内的规则
 	ManagedRules []firewall.Rule `json:"managed_rules"`
@@ -737,6 +752,11 @@ type FirewallStatus struct {
 	ExternalRules []firewall.Rule `json:"external_rules"`
 	// Listening 是当前主机实际监听的端口，用于识别哪些端口已被占用
 	Listening []firewall.ListeningPort `json:"listening"`
+	// ListeningUnknown 表示「监听端口扫描失败」，Listening 因此不完整。
+	//
+	// 空列表有两种含义：真的没有端口在监听，或者这次没扫成。界面把后者
+	// 显示成「未扫描到监听端口」，管理员会以为主机很干净。
+	ListeningUnknown bool `json:"listening_unknown"`
 
 	// PendingOps 是「本该放行/收回、但 helper 当时失败」的端口，正在后台重试。
 	//
@@ -773,8 +793,31 @@ func (s *Services) FirewallStatusOf() *FirewallStatus {
 		st.Reason = n.Reason()
 	}
 
+	fillBackendState(st, be)
+
+	if ports, err := scanListeningPorts(); err == nil {
+		st.Listening = ports
+	} else {
+		// 扫不到不等于没有：把原因带出去，否则界面显示「0 个端口被占用」
+		// 而实际只是这次没读成，管理员会据此误判端口池还很宽裕。
+		st.ListeningUnknown = true
+		appendFirewallStatusError(st, "读取系统监听端口失败："+err.Error())
+	}
+	return st
+}
+
+// fillBackendState 读后端的「生效状态」与「规则集」，查询失败如实记录。
+//
+// 两个查询各自独立：一个失败不该让另一个的结果也丢掉——管理员至少要知道
+// 规则是能读到的，只是状态没查到（或反过来）。
+func fillBackendState(st *FirewallStatus, be firewall.Backend) {
 	if active, err := be.Status(); err == nil {
 		st.Active = active
+	} else {
+		// 不能保持 Active=false 了事：那会被界面显示成「未生效」，
+		// 而真实原因只是这次没查成。
+		st.ActiveUnknown = true
+		appendFirewallStatusError(st, "读取防火墙生效状态失败："+err.Error())
 	}
 
 	if rules, err := be.ListRules(); err == nil {
@@ -786,21 +829,20 @@ func (s *Services) FirewallStatusOf() *FirewallStatus {
 			}
 		}
 	} else {
-		st.Error = err.Error()
+		appendFirewallStatusError(st, "读取防火墙规则失败："+err.Error())
 	}
+}
 
-	if ports, err := firewall.ScanListening(); err == nil {
-		st.Listening = ports
-	} else {
-		// 扫不到不等于没有：把原因带出去，否则界面显示「0 个端口被占用」
-		// 而实际只是这次没读成，管理员会据此误判端口池还很宽裕。
-		if st.Error == "" {
-			st.Error = "读取系统监听端口失败：" + err.Error()
-		} else {
-			st.Error += "；读取系统监听端口失败：" + err.Error()
-		}
+// appendFirewallStatusError 追加一条状态查询失败原因。
+//
+// 多个来源（状态、规则、监听扫描）可能同时失败，只保留最后一条会让管理员
+// 按着不完整的原因去排查；分号连接之后界面上一次就能看全。
+func appendFirewallStatusError(st *FirewallStatus, msg string) {
+	if st.Error == "" {
+		st.Error = msg
+		return
 	}
-	return st
+	st.Error += "；" + msg
 }
 
 // PortPoolUsage 描述端口池的使用情况，供管理页做可视化。
@@ -875,7 +917,7 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 	//
 	// 扫描失败时同样不能按「没有端口被占用」继续算：那会让空闲量偏高，
 	// 而实际可能一个端口都不剩。标记为未知，由界面明确展示。
-	if listening, err := firewall.ListeningPortSet(); err != nil {
+	if listening, err := listeningPortSet(); err != nil {
 		u.ListeningUnknown = true
 		u.ListeningError = err.Error()
 	} else {

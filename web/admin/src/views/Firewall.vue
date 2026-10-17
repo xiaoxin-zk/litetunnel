@@ -38,6 +38,18 @@
         description="云服务器安全组不受本功能影响，仍需在云控制台单独放行。"
       />
 
+      <!-- 状态查询失败：以前这个字段后端一直在传，界面却从不显示，
+           于是「没查到」与「一切正常」在页面上长得一模一样 -->
+      <el-alert
+        v-if="fw.error"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        title="部分状态查询失败"
+        :description="`${fw.error}。下方列表与「规则生效」可能不完整，请稍后重新扫描。`"
+      />
+
       <el-descriptions :column="4" border size="small">
         <el-descriptions-item label="启用状态">
           <el-tag :type="fw.enabled ? 'success' : 'info'" size="small">
@@ -46,8 +58,13 @@
         </el-descriptions-item>
         <el-descriptions-item label="后端">{{ fw.backend || '-' }}</el-descriptions-item>
         <el-descriptions-item label="规则生效">
-          <el-tag :type="fw.active ? 'success' : 'info'" size="small">
-            {{ fw.active ? '生效中' : '未生效' }}
+          <!-- 查询失败时显示「未知」：显示成「未生效」会让管理员去排查
+               一个并不存在的问题（实际只是这次没读到） -->
+          <el-tag
+            :type="fw.active_unknown ? 'warning' : (fw.active ? 'success' : 'info')"
+            size="small"
+          >
+            {{ fw.active_unknown ? '未知' : (fw.active ? '生效中' : '未生效') }}
           </el-tag>
         </el-descriptions-item>
         <el-descriptions-item label="自动放行">
@@ -173,7 +190,10 @@
       </div>
       <div class="legend">
         <span><i class="dot reserved" />保留 {{ poolSeg.reserved }}</span>
-        <span><i class="dot system" />系统占用 {{ poolSeg.listening }}</span>
+        <span>
+          <i class="dot system" />系统占用
+          {{ pool.listening_unknown ? '未知' : poolSeg.listening }}
+        </span>
         <span>
           <i class="dot allocated" />已分配
           {{ pool.free_unknown ? '未知' : poolSeg.allocated }}
@@ -279,7 +299,9 @@
     <!-- ============ 监听端口 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
-        <span>主机监听端口（{{ fw.listening?.length || 0 }}）</span>
+        <span>
+          主机监听端口（{{ fw.listening_unknown ? '未知' : (fw.listening?.length || 0) }}）
+        </span>
       </div>
       <el-table :data="fw.listening || []" size="small" stripe max-height="360">
         <el-table-column label="端口" prop="port" width="100" />
@@ -296,7 +318,11 @@
             </el-tag>
           </template>
         </el-table-column>
-        <template #empty><el-empty description="未扫描到监听端口" /></template>
+        <template #empty>
+          <el-empty
+            :description="fw.listening_unknown ? '扫描失败，无法确定主机监听端口' : '未扫描到监听端口'"
+          />
+        </template>
       </el-table>
     </div>
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type clientInfo struct {
@@ -236,6 +237,9 @@ func (a *App) Logout() (State, error) {
 	// 错误的排查方向，而退避时间会让新账号的隧道白白多等一会儿。
 	a.tunnelErrs = map[uint]tunnelErr{}
 	a.retries = map[uint]*retryState{}
+	// 连接起点也是按隧道 id 记账的：换了账号之后这些 id 指向别的隧道，
+	// 留着只会让新账号的隧道显示一段不属于它的等待时长。
+	a.connectAt = map[uint]time.Time{}
 	a.mu.Unlock()
 
 	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。

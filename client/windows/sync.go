@@ -656,12 +656,17 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	// 把配置路径一起打出来：隧道起不来时，第一件要确认的就是
 	// 「客户端到底用了哪份配置」，而这份配置是每条隧道一份的。
 	a.emitTunnelLog(t.Name, "开始加载隧道配置："+path)
+
+	// 起点必须在**启动之前**记下：frpc 可能在 Start 返回之前就打印
+	// start proxy success，注册回调会清掉起点；若在 Start 之后再写，
+	// 等于把一次已经结束的等待又贴回来，之后掉线重连显示的时长里
+	// 会混进那段早就连上的时间。
+	a.markConnectStart(t.ID)
 	if err := a.mgr.Start(t.ID, t.Name, path); err != nil {
+		// 没起来就不算「连接中」：留着起点会让界面显示一段并不存在的等待。
+		a.clearConnectStart(t.ID)
 		return err
 	}
-	// 记下「这次连接从什么时候开始」：frpc 进程活着但一直没注册成功时，
-	// 界面要能显示已经等了多久，而不是永远一句「连接中」。
-	a.markConnectStart(t.ID)
 
 	// 记下这次写入的原文。下一次同步据此判断「配置有没有变」——
 	// 不记的话每次同步都会判定为变化并重启一遍，连接会一直抖。
@@ -924,6 +929,13 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 	for id := range a.errEmitAt {
 		if !alive[id] {
 			delete(a.errEmitAt, id)
+		}
+	}
+	// 连接起点同理：一条隧道反复「建了、连不上、删掉」时，这些条目没有
+	// 任何机会被再次访问，会随进程寿命一直留着。
+	for id := range a.connectAt {
+		if !alive[id] {
+			delete(a.connectAt, id)
 		}
 	}
 }

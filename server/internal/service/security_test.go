@@ -3505,6 +3505,63 @@ func TestTrafficResetMarkSeedCoversOfflineUsers(t *testing.T) {
 	}
 }
 
+// TestSeedUnknownResetGensReportsFailure 覆盖「播种失败却宣告迁移完成」。
+//
+// 播种只写进去一部分就返回的话，调用方仍会继续采集，成功后还会落下迁移
+// 标记；那些没被标记的用户下次上线时仍会被当成「代次没变」，把清零前的
+// 流量加回来。所以失败必须如实返回，由调用方放弃本轮、下轮重试。
+func TestSeedUnknownResetGensReportsFailure(t *testing.T) {
+	svc := newTestServices(t, &config.Config{})
+	u := &model.User{Username: "seedfail", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	// 标记表写不进去（模拟迁移中途缺表）。
+	if err := svc.DB.Migrator().DropTable(&model.TrafficResetMark{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+	if err := svc.seedUnknownResetGens(map[uint]int64{}); err == nil {
+		t.Fatal("写入失败时必须返回错误，否则迁移会在标记不完整的情况下被宣告完成")
+	}
+}
+
+// TestSettingStoreReloadIfChanged 覆盖「多实例共用一个库时配置缓存不刷新」。
+//
+// 缓存只在本实例写配置后刷新。A 上保存的保留端口，B 会一直按旧值分配，
+// 直到 B 重启——所以每个实例都要周期性比对一次库里的原文。
+func TestSettingStoreReloadIfChanged(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	changed, err := svc.Settings.ReloadIfChanged()
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if changed {
+		t.Fatal("没有写入时不该判定为变化")
+	}
+
+	// 另一个实例（同一份库）保存配置。
+	other := NewSettingStore(svc.DB, cfg)
+	if err := other.SetMany(map[SettingKey]string{KeyPortReserved: "30000-30010"}); err != nil {
+		t.Fatalf("写入配置失败: %v", err)
+	}
+	if got := svc.Settings.Get(KeyPortReserved); got == "30000-30010" {
+		t.Fatal("本实例的缓存不该被另一个实例的写入自动改动（这正是需要轮询的原因）")
+	}
+
+	changed, err = svc.Settings.ReloadIfChanged()
+	if err != nil {
+		t.Fatalf("读取配置失败: %v", err)
+	}
+	if !changed {
+		t.Fatal("其他实例改了配置，本实例应重新载入")
+	}
+	if got := svc.Settings.Get(KeyPortReserved); got != "30000-30010" {
+		t.Fatalf("应读到新值，实际 %q", got)
+	}
+}
+
 // TestPortAllocationSkipsReservedPorts 覆盖「自动/手动分配落到保留端口」。
 func TestPortAllocationSkipsReservedPorts(t *testing.T) {
 	svc := newTestServices(t, &config.Config{PortRangeStart: 30000, PortRangeEnd: 30005})

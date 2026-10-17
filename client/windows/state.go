@@ -121,6 +121,16 @@ func (a *App) markConnectStart(id uint) {
 	a.connectAt[id] = time.Now()
 }
 
+// clearConnectStart 撤销某条隧道的「等待中」起点。
+//
+// 用在「起点已经记下、但这次连接根本没起来」的路径上（启动失败、隧道被删、
+// 退出登录）：留着的话，界面会显示一段并不存在的等待时长。
+func (a *App) clearConnectStart(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.connectAt, id)
+}
+
 // markReconnectStart 记录「曾经连上、现在又断开」的等待起点。
 //
 // 与 markConnectStart 的区别是不覆盖已有起点：这条路径每轮同步都会走一次，

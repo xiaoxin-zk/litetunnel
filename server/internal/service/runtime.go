@@ -1017,6 +1017,10 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// 运行期设置跟着别的实例收敛：多实例共用一个库时，配置缓存
+				// 只在本实例写入后才刷新，别的实例改了（保留端口、注册开关、
+				// 配额规则…）这边会一直按旧值运行。
+				s.ReloadSettingsIfChanged()
 				// 到期准入刷新放在采集**之前**、且不看采集成败：
 				// 它是时间驱动的，与 frps 管理接口是否可用无关。
 				// 挂在采集流程里的话，frps 一挂，到期用户的标记就停在旧值
@@ -1914,8 +1918,16 @@ func (s *Services) loadTrafficBaseline() bool {
 	// 首次启用标记表：除已有真实标记的用户外，其余全部记为「代次未知」。
 	// 只依赖「本轮采样到的用户」会让升级时离线的用户在下次上线时被当成
 	// 「代次没变」，见 resetGenUnknown 的说明。
+	//
+	// 播种失败必须**整轮放弃**，不能带着「一部分用户还没有标记」的状态继续：
+	// 本轮采集成功后会落下迁移标记，而缺失的那些用户下次上线时仍会被当成
+	// 「代次没变」，把清零前的流量加回来——正是这条迁移要防的事。
+	// 返回 false 会让调用方跳过本轮并保留迁移标记，下一轮重新走这里重试。
 	if seedReset {
-		s.seedUnknownResetGens(gens)
+		if err := s.seedUnknownResetGens(gens); err != nil {
+			log.Printf("[traffic] 清零代次标记初始化失败，本轮跳过采集（下轮重试）: %v", err)
+			return false
+		}
 	}
 
 	s.Runtime.mu.Lock()
@@ -1945,13 +1957,13 @@ func (s *Services) loadTrafficBaseline() bool {
 //
 // 哨兵必须**落库**：只放内存的话，控制面在那些用户上线之前重启一次，
 // 这份「未知」就丢了，又回到「没有记录 = 代次没变」的老问题。
-func (s *Services) seedUnknownResetGens(gens map[uint]int64) {
+//
+// 返回错误表示「还有用户没被标记」：调用方必须据此放弃本轮采集，否则
+// 迁移会在标记不完整的情况下被宣告完成，而那些用户永远等不到哨兵。
+func (s *Services) seedUnknownResetGens(gens map[uint]int64) error {
 	var ids []uint
 	if err := s.DB.Model(&model.User{}).Pluck("id", &ids).Error; err != nil {
-		// 读不到用户列表也不阻断采集：本轮采样到的用户仍会被写进标记表，
-		// 只是「离线用户」这一部分退化成原来的行为。
-		log.Printf("[traffic] 读取用户列表失败，本次只按采样到的用户初始化清零代次: %v", err)
-		return
+		return fmt.Errorf("读取用户列表失败: %w", err)
 	}
 	marks := make([]model.TrafficResetMark, 0, len(ids))
 	for _, id := range ids {
@@ -1962,16 +1974,16 @@ func (s *Services) seedUnknownResetGens(gens map[uint]int64) {
 		marks = append(marks, model.TrafficResetMark{UserID: id, Gen: resetGenUnknown})
 	}
 	if len(marks) == 0 {
-		return
+		return nil
 	}
 	// DoNothing：并发启动的另一个实例可能已经写过真实值，不能覆盖。
 	// 分批写：用户量大时一次 INSERT 的绑定参数会超过驱动的上限。
 	if err := s.DB.Clauses(clause.OnConflict{DoNothing: true}).
 		CreateInBatches(&marks, 200).Error; err != nil {
-		log.Printf("[traffic] 写入清零代次哨兵失败（本次仍按未知处理，重启后会丢失）: %v", err)
-		return
+		return fmt.Errorf("写入清零代次哨兵失败: %w", err)
 	}
 	log.Printf("[traffic] 已为 %d 个用户写入「清零代次未知」标记，下次采样时保守跳过一轮增量", len(marks))
+	return nil
 }
 
 // refreshQuotaFlags 刷新内存中的超额与禁用标记，供 frps 插件实时拦截。

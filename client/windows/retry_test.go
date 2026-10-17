@@ -79,6 +79,24 @@ func TestReconnectStartDoesNotResetTimer(t *testing.T) {
 	}
 }
 
+// TestPruneTunnelStateClearsConnectAt 覆盖「服务端已删除的隧道留下计时条目」。
+//
+// 一条隧道反复「建了、连不上、删掉」时，它的连接起点没有任何机会再被
+// 访问；不清就会随进程寿命一直留着。
+func TestPruneTunnelStateClearsConnectAt(t *testing.T) {
+	a := &App{connectAt: map[uint]time.Time{
+		1: time.Now(),
+		2: time.Now(),
+	}}
+	a.pruneTunnelState(map[uint]bool{2: true})
+	if _, ok := a.connectAt[1]; ok {
+		t.Fatal("服务端已不存在的隧道应清掉连接起点")
+	}
+	if _, ok := a.connectAt[2]; !ok {
+		t.Fatal("仍然存在的隧道不该被清")
+	}
+}
+
 // TestRegisteredClearsConnectTimer 覆盖「连上之后计时归零」。
 func TestRegisteredClearsConnectTimer(t *testing.T) {
 	a := &App{

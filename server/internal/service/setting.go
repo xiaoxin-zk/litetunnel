@@ -360,6 +360,14 @@ type SettingStore struct {
 	// 放内存里而不是每次查库：用它的都是热路径（每个 HTTP/HTTPS 隧道请求都要
 	// 按隧道根域名判权），一次 count 查询就把 SettingStore 存在的意义抵消了。
 	present map[SettingKey]bool
+
+	// raw 是上一次从库里读到的**原始**行（含密文），用于判断「别的实例有没有
+	// 改过配置」（见 ReloadIfChanged）。
+	//
+	// 存原文而不是解析后的值：比较的目的是「这一份快照是否已经过时」，
+	// 加密字段解出来是同一个明文就说明没变，但解密的成本与失败回落都
+	// 不该掺进这个判断里。
+	raw map[string]string
 }
 
 // NewSettingStore 构造配置存储并完成首次加载。
@@ -387,19 +395,70 @@ func (s *SettingStore) applyDefaults() {
 		// 回落默认值意味着「这一份不是从库里读出来的」，因此视为没有行。
 		s.present[spec.Key] = false
 	}
+	// 没有读到库里的行：清掉快照，下一次 ReloadIfChanged 一定判为「变了」
+	// 并重新读一次——启动时读失败不再需要重启才能恢复。
+	s.raw = nil
 }
 
 // Reload 从数据库重新载入全部配置。
 func (s *SettingStore) Reload() error {
+	stored, err := s.fetch()
+	if err != nil {
+		return err
+	}
+	s.apply(stored)
+	return nil
+}
+
+// ReloadIfChanged 在库里的配置与本地快照不一致时重新载入，返回是否发生了更新。
+//
+// # 为什么需要它
+//
+// 配置缓存在内存里，而缓存只在**本实例**写配置之后刷新。多实例共用一个库时，
+// 管理员在 A 上保存的保留端口、注册开关、配额规则，B 会一直按旧值运行——
+// 例如 A 新增了保留端口，B 仍可能把那个端口分配出去，直到 B 重启。
+//
+// 判据取「整表原文是否一致」而不是 updated_at：这几十行的读取成本可以忽略，
+// 而时间戳依赖每条写入路径都正确维护它，漏掉一处（原生 SQL、批量更新）
+// 就会永远同步不过去。整表比较不依赖任何列语义。
+func (s *SettingStore) ReloadIfChanged() (bool, error) {
+	stored, err := s.fetch()
+	if err != nil {
+		return false, err
+	}
+	s.mu.RLock()
+	same := s.raw != nil && len(s.raw) == len(stored)
+	if same {
+		for k, v := range stored {
+			if s.raw[k] != v {
+				same = false
+				break
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if same {
+		return false, nil
+	}
+	s.apply(stored)
+	return true, nil
+}
+
+// fetch 读出设置表的全部原始行。
+func (s *SettingStore) fetch() (map[string]string, error) {
 	rows := make([]model.Setting, 0, len(settingSpecs))
 	if err := s.db.Find(&rows).Error; err != nil {
-		return err
+		return nil, err
 	}
 	stored := make(map[string]string, len(rows))
 	for _, r := range rows {
 		stored[r.Key] = r.Value
 	}
+	return stored, nil
+}
 
+// apply 用一份库里的原始行重建内存缓存。
+func (s *SettingStore) apply(stored map[string]string) {
 	vals := make(map[SettingKey]string, len(settingSpecs))
 	present := make(map[SettingKey]bool, len(settingSpecs))
 	for _, spec := range settingSpecs {
@@ -428,8 +487,8 @@ func (s *SettingStore) Reload() error {
 	s.mu.Lock()
 	s.vals = vals
 	s.present = present
+	s.raw = stored
 	s.mu.Unlock()
-	return nil
 }
 
 // Get 读取字符串配置。
@@ -562,6 +621,22 @@ func (s *SettingStore) hasRow(k SettingKey) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.present[k]
+}
+
+// ReloadSettingsIfChanged 让运行期配置与其他实例的写入收敛。
+//
+// 由采集协程每个周期调用一次（默认 30 秒）。收敛延迟与采集周期一致，对
+// 「保留端口」「注册开关」这类配置足够；真正的热路径仍然只读内存缓存。
+func (s *Services) ReloadSettingsIfChanged() {
+	changed, err := s.Settings.ReloadIfChanged()
+	if err != nil {
+		// 数据库暂时不可用：保持现有缓存（旧值仍然可用），下一轮再试。
+		// 不在这里打日志：采集与准入路径已经各自记过读库失败，重复只会刷屏。
+		return
+	}
+	if changed {
+		log.Printf("[setting] 检测到其他实例修改了运行期配置，已重新载入")
+	}
 }
 
 // 这里刻意**没有**「升级时把期望值补成已生效」的对齐逻辑。

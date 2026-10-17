@@ -791,6 +791,11 @@ jobs:
         working-directory: web/${{ matrix.app }}
         run: npm install --no-audit --no-fund
 
+      - name: Test user UI
+        if: matrix.app == 'user'
+        working-directory: web/user
+        run: npm test
+
       - name: Build
         working-directory: web/${{ matrix.app }}
         run: npm run build

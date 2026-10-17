@@ -70,7 +70,11 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	// 成立——官方镜像没有 dns 插件、自建镜像有，两者的指令集不同，校验等于
 	// 自我安慰。宁可当场报错，也不要留下「校验过的东西不是要上线的东西」。
 	caddyImage := s.effectiveCaddyImage(vars)
-	if composeImage := tlscfg.ComposeCaddyImage(vars); !strings.EqualFold(caddyImage, composeImage) {
+	// 必须逐字比较：镜像引用区分大小写，:Release 与 :release 可能是
+	// 两个不同的 tag。用 EqualFold 的话，「校验镜像 == Compose 镜像」
+	// 会放过仅大小写不同的错配——校验又在为另一个镜像背书了。
+	// 两边都来自 .env / 配置的原始写法，比较的就是管理员填的那串字符。
+	if composeImage := tlscfg.ComposeCaddyImage(vars); caddyImage != composeImage {
 		return res, fmt.Errorf(
 			"校验用的 Caddy 镜像（%s）与 Compose 实际会使用的镜像（%s）不一致："+
 				"请让 LT_CFG_CADDY_IMAGE 与 .env 的 LT_CADDY_IMAGE 相同，或取消前者",

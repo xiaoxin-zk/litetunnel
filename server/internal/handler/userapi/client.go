@@ -199,7 +199,9 @@ func (h *Handler) ClientInfo(c *gin.Context) {
 		// config_rev 让客户端跳过没变化的配置请求：它的值由渲染结果算出，
 		// 隧道字段、分组限速、站点设置、客户端密钥只要有一处变化，摘要就会变，
 		// 客户端因此不会漏掉变更，也不会为没变的隧道反复发请求。
-		vo["config_rev"] = service.FrpcConfigRev(header + h.svc.FrpcConfigProxy(u, tunnels[i]))
+		// 限速传入上面算好的值：逐条重算会让「分组过期/未绑定」的账号
+		// 每条隧道多查一次默认分组（N+1），而这里是每 20 秒一次的同步路径。
+		vo["config_rev"] = service.FrpcConfigRev(header + h.svc.FrpcConfigProxy(u, tunnels[i], bl))
 		out = append(out, vo)
 	}
 	// 分组信息：客户端据此限制建隧道表单的可选项

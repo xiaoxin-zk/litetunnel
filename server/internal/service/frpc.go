@@ -175,8 +175,10 @@ func (s *Services) BuildFrpcConfig(u *model.User, tunnels []model.Tunnel) (strin
 		return b.String(), nil
 	}
 
+	// 限速只算一次：它是分组当前值，同一轮里不会变，逐隧道重算纯属浪费。
+	limit := s.EffectiveBandwidth(u)
 	for _, t := range tunnels {
-		b.WriteString(s.FrpcConfigProxy(u, t))
+		b.WriteString(s.FrpcConfigProxy(u, t, limit))
 	}
 	return b.String(), nil
 }
@@ -220,7 +222,12 @@ func (s *Services) FrpcConfigHeader(info *ClientInfo) string {
 }
 
 // FrpcConfigProxy 渲染单条隧道的 [[proxies]] 段；未启用时返回空串。
-func (s *Services) FrpcConfigProxy(u *model.User, t model.Tunnel) string {
+//
+// bandwidthLimit 由调用方用 EffectiveBandwidth 算好传进来，不能在这里自己算：
+// 分组过期或未绑定的账号会走 EffectiveGroup → defaultGroup() 的回落路径，
+// 那是**一次数据库查询**。而 /client/info 要为每条隧道算配置摘要、客户端每
+// 20 秒同步一次，逐条重算就是典型的 N+1——隧道越多、越持续。
+func (s *Services) FrpcConfigProxy(u *model.User, t model.Tunnel, bandwidthLimit int64) string {
 	if t.Status != model.TunnelStatusActive {
 		return ""
 	}
@@ -253,8 +260,8 @@ func (s *Services) FrpcConfigProxy(u *model.User, t model.Tunnel) string {
 	//
 	// 虽然服务端会在 NewProxy 时覆盖这个声明、改错了也不影响实际生效，
 	// 但生成的文件要给用户看——里面写着一个旧值会让人以为限制就是那样。
-	// EffectiveGroup 用的是已预加载的 u.Group，这里不产生额外查询。
-	if limit := FormatBandwidth(s.EffectiveBandwidth(u)); limit != "" {
+	// 值由调用方传入（见函数注释）：这里再算一次就是每条隧道一次查询。
+	if limit := FormatBandwidth(bandwidthLimit); limit != "" {
 		fmt.Fprintf(&b, "transport.bandwidthLimit = %s\n", tomlString(limit))
 		// 由服务端强制限速，客户端侧无法通过改配置绕过。
 		b.WriteString("transport.bandwidthLimitMode = \"server\"\n")

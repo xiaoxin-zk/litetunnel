@@ -522,6 +522,75 @@ func TestApplySyncSkipsUnchangedConfig(t *testing.T) {
 	}
 }
 
+// TestOldServerClearsStaleConfigRev 覆盖「新服务端 → 旧服务端」的摘要残留。
+//
+// 旧服务端的配置响应没有 X-Config-Rev。若这时**保留**之前记下的摘要,
+// 它描述的文本可能已经过期:期间配置从 A 改到 B、又回到 A 之后,客户端会
+// 拿那条旧摘要命中缓存,把 B 的正文当成 A 用下去,而且没有任何报错。
+// 所以收到正文却没有摘要时,必须把该隧道的旧摘要清掉,退回逐轮拉取。
+func TestOldServerClearsStaleConfigRev(t *testing.T) {
+	if defaultServerURL() != "" {
+		t.Skip("当前构建注入了服务端地址,本用例需要自己控制服务端")
+	}
+	withTempConfigDir(t)
+
+	const body = "serverAddr = \"127.0.0.1\"\n"
+	var (
+		sendListRev atomic.Bool
+		sendCfgRev  atomic.Bool
+		cfgRequests atomic.Int32
+	)
+	sendListRev.Store(false) // 先当作旧服务端
+	sendCfgRev.Store(false)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			cfgRequests.Add(1)
+			if sendCfgRev.Load() {
+				w.Header().Set(configRevHeader, "rev-A")
+			}
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		rev := ""
+		if sendListRev.Load() {
+			rev = `,"config_rev":"rev-A"`
+		}
+		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[` +
+			`{"id":1,"name":"mc","type":"tcp","status":"active"` + rev + `}]}}`))
+	}))
+	defer srv.Close()
+
+	a := newSyncTestApp(t, srv)
+	// 本地已有一份「成功应用过」的记账(applied=A, 摘要 rev-A),
+	// 这是新服务端时期留下来的。
+	a.mu.Lock()
+	a.applied[1] = body
+	a.cfgRev[1] = "rev-A"
+	a.mu.Unlock()
+
+	syncOnce := func() {
+		a.clearRetry(1)
+		_, _ = a.applySync()
+	}
+
+	// 旧服务端:正文照旧是 A(本地已是 A,不会触发重启),但没有摘要头。
+	syncOnce()
+	if rev, ok := a.cfgRev[1]; ok {
+		t.Fatalf("没有 X-Config-Rev 时必须清除旧摘要,实际仍是 %q", rev)
+	}
+
+	// 服务端换回新版(清单重新带上 rev-A):摘要已被清掉,必须重新拉取,
+	// 而不是凭「清单说 rev-A、本地也曾记过 rev-A」直接命中。
+	cfgRequests.Store(0)
+	sendListRev.Store(true)
+	syncOnce()
+	if got := cfgRequests.Load(); got != 1 {
+		t.Fatalf("摘要被清掉后应重新拉取一次,实际请求 %d 次", got)
+	}
+}
+
 // TestFetchTunnelConfigUsesServedRev 覆盖「摘要与正文必须同源」。
 //
 // 清单里的 config_rev 是**另一次**渲染算出来的,中间隔着一次网络往返。

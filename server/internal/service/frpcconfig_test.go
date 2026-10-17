@@ -1,14 +1,30 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
+
+// queryCounter 只数 SQL 条数，其余日志行为交给 Discard。
+type queryCounter struct {
+	logger.Interface
+	n *atomic.Int32
+}
+
+func (q queryCounter) Trace(_ context.Context, _ time.Time, _ func() (string, int64), _ error) {
+	q.n.Add(1)
+}
 
 // TestBuildFrpcConfigLogsToConsole 覆盖「frpc 日志写进文件，客户端什么都看不到」。
 //
@@ -74,7 +90,7 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("组装接入信息失败: %v", err)
 		}
-		return FrpcConfigRev(svc.FrpcConfigHeader(info) + svc.FrpcConfigProxy(u, tun))
+		return FrpcConfigRev(svc.FrpcConfigHeader(info) + svc.FrpcConfigProxy(u, tun, svc.EffectiveBandwidth(u)))
 	}
 
 	origin := revOf(base)
@@ -85,7 +101,7 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("生成配置失败: %v", err)
 	}
-	if !strings.Contains(full, svc.FrpcConfigProxy(u, base)) {
+	if !strings.Contains(full, svc.FrpcConfigProxy(u, base, svc.EffectiveBandwidth(u))) {
 		t.Fatal("单条隧道的渲染结果必须与完整配置里的那一段逐字节相同")
 	}
 
@@ -131,6 +147,49 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 	// 没变就不该变:否则每轮都要重拉,摘要就白设了。
 	if again := revOf(base); again != origin {
 		t.Fatalf("同一个输入算出的摘要必须稳定:第一次 %s,第二次 %s", origin, again)
+	}
+}
+
+// TestFrpcConfigProxyDoesNotQueryDB 覆盖「每条隧道一次默认分组查询」。
+//
+// 分组过期或未绑定的账号会走 EffectiveGroup → defaultGroup() 的回落路径，
+// 那是**一次数据库查询**。而 /client/info 要为每条隧道算配置摘要，客户端
+// 每 20 秒同步一次——渲染器里再算一遍限速就是 N+1，隧道越多、越持续。
+// 限速改由调用方传入后，渲染本身不该再触碰数据库。
+func TestFrpcConfigProxyDoesNotQueryDB(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	// 过期时间放在过去：这正是会回落默认分组、每次都要查库的那条分支。
+	past := time.Now().Add(-time.Hour)
+	u := &model.User{
+		Username:      "expiredbw",
+		Password:      "not-used",
+		Status:        model.UserStatusActive,
+		GroupExpireAt: &past,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20001,
+		Status: model.TunnelStatusActive,
+	}
+
+	var queries atomic.Int32
+	svc.DB = svc.DB.Session(&gorm.Session{Logger: queryCounter{Interface: logger.Discard, n: &queries}})
+
+	// 这一句允许查库（整个请求里只算这一次）。
+	limit := svc.EffectiveBandwidth(u)
+	queries.Store(0)
+
+	for i := 0; i < 5; i++ {
+		if got := svc.FrpcConfigProxy(u, tun, limit); !strings.Contains(got, "[[proxies]]") {
+			t.Fatalf("第 %d 次渲染结果异常: %q", i+1, got)
+		}
+	}
+	if n := queries.Load(); n != 0 {
+		t.Fatalf("渲染单条隧道不该查库（N+1）：5 次渲染共查了 %d 次", n)
 	}
 }
 

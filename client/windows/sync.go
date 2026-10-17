@@ -430,16 +430,17 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		prev := a.appliedConfigOf(t.ID)
 		cfgChanged := cfgText != prev
 
-		// 摘要只在「这次拿到的文本与磁盘上那份一致」时记账。
+		// 摘要必须始终描述 applied 里的那份文本(cachedConfig 靠这个等式)。
 		//
-		// 摘要必须始终描述 applied 里的那份文本(cachedConfig 靠这个等式),
-		// 所以不能在文本不同时就更新它:那样下一轮会拿旧的 applied 去命中
-		// 新的摘要,悄悄把隧道跑在旧配置上。文本不同时分两种情况——
-		// 启动成功由 writeAndStart 一起记账,启动失败则两边都不动。
-		if !cfgChanged && t.ConfigRev != "" {
-			a.mu.Lock()
-			a.cfgRev[t.ID] = t.ConfigRev
-			a.mu.Unlock()
+		//   - 文本没变:把摘要对齐到本次响应。响应里没有摘要(老服务端)时
+		//     是**删除**旧值,不是保留——留着的话下一轮会拿它去比清单,
+		//     而它描述的文本可能早已不是磁盘上那份了;
+		//   - 文本变了:旧摘要立刻作废,等 writeAndStart 成功后再按新文本记账;
+		//     启动失败则保持「无摘要」,下一轮必然重新拉取。
+		if !cfgChanged {
+			a.setConfigRev(t.ID, t.ConfigRev)
+		} else {
+			a.setConfigRev(t.ID, "")
 		}
 
 		switch {
@@ -666,11 +667,25 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	// 下一轮仍会重新拉取,而不是拿「服务端说没变」跳过一次没写成的配置。
 	a.mu.Lock()
 	a.applied[t.ID] = cfgText
-	if t.ConfigRev != "" {
-		a.cfgRev[t.ID] = t.ConfigRev
+	a.mu.Unlock()
+	a.setConfigRev(t.ID, t.ConfigRev)
+	return nil
+}
+
+// setConfigRev 更新某条隧道记录的配置摘要。
+//
+// 空摘要表示「服务端没给」——必须**删除**旧值，而不是留着不动：
+// 留着的话，下一轮会拿这个旧摘要去比对清单，而它描述的文本可能已经不是
+// 磁盘上那份了（老服务端期间配置被改过）。删掉之后 cachedConfig 一律不命中，
+// 该隧道退回逐轮拉取：慢一点，但不会把旧配置当成新的。
+func (a *App) setConfigRev(id uint, rev string) {
+	a.mu.Lock()
+	if rev == "" {
+		delete(a.cfgRev, id)
+	} else {
+		a.cfgRev[id] = rev
 	}
 	a.mu.Unlock()
-	return nil
 }
 
 // startTunnelProcess 为用户主动点「连接」的隧道拉配置并启动。

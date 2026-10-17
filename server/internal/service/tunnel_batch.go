@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -86,12 +87,28 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 		// （字母数字下划线），连字符会被拒绝。
 		name := fmt.Sprintf("%s_%d", prefix, port)
 
-		t, err := s.createTunnelLocked(u, TunnelInput{
-			Name:      name,
-			Type:      in.Type,
-			LocalIP:   in.LocalIP,
-			LocalPort: port,
-		}, false)
+		// 自动分配端口撞车要换端口重试，与单条创建（CreateTunnel）一致：
+		// 候选端口是在加锁之前读到的，并发批量创建时可能已被别的账号占掉。
+		// 不重试的话，端口池明明还有空位，这一条却被记成失败——而且批量
+		// 场景恰恰是最容易撞上的（一次要挑好几个端口）。
+		// 只有端口冲突才重试；重名、超上限、参数错重试多少次都是同一个结果。
+		var (
+			t   *model.Tunnel
+			err error
+		)
+		for attempt := 1; attempt <= portAllocAttempts; attempt++ {
+			t, err = s.createTunnelLocked(u, TunnelInput{
+				Name:      name,
+				Type:      in.Type,
+				LocalIP:   in.LocalIP,
+				LocalPort: port,
+			}, false)
+			if err == nil || !isPortConflict(err) {
+				break
+			}
+			log.Printf("[tunnel] 批量创建端口分配撞车（%s，第 %d/%d 次尝试），重新随机分配后重试",
+				name, attempt, portAllocAttempts)
+		}
 		if err != nil {
 			// 逐条回报失败原因，同样要把数据库原文翻译一遍：
 			// 批量失败列表里出现 "UNIQUE constraint failed" 这种内容，

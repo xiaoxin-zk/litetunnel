@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -30,17 +31,46 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestPumpReportsScannerError 覆盖「日志读取静默停摆」。
+// TestPumpTruncatesLongLineButKeepsReading 覆盖「超长单行不得让读取端停摆」。
 //
-// bufio.Scanner 遇到超长行（或底层管道出错）会停止读取并返回错误。
-// 不检查它的话，日志会凭空停在某一行，看起来像「frpc 不再输出了」，
-// 而真实原因是客户端这边的读取端坏了——这类现象最容易被归因到
-// frpc 或服务端上。
-func TestPumpReportsScannerError(t *testing.T) {
+// 旧实现用 bufio.Scanner：超过 1 MiB 的行会让它返回 ErrTooLong 并**停止
+// 读取**，管道再没人消费，写端一满子进程就阻塞在写日志上——它既不退出
+// 也不响应，cmd.Wait 永远不返回，界面一直把这条隧道显示成「运行中」。
+// 现在超限只截断日志内容，读取继续到换行、继续跟进后面的行。
+func TestPumpTruncatesLongLineButKeepsReading(t *testing.T) {
 	m := testManager(t)
 
-	// 单行 2 MiB，远超 1 MiB 的单行上限，Scanner 必定报 ErrTooLong。
-	m.pump(1, "mc1", strings.NewReader(strings.Repeat("x", 2<<20)))
+	long := strings.Repeat("x", 2<<20)
+	m.pump(1, "mc1", strings.NewReader(long+"\n后面一行\n"))
+
+	var truncated, after bool
+	for _, l := range m.Logs() {
+		if strings.Contains(l, "已截断") {
+			truncated = true
+		}
+		if strings.Contains(l, "后面一行") {
+			after = true
+		}
+		if strings.Contains(l, "日志读取中断") {
+			t.Fatal("超长行不是读取故障，不该报「读取中断」")
+		}
+	}
+	if !truncated {
+		t.Fatal("超长行必须标明已截断，否则用户以为日志是完整的")
+	}
+	if !after {
+		t.Fatal("超长行之后的内容必须继续被读取：停读会让子进程阻塞在写管道上，永远退不出去")
+	}
+}
+
+// TestPumpReportsReadError 覆盖「读取端真的坏了」时留痕。
+//
+// 这种情况与超长行不同：管道本身出错，读取确实无法继续，必须写一行日志，
+// 否则日志会凭空停在某一行，看起来像「frpc 不再输出了」。
+func TestPumpReportsReadError(t *testing.T) {
+	m := testManager(t)
+
+	m.pump(1, "mc1", iotest.ErrReader(errors.New("管道已断开")))
 
 	var found bool
 	for _, l := range m.Logs() {
@@ -197,6 +227,34 @@ func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 		if !strings.Contains(l, "Tunnel/mc1") {
 			t.Fatalf("日志行缺少隧道前缀: %q", l)
 		}
+	}
+}
+
+// TestCloseRejectsNewProcess 覆盖「关停之后不再拉起新进程」。
+//
+// 关闸必须发生在停进程之前：只调 StopAll 的话，与退出并发的一轮同步
+// 可以在 StopAll 之后拿到配置再起一个进程，那个进程就没人管了。
+func TestCloseRejectsNewProcess(t *testing.T) {
+	m := testManager(t)
+	cfg := testConfig(t)
+
+	if err := m.Start(1, "mc1", cfg); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if m.AnyRunning() {
+		t.Fatal("Close 之后不应还有进程在跑")
+	}
+	if !m.Closed() {
+		t.Fatal("Close 之后应处于关闭状态")
+	}
+	if err := m.Start(1, "mc1", cfg); !errors.Is(err, ErrClosed) {
+		t.Fatalf("关闭后再启动应返回 ErrClosed，实际: %v", err)
+	}
+	if err := m.Start(2, "nas", cfg); !errors.Is(err, ErrClosed) {
+		t.Fatalf("关闭后启动其他隧道也应返回 ErrClosed，实际: %v", err)
 	}
 }
 

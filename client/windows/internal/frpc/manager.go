@@ -29,6 +29,12 @@ const maxLogLines = 500
 // ErrAlreadyRunning 表示该隧道的 frpc 已在运行。
 var ErrAlreadyRunning = errors.New("该隧道的 frpc 已在运行")
 
+// ErrClosed 表示管理器已进入关闭状态，不再启动新进程。
+//
+// 关闭是**单向**的：Close 之后 Start 永远失败。退出流程靠它兜住
+// 「同步在 StopAll 之后才把进程拉起来」这一类漏网。
+var ErrClosed = errors.New("客户端正在退出，不再启动 frpc")
+
 // process 是某一条隧道的 frpc 进程。
 type process struct {
 	// name 只用于日志前缀。进程本身不认隧道名，改名不影响运行中的连接。
@@ -57,6 +63,9 @@ type Manager struct {
 	logs  []string
 
 	exePath string
+
+	// closed 表示已进入关闭流程：此后 Start 直接失败，见 Close。
+	closed bool
 
 	// onLog 收到的行已经带好「Tunnel/<名字>」前缀。
 	onLog func(tunnelID uint, tunnelName, line string)
@@ -150,6 +159,12 @@ func (m *Manager) AnyRunning() bool {
 // 不依赖隧道名字，因此改名不影响正在运行的连接。
 func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	m.mu.Lock()
+	// 关闭之后不再放行任何新进程：关闭流程是「关闸 → 停全部」，
+	// 反过来的话与它并发的调用方能在 StopAll 之后拉起一个漏网进程。
+	if m.closed {
+		m.mu.Unlock()
+		return ErrClosed
+	}
 	if _, ok := m.procs[tunnelID]; ok {
 		m.mu.Unlock()
 		return ErrAlreadyRunning
@@ -326,6 +341,25 @@ func (m *Manager) StopAll() error {
 	return firstErr
 }
 
+// Close 进入关闭状态并停止全部进程，返回第一个错误。
+//
+// 顺序必须是「先关闸、后停进程」：只调 StopAll 的话，与退出并发的一轮
+// 同步可以在 StopAll 之后拿到配置并拉起新进程——那个进程就没人管了
+// （Job Object 绑定失败时尤其明显）。
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	return m.StopAll()
+}
+
+// Closed 报告是否已进入关闭状态。
+func (m *Manager) Closed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
 // Logs 返回日志快照。
 func (m *Manager) Logs() []string {
 	m.mu.Lock()
@@ -342,23 +376,74 @@ func (m *Manager) ClearLogs() {
 	m.logs = nil
 }
 
-func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	// 单行上限 1 MiB。frpc 的正常输出远小于它，但真出现超长行时
-	// 不能让读取端**静默**停摆：管道写满之后子进程会跟着阻塞。
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+// pumpLineLimit 是单行日志保留的字节上限，超出的部分截断丢弃。
+//
+// frpc 的正常输出远小于它。超限不是「停止读取」的理由：读取端一旦停摆，
+// 管道写满之后子进程就阻塞在写日志上——它既不退出也不响应，Wait 永远
+// 不返回，界面上那条隧道会一直是「运行中」。
+const pumpLineLimit = 1024 * 1024
 
-	for scanner.Scan() {
-		m.appendLog(tunnelID, tunnelName, scanner.Text())
+func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
+	// 用 ReadSlice 而不是 bufio.Scanner：Scanner 遇到超过上限的行会返回
+	// ErrTooLong 并**停止读取**，剩下的输出没人消费，子进程就卡在写管道上。
+	// 这里超限只截断日志内容，读取照常继续到换行、继续跟进后面的行。
+	br := bufio.NewReaderSize(r, 64*1024)
+
+	var (
+		line      []byte
+		truncated bool
+	)
+	// flush 把攒好的一行交出去。超限的标记只加在日志里，不改变「已经读到
+	// 换行」这个事实——后续输出必须继续被消费。
+	flush := func() {
+		text := string(line)
+		if truncated {
+			text += "（本行超过 1 MiB，其余内容已截断）"
+		}
+		m.appendLog(tunnelID, tunnelName, text)
+		line = line[:0]
+		truncated = false
 	}
 
-	// 读取失败必须留痕。
-	//
-	// 以前这里什么都不做：日志会凭空停在某一行，看起来像「frpc 不再输出了」，
-	// 而真实原因是我们的读取端坏了（超长行、管道错误）。这类现象最容易被
-	// 归因到 frpc 或服务端，实际上问题在客户端自己。
-	if err := scanner.Err(); err != nil {
-		m.appendLog(tunnelID, tunnelName, "日志读取中断："+err.Error())
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if room := pumpLineLimit - len(line); room > 0 {
+				if len(chunk) <= room {
+					line = append(line, chunk...)
+				} else {
+					line = append(line, chunk[:room]...)
+					truncated = true
+				}
+			} else {
+				truncated = true
+			}
+		}
+
+		switch {
+		case err == nil:
+			flush()
+		case errors.Is(err, bufio.ErrBufferFull):
+			// 还没读到换行：继续取同一行的后续片段。
+			continue
+		case errors.Is(err, io.EOF):
+			// 最后一行没有换行符，同样要记下来。
+			if len(line) > 0 || truncated {
+				flush()
+			}
+			return
+		default:
+			if len(line) > 0 || truncated {
+				flush()
+			}
+			// 读取失败必须留痕。
+			//
+			// 以前这里什么都不做：日志会凭空停在某一行，看起来像「frpc 不再
+			// 输出了」，而真实原因是我们的读取端坏了（管道错误、卷被卸载）。
+			// 这类现象最容易被归因到 frpc 或服务端，实际上问题在客户端自己。
+			m.appendLog(tunnelID, tunnelName, "日志读取中断："+err.Error())
+			return
+		}
 	}
 }
 

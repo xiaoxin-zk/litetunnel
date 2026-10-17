@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,6 +64,60 @@ func newSyncTestApp(t *testing.T, srv *httptest.Server) *App {
 		tunnelErrs: map[uint]tunnelErr{},
 		retries:    map[uint]*retryState{},
 		http:       &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// TestShutdownWaitsForSyncThenClosesManager 覆盖「关停不能漏停同步期间新起的进程」。
+//
+// 旧实现只调 mgr.StopAll()：同步用的是自己的根上下文，关窗口不会让它停下，
+// 它可能正好在 StopAll 之后拿到配置、把 frpc 拉起来——Job Object 绑定失败时
+// 那就是一个真正的孤儿进程（端口被占着、隧道还在转发，界面上却已经关了）。
+// 现在关停必须是「取消同步 → 等这一轮退出 → 关闸 → 停全部进程」。
+func TestShutdownWaitsForSyncThenClosesManager(t *testing.T) {
+	a := &App{mgr: frpc.New(filepath.Join(t.TempDir(), "no-such-frpc.exe"))}
+	root, cancel := context.WithCancel(context.Background())
+	a.syncRoot, a.syncCancel = root, cancel
+
+	// 模拟一轮正在跑的同步：整轮持着 syncMu。
+	a.syncMu.Lock()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		a.syncMu.Unlock()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		a.shutdown(context.Background())
+		close(done)
+	}()
+
+	// 第一步必须是取消同步：在途请求因此立刻返回，退出流程才等得到 syncMu。
+	deadline := time.Now().Add(2 * time.Second)
+	for root.Err() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if root.Err() == nil {
+		t.Fatal("关停必须先取消同步，否则要等每条请求各自的超时，窗口关不掉")
+	}
+
+	// 同步还没收工时不能停完进程：它随后起来的进程就漏掉了。
+	select {
+	case <-done:
+		t.Fatal("同步还没退出就完成了关停：同步可能在 StopAll 之后又拉起一个进程")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("同步退出后关停应立即完成")
+	}
+
+	if !a.mgr.Closed() {
+		t.Fatal("关停后管理器必须处于关闭状态")
+	}
+	if err := a.mgr.Start(1, "mc", filepath.Join(t.TempDir(), "frpc.toml")); !errors.Is(err, frpc.ErrClosed) {
+		t.Fatalf("关停后再启动进程必须被拒绝，实际: %v", err)
 	}
 }
 

@@ -157,6 +157,19 @@ type App struct {
 	// 「刚停掉又被拉起来」的反复闪断。
 	syncMu sync.Mutex
 
+	// syncRoot 是同步用的根上下文，退出时由 syncCancel 取消。
+	//
+	// 各轮同步自己带 context.Background() 起截止时间的话，关窗口**取消不了**
+	// 在途的清单/配置请求：进程一边在退出，一边还有一轮同步在跑，它可能在
+	// StopAll 之后才拿到配置并把 frpc 拉起来。Job Object 能兜住异常退出，
+	// 但它绑定失败时（见 frpc.Manager.Start 的提示）那就是一个真正的孤儿进程。
+	// 所以退出流程固定为「取消同步 → 等这一轮退出 → 关闭并停全部进程」。
+	syncRoot   context.Context
+	syncCancel context.CancelFunc
+
+	// closeDone 保证退出清理只执行一次（窗口可能触发多次关闭事件）。
+	closeDone sync.Once
+
 	// syncSeq 发放给每次拉取到的清单快照，appliedSyncSeq 记录已应用的最大
 	// 序号（由 syncMu 保护）。
 	//
@@ -256,9 +269,14 @@ func NewApp() *App {
 		exePath = ""
 	}
 
+	// 同步的根上下文：应用退出时由 shutdown 取消（见 App.syncRoot）。
+	syncCtx, syncCancel := context.WithCancel(context.Background())
+
 	app := &App{
 		cfg:          cfg,
 		mgr:          frpc.New(exePath),
+		syncRoot:     syncCtx,
+		syncCancel:   syncCancel,
 		applied:      map[uint]string{},
 		tunnelErrs:   map[uint]tunnelErr{},
 		retries:      map[uint]*retryState{},
@@ -406,15 +424,55 @@ func (a *App) startOnce(ctx context.Context) {
 	}()
 }
 
+// shutdownSyncWait 是退出时等待在途同步收工的上限。
+//
+// 取 3 秒：一轮同步的网络请求都会被 syncCancel 立刻打断，正常情况下只需
+// 几毫秒；留这点余量是为了偶尔在写磁盘、起停进程上多花的时间，再长就
+// 等于让用户盯着一个关不掉的窗口。
+const shutdownSyncWait = 3 * time.Second
+
 // shutdown 在客户端退出前被调用，确保所有 frpc 子进程一并结束。
 //
-// 这是「正常关闭」这条路径的清理。异常退出（崩溃、被任务管理器强杀、
-// 系统关机时的强制终止）走不到这里，由 frpc 包里的 Job Object 兜底——
-// 两者是互补关系，缺任何一层都会留下孤儿进程。
+// 顺序有讲究：**取消同步 → 等这一轮退出 → 关闸并停全部进程**。
+//
+// 只调 StopAll 不够：同步用的是自己的根上下文（见 App.syncRoot），
+// 关窗口并不会让它停下来。它可能正好在 StopAll 之后才拿到配置，把 frpc
+// 重新拉起来——这次关停就漏掉了那个进程。Job Object 通常能兜住（父进程
+// 退出时连带结束子进程），但它绑定失败时（见 frpc.Manager.Start 的提示）
+// 就是一个真正的孤儿进程：端口仍被占着，隧道仍在转发。
+//
+// 异常退出（崩溃、被任务管理器强杀、系统关机时的强制终止）走不到这里，
+// 由 Job Object 兜底——两者是互补关系，缺任何一层都会留下孤儿进程。
 func (a *App) shutdown(ctx context.Context) {
-	if err := a.mgr.StopAll(); err != nil {
-		log.Printf("[client] 退出时停止 frpc 失败: %v", err)
-	}
+	a.closeDone.Do(func() {
+		// 取消在途的清单/配置请求，下面的等待才有上界。
+		if a.syncCancel != nil {
+			a.syncCancel()
+		}
+
+		// 等到「没有同步在跑」为止：syncMu 是整轮同步的临界区，
+		// 拿得到它就意味着那一轮已经收工，不会再拉起新进程。
+		// 带超时是因为关闭流程不能无限期卡住——真有异常停滞时，
+		// 下面 Manager.Close 关掉的那个闸门仍然挡得住迟到的启动。
+		done := make(chan struct{})
+		go func() {
+			a.syncMu.Lock()
+			a.syncMu.Unlock()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(shutdownSyncWait):
+			log.Printf("[client] 退出时等待同步结束超时（%s），继续停止 frpc", shutdownSyncWait)
+		}
+
+		// 先关闸、再停进程：Close 之后任何 Start 都会直接失败，
+		// 即便上面等超时了，也不会有新进程漏在 StopAll 之后。
+		if err := a.mgr.Close(); err != nil {
+			log.Printf("[client] 退出时停止 frpc 失败: %v", err)
+		}
+	})
+
 	// 把队列里剩下的日志推出去：停止进程会产出「隧道已断开」「frpc 已退出」
 	// 这类收尾日志，攒在队列里不发，用户下次打开客户端时日志就断在退出前。
 	a.flushLogs()

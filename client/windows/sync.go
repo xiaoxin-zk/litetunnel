@@ -126,9 +126,23 @@ func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err 
 	if seq <= a.appliedSyncSeq {
 		return a.applySync()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	ctx, cancel := a.newSyncContext()
 	defer cancel()
 	return a.applySyncData(ctx, data, seq)
+}
+
+// newSyncContext 为一轮同步创建带截止时间的上下文。
+//
+// 根上下文是 a.syncRoot 而不是 context.Background()：应用退出时它会被
+// 取消（见 App.shutdown），这一轮正在跑的清单/配置请求立刻返回，退出流程
+// 才等得到 syncMu——等不到就拿不到「不会再有新进程被拉起」的保证。
+// 测试里直接构造 App 时没有根上下文，退回 Background。
+func (a *App) newSyncContext() (context.Context, context.CancelFunc) {
+	base := a.syncRoot
+	if base == nil {
+		base = context.Background()
+	}
+	return context.WithTimeout(base, syncRoundTimeout)
 }
 
 // applySync 拉取隧道清单，并把本机的 frpc 进程对账到服务端说的状态。
@@ -156,7 +170,8 @@ func (a *App) applySync() (changed bool, err error) {
 	// 整轮共用一个截止上下文：接入信息（可能还要分页）与后续的配置拉取
 	// 都在同一笔预算里。只给配置拉取限时的话，前面那几次请求仍可各自
 	// 等满超时，手动操作被挡的总时长并没有真正封顶。
-	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
+	// 根上下文随应用退出而取消，见 newSyncContext。
+	ctx, cancel := a.newSyncContext()
 	defer cancel()
 
 	data, err := a.fetchClientInfo(ctx, base, apiKey)

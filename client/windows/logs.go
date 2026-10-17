@@ -55,6 +55,19 @@ const maxLogBatch = 200
 // 再大就只是拿内存换更旧的日志。
 const maxLogQueue = 2000
 
+// maxLogQueueBytes 是待推送队列的总字节上限。
+//
+// 只限行数挡不住「每行都很长」：单行在 frpc 那边可以留到 1 MiB，2000 行
+// 就是 2 GiB。两份预算都设，谁先到按谁裁。
+const maxLogQueueBytes = 1024 * 1024
+
+// maxLogBatchBytes 是单次推送事件的总字节上限。
+//
+// 与 maxLogBatch 的关系同理：200 行 × 1 MiB 的事件要序列化、跨进程传、
+// 再在 JS 里处理，会把 Wails 那条桥堵住很久——而桥一堵，后面所有事件
+// （包括界面刷新）都排在它后面。
+const maxLogBatchBytes = 128 * 1024
+
 // logFlushInterval 是日志批量推送的间隔。
 //
 // 取 120ms：略大于人眼能分辨的停顿，日志看起来仍是实时滚动的；而事件数
@@ -95,15 +108,25 @@ func (a *App) pushLog(line string) bool {
 	// 「刚才发生了什么」；丢最新的会让用户盯着一段早已过去的开头，
 	// 而真正触发问题的那些行反而没了。
 	//
+	// 行数与总字节两份预算，谁先到按谁裁：单行可以很长，只数行数的话
+	// 「2000 行 × 1 MiB」照样能把内存吃光。
+	//
 	// 一次丢一批（1/4）而不是逐条丢：逐条丢意味着每来一行都要把剩下的元素
 	// 整体前移，在日志洪峰时这本身就成了新瓶颈——恰恰是这里要避免的事。
-	if len(a.logBuf) >= maxLogQueue {
-		drop := maxLogQueue / 4
+	if len(a.logBuf) >= maxLogQueue || a.logBufBytes >= maxLogQueueBytes {
+		drop := len(a.logBuf) / 4
+		if drop < 1 {
+			drop = 1
+		}
+		for i := 0; i < drop && i < len(a.logBuf); i++ {
+			a.logBufBytes -= len(a.logBuf[i])
+		}
 		a.logBuf = append(a.logBuf[:0], a.logBuf[drop:]...)
 		a.logDropped += drop
 	}
 
 	a.logBuf = append(a.logBuf, line)
+	a.logBufBytes += len(line)
 	return len(a.logBuf) >= maxLogBatch
 }
 
@@ -124,6 +147,24 @@ func (a *App) takeLogBatch() []string {
 		n = maxLogBatch
 	}
 
+	// 再按总字节收一次：行数上限挡不住「每行都很长」，而一次事件过大
+	// 会把 Wails 那条桥堵住——桥一堵，后面所有事件都跟着排队。
+	//
+	// 第一行无条件取（判断条件带 limit > 0）：单行本身就超预算时也得发出去，
+	// 否则这一行永远清不出队列，后面的日志全部堵在它后面。
+	// n == 0 是「只剩一条丢弃提示」的情况，此处不会取行。
+	bytes := 0
+	limit := 0
+	for limit < n {
+		size := len(a.logBuf[limit])
+		if limit > 0 && bytes+size > maxLogBatchBytes {
+			break
+		}
+		bytes += size
+		limit++
+	}
+	n = limit
+
 	// 丢弃提示单独占一行插在最前面：静默丢日志比丢日志本身更糟——
 	// 用户会以为自己看到了完整的现场。
 	batch := make([]string, 0, n+1)
@@ -135,6 +176,9 @@ func (a *App) takeLogBatch() []string {
 	batch = append(batch, a.logBuf[:n]...)
 
 	// 从头部截断而不是重新分配：剩下的是「更新的那部分」，顺序不变。
+	for i := 0; i < n; i++ {
+		a.logBufBytes -= len(a.logBuf[i])
+	}
 	a.logBuf = a.logBuf[n:]
 	return batch
 }

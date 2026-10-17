@@ -74,6 +74,88 @@ func TestTakeLogBatchCapsAtMaxLogBatch(t *testing.T) {
 	}
 }
 
+// TestLogQueueRespectsByteBudget 覆盖「只数行数挡不住大日志」。
+//
+// 单行在 frpc 那边可以留到 1 MiB，2000 行就是 2 GiB——行数上限看起来在，
+// 内存照样能被吃光。字节预算与行数预算同时生效，谁先到按谁裁。
+func TestLogQueueRespectsByteBudget(t *testing.T) {
+	a := &App{}
+	line := strings.Repeat("x", 8*1024)
+	for i := 0; i < 400; i++ {
+		a.pushLog(line)
+	}
+
+	a.logMu.Lock()
+	bytes, lines := a.logBufBytes, len(a.logBuf)
+	sum := 0
+	for _, l := range a.logBuf {
+		sum += len(l)
+	}
+	a.logMu.Unlock()
+
+	if lines >= 400 {
+		t.Fatal("按字节超限时必须已经丢弃过最旧的行")
+	}
+	// 允许最后一行的溢出：是否丢弃是在入队**之前**判断的。
+	if bytes > maxLogQueueBytes+len(line) {
+		t.Fatalf("待推送队列总字节必须有界：实际 %d 字节（上限 %d）", bytes, maxLogQueueBytes)
+	}
+	if bytes != sum {
+		t.Fatalf("字节计数必须与队列内容一致：计数 %d，实际 %d（裁剪时漏减了）", bytes, sum)
+	}
+}
+
+// TestTakeLogBatchRespectsByteBudget 覆盖「单次事件过大」。
+//
+// 200 行 × 1 MiB 的事件要序列化、跨进程传、再在 JS 里处理，会把 Wails
+// 那条桥堵住很久。行数之外还要有字节上限；但单行本身就超预算时仍要发出去，
+// 否则队列永远清不空。
+func TestTakeLogBatchRespectsByteBudget(t *testing.T) {
+	a := &App{}
+	line := strings.Repeat("y", 16*1024)
+	for i := 0; i < 50; i++ {
+		a.pushLog(line)
+	}
+
+	batch := a.takeLogBatch()
+	total := 0
+	for _, l := range batch {
+		total += len(l)
+	}
+	if len(batch) == 0 {
+		t.Fatal("有积压时不该返回空批次")
+	}
+	if total > maxLogBatchBytes {
+		t.Fatalf("单次推送总字节必须有界：实际 %d（上限 %d）", total, maxLogBatchBytes)
+	}
+
+	single := &App{}
+	huge := strings.Repeat("z", maxLogBatchBytes+1)
+	single.pushLog(huge)
+	if got := single.takeLogBatch(); len(got) != 1 || got[0] != huge {
+		t.Fatalf("单行超过批次预算时也必须发出去，否则队列永远清不空（实际 %d 行）", len(got))
+	}
+}
+
+// TestTakeLogBatchOnlyDroppedNotice 覆盖「队列已空、只剩丢弃提示」。
+//
+// 这时 batch 里只有那行提示，取行逻辑不能按「至少取一行」去碰空队列——
+// 越界取会让整个客户端崩在日志推送协程里，而且崩得毫无征兆。
+func TestTakeLogBatchOnlyDroppedNotice(t *testing.T) {
+	a := &App{}
+	a.pushLog("x")
+	_ = a.takeLogBatch() // 先清空队列
+
+	a.logMu.Lock()
+	a.logDropped = 7
+	a.logMu.Unlock()
+
+	batch := a.takeLogBatch()
+	if len(batch) != 1 || !strings.Contains(batch[0], "已丢弃") {
+		t.Fatalf("应只返回一条丢弃提示，实际 %v", batch)
+	}
+}
+
 // TestTakeLogBatchReportsDropped 覆盖「静默丢弃」。
 //
 // 悄悄丢日志比丢日志本身更糟：用户会以为自己看到了完整的现场，

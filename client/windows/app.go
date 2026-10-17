@@ -157,6 +157,15 @@ type App struct {
 	// 「刚停掉又被拉起来」的反复闪断。
 	syncMu sync.Mutex
 
+	// syncStart 是下一轮同步从清单的哪个位置开始处理（见 applySyncData）。
+	//
+	// 服务端清单按 id 倒序返回，配置又是「并发 6 条 + 整轮 45 秒截止」：
+	// 若每轮都从清单开头开始，前面几条一旦持续超时，后面的隧道永远轮不到
+	// ——客户端重启也不会变，因为它们仍在同一位次。记下上一轮处理到哪儿、
+	// 下一轮从那里环形开始，被截止时间砍掉的尾部自然排到最前面。
+	// 由 syncMu 保护。
+	syncStart int
+
 	// syncRoot 是同步用的根上下文，退出时由 syncCancel 取消。
 	//
 	// 各轮同步自己带 context.Background() 起截止时间的话，关窗口**取消不了**
@@ -225,9 +234,12 @@ type App struct {
 	// logBuf 有容量上限（maxLogQueue）：前端消费慢于生产时队列会一直涨，
 	// 而日志洪峰恰恰出现在客户端出问题的时候——那时最不该再把内存吃光。
 	// 触顶时丢弃最旧的并累计到 logDropped，下一次推送会明确告知丢了多少。
-	logMu      sync.Mutex
-	logBuf     []string
-	logDropped int
+	logMu sync.Mutex
+	// logBufBytes 是 logBuf 的总字节数：行数上限挡不住「每行都很长」，
+	// 两份预算一起用（见 maxLogQueueBytes）。
+	logBuf      []string
+	logBufBytes int
+	logDropped  int
 	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
 	// 不排队也不阻塞——推送协程醒来时取走一批（maxLogBatch 行）。
 	logKick chan struct{}

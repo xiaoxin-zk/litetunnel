@@ -21,10 +21,24 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // maxLogLines 内存中保留的日志行数。
 const maxLogLines = 500
+
+// maxLogBytes 是内存里保留日志的**总字节**上限。
+//
+// 只限行数不够：单行可以留到 1 MiB（见 pumpLineLimit），500 行就是 500 MiB
+// ——而日志洪峰恰恰出现在客户端出问题的时候，那时最不该把内存吃光。
+const maxLogBytes = 512 * 1024
+
+// maxLogLineBytes 是单行进入日志缓冲时的保留上限。
+//
+// 与 pumpLineLimit 是两件事：后者管「读管道时一行最多吞多少」，这里管
+// 「进日志缓冲时一行最多占多少」。一行 1 MiB 会自己吃掉整个字节预算，
+// 把前面所有有用的行挤出去，而它的信息量并不比前 8 KiB 多。
+const maxLogLineBytes = 8 * 1024
 
 // ErrAlreadyRunning 表示该隧道的 frpc 已在运行。
 var ErrAlreadyRunning = errors.New("该隧道的 frpc 已在运行")
@@ -61,6 +75,8 @@ type Manager struct {
 	mu    sync.Mutex
 	procs map[uint]*process
 	logs  []string
+	// logBytes 是 logs 里所有行的总字节数，用于按字节预算裁剪。
+	logBytes int
 
 	exePath string
 
@@ -374,6 +390,7 @@ func (m *Manager) ClearLogs() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.logs = nil
+	m.logBytes = 0
 }
 
 // pumpLineLimit 是单行日志保留的字节上限，超出的部分截断丢弃。
@@ -449,6 +466,7 @@ func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	line = strings.TrimRight(line, "\r\n")
+	line = clipLogLine(line, maxLogLineBytes)
 	if line == "" {
 		return
 	}
@@ -456,8 +474,19 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 
 	m.mu.Lock()
 	m.logs = append(m.logs, stamped)
-	if len(m.logs) > maxLogLines {
-		m.logs = m.logs[len(m.logs)-maxLogLines:]
+	m.logBytes += len(stamped)
+
+	// 先按行数裁，再按总字节裁：两个上限针对的是不同的失控方式
+	// （行数爆炸 / 单行过大），只留一个都会被另一个绕过。
+	if over := len(m.logs) - maxLogLines; over > 0 {
+		for i := 0; i < over; i++ {
+			m.logBytes -= len(m.logs[i])
+		}
+		m.logs = m.logs[over:]
+	}
+	for len(m.logs) > 1 && m.logBytes > maxLogBytes {
+		m.logBytes -= len(m.logs[0])
+		m.logs = m.logs[1:]
 	}
 	cb := m.onLog
 	m.mu.Unlock()
@@ -465,6 +494,18 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	if cb != nil {
 		cb(tunnelID, tunnelName, stamped)
 	}
+}
+
+// clipLogLine 把超长的单行截断，且不切断多字节字符。
+func clipLogLine(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…（超长，已截断）"
 }
 
 // logPrefix 生成日志行的隧道前缀。

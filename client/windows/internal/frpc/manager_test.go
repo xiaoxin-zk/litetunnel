@@ -230,6 +230,49 @@ func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 	}
 }
 
+// TestLogBufferRespectsByteBudget 覆盖「只限行数挡不住超大日志」。
+//
+// 单行可以留到 1 MiB，500 行就是 500 MiB——而日志洪峰恰恰出现在客户端出
+// 问题的时候。现在按总字节再裁一次，并把单行压到 maxLogLineBytes。
+func TestLogBufferRespectsByteBudget(t *testing.T) {
+	m := testManager(t)
+	for i := 0; i < 200; i++ {
+		m.appendLog(1, "mc1", strings.Repeat("x", maxLogLineBytes))
+	}
+
+	m.mu.Lock()
+	bytes, lines := m.logBytes, len(m.logs)
+	sum := 0
+	for _, l := range m.logs {
+		sum += len(l)
+	}
+	m.mu.Unlock()
+
+	if lines > maxLogLines {
+		t.Fatalf("行数必须有界：实际 %d 行（上限 %d）", lines, maxLogLines)
+	}
+	if bytes > maxLogBytes {
+		t.Fatalf("日志总字节必须有界：实际 %d（上限 %d）", bytes, maxLogBytes)
+	}
+	if bytes != sum {
+		t.Fatalf("字节计数必须与日志内容一致：计数 %d，实际 %d", bytes, sum)
+	}
+
+	// 单行超长：截断后仍要留下，且标明截断。
+	m2 := testManager(t)
+	m2.appendLog(1, "mc1", strings.Repeat("y", 4*maxLogLineBytes))
+	logs := m2.Logs()
+	if len(logs) != 1 {
+		t.Fatalf("应只留一行，实际 %d 行", len(logs))
+	}
+	if len(logs[0]) > maxLogLineBytes+64 {
+		t.Fatalf("单行必须被截断：实际 %d 字节", len(logs[0]))
+	}
+	if !strings.Contains(logs[0], "已截断") {
+		t.Fatal("截断后应标明，否则用户以为日志完整")
+	}
+}
+
 // TestCloseRejectsNewProcess 覆盖「关停之后不再拉起新进程」。
 //
 // 关闸必须发生在停进程之前：只调 StopAll 的话，与退出并发的一轮同步

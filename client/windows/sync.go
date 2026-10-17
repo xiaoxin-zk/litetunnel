@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -138,11 +139,16 @@ func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err 
 // 才等得到 syncMu——等不到就拿不到「不会再有新进程被拉起」的保证。
 // 测试里直接构造 App 时没有根上下文，退回 Background。
 func (a *App) newSyncContext() (context.Context, context.CancelFunc) {
-	base := a.syncRoot
-	if base == nil {
-		base = context.Background()
+	return context.WithTimeout(a.rootContext(), syncRoundTimeout)
+}
+
+// rootContext 是所有客户端请求的根上下文：应用退出时被取消（见 App.shutdown）。
+// 测试里直接构造 App 时没有它，退回 Background。
+func (a *App) rootContext() context.Context {
+	if a.syncRoot != nil {
+		return a.syncRoot
 	}
-	return context.WithTimeout(base, syncRoundTimeout)
+	return context.Background()
 }
 
 // applySync 拉取隧道清单，并把本机的 frpc 进程对账到服务端说的状态。
@@ -327,6 +333,23 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		pending = append(pending, t)
 	}
 
+	// 从上一轮停下的位置开始环形遍历（见 syncStart）。
+	//
+	// 不这么做就会「尾部饿死」：清单按 id 倒序，配置并发 6 条、整轮 45 秒，
+	// 前几条一旦持续卡到超时，后面的一直排不上队；下一轮又从同一条开始，
+	// 于是尾部隧道永远拿不到配置——新建的隧道一直「连接中」，改了配置的
+	// 隧道一直跑旧配置，而且重启客户端也没用（位次没变）。
+	rot := 0
+	if n := len(pending); n > 1 {
+		rot = a.syncStart % n
+		if rot > 0 {
+			ordered := make([]TunnelVO, 0, n)
+			ordered = append(ordered, pending[rot:]...)
+			ordered = append(ordered, pending[:rot]...)
+			pending = ordered
+		}
+	}
+
 	// 第二遍起：并发取配置，每收到一条就立刻处理。
 	//
 	// 只并发「取配置」这一件事：写文件、起停进程、记退避、记失败都在改同一批
@@ -384,14 +407,25 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		}
 	}
 
-	for res := range a.streamTunnelConfigs(ctx, base, apiKey, pending) {
+	results, dispatched := a.streamTunnelConfigs(ctx, base, apiKey, pending)
+	for res := range results {
 		applyCfg(res.tunnel, res.text, res.err)
+	}
+	// 记下续传位置：派发是从本轮起点开始、按顺序进行的，派发到哪儿就意味着
+	// 这一轮走到哪儿。下一轮从那里接着来，被截止时间砍掉的尾部排到最前。
+	// 全派发完时它会回到本次的起点（rot + 条数 ≡ rot），顺序保持不变。
+	if n := len(pending); n > 0 {
+		done := int(dispatched.Load())
+		if done > n {
+			done = n
+		}
+		a.syncStart = (rot + done) % n
 	}
 
 	if ctx.Err() != nil {
 		// 超时不算完全成功：SyncErr 要亮出来，否则用户以为同步过了，
 		// 而部分隧道根本没对上账。已处理完的隧道不受影响，保持原状。
-		roundErr := fmt.Errorf("本轮同步超时（超过 %s），未处理的隧道将在下一轮自动重试", syncRoundTimeout)
+		roundErr := fmt.Errorf("本轮同步超时（超过 %s），未处理的隧道将在下一轮优先重试", syncRoundTimeout)
 		if len(failures) > 0 {
 			roundErr = fmt.Errorf("%w；另有 %d 条隧道同步失败", roundErr, len(failures))
 		}
@@ -444,11 +478,17 @@ type cfgResult struct {
 // 单次请求的超时由 a.http 自己的 Timeout 兜底；整轮还有 ctx 截止时间
 // （调用方传入），到点后未派发的任务直接放弃，由下一轮同步补上。
 // 通道在全部结果流出（或截止）后关闭，调用方 range 到结束即可。
-func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunnels []TunnelVO) <-chan cfgResult {
+//
+// 第二个返回值是**实际派发出去的条数**：调用方据此推进续传位置
+// （见 applySyncData 里的 syncStart）。不能用「收到的结果条数」代替——
+// 截止时 worker 的 fetch 失败后可能直接返回、不再投递结果，那样算出来
+// 的位置会原地不动，下一轮又从头开始处理同一批隧道。
+func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunnels []TunnelVO) (<-chan cfgResult, *atomic.Int64) {
+	dispatched := &atomic.Int64{}
 	results := make(chan cfgResult, len(tunnels))
 	if len(tunnels) == 0 {
 		close(results)
-		return results
+		return results, dispatched
 	}
 
 	workers := configFetchConcurrency
@@ -495,6 +535,7 @@ func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunn
 			case <-ctx.Done():
 				return
 			case jobs <- t:
+				dispatched.Add(1)
 			}
 		}
 	}()
@@ -503,7 +544,7 @@ func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunn
 		close(results)
 	}()
 
-	return results
+	return results, dispatched
 }
 
 // writeAndStart 落盘配置并启动该隧道的 frpc 进程。
@@ -546,7 +587,10 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 }
 
 // startTunnelProcess 为用户主动点「连接」的隧道拉配置并启动。
-func (a *App) startTunnelProcess(t TunnelVO) error {
+//
+// ctx 是这次开关操作的整笔预算（见 manualOpTimeout）：请求失败或超时都要
+// 如实返回，界面据此提示，而不是让按钮一直转。
+func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 	if a.mgr.Running(t.ID) {
 		return nil
 	}
@@ -557,7 +601,7 @@ func (a *App) startTunnelProcess(t TunnelVO) error {
 	if err != nil {
 		return err
 	}
-	cfgText, err := a.fetchTunnelConfig(context.Background(), base, apiKey, t.ID)
+	cfgText, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
 	if err != nil {
 		return err
 	}

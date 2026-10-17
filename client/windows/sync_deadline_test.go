@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,6 +72,75 @@ func TestSyncRoundTimeoutCutsOffSlowFetch(t *testing.T) {
 	}
 }
 
+// TestSyncRoundResumesAfterTimeout 覆盖「清单尾部隧道永远轮不到配置」。
+//
+// 清单按 id 倒序返回、配置并发 6 条、整轮 45 秒截止：若每轮都从清单开头
+// 开始，前面几条一旦持续卡到超时，后面的隧道就永远排不上——新建的隧道
+// 一直「连接中」、改了配置的一直跑旧配置，而且重启客户端也没用（位次没变）。
+// 现在每轮记下派发到哪儿，下一轮从那里环形开始，被砍掉的尾部排到最前。
+func TestSyncRoundResumesAfterTimeout(t *testing.T) {
+	oldTimeout := syncRoundTimeout
+	syncRoundTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { syncRoundTimeout = oldTimeout })
+
+	var mu sync.Mutex
+	requested := map[string]bool{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			mu.Lock()
+			requested[r.URL.Query().Get("tunnel_id")] = true
+			mu.Unlock()
+			<-r.Context().Done() // 挂到本轮超时为止
+			return
+		}
+		// /client/info：12 条启用中的隧道，与真实服务端一样按 id 倒序。
+		w.Header().Set("Content-Type", "application/json")
+		var sb strings.Builder
+		sb.WriteString(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[`)
+		for i := 12; i >= 1; i-- {
+			if i != 12 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(`{"id":` + itoa(i) + `,"name":"t","type":"tcp","status":"active"}`)
+		}
+		sb.WriteString(`]}}`)
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newSyncTestApp(t, srv)
+
+	if _, err := a.syncLocked(); err == nil {
+		t.Fatal("配置接口全部挂住时，本轮同步应报超时")
+	}
+	if a.syncStart == 0 {
+		t.Fatal("超时后必须推进续传位置，否则下一轮还是从同一批隧道开始")
+	}
+	first := make(map[string]bool, len(requested))
+	mu.Lock()
+	for id := range requested {
+		first[id] = true
+	}
+	mu.Unlock()
+
+	if _, err := a.syncLocked(); err == nil {
+		t.Fatal("第二轮同样会超时")
+	}
+
+	mu.Lock()
+	fresh := 0
+	for id := range requested {
+		if !first[id] {
+			fresh++
+		}
+	}
+	mu.Unlock()
+	if fresh == 0 {
+		t.Fatal("第二轮必须处理到第一轮没轮上的隧道，否则尾部隧道永远拿不到配置")
+	}
+}
+
 // TestStreamTunnelConfigsStopsOnCanceledContext 覆盖「截止后不再派发」。
 //
 // 取消的 context 下，worker 不应再发起任何请求，结果通道正常关闭，
@@ -92,8 +162,9 @@ func TestStreamTunnelConfigsStopsOnCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 一开始就取消
 
+	results, _ := a.streamTunnelConfigs(ctx, srv.URL, "k", tunnels)
 	count := 0
-	for range a.streamTunnelConfigs(ctx, srv.URL, "k", tunnels) {
+	for range results {
 		count++
 	}
 	if count != 0 {

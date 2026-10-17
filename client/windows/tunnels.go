@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/client/internal/localsvc"
 )
@@ -193,9 +194,15 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	if !ok {
 		return a.GetState(), errors.New("找不到这条隧道，请等待同步完成后重试")
 	}
+	// 整笔操作共用一个截止：下面两步各自带 15 秒超时，网络不好时串起来
+	// 就是近 30 秒的干等，而且用户不知道卡在哪一步（见 manualOpTimeout）。
+	ctx, cancel := a.newManualContext()
+	defer cancel()
+
 	if t.Status != tunnelStatusActive {
-		if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusActive); err != nil {
-			return a.GetState(), err
+		a.emitTunnelLog(t.Name, "正在启用（提交服务端状态）…")
+		if err := a.setTunnelStatus(ctx, base, apiKey, id, tunnelStatusActive); err != nil {
+			return a.GetState(), describeManualErr(err)
 		}
 		// 服务端状态已经改了，本机缓存也要跟上：GetState 直接读它，
 		// 不更新的话返回给前端的快照仍是「已停用」——用户点了开启，
@@ -205,9 +212,10 @@ func (a *App) StartTunnel(id uint) (State, error) {
 			t = nt
 		}
 	}
-	if err := a.startTunnelProcess(t); err != nil {
+	a.emitTunnelLog(t.Name, "正在拉取配置并启动 frpc…")
+	if err := a.startTunnelProcess(ctx, t); err != nil {
 		a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
-		return a.GetState(), err
+		return a.GetState(), describeManualErr(err)
 	}
 	// 退避由 startTunnelProcess → writeAndStart 在**启动之前**清掉。
 	// 用户主动点开当然要立刻重试，而不是等上一次失败留下的退避时间。
@@ -258,9 +266,14 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	if !ok {
 		return a.GetState(), errors.New("找不到这条隧道，请等待同步完成后重试")
 	}
+	// 与 StartTunnel 一样：整笔操作共用一个预算，两步串行等待有上界。
+	ctx, cancel := a.newManualContext()
+	defer cancel()
+
 	if t.Status != tunnelStatusDisabled {
-		if err := a.setTunnelStatus(base, apiKey, id, tunnelStatusDisabled); err != nil {
-			return a.GetState(), err
+		a.emitTunnelLog(t.Name, "正在停用（提交服务端状态）…")
+		if err := a.setTunnelStatus(ctx, base, apiKey, id, tunnelStatusDisabled); err != nil {
+			return a.GetState(), describeManualErr(err)
 		}
 		// 与 StartTunnel 同理：本机缓存先落下，界面上的开关立刻响应。
 		a.applyLocalStatus(id, tunnelStatusDisabled)
@@ -316,13 +329,42 @@ func (a *App) syncAndState() State {
 }
 
 // setTunnelStatus 修改隧道在服务端的启用状态。
-func (a *App) setTunnelStatus(base, apiKey string, id uint, status string) error {
+func (a *App) setTunnelStatus(ctx context.Context, base, apiKey string, id uint, status string) error {
 	payload, err := json.Marshal(map[string]string{"status": status})
 	if err != nil {
 		return err
 	}
 	endpoint := fmt.Sprintf("%s/api/user/tunnels/%d/status", base, id)
-	_, err = a.do(context.Background(), http.MethodPost, endpoint, apiKey, payload)
+	_, err = a.do(ctx, http.MethodPost, endpoint, apiKey, payload)
+	return err
+}
+
+// manualOpTimeout 是一次手动开关操作（开/关隧道）的整笔时间预算。
+//
+// 「改服务端状态」和「拉配置起进程」是两步串行请求，各自带 15 秒超时：
+// 网络不好时用户要干等将近 30 秒，而且完全不知道卡在哪一步。给整笔操作
+// 一个共用预算，并让每一步在日志里报出自己的阶段。
+const manualOpTimeout = 30 * time.Second
+
+// newManualContext 为一次手动操作创建整笔预算的上下文。
+//
+// 根上下文与同步共用（见 App.syncRoot）：应用退出时一并取消，
+// 窗口不会因为一次卡住的请求而关不掉。
+func (a *App) newManualContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(a.rootContext(), manualOpTimeout)
+}
+
+// describeManualErr 把手动操作的超时翻译成用户能照做的说法。
+//
+// 直接把 "context deadline exceeded" 摆到界面上，用户既看不出是谁超时，
+// 也不知道该等还是该重试。
+func describeManualErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("操作超时（超过 %s），请检查网络后重试", manualOpTimeout)
+	}
 	return err
 }
 

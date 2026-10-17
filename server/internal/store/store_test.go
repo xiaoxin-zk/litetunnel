@@ -30,6 +30,39 @@ func newTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+// TestMailIDIsUniquePerCredential 覆盖「一封邮件只能激活出一条凭据」。
+//
+// 多实例并发激活同一封邮件时，两边的「已激活」检查可能都落空，各插一条相同
+// 验证码；而校验只消费命中的那一条，另一条仍然可用——一次性语义就没了。
+// 代码里的领取已经避免这种并发，唯一索引是最后一道保险。
+func TestMailIDIsUniquePerCredential(t *testing.T) {
+	db := newTestDB(t)
+
+	first := &model.EmailCode{
+		Email: "dup@example.com", Scene: "reset", CodeHash: "h1",
+		ExpireAt: time.Now().Add(time.Hour), MailID: 7,
+	}
+	if err := db.Create(first).Error; err != nil {
+		t.Fatalf("第一条应写入成功: %v", err)
+	}
+
+	second := &model.EmailCode{
+		Email: "dup@example.com", Scene: "reset", CodeHash: "h2",
+		ExpireAt: time.Now().Add(time.Hour), MailID: 7,
+	}
+	if err := db.Create(second).Error; err == nil {
+		t.Fatal("同一封邮件不得激活出第二条验证码（一次性语义会被破坏）")
+	}
+
+	// mail_id 为 0 的记录（历史数据/手工插入）不受约束。
+	if err := db.Create(&model.EmailCode{
+		Email: "legacy@example.com", Scene: "reset", CodeHash: "h3",
+		ExpireAt: time.Now().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("mail_id 为 0 的记录不该受唯一约束影响: %v", err)
+	}
+}
+
 // TestPurgeLegacyMailDrafts 覆盖「升级遗留的草稿邮件」。
 //
 // 旧版本用 draft 表示「已写好、待复核额度」：进程若在复核与释放之间崩溃，

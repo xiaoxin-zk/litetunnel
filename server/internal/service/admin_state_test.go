@@ -445,12 +445,13 @@ func TestMailActionObsoleteForDeletedUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.applyMailAction(row); !errors.Is(err, errMailActionObsolete) {
+	token := claimForTest(t, svc, row)
+	if err := svc.applyMailAction(row, token); !errors.Is(err, errMailActionObsolete) {
 		t.Fatalf("账号已删时应返回「动作作废」，实际 %v", err)
 	}
 
 	// 走完整收尾：按已办结处理，不留下重试。
-	svc.finishMailAction(row)
+	svc.finishMailAction(row, token)
 	var after model.MailOutbox
 	if err := svc.DB.First(&after, row.ID).Error; err != nil {
 		t.Fatal(err)

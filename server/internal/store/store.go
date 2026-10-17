@@ -95,6 +95,9 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		// 发件箱：必须落库，否则重启丢信、失败即弃，而验证码与重置链接
 		// 会在「信进队列」时就作废旧凭据——用户就再也找不回账号了。
 		&model.MailOutbox{},
+		// 跨实例租约：多实例部署时用它保证「同一件事只有一个实例在做」
+		// （目前是流量采集）。放在库里而不是内存里，正是为了让别的进程看得见。
+		&model.RuntimeLease{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
@@ -122,6 +125,26 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		 ON lt_users(lower(email)) WHERE email <> ''`,
 	).Error; err != nil {
 		log.Printf("[store] 邮箱唯一索引未建立（历史数据可能存在重复邮箱，请人工清理后重启）：%v", err)
+	}
+
+	// 一封邮件最多激活出一条凭据。
+	//
+	// 多实例并发激活同一封邮件时，两边的「已激活」检查可能都落空，各插一条
+	// 相同验证码；而校验只消费命中的那一条，另一条仍然可用——一次性语义就没了。
+	// 代码里的领取已经避免了这种并发，唯一索引是最后一道保险。
+	// 尽力而为：老库里若已有重复（旧版本并发激活留下的），建索引会失败，
+	// 此时只告警、不阻断启动——代码里的领取已经能防止新的重复。
+	if err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq
+		 ON lt_email_codes(mail_id) WHERE mail_id > 0`,
+	).Error; err != nil {
+		log.Printf("[store] 验证码来源唯一索引未建立（历史数据可能有重复，请人工清理后重启）：%v", err)
+	}
+	if err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_reset_tokens_mail_uniq
+		 ON lt_password_reset_tokens(mail_id) WHERE mail_id > 0`,
+	).Error; err != nil {
+		log.Printf("[store] 重置令牌来源唯一索引未建立（历史数据可能有重复，请人工清理后重启）：%v", err)
 	}
 
 	// 清理旧版本遗留的邮件草稿，见 purgeLegacyMailDrafts 的说明。

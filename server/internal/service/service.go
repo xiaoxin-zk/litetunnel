@@ -193,6 +193,19 @@ type Services struct {
 	// 而不是等下一个轮询周期。
 	fwKick chan struct{}
 
+	// instanceID 是本进程的随机标识，用于跨实例租约的持有者判定。
+	instanceID string
+
+	// collectorOwned 表示本实例当前是否持有「流量采集」租约。
+	// 只在采集协程里读写；用原子量是因为测试也会并发调用 collectTraffic。
+	collectorOwned atomic.Bool
+
+	// collectorStarted 表示本进程是否已经拿到过采集租约。
+	//
+	// 用来区分「首次启动」与「从别的实例手里接管」：前者由启动流程负责
+	// 读基线，后者必须重新读一次（自己内存里的基线是旧的）。
+	collectorStarted atomic.Bool
+
 	// guardFullAt 是上一次**全量**准入标记校准的时刻（UnixNano）。
 	//
 	// 常规采集轮次只刷新「本轮有流量」与「计费周期到期」的用户，
@@ -270,6 +283,10 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Captchas:   NewCaptchaStore(),
 		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),
 
+		// 实例标识：跨实例租约（例如「只有一个实例跑流量采集」）靠它区分持有者。
+		// 每次启动重新生成——重启后的实例本来就不该继承上一个进程的租约。
+		instanceID: newInstanceID(),
+
 		Monitor:    monitor.New(cfg.MonitorDiskPath),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		loginFails: newLoginFailureCounter(),
@@ -277,6 +294,17 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		fwPending:  map[int]pendingFW{},
 		fwKick:     make(chan struct{}, 1),
 	}
+}
+
+// newInstanceID 生成一个进程级随机标识。
+//
+// 取不到随机数时退回时间戳：租约只要求「不同实例不同值」，
+// 这种情况几乎不会发生，但也不能让构造失败。
+func newInstanceID() string {
+	if id, err := randomHex(8); err == nil {
+		return id
+	}
+	return fmt.Sprintf("t%d", time.Now().UnixNano())
 }
 
 // mailSender 是发信器的最小接口，便于测试注入替身。

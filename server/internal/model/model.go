@@ -399,6 +399,11 @@ const (
 	// 多实例共用一个库时，同一封信只会被一个实例取走；实例在发送途中崩溃，
 	// 租约到期后另一个实例可以重新领取（至多重复投递一次，方向安全）。
 	MailSending = "sending"
+	// MailActivating 已被某个实例领取、正在执行凭据动作（激活验证码/令牌）。
+	//
+	// 与发送分开是必要的：激活不重发邮件、失败只重试这一步；两者各自需要
+	// 「谁领谁写」的租约，否则多实例会各激活一次（验证码被插两条，一次性失效）。
+	MailActivating = "activating"
 	// MailDraft 是**已废弃**的状态，仅为升级清理保留。
 	//
 	// 某个中间版本用它表示「已写好、待复核额度」，进程若在复核与释放之间
@@ -467,7 +472,13 @@ type MailOutbox struct {
 	// 两者失败原因完全不同（网络 vs 数据库），混在一起会让排查无从下手。
 	ActionAttempts int    `gorm:"not null;default:0" json:"action_attempts"`
 	Status         string `gorm:"size:16;not null;index;default:pending" json:"status"`
-	// NextAt 下次尝试时间，用于退避（发送与激活共用）。
+	// ClaimToken 是当前持有者的领取令牌（每次领取重新生成）。
+	//
+	// 所有回写（送达/失败/激活结果）都必须带上它：租约过期、别的实例接手之后，
+	// 旧持有者的结果不能再覆盖新持有者的状态——否则会出现「已被换邮箱作废的
+	// 邮件被旧持有者写回待发」「旧实例把新实例的领取状态改掉」这类交错。
+	ClaimToken string `gorm:"size:32" json:"-"`
+	// NextAt 下次尝试时间，用于退避（发送与激活共用）；领取时改写为租约到期时间。
 	NextAt  time.Time `gorm:"not null;index" json:"next_at"`
 	LastErr string    `gorm:"size:255" json:"last_err"`
 
@@ -509,6 +520,27 @@ type TrafficBaseline struct {
 
 // TableName 固定表名。
 func (TrafficBaseline) TableName() string { return "lt_traffic_baseline" }
+
+// RuntimeLease 是跨实例的运行期租约（当前用于「流量采集只由一个实例跑」）。
+//
+// # 为什么需要它
+//
+// 每个面板进程都会启动采集器，各自从 frps 读同一份累计值、各自算增量、
+// 各自把增量加进用户用量——同一段流量会被记两遍。进程内的互斥（Runtime.mu）
+// 管不到别的进程，所以租约必须落在数据库里。
+//
+// 抢占用条件更新实现：只有把 expires_at 推进成功的那一个实例，在租期内独占。
+// 实例崩溃后租约自然过期，另一个实例接手；接手的实例要重新读一次采样基线
+// （它自己的内存基线是旧的），否则会把当天累计值整个重记一遍。
+type RuntimeLease struct {
+	Name      string    `gorm:"primarykey;size:64" json:"name"`
+	Holder    string    `gorm:"size:64" json:"holder"`
+	ExpiresAt time.Time `gorm:"index" json:"expires_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (RuntimeLease) TableName() string { return "lt_runtime_leases" }
 
 // FirewallPending 是一条待重试的防火墙端口操作。
 //

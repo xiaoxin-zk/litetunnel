@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -693,17 +694,27 @@ func (s *Services) ConfirmEmailChange(userID uint, newEmail, code string) error 
 		return ErrEmailRequired
 	}
 
-	var old model.User
-	if err := s.DB.First(&old, userID).Error; err != nil {
-		return ErrNotFound
-	}
-
 	rec, err := s.checkEmailCode(s.DB, email, EmailSceneChange, code)
 	if err != nil {
 		return err
 	}
 
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁住用户行，与「激活重置令牌」串行（那边也锁这一行）。
+		//
+		// 不锁的话存在这条交错：激活事务查到「邮箱还是旧的」，本事务随后
+		// 提交（删掉旧令牌、把旧邮件标成失败），激活事务最后才插入令牌——
+		// 清理之后又冒出一份可用的旧链接。锁上之后只剩两种顺序：
+		// 激活先完成（随后被这里删掉），或本事务先完成（那边查到的邮箱已变，作废）。
+		var old model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&old, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+
 		// 唯一性在事务里再判一次：两个账号可能同时确认同一个新邮箱。
 		var taken int64
 		if err := tx.Model(&model.User{}).
@@ -764,7 +775,7 @@ func purgeEmailCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", email,
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailSending, model.MailDelivered}).
+			[]string{model.MailPending, model.MailSending, model.MailActivating, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",
@@ -849,7 +860,7 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", strings.ToLower(email),
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailSending, model.MailDelivered}).
+			[]string{model.MailPending, model.MailSending, model.MailActivating, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",

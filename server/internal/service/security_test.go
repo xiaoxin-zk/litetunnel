@@ -1572,9 +1572,17 @@ func TestTrafficBaselineSurvivesRestart(t *testing.T) {
 	}
 
 	// 模拟「只重启控制面、frps 没重启」：同一个库上新建一套 Services。
+	//
+	// 旧进程若是崩溃退出（没走优雅关停），采集租约还挂在它名下；
+	// 这里把租约置为已过期，模拟租期到了之后新实例接手。
 	restarted := New(svc.DB, cfg)
 	restarted.Frps = NewFrpsClient(cfg)
 	restarted.loadTrafficBaseline()
+	if err := svc.DB.Model(&model.RuntimeLease{}).
+		Where("name = ?", leaseTrafficCollector).
+		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("释放采集租约失败: %v", err)
+	}
 
 	// frps 的当天累计值没变，重启后的这一轮不该再记一遍。
 	restarted.collectTraffic(ctx)
@@ -3245,6 +3253,68 @@ func TestPruneDeadBaselines(t *testing.T) {
 	}
 	if _, ok := nextStat["lt_u1.recent"]; !ok {
 		t.Fatal("旧数据仍在保留期内应保留")
+	}
+}
+
+// TestTrafficCollectorLeaseKeepsSingleWriter 覆盖「多实例各自采集导致重复记账」。
+//
+// 每个面板进程都会启动采集器：各自从 frps 读同一份累计值、各自算增量、
+// 各自累加——同一段流量被记两遍。进程内的 Runtime.mu 管不到别的进程，
+// 所以用数据库里的租约把「谁采集」收敛成一个。
+func TestTrafficCollectorLeaseKeepsSingleWriter(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	u := &model.User{Username: "leaseuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20091,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+	frps.total.Store(1000)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, tun.ID); got != 1000 {
+		t.Fatalf("首个实例应记 1000，实际 %d", got)
+	}
+
+	// 第二个实例（同一个库）：这一轮拿不到租约，必须完全跳过。
+	//
+	// 先落下「基线已迁移」标记：否则 loadTrafficBaseline 会把它当成首次迁移，
+	// 第一轮只记基线、不计增量，测不出「谁在记账」这件事。
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+		t.Fatalf("写迁移标记失败: %v", err)
+	}
+	second := New(svc.DB, cfg)
+	second.Frps = NewFrpsClient(cfg)
+	second.loadTrafficBaseline()
+	frps.total.Store(1200)
+	second.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, second, tun.ID); got != 1000 {
+		t.Fatalf("拿不到租约的实例不该记账（会重复计费），实际 %d", got)
+	}
+
+	// 租约到期后接手：只补记新增的 200，不把当天累计重记一遍。
+	if err := svc.DB.Model(&model.RuntimeLease{}).
+		Where("name = ?", leaseTrafficCollector).
+		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	second.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, second, tun.ID); got != 1200 {
+		t.Fatalf("接手后应只补记新增流量，实际 %d", got)
 	}
 }
 

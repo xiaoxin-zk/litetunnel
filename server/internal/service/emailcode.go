@@ -151,18 +151,20 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	return nil
 }
 
-// voidMail 作废一封尚未投递的邮件：不再发送，正文与参数一并清掉。
+// voidMail 作废一封尚未办结的邮件：不再发送、不再激活，正文与参数一并清掉。
 //
-// 条件更新（pending / sending）：如果它已经被 worker 取走发出去了，
-// 这里不改状态——那封信的凭据动作会由激活环节按当前账号状态再判一次。
+// 条件更新（pending / sending / activating）：只改还在这三个状态的行；
+// 已送达或已办结的不动。清掉领取令牌之后，旧持有者的回写也会被拒绝。
 func (s *Services) voidMail(id uint, reason string) {
 	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status IN ?", id, []string{model.MailPending, model.MailSending}).
+		Where("id = ? AND status IN ?", id,
+			[]string{model.MailPending, model.MailSending, model.MailActivating}).
 		Updates(map[string]any{
-			"status":   model.MailFailed,
-			"body":     "",
-			"payload":  "",
-			"last_err": truncate(reason, 255),
+			"status":      model.MailFailed,
+			"claim_token": "",
+			"body":        "",
+			"payload":     "",
+			"last_err":    truncate(reason, 255),
 		}).Error; err != nil {
 		log.Printf("[mail] 作废超额邮件失败（id=%d）: %v", id, err)
 	}

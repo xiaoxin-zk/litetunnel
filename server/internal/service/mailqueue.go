@@ -245,10 +245,13 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 
 	// 记录清理交给维护任务（StartMaintenanceWorker）统一做，这里只管收发：
 	// 两处都清会让「谁删了什么」变得难以追溯。
-	now := time.Now()
 
+	// 1) 激活：已送达、凭据还没生效。
+	//
+	// 同样要**领取**：多实例时两个实例会各执行一次凭据动作，各插一条相同
+	// 验证码——而校验只消费命中的一条，另一条仍然可用，一次性语义就没了。
 	var pendingActions []model.MailOutbox
-	if err := s.DB.Where("status = ? AND next_at <= ?", model.MailDelivered, now).
+	if err := s.DB.Where("status = ? AND next_at <= ?", model.MailDelivered, time.Now()).
 		Order("id asc").Limit(mailBatchSize).Find(&pendingActions).Error; err != nil {
 		log.Printf("[mail] 读取待激活记录失败: %v", err)
 	}
@@ -256,14 +259,17 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		s.finishMailAction(row)
+		token, ok := s.claimMail(row.ID, []string{model.MailDelivered}, model.MailActivating, mailActivateLease)
+		if !ok {
+			continue
+		}
+		s.finishMailAction(row, token)
 	}
 
-	// 待发 + 租约已过期的「发送中」：后者是某个实例在发送途中崩溃留下的，
-	// 租约到期后由任意实例接手（至多重复投递一次，方向安全）。
+	// 2) 发送：待发 + 租约已过期的「发送中」（后者是实例崩溃留下的，到期可接手）。
 	var toSend []model.MailOutbox
 	if err := s.DB.Where("status IN ? AND next_at <= ?",
-		[]string{model.MailPending, model.MailSending}, now).
+		[]string{model.MailPending, model.MailSending}, time.Now()).
 		Order("id asc").Limit(mailBatchSize).Find(&toSend).Error; err != nil {
 		log.Printf("[mail] 读取发件箱失败: %v", err)
 		return
@@ -272,46 +278,64 @@ func (s *Services) processMailOutbox(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if !s.claimMail(row.ID, now) {
-			// 被别的实例抢先领走了。多实例共用一个库时这是常态，
-			// 不是异常——安静跳过即可。
+		token, ok := s.claimMail(row.ID, []string{model.MailPending, model.MailSending},
+			model.MailSending, mailSendLease)
+		if !ok {
+			// 被别的实例抢先领走了。多实例共用一个库时这是常态，不是异常。
 			continue
 		}
-		s.deliverMail(ctx, row)
+		s.deliverMail(ctx, row, token)
 	}
 }
 
-// mailSendLease 是「发送中」的租约时长。
-//
-// 领取时把 next_at 推后这么久：租约内别的实例不会再取到这一行；
-// 持有者若在发送途中崩溃，到期后可以被重新领取。取值要覆盖一次发送的
-// 最坏耗时（MailSendTimeout + 一点余量），否则正常发送中的信会被重复领取。
-const mailSendLease = MailSendTimeout + 30*time.Second
+const (
+	// mailSendLease 是「发送中」的租约时长：覆盖一次发送的最坏耗时，
+	// 留一点余量，否则正常发送中的信会被别的实例重复领取。
+	mailSendLease = MailSendTimeout + 30*time.Second
+	// mailActivateLease 是「激活中」的租约时长：激活只是一次数据库事务，
+	// 但失败重试、数据库卡顿都要留余量；到期即可被接手。
+	mailActivateLease = 2 * time.Minute
+)
 
-// claimMail 原子领取一封待发邮件：pending（或租约过期的 sending）→ sending。
+// claimMail 原子领取一行待办，返回本次领取的令牌。
 //
-// 多实例共用 PostgreSQL 时，每个实例都有自己的发件协程。直接读 pending 就发
-// 会让同一行被两个实例各发一次——收件人会收到两封、凭据被激活两次。
-// 条件更新把「谁能发」收敛成一个原子动作：只有 RowsAffected=1 的那个实例发。
+// 「谁能处理」收敛成一个条件更新：只有 RowsAffected=1 的实例继续。
+// 令牌让回写可被校验——租约过期、别的实例接手之后，旧持有者的结果
+// 不能覆盖新持有者的状态。
+//
+// 租约用**当前时间**而不是批次开始时间：批次是串行处理的，前面几封慢下来后，
+// 用批次起点算出的租约会在实际处理之前就到期，多实例下会被重复领取。
 //
 // SQLite 单连接下天然串行，这一步同样没有副作用。
-func (s *Services) claimMail(id uint, now time.Time) bool {
+func (s *Services) claimMail(id uint, from []string, to string, lease time.Duration) (string, bool) {
+	token, err := randomHex(16)
+	if err != nil {
+		log.Printf("[mail] 生成领取令牌失败（id=%d）: %v", id, err)
+		return "", false
+	}
+	now := time.Now()
 	res := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status IN ? AND next_at <= ?",
-			id, []string{model.MailPending, model.MailSending}, now).
+		Where("id = ? AND status IN ? AND next_at <= ?", id, from, now).
 		Updates(map[string]any{
-			"status":  model.MailSending,
-			"next_at": now.Add(mailSendLease),
+			"status":      to,
+			"claim_token": token,
+			"next_at":     now.Add(lease),
 		})
 	if res.Error != nil {
 		log.Printf("[mail] 领取邮件失败（id=%d）: %v", id, res.Error)
-		return false
+		return "", false
 	}
-	return res.RowsAffected == 1
+	if res.RowsAffected != 1 {
+		return "", false
+	}
+	return token, true
 }
 
 // deliverMail 发送一封邮件；送达后再执行凭据动作。
-func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
+//
+// token 是本次领取的令牌：所有回写都带上它，避免租约过期被别人接手后
+// 旧结果覆盖新状态。
+func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox, token string) {
 	sender := s.mailSender()
 	// 发送预算通过 ctx 传给客户端：拨号与会话读写共用同一个截止，
 	// 不会再出现「外层判超时、实际稍后送达」的重复投递。
@@ -343,7 +367,7 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 				maskEmail(row.To), row.Kind, row.ID)
 			return
 		}
-		s.failMail(row, err)
+		s.failMail(row, token, err)
 		return
 	}
 
@@ -354,22 +378,24 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 	// 留着只是把敏感数据在库里多放一段时间。
 	// Payload 先留着——凭据动作还要用它，动作完成后一并清掉。
 	updates := map[string]any{
-		"status":   model.MailDelivered,
-		"attempts": row.Attempts + 1,
-		"last_err": "",
-		"body":     "",
+		"status":      model.MailDelivered,
+		"attempts":    row.Attempts + 1,
+		"last_err":    "",
+		"body":        "",
+		"claim_token": "",         // 交还令牌：下一步激活会重新领取
+		"next_at":     time.Now(), // 立刻可被激活领取（不留发送租约的尾巴）
 	}
-	// 状态用**条件**更新（仅 sending，即本实例领取时写入的状态）：
-	// 这封信在发送期间可能已经被作废——换邮箱会把旧地址的待发邮件标成失败。
-	// 无条件写回 delivered 会把它「复活」，随后激活出一份指向旧邮箱的凭据。
+	// 条件更新：仍是**本次领取的** sending 才写回。
+	// 这封信在发送期间可能已经被作废（换邮箱会把旧地址的邮件标成失败），
+	// 也可能因租约过期被别的实例接手——两种情况下都不该由我们来写状态。
 	res := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status = ?", row.ID, model.MailSending).
+		Where("id = ? AND status = ? AND claim_token = ?", row.ID, model.MailSending, token).
 		Updates(updates)
 	if res.Error != nil {
 		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", row.ID, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		log.Printf("[mail] 邮件在发送期间已被作废，跳过凭据激活（收件人 %s，类型 %s，id=%d）",
+		log.Printf("[mail] 邮件已作废或已被其他实例接手，跳过凭据激活（收件人 %s，类型 %s，id=%d）",
 			maskEmail(row.To), row.Kind, row.ID)
 		return
 	}
@@ -379,7 +405,15 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 	// （激活重试并不是发送尝试），审计数据就不准了。
 	row.Attempts++
 	row.Body = ""
-	s.finishMailAction(row)
+
+	// 激活是**另一次领取**：上一步已经把令牌交还，这里重新抢一次。
+	// 抢不到说明别的实例已经在处理这封信的凭据动作——让它做完即可。
+	activateToken, ok := s.claimMail(row.ID, []string{model.MailDelivered},
+		model.MailActivating, mailActivateLease)
+	if !ok {
+		return
+	}
+	s.finishMailAction(row, activateToken)
 }
 
 // finishMailAction 执行凭据动作；失败只重试这一步，不重发邮件。
@@ -387,14 +421,14 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 // 「邮件已送达」与「凭据已生效」是两件事，必须能分别重试：
 // 把两者绑成一步的话，数据库瞬时故障就会把整封邮件标成 failed 而不再尝试
 // ——用户手里拿着验证码，库里却没有对应记录，谁也救不回来。
-func (s *Services) finishMailAction(row model.MailOutbox) {
-	err := s.applyMailAction(row)
+func (s *Services) finishMailAction(row model.MailOutbox, token string) {
+	err := s.applyMailAction(row, token)
 	if errors.Is(err, errMailActionSuperseded) {
 		// 被更新的同类凭据取代：这是**有意跳过**，不是失败。
 		// 重试没有意义（旧凭据永远不该再压过新凭据），按已办结处理。
 		log.Printf("[mail] 凭据激活已跳过：用户此后又请求了更新的凭据（收件人 %s，类型 %s，id=%d）",
 			maskEmail(row.To), row.Kind, row.ID)
-		s.finishMail(row.ID, mailFinish{
+		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailSent,
 			attempts:       row.Attempts,
 			actionAttempts: row.ActionAttempts,
@@ -407,7 +441,7 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 		// 目标账号已删除：凭据动作注定无效，重试只是空转。
 		log.Printf("[mail] 凭据激活已作废：目标账号不存在（收件人 %s，类型 %s，id=%d）",
 			maskEmail(row.To), row.Kind, row.ID)
-		s.finishMail(row.ID, mailFinish{
+		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailSent,
 			attempts:       row.Attempts,
 			actionAttempts: row.ActionAttempts,
@@ -421,7 +455,7 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 		// 凭据已生效：参数（含验证码摘要）也没有保留价值了，一并清掉。
 		// attempts 用 row.Attempts（发送次数，已由调用方同步过），
 		// 而不是 +1——激活重试不是发送尝试。
-		s.finishMail(row.ID, mailFinish{
+		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailSent,
 			attempts:       row.Attempts,
 			actionAttempts: row.ActionAttempts,
@@ -435,7 +469,7 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 		log.Printf("[mail] 邮件已送达但凭据激活连续 %d 次失败，放弃（收件人 %s，id=%d）: %v"+
 			"；该凭据未生效，用户原有凭据仍然可用，需要人工处理",
 			attempts, maskEmail(row.To), row.ID, err)
-		s.finishMail(row.ID, mailFinish{
+		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailFailed,
 			attempts:       row.Attempts,
 			actionAttempts: attempts,
@@ -454,22 +488,25 @@ func (s *Services) finishMailAction(row model.MailOutbox) {
 		"action_attempts": attempts,
 		"next_at":         time.Now().Add(delay),
 		"last_err":        truncate(err.Error(), 255),
+		// 交还令牌：下一轮会重新领取。
+		"claim_token": "",
 	}
-	if uerr := s.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+	if uerr := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND claim_token = ?", row.ID, token).
 		Updates(updates).Error; uerr != nil {
 		log.Printf("[mail] 更新发件箱失败（id=%d）: %v", row.ID, uerr)
 	}
 }
 
 // failMail 记录一次发送失败并按需安排重试。
-func (s *Services) failMail(row model.MailOutbox, err error) {
+func (s *Services) failMail(row model.MailOutbox, token string, err error) {
 	attempts := row.Attempts + 1
 	if attempts >= mailMaxAttempts {
 		log.Printf("[mail] 发送失败且已达重试上限（收件人 %s，类型 %s，共 %d 次）: %v"+
 			"；该凭据未生效，用户原有凭据仍然可用",
 			maskEmail(row.To), row.Kind, attempts, err)
 		// 不会重发了，正文（含明文验证码）也没有保留价值。
-		s.finishMail(row.ID, mailFinish{
+		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailFailed,
 			attempts:       attempts,
 			actionAttempts: row.ActionAttempts,
@@ -488,9 +525,21 @@ func (s *Services) failMail(row model.MailOutbox, err error) {
 		"next_at":  time.Now().Add(delay),
 		"last_err": truncate(err.Error(), 255),
 		"status":   model.MailPending,
+		// 交还令牌：下一次尝试会重新领取。
+		"claim_token": "",
 	}
-	if uerr := s.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).Updates(updates).Error; uerr != nil {
-		log.Printf("[mail] 更新发件箱失败（id=%d）: %v", row.ID, uerr)
+	// 条件写回：只有「仍是本次领取的 sending」才改回待发。
+	// 这封信在发送期间可能已被作废（换邮箱/删账号会把它标成失败并清空正文），
+	// 无条件写回 pending 会把它重新排队，最后发出一封**空邮件**。
+	res := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND status = ? AND claim_token = ?", row.ID, model.MailSending, token).
+		Updates(updates)
+	if res.Error != nil {
+		log.Printf("[mail] 更新发件箱失败（id=%d）: %v", row.ID, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		log.Printf("[mail] 邮件已作废或已被其他实例接手，失败状态不再写回（收件人 %s，id=%d）",
+			maskEmail(row.To), row.ID)
 	}
 }
 
@@ -509,19 +558,29 @@ type mailFinish struct {
 }
 
 // finishMail 写下一封邮件的终态。
-func (s *Services) finishMail(id uint, f mailFinish) {
+//
+// 必须带上领取令牌：租约过期后可能已有别的实例接手，旧持有者的终态
+// 不能覆盖新状态（否则「已作废」会被改回「已发送」，或反之）。
+func (s *Services) finishMail(id uint, token string, f mailFinish) {
 	updates := map[string]any{
 		"status":          f.status,
 		"attempts":        f.attempts,
 		"action_attempts": f.actionAttempts,
 		"last_err":        truncate(f.lastErr, 255),
+		"claim_token":     "",
 	}
 	if f.clearSensitive {
 		updates["body"] = ""
 		updates["payload"] = ""
 	}
-	if err := s.DB.Model(&model.MailOutbox{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", id, err)
+	res := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND claim_token = ?", id, token).
+		Updates(updates)
+	if res.Error != nil {
+		log.Printf("[mail] 更新发件箱状态失败（id=%d）: %v", id, res.Error)
+	}
+	if res.RowsAffected == 0 {
+		log.Printf("[mail] 邮件已被其他实例接手或已作废，终态不再写回（id=%d）", id)
 	}
 }
 

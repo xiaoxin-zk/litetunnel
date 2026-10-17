@@ -781,6 +781,9 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 		interval = 5 * time.Second
 	}
 	go func() {
+		// 退出时主动交还采集租约：正常重启不必等租期到期，新进程立刻能接手。
+		defer s.releaseLease(leaseTrafficCollector)
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		gcTicker := time.NewTicker(10 * time.Minute)
@@ -874,8 +877,78 @@ func queryInBatches[T any](db *gorm.DB, column string, ids []uint) ([]T, error) 
 	return out, nil
 }
 
+// leaseTrafficCollector 是「流量采集」的跨实例租约名。
+const leaseTrafficCollector = "traffic-collector"
+
+// trafficCollectLease 是采集租约的时长：必须长于一轮采集（含 frps 往返），
+// 否则正常采集中的实例会被另一个实例抢走，两边同时记账。
+const trafficCollectLease = 2 * time.Minute
+
+// acquireLease 抢占一个跨实例租约，返回是否持有。
+//
+// 抢占用条件更新：只有把 expires_at 推进成功的那一个实例，在租期内独占。
+// 首次插入即成功；已存在时按「已过期」或「仍由我持有」续租——后者让持有者
+// 每轮都能刷新租期，而不必等它过期。
+//
+// 插入失败不能一律当成「已被占用」：也可能是数据库真出错。此时走更新分支，
+// 失败就返回 false（这一轮不采集），错误会在下一轮重试。
+func (s *Services) acquireLease(name string, ttl time.Duration) bool {
+	now := time.Now()
+	exp := now.Add(ttl)
+	rec := model.RuntimeLease{Name: name, Holder: s.instanceID, ExpiresAt: exp}
+	if err := s.DB.Create(&rec).Error; err == nil {
+		return true
+	}
+	res := s.DB.Model(&model.RuntimeLease{}).
+		Where("name = ? AND (expires_at < ? OR holder = ?)", name, now, s.instanceID).
+		Updates(map[string]any{"holder": s.instanceID, "expires_at": exp})
+	if res.Error != nil {
+		log.Printf("[lease] 抢占租约 %s 失败: %v", name, res.Error)
+		return false
+	}
+	return res.RowsAffected == 1
+}
+
+// releaseLease 主动交还租约（仅当持有者是自己）。
+//
+// 正常退出时调用：新进程不必等租期到期就能接手采集。
+// 崩溃退出时没人调用，租约自然过期——所以租期本身要短于「可接受的空窗」。
+func (s *Services) releaseLease(name string) {
+	res := s.DB.Model(&model.RuntimeLease{}).
+		Where("name = ? AND holder = ?", name, s.instanceID).
+		Update("expires_at", time.Now().Add(-time.Second))
+	if res.Error != nil {
+		log.Printf("[lease] 交还租约 %s 失败: %v", name, res.Error)
+	}
+}
+
 // collectTraffic 单次采集：拉取 frps 代理状态，计算增量并落库。
 func (s *Services) collectTraffic(ctx context.Context) {
+	// 多实例共用一个库时，每个进程都会启动采集器：各自读同一份 frps 累计值、
+	// 各自算增量、各自累加——同一段流量会被记两遍。进程内的 Runtime.mu 管不到
+	// 别的进程，所以用数据库里的租约把「谁采集」收敛成一个。
+	if !s.acquireLease(leaseTrafficCollector, trafficCollectLease) {
+		if s.collectorOwned.Swap(false) {
+			log.Printf("[traffic] 采集租约已转交其他实例，本实例暂停采集")
+		}
+		return
+	}
+	if !s.collectorOwned.Swap(true) {
+		// 从别的实例手里接管：内存里的基线是旧的，必须按库里的重建，
+		// 否则会把 frps 的当天累计值整个当成新增量记一遍。
+		//
+		// 本进程**首次**取得租约时不重复读：启动流程（StartTrafficCollector）
+		// 已经在第一轮之前读过基线，再读一次只会把「首次迁移」的种子标记
+		// 重新置上，白白丢掉一轮增量。
+		if s.collectorStarted.Swap(true) {
+			if !s.loadTrafficBaseline() {
+				log.Printf("[traffic] 接管采集时读取基线失败，本轮跳过（下轮重试）")
+				return
+			}
+			log.Printf("[traffic] 已接管采集租约，按库中基线继续采集")
+		}
+	}
+
 	proxies, err := s.Frps.ListProxies(ctx)
 	if err != nil {
 		// 采集失败不致命：frps 可能正在重启，下一轮会自动恢复。

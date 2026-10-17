@@ -359,7 +359,12 @@ func TestDeliverMailSkipsActivationWhenVoided(t *testing.T) {
 		t.Fatalf("建待发邮件失败: %v", err)
 	}
 
-	// 模拟「发送期间被换邮箱流程作废」。
+	// 先领取（sending），再模拟「发送期间被换邮箱流程作废」。
+	token, ok := svc.claimMail(row.ID, []string{model.MailPending, model.MailSending},
+		model.MailSending, mailSendLease)
+	if !ok {
+		t.Fatal("领取待发邮件失败")
+	}
 	svc.voidMail(row.ID, "邮箱已更换，邮件作废")
 	if err := svc.DB.First(&row, row.ID).Error; err != nil {
 		t.Fatal(err)
@@ -367,7 +372,7 @@ func TestDeliverMailSkipsActivationWhenVoided(t *testing.T) {
 
 	// 用假发信器：这封信会被真的「发出去」，但状态不能因此被改写。
 	svc.mailerOverride = &fakeMailer{}
-	svc.deliverMail(context.Background(), row)
+	svc.deliverMail(context.Background(), row, token)
 
 	var after model.MailOutbox
 	if err := svc.DB.First(&after, row.ID).Error; err != nil {
@@ -405,7 +410,7 @@ func TestActivateResetTokenRejectsChangedAddress(t *testing.T) {
 	row := mkOutboxRow(t, svc, model.MailKindResetLink, "old@example.com",
 		resetLinkPayload{UserID: u.ID, TokenHash: "stale-addr", TTLSeconds: 600})
 
-	if err := svc.applyMailAction(row); !errors.Is(err, errMailActionObsolete) {
+	if err := svc.applyMailAction(row, claimForTest(t, svc, row)); !errors.Is(err, errMailActionObsolete) {
 		t.Fatalf("收件地址已不是账号当前邮箱，激活应作废，实际 %v", err)
 	}
 	var tokens int64
@@ -415,6 +420,55 @@ func TestActivateResetTokenRejectsChangedAddress(t *testing.T) {
 	}
 	if tokens != 0 {
 		t.Fatal("旧地址的邮件不得激活出重置令牌")
+	}
+}
+
+// TestConfirmEmailChangeBlocksStaleResetActivation 覆盖「换绑后旧地址的邮件仍被激活」。
+//
+// 换绑事务会删掉旧令牌、把旧地址的邮件标成失败；但激活动作若在清理之后才插入
+// 令牌，旧链接就又会生效。两边都锁用户行之后只剩两种顺序：激活先完成（随后被
+// 换绑删掉），或换绑先完成（激活时查到的邮箱已变，作废）。
+func TestConfirmEmailChangeBlocksStaleResetActivation(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{
+		Username: "stalelink", Password: "not-used", Status: model.UserStatusActive,
+		Email: "oldaddr@example.com", EmailVerified: true,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 一封发往旧地址的重置邮件，已送达、尚未激活。
+	stale := mkOutboxRow(t, svc, model.MailKindResetLink, "oldaddr@example.com",
+		resetLinkPayload{UserID: u.ID, TokenHash: "stale-link", TTLSeconds: 600})
+
+	// 完成换绑（此时会作废旧地址的邮件）。
+	seedChangeCode(t, svc, "newaddr@example.com", "445566")
+	if err := svc.ConfirmEmailChange(u.ID, "newaddr@example.com", "445566"); err != nil {
+		t.Fatalf("换绑失败: %v", err)
+	}
+
+	// 旧地址那封信必须已被作废（换绑事务里清理），且再也领不到。
+	var after model.MailOutbox
+	if err := svc.DB.First(&after, stale.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.MailFailed {
+		t.Fatalf("换绑后旧地址的待激活邮件应被作废，实际 %q", after.Status)
+	}
+	if _, ok := svc.claimMail(stale.ID, []string{model.MailDelivered},
+		model.MailActivating, mailActivateLease); ok {
+		t.Fatal("已作废的邮件不该被领取激活")
+	}
+
+	var tokens int64
+	if err := svc.DB.Model(&model.PasswordResetToken{}).
+		Where("token_hash = ?", "stale-link").Count(&tokens).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tokens != 0 {
+		t.Fatal("换绑后不得再激活出旧地址的重置令牌")
 	}
 }
 

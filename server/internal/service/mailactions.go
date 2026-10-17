@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -57,17 +58,35 @@ var errMailActionObsolete = errors.New("目标账号已不存在，凭据动作�
 //
 // 现在顺序反过来：送达到才生效。投递失败只是「这次没收到」，
 // 用户原有的凭据仍然可用，可以随时再试。
-func (s *Services) applyMailAction(row model.MailOutbox) error {
+func (s *Services) applyMailAction(row model.MailOutbox, token string) error {
 	switch row.Kind {
 	case model.MailKindEmailCodeRegister, model.MailKindEmailCodeReset, model.MailKindEmailCodeChange:
-		return s.activateEmailCode(row)
+		return s.activateEmailCode(row, token)
 	case model.MailKindResetLink:
-		return s.activateResetToken(row)
+		return s.activateResetToken(row, token)
 	default:
 		// 未知类型：邮件已经发出去了，但没有凭据要激活。
 		// 不报错——报错会把它标成 failed，而实际上信是发出去的。
 		return nil
 	}
+}
+
+// stillClaimed 在事务内确认这封信仍由本次领取持有。
+//
+// 多实例时租约可能过期、被别的实例接手；也可能在这期间被作废
+// （换邮箱会把旧地址的邮件标成失败并清空参数）。这两种情况下都不该
+// 再激活凭据——否则会出现「清理之后又被写回一份可用令牌」。
+func stillClaimed(tx *gorm.DB, rowID uint, token string) error {
+	var n int64
+	if err := tx.Model(&model.MailOutbox{}).
+		Where("id = ? AND status = ? AND claim_token = ?", rowID, model.MailActivating, token).
+		Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return errMailActionObsolete
+	}
+	return nil
 }
 
 // activateEmailCode 创建验证码记录，并作废同一邮箱同一场景下的旧码。
@@ -87,7 +106,7 @@ func (s *Services) applyMailAction(row model.MailOutbox) error {
 // 秒级精度下同一秒的两封信分不出先后；而且比较的是「已激活的凭据」，
 // 与它有没有被用掉无关——较新的链接被用户用掉之后，旧邮件的延迟重试
 // 仍然必须放弃，否则会把旧链接重新激活成有效凭据。
-func (s *Services) activateEmailCode(row model.MailOutbox) error {
+func (s *Services) activateEmailCode(row model.MailOutbox, token string) error {
 	var p emailCodePayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return err
@@ -96,19 +115,32 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 		return errors.New("验证码缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// 这封信必须仍由本次领取持有：租约过期被别人接手、或期间被作废，
+		// 都不该继续激活。
+		if err := stillClaimed(tx, row.ID, token); err != nil {
+			return err
+		}
+
 		// 找回密码的验证码只对「当前且已验证」的地址有意义。
 		//
 		// 地址被换掉之后（换绑事务可能与本动作交错），旧地址的验证码若照常
 		// 激活，用户在找回页面填新邮箱也查不到它，反倒是旧邮箱持有人拿着
 		// 一个「库里有效」的码——那正是清理之后被反向激活的那条路径。
+		//
+		// 加行锁与换绑串行：换绑同样锁这一行（见 ConfirmEmailChange），
+		// 于是「查邮箱 → 插码」之间不可能插进一次换绑。
 		if p.Scene == EmailSceneReset {
-			var bound int64
-			if err := tx.Model(&model.User{}).
-				Where("lower(email) = ? AND email_verified = ?", strings.ToLower(row.To), true).
-				Count(&bound).Error; err != nil {
+			var u model.User
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("lower(email) = ?", strings.ToLower(row.To)).
+				First(&u).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errMailActionObsolete
+			}
+			if err != nil {
 				return err
 			}
-			if bound == 0 {
+			if !u.EmailVerified {
 				return errMailActionObsolete
 			}
 		}
@@ -158,7 +190,7 @@ func (s *Services) activateEmailCode(row model.MailOutbox) error {
 // activateResetToken 创建重置令牌，并作废该账号的旧令牌。
 // 取代判定与幂等重放见 activateEmailCode 的说明——两者的竞态形态一致：
 // 较早邮件的激活重试不得作废较新邮件刚生效的链接。
-func (s *Services) activateResetToken(row model.MailOutbox) error {
+func (s *Services) activateResetToken(row model.MailOutbox, token string) error {
 	var p resetLinkPayload
 	if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
 		return err
@@ -167,20 +199,27 @@ func (s *Services) activateResetToken(row model.MailOutbox) error {
 		return errors.New("重置令牌缺少有效期参数")
 	}
 	return s.DB.Transaction(func(tx *gorm.DB) error {
-		// 收件地址必须仍是该账号**当前且已验证**的邮箱。
-		//
-		// 只查「账号还在」是不够的：换绑邮箱时会把旧地址的待发/待激活邮件
-		// 标成失败，但发送或激活可能与换绑交错——那一步之后若还按 row.To
-		// 激活，就等于在清理之后又把一份指向旧邮箱的令牌写了回来。
-		// 顺带覆盖两种情形：账号已删除、邮箱已被换掉。
-		var bound int64
-		if err := tx.Model(&model.User{}).
-			Where("id = ? AND lower(email) = ? AND email_verified = ?",
-				p.UserID, strings.ToLower(row.To), true).
-			Count(&bound).Error; err != nil {
+		// 这封信必须仍由本次领取持有（同上）。
+		if err := stillClaimed(tx, row.ID, token); err != nil {
 			return err
 		}
-		if bound == 0 {
+
+		// 收件地址必须仍是该账号**当前且已验证**的邮箱，且这一步要**锁住用户行**。
+		//
+		// 只查不锁是有洞的：本事务查到「还是旧邮箱」，换绑事务随后提交
+		// （删掉旧令牌、把邮件标成失败），本事务最后才插入令牌——清理之后
+		// 又出现一份可用的旧链接。两边都锁同一行之后只剩两种顺序：
+		// 激活先完成（随后被换绑删掉），或换绑先完成（这里查到的邮箱已变，作废）。
+		var u model.User
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&u, p.UserID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errMailActionObsolete
+		}
+		if err != nil {
+			return err
+		}
+		if !u.EmailVerified || !strings.EqualFold(u.Email, row.To) {
 			return errMailActionObsolete
 		}
 		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便

@@ -72,26 +72,74 @@ func TestClaimMailPreventsDoubleSend(t *testing.T) {
 		t.Fatalf("建待发邮件失败: %v", err)
 	}
 
-	now := time.Now()
-	if !svc.claimMail(row.ID, now) {
+	from := []string{model.MailPending, model.MailSending}
+	if _, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease); !ok {
 		t.Fatal("第一次领取应成功")
 	}
-	if svc.claimMail(row.ID, now) {
+	if _, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease); ok {
 		t.Fatal("租约内不该被再次领取（多实例会重复发信）")
 	}
 
-	// 租约到期：崩溃恢复，允许重新领取。
-	if !svc.claimMail(row.ID, now.Add(mailSendLease+time.Second)) {
+	// 租约到期：崩溃恢复，允许重新领取（把 next_at 拨回过去模拟租约过期）。
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+		Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease); !ok {
 		t.Fatal("租约到期后应可重新领取（实例崩溃恢复）")
 	}
 
 	// 已作废的邮件不该被领取。
 	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
-		Update("status", model.MailFailed).Error; err != nil {
+		Updates(map[string]any{"status": model.MailFailed, "next_at": time.Now().Add(-time.Second)}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if svc.claimMail(row.ID, now.Add(2*mailSendLease)) {
+	if _, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease); ok {
 		t.Fatal("已作废的邮件不该被领取")
+	}
+}
+
+// TestClaimMailTokenGuardsWriteBack 覆盖「旧持有者的回写被拒绝」。
+//
+// 租约过期后另一个实例接手，旧持有者的失败回写若不带令牌校验，就会把
+// 新持有者刚领取的行改回待发（甚至把已作废的邮件重新排队，发一封空信）。
+func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	row := &model.MailOutbox{
+		To: "stale@example.com", Subject: "s", Body: "body",
+		Kind: model.MailKindResetLink, Status: model.MailPending, NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(row).Error; err != nil {
+		t.Fatalf("建待发邮件失败: %v", err)
+	}
+
+	from := []string{model.MailPending, model.MailSending}
+	oldToken, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease)
+	if !ok {
+		t.Fatal("第一次领取应成功")
+	}
+
+	// 模拟租约过期、另一实例接手。
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+		Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	newToken, ok := svc.claimMail(row.ID, from, model.MailSending, mailSendLease)
+	if !ok {
+		t.Fatal("租约到期后应可接手")
+	}
+
+	// 旧持有者的失败回写：必须被拒绝。
+	svc.failMail(*row, oldToken, errors.New("smtp 失败"))
+
+	var after model.MailOutbox
+	if err := svc.DB.First(&after, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.MailSending || after.ClaimToken != newToken {
+		t.Fatalf("旧持有者的回写不该生效：status=%q token=%q（期望 sending / %q）",
+			after.Status, after.ClaimToken, newToken)
 	}
 }
 

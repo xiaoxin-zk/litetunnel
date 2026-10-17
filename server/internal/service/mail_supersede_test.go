@@ -19,6 +19,20 @@ import (
 
 // mkOutboxRow 插入一封「已送达、待激活」的发件箱记录并返回（ID 由库分配）。
 // 不需要回拨 created_at：取代判定只看 ID。
+// claimForTest 领取一封「已送达、待激活」的邮件，返回领取令牌。
+//
+// 激活动作现在要求调用方先领取（多实例下防止同一封信被激活两次），
+// 测试也走同一条路径，而不是绕过领取直接调用。
+func claimForTest(t *testing.T, svc *Services, row model.MailOutbox) string {
+	t.Helper()
+	token, ok := svc.claimMail(row.ID, []string{model.MailDelivered},
+		model.MailActivating, mailActivateLease)
+	if !ok {
+		t.Fatalf("领取邮件失败（id=%d，状态 %s）", row.ID, row.Status)
+	}
+	return token
+}
+
 func mkOutboxRow(t *testing.T, svc *Services, kind, to string, payload any) model.MailOutbox {
 	t.Helper()
 	raw, err := json.Marshal(payload)
@@ -79,7 +93,7 @@ func TestResetTokenActionSupersededByNewer(t *testing.T) {
 	}
 
 	// 旧动作重试：必须识别「已被取代」，跳过激活。
-	if err := svc.applyMailAction(rowOld); err == nil {
+	if err := svc.applyMailAction(rowOld, claimForTest(t, svc, rowOld)); err == nil {
 		t.Fatal("旧邮件的激活应报告被取代，而不是静默成功")
 	}
 
@@ -121,7 +135,7 @@ func TestResetTokenSupersededEvenAfterNewOneUsed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.applyMailAction(rowOld); err == nil {
+	if err := svc.applyMailAction(rowOld, claimForTest(t, svc, rowOld)); err == nil {
 		t.Fatal("较新凭据已被使用，旧邮件的激活仍应被拒绝")
 	}
 	if got := countResetTokens(t, svc, "token_hash = ?", "hash-old"); got != 0 {
@@ -147,11 +161,20 @@ func TestMailActionReplayIdempotent(t *testing.T) {
 	row := mkOutboxRow(t, svc, model.MailKindResetLink, u.Email,
 		resetLinkPayload{UserID: u.ID, TokenHash: "hash-once", TTLSeconds: 600})
 
-	if err := svc.applyMailAction(row); err != nil {
+	if err := svc.applyMailAction(row, claimForTest(t, svc, row)); err != nil {
 		t.Fatalf("首次激活应成功: %v", err)
 	}
-	// 重放：不刷新任何状态，直接再执行一遍。
-	if err := svc.applyMailAction(row); err != nil {
+	// 重放：模拟「凭据已生效、但终态没写回」的那次重试——
+	// 把状态放回待激活，再领一次并执行同一个动作。
+	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
+		Updates(map[string]any{
+			"status":      model.MailDelivered,
+			"claim_token": "",
+			"next_at":     time.Now().Add(-time.Second),
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.applyMailAction(row, claimForTest(t, svc, row)); err != nil {
 		t.Fatalf("重放应幂等成功: %v", err)
 	}
 	if got := countResetTokens(t, svc, "token_hash = ?", "hash-once"); got != 1 {
@@ -189,7 +212,7 @@ func TestEmailCodeActionSupersededByNewer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := svc.applyMailAction(rowOld); err == nil {
+	if err := svc.applyMailAction(rowOld, claimForTest(t, svc, rowOld)); err == nil {
 		t.Fatal("旧验证码邮件的激活应报告被取代（新码已使用同样算更新）")
 	}
 	var n int64

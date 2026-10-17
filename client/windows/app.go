@@ -192,15 +192,20 @@ type App struct {
 	// 一次，重复的错误对用户没有新信息。
 	errEmitAt map[uint]time.Time
 
-	// logMu / logBuf / logKick 是日志的批量推送队列，见 appendLogLine。
+	// logMu / logBuf / logKick 是日志的批量推送队列，见 pushLog。
 	//
 	// 不直接逐行 EventsEmit 的原因：frpc 出错时会瞬间刷出上千行，
 	// 每行一次 Wails 调用都要跨进程、序列化、唤醒 JS，这条桥会被堵住，
 	// 反过来把读取管道的协程也拖慢（管道写满后子进程跟着阻塞）。
-	logMu  sync.Mutex
-	logBuf []string
+	//
+	// logBuf 有容量上限（maxLogQueue）：前端消费慢于生产时队列会一直涨，
+	// 而日志洪峰恰恰出现在客户端出问题的时候——那时最不该再把内存吃光。
+	// 触顶时丢弃最旧的并累计到 logDropped，下一次推送会明确告知丢了多少。
+	logMu      sync.Mutex
+	logBuf     []string
+	logDropped int
 	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
-	// 不排队也不阻塞——推送协程醒来时会把积压全部取走。
+	// 不排队也不阻塞——推送协程醒来时取走一批（maxLogBatch 行）。
 	logKick chan struct{}
 
 	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。

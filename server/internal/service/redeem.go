@@ -27,7 +27,8 @@ const codeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 const (
 	// maxRedeemTrafficValue 单张流量码上限：1 PiB。
 	maxRedeemTrafficValue = int64(1) << 50
-	// maxRedeemBalanceValue 单张余额码上限：1 亿元（以分为单位）。
+	// maxRedeemBalanceValue 单张余额码上限：1000 万元（以分为单位，
+	// 10_000_000_00 分 = 1e9 分 = 1e7 元）。
 	maxRedeemBalanceValue = int64(10_000_000_00)
 	// maxRedeemDurationValue 单张时长码上限：100 年（天）。
 	maxRedeemDurationValue = int64(36500)

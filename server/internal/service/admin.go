@@ -712,19 +712,48 @@ func (s *Services) AdminCreateUser(in AdminCreateUserInput) (*model.User, error)
 	}
 	// 邮箱标记为「未验证」：管理员填的邮箱没有走过验证码，
 	// 标成已验证会在「邮箱即身份凭证」的场景下造成误判。
-	u, err := s.insertUser(username, email, in.Password, "", false)
+	user, err := s.prepareNewUser(username, email, in.Password, "", false)
 	if err != nil {
 		return nil, err
 	}
 
-	updates := map[string]any{"remark": truncate(in.Remark, 200)}
-	if in.GroupID > 0 {
-		updates["group_id"] = in.GroupID
-	}
-	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).Updates(updates).Error; err != nil {
+	// 插入用户与分组赋值必须在同一事务，并对目标分组行 FOR UPDATE
+	// （锁序：用户行 → 分组行，与 Redeem / AdminSetUserGroup 一致）。
+	// 原先分两步有两个问题：
+	//
+	//   - 分组赋值这条路径既不验证分组存在、也不锁分组行，并发删除分组
+	//     时会写出一个悬空的 group_id——运行期回落默认分组，界面上
+	//     却显示用户属于那个分组；
+	//   - 第二步失败时接口返回错误，但用户记录已经创建了——管理员重试
+	//     会撞「用户名已存在」，而且库里留下一个分组/备注都不对的半成品。
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := s.insertUserTx(tx, user); err != nil {
+			return err
+		}
+		updates := map[string]any{"remark": truncate(in.Remark, 200)}
+		if in.GroupID > 0 {
+			var g model.Group
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&g, in.GroupID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("%w: 分组不存在", ErrInvalidParam)
+				}
+				return err
+			}
+			updates["group_id"] = g.ID
+		}
+		res := tx.Model(&model.User{}).Where("id = ?", user.ID).Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
-	return s.LoadUser(u.ID)
+	return s.LoadUser(user.ID)
 }
 
 // AdminUpdateUserInput 管理员改号入参。指针字段用于区分「未传」与「传空」。

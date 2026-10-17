@@ -102,6 +102,7 @@ func TestClientConfigSingleTunnel(t *testing.T) {
 		t.Fatalf("整份配置返回 %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
+	fullBody := body // 留一份整份配置，下面用来验证「正文不同则摘要不同」
 	for _, name := range []string{mc1.Name, mc2.Name} {
 		if !strings.Contains(body, `name = "`+name+`"`) {
 			t.Fatalf("整份配置里缺少隧道 %q:\n%s", name, body)
@@ -120,6 +121,23 @@ func TestClientConfigSingleTunnel(t *testing.T) {
 	}
 	if strings.Contains(body, `name = "`+mc2.Name+`"`) {
 		t.Fatalf("单条配置里混进了其他隧道 %q:\n%s", mc2.Name, body)
+	}
+
+	// 2.1) 摘要必须**随正文**返回，且等于这份正文的哈希。
+	//
+	// 客户端拿它判断「本地缓存还要不要刷新」：如果摘要不是由本次正文算出来的，
+	// 而是来自另一次清单渲染，客户端就会把「新正文 + 旧摘要」配成一对缓存，
+	// 之后可能长期跑着过时配置。
+	rev := rec.Header().Get("X-Config-Rev")
+	if rev == "" {
+		t.Fatal("配置响应必须带 X-Config-Rev（客户端据此跳过未变的拉取）")
+	}
+	if want := service.FrpcConfigRev(rec.Body.String()); rev != want {
+		t.Fatalf("X-Config-Rev 与正文不一致: 头 %q, 正文哈希 %q", rev, want)
+	}
+	// 不同的正文必须得到不同的摘要（否则「没变」的判断不成立）。
+	if rev == service.FrpcConfigRev(fullBody) {
+		t.Fatal("单条配置与整份配置的正文不同，摘要不该相同")
 	}
 
 	// 3) 他人的隧道 ID：按「不存在」处理，不能返回别人的配置。

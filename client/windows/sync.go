@@ -371,14 +371,21 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		t    TunnelVO
 		text string
 	}
-	var cached []cachedCfg
-	needFetch := make([]TunnelVO, 0, len(pending))
-	for _, t := range pending {
+	var (
+		cached    []cachedCfg
+		needFetch []TunnelVO
+		// fetchPos 是 needFetch[i] 在 pending(本轮环形顺序)里的下标。
+		// 续传位置必须按这个下标推进,不能按「派发数 + 命中数」——
+		// 命中的隧道散落在清单各处,按总数推进会越过还没处理的那一段。
+		fetchPos []int
+	)
+	for i, t := range pending {
 		if text, ok := a.cachedConfig(t.ID, t.ConfigRev); ok {
 			cached = append(cached, cachedCfg{t: t, text: text})
 			continue
 		}
 		needFetch = append(needFetch, t)
+		fetchPos = append(fetchPos, i)
 	}
 	// 刻意不为「跳过」写日志:每 20 秒一条会把真正有用的行挤出队列,
 	// 而这件事本身没有任何需要用户知道的信息。
@@ -394,7 +401,7 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	// 等齐的话最慢的那一条会把已经取到配置的隧道也挡住。所有状态变更
 	// （写文件、起停、记失败）仍然只发生在主协程的这段循环里，
 	// 并发只存在于网络请求。
-	applyCfg := func(t TunnelVO, cfgText string, cfgErr error) {
+	applyCfg := func(t TunnelVO, cfgText, servedRev string, cfgErr error) {
 		if cfgErr != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
@@ -410,6 +417,15 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 			failSync(t, "服务端未返回该隧道的配置")
 			return
 		}
+
+		// 摘要一律以**产出这份正文的那次响应**为准(响应头 X-Config-Rev),
+		// 而不是清单里那一份:两者是两次渲染,中间隔着一次网络往返,管理端
+		// 在这期间改了隧道的话,「新正文 + 旧摘要」会被配成一对缓存下来,
+		// 之后就可能长期跑着过时的配置。
+		//
+		// 老服务端没有这个头:那就干脆不记账(退回清单摘要会重新引入同样的
+		// 不匹配),该隧道保持逐轮拉取。
+		t.ConfigRev = servedRev
 
 		prev := a.appliedConfigOf(t.ID)
 		cfgChanged := cfgText != prev
@@ -454,23 +470,34 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 
 	results, dispatched := a.streamTunnelConfigs(ctx, base, apiKey, needFetch)
 	for res := range results {
-		applyCfg(res.tunnel, res.text, res.err)
+		applyCfg(res.tunnel, res.text, res.rev, res.err)
 	}
 	// 命中缓存的隧道同样要走一遍应用逻辑：进程可能没在跑、配置可能还没落盘。
 	// 它们不产生网络请求，所以放在拉取之后处理——先完成要等网络的，
 	// 不需要等网络的立刻跟上。
+	// 摘要沿用清单里那一份:命中缓存的前提本就是「清单摘要与本地记账一致」,
+	// 把同一个值写回去,记账的含义不变。
 	for _, c := range cached {
-		applyCfg(c.t, c.text, nil)
+		applyCfg(c.t, c.text, c.t.ConfigRev, nil)
 	}
 	// 记下续传位置：派发是从本轮起点开始、按顺序进行的，派发到哪儿就意味着
 	// 这一轮走到哪儿。下一轮从那里接着来，被截止时间砍掉的尾部排到最前。
 	// 全派发完时它会回到本次的起点（rot + 条数 ≡ rot），顺序保持不变。
 	if n := len(pending); n > 0 {
-		done := int(dispatched.Load()) + len(cached)
-		if done > n {
-			done = n
+		// 必须按**原清单里的位置**推进,不能按「派发数 + 命中缓存数」:
+		// 缓存命中散布在清单各处(哪条没变就跳过哪条),按个数相加等于把游标
+		// 推到更靠后的位置,中间那些还没轮到请求的隧道会被整段跳过;
+		// 极端情况下游标会在两个位置之间来回,尾部几条永远进不了请求队列。
+		next := rot
+		if d := int(dispatched.Load()); d > 0 {
+			if d > len(fetchPos) {
+				d = len(fetchPos)
+			}
+			// fetchPos 是**环形左移之后**的下标,而 syncStart 是在原清单里
+			// 的位置,所以要加回 rot —— 漏掉这一步游标会往回走。
+			next = (rot + fetchPos[d-1] + 1) % n
 		}
-		a.syncStart = (rot + done) % n
+		a.syncStart = next
 	}
 
 	if ctx.Err() != nil {
@@ -497,20 +524,23 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 // fetchTunnelConfig 拉取某条隧道专属的配置文本。
 //
 // 只取这一条：配置文件里只有一条 [[proxies]]，进程之间不会互相干扰。
-func (a *App) fetchTunnelConfig(ctx context.Context, base, apiKey string, id uint) (string, error) {
-	var text string
+func (a *App) fetchTunnelConfig(ctx context.Context, base, apiKey string, id uint) (string, string, error) {
 	endpoint := fmt.Sprintf("%s/api/user/client/config?tunnel_id=%d", base, id)
-	if err := a.getRaw(ctx, endpoint, apiKey, &text); err != nil {
-		return "", err
+	text, rev, err := a.getRawWithRev(ctx, endpoint, apiKey)
+	if err != nil {
+		return "", "", err
 	}
-	return strings.TrimSpace(text), nil
+	return strings.TrimSpace(text), rev, nil
 }
 
 // cfgResult 是一条隧道的配置拉取结果。
 type cfgResult struct {
 	tunnel TunnelVO
 	text   string
-	err    error
+	// rev 是服务端**随这份正文**给出的摘要(响应头 X-Config-Rev)。
+	// 老服务端为空,由调用方退回清单里的 config_rev。
+	rev string
+	err error
 }
 
 // streamTunnelConfigs 并发拉取一批隧道的配置，结果按**完成顺序**流出。
@@ -564,9 +594,9 @@ func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunn
 					if !ok {
 						return
 					}
-					text, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
+					text, rev, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
 					select {
-					case results <- cfgResult{tunnel: t, text: text, err: err}:
+					case results <- cfgResult{tunnel: t, text: text, rev: rev, err: err}:
 					case <-ctx.Done():
 						return
 					}
@@ -658,18 +688,20 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 	if err != nil {
 		return err
 	}
-	// 摘要与本地记账一致时直接用缓存的那份:用户手动点连接时不该再为一个
-	// 已知没变的配置等一次往返(见 cachedConfig)。
-	cfgText, hit := a.cachedConfig(t.ID, t.ConfigRev)
-	if !hit {
-		cfgText, err = a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
-		if err != nil {
-			return err
-		}
+	// 手动点连接一律重新拉取,不受摘要缓存影响。
+	//
+	// 「用户刚刚在网页端改了配置、然后点连接」是最常见的操作顺序,而这中间
+	// 客户端可能还没跑过一轮同步(清单里的 config_rev 还是旧的)。用摘要跳过
+	// 就等于让用户拿到改之前的配置——他改了端口却连到旧端口,而且日志里
+	// 没有任何异常。一次往返换一个「点了就是最新的」,这个代价值得。
+	cfgText, servedRev, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
+	if err != nil {
+		return err
 	}
 	if cfgText == "" {
 		return errors.New("服务端未返回该隧道的配置")
 	}
+	t.ConfigRev = servedRev
 	return a.writeAndStart(t, cfgText)
 }
 

@@ -522,6 +522,50 @@ func TestApplySyncSkipsUnchangedConfig(t *testing.T) {
 	}
 }
 
+// TestFetchTunnelConfigUsesServedRev 覆盖「摘要与正文必须同源」。
+//
+// 清单里的 config_rev 是**另一次**渲染算出来的,中间隔着一次网络往返。
+// 管理端在这期间改了隧道的话,若把清单摘要与新正文配成一对缓存,下一轮
+// 就可能误判「没变」而一直跑旧配置。所以摘要一律取配置响应自带的
+// X-Config-Rev;老服务端没有这个头时宁可不记账(返回空串)。
+func TestFetchTunnelConfigUsesServedRev(t *testing.T) {
+	var withHeader atomic.Bool
+	withHeader.Store(true)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if withHeader.Load() {
+			w.Header().Set(configRevHeader, "rev-from-body")
+		}
+		_, _ = w.Write([]byte("serverAddr = \"127.0.0.1\"\n"))
+	}))
+	defer srv.Close()
+
+	a := &App{http: &http.Client{Timeout: 5 * time.Second}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	text, rev, err := a.fetchTunnelConfig(ctx, srv.URL, "k", 1)
+	if err != nil {
+		t.Fatalf("拉取失败: %v", err)
+	}
+	if rev != "rev-from-body" {
+		t.Fatalf("摘要必须取自本次响应,实际 %q", rev)
+	}
+	if !strings.Contains(text, "serverAddr") {
+		t.Fatalf("正文解析错误: %q", text)
+	}
+
+	// 老服务端:没有头 → 空摘要 → 调用方不记账,保持逐轮拉取。
+	withHeader.Store(false)
+	_, rev, err = a.fetchTunnelConfig(ctx, srv.URL, "k", 1)
+	if err != nil {
+		t.Fatalf("拉取失败: %v", err)
+	}
+	if rev != "" {
+		t.Fatalf("没有响应头时摘要应为空(否则会拿清单摘要冒充),实际 %q", rev)
+	}
+}
+
 // TestApplySyncTreatsEmptyConfigAsFailure 覆盖「空配置被当成成功」。
 //
 // 静默跳过的话这一轮会被记成完全成功（SyncErr 清空、LastSyncAt 更新），

@@ -134,6 +134,58 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 	}
 }
 
+// TestQueryInBatchesCoversAllIDs 覆盖「IN (?) 参数上限」的防御。
+//
+// 一次性把在线隧道涉及的用户 ID 展开进 IN (...) 时，绑定参数个数会随规模
+// 增长（SQLite 32766 / PostgreSQL 65535）。撞上限是直接报错，而采集每 30 秒
+// 跑一次——一次失败就丢掉整轮流量。分批之后批数变多但每批参数有限。
+func TestQueryInBatchesCoversAllIDs(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	const n = 7
+	ids := make([]uint, 0, n)
+	for i := 0; i < n; i++ {
+		u := &model.User{
+			Username: fmt.Sprintf("batch%d", i),
+			Password: "not-used",
+			Status:   model.UserStatusActive,
+		}
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户失败: %v", err)
+		}
+		ids = append(ids, u.ID)
+	}
+
+	old := inQueryBatch
+	inQueryBatch = 2 // 逼出 4 批（2+2+2+1）
+	t.Cleanup(func() { inQueryBatch = old })
+
+	users, err := queryInBatches[model.User](svc.DB, "id", ids)
+	if err != nil {
+		t.Fatalf("分批查询失败: %v", err)
+	}
+	if len(users) != n {
+		t.Fatalf("分批查询必须覆盖全部 id：期望 %d 条，实际 %d 条", n, len(users))
+	}
+	seen := make(map[uint]bool, n)
+	for i := range users {
+		if seen[users[i].ID] {
+			t.Fatalf("id %d 被重复返回（批次边界算错了）", users[i].ID)
+		}
+		seen[users[i].ID] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Fatalf("id %d 没有被查到（批次漏了尾部）", id)
+		}
+	}
+
+	// 空集合不该发出任何查询，也不该报错。
+	if got, err := queryInBatches[model.Tunnel](svc.DB, "user_id", nil); err != nil || len(got) != 0 {
+		t.Fatalf("空 id 集合应返回空结果，实际 %d 条 / %v", len(got), err)
+	}
+}
+
 // TestAllocatePortIsRandom 覆盖「端口按固定顺序分配、外部可预测」。
 //
 // 从前的起点由用户 ID 派生、然后顺序向后扫：同一用户每次都拿到池里靠前的

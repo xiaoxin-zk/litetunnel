@@ -141,6 +141,95 @@ func TestSyncRoundResumesAfterTimeout(t *testing.T) {
 	}
 }
 
+// TestSyncCursorFollowsManifestPosition 覆盖「缓存命中把游标推过头」。
+//
+// 续传位置必须按**原清单里的位置**推进,而不是「派发数 + 命中缓存数」:
+// 命中缓存是散布在清单各处的(哪条没变跳过哪条),按个数相加会把游标推到
+// 清单里更靠后的位置,中间那些还没轮到请求的隧道被整段跳过。极端情况下
+// (前几批一直超时)游标会在两个位置之间来回,尾部几条永远进不了请求队列,
+// 一直跑着旧配置或压根没启动。
+func TestSyncCursorFollowsManifestPosition(t *testing.T) {
+	oldTimeout := syncRoundTimeout
+	syncRoundTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { syncRoundTimeout = oldTimeout })
+
+	const total = 40
+
+	var mu sync.Mutex
+	requested := map[string]bool{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			mu.Lock()
+			requested[r.URL.Query().Get("tunnel_id")] = true
+			mu.Unlock()
+			<-r.Context().Done() // 挂到本轮超时
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var sb strings.Builder
+		sb.WriteString(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[`)
+		for i := 0; i < total; i++ {
+			if i != 0 {
+				sb.WriteString(",")
+			}
+			id := i + 1
+			// 奇数位隧道带摘要(测试里当作「已缓存」),偶数位不带(需要拉取)。
+			rev := ""
+			if i%2 == 1 {
+				rev = `,"config_rev":"rev-` + itoa(i) + `"`
+			}
+			sb.WriteString(`{"id":` + itoa(id) + `,"name":"t","type":"tcp","status":"active"` + rev + `}`)
+		}
+		sb.WriteString(`]}}`)
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newSyncTestApp(t, srv)
+	// 构造「这些隧道上一轮已经成功应用过」的状态:摘要与本地记账一致,
+	// 于是这一轮它们不需要再拉。
+	for i := 0; i < total; i++ {
+		if i%2 != 1 {
+			continue
+		}
+		id := uint(i + 1)
+		a.applied[id] = "serverAddr = \"127.0.0.1\"\n"
+		a.cfgRev[id] = "rev-" + itoa(i)
+	}
+
+	_, _ = a.applySync()
+
+	// 本轮实际请求到的隧道在清单里的最大位次,就是游标该停的地方。
+	maxIdx := -1
+	mu.Lock()
+	var bad []string
+	for i := 0; i < total; i++ {
+		if !requested[itoa(i+1)] {
+			continue
+		}
+		if i%2 != 0 {
+			bad = append(bad, itoa(i+1)) // 带了摘要,不该被请求
+		}
+		if i > maxIdx {
+			maxIdx = i
+		}
+	}
+	mu.Unlock()
+
+	if maxIdx < 0 {
+		t.Fatal("本轮应至少派发出一条配置请求")
+	}
+	if len(bad) > 0 {
+		t.Fatalf("带摘要(无需拉取)的隧道不该被请求:%v", bad)
+	}
+	want := (maxIdx + 1) % total
+	if a.syncStart != want {
+		t.Fatalf("续传位置 = %d,期望 %d:必须跟着最后一个被派发的隧道走，"+
+			"按「派发数 + 命中缓存数」推进会整段跳过未被请求的隧道", a.syncStart, want)
+	}
+}
+
 // TestStreamTunnelConfigsStopsOnCanceledContext 覆盖「截止后不再派发」。
 //
 // 取消的 context 下，worker 不应再发起任何请求，结果通道正常关闭，

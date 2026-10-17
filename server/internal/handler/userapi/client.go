@@ -285,6 +285,14 @@ func (h *Handler) ClientConfig(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
+	// 摘要随**正文**一起返回,而不是只放在清单里。
+	//
+	// 清单里的 config_rev 是另一次请求(另一次渲染)算出来的:两次请求之间
+	// 管理端若改了隧道或分组,客户端就可能把「新正文 + 旧摘要」配成一对缓存
+	// 下来。虽然下一轮通常能纠正,但只要服务端在下一轮之前又回到旧摘要,
+	// 客户端就会误判缓存有效,一直跑着过时的配置。
+	// 这里用**本次正文**的哈希,客户端核对的就是它自己那份字节。
+	c.Header("X-Config-Rev", service.FrpcConfigRev(text))
 	if c.Query("download") == "1" {
 		c.Header("Content-Disposition", `attachment; filename="frpc.toml"`)
 	}

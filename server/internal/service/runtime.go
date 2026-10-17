@@ -748,6 +748,36 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 	}()
 }
 
+// inQueryBatch 是 IN (?) 查询的单批参数个数。
+//
+// 取 500：远低于两个驱动的绑定参数上限（SQLite 32766、PostgreSQL 65535），
+// 同时把一轮采集的往返次数压在个位数量级——再大只是把上限推得更近。
+// 用变量而不是常量：测试里压小它才能覆盖分批逻辑。
+var inQueryBatch = 500
+
+// queryInBatches 把 ids 切成若干批逐批查询，合并结果。
+//
+// 一次性展开 ids 时，绑定参数个数随在线隧道数增长：撞上驱动的上限会直接
+// 报错，而这条路径每 30 秒跑一次，一次失败就丢掉整轮流量采集。
+//
+// column 只接受内部常量（"id" / "user_id"），不来自用户输入。
+// 返回顺序不保证：调用方都是建映射表，与顺序无关。
+func queryInBatches[T any](db *gorm.DB, column string, ids []uint) ([]T, error) {
+	var out []T
+	for start := 0; start < len(ids); start += inQueryBatch {
+		end := start + inQueryBatch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var batch []T
+		if err := db.Where(column+" IN ?", ids[start:end]).Find(&batch).Error; err != nil {
+			return nil, err
+		}
+		out = append(out, batch...)
+	}
+	return out, nil
+}
+
 // collectTraffic 单次采集：拉取 frps 代理状态，计算增量并落库。
 func (s *Services) collectTraffic(ctx context.Context) {
 	proxies, err := s.Frps.ListProxies(ctx)
@@ -801,8 +831,11 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	tunnelByKey := make(map[tunnelKey]*model.Tunnel, len(refs))
 	tunnelOwner := make(map[uint]uint, len(refs))
 	if len(userIDs) > 0 {
-		var users []model.User
-		if err := s.DB.Where("id IN ?", userIDs).Find(&users).Error; err != nil {
+		// 分批查而不是一次性展开：IN (?) 占用的绑定参数个数随在线隧道数增长，
+		// SQLite 的上限是 32766（更早的编译选项下还要小），PostgreSQL 是 65535。
+		// 撞上限是直接报错，而这条路径每 30 秒跑一次——一次失败就丢掉整轮采集。
+		users, err := queryInBatches[model.User](s.DB, "id", userIDs)
+		if err != nil {
 			log.Printf("[traffic] 载入用户失败: %v", err)
 			return
 		}
@@ -812,8 +845,8 @@ func (s *Services) collectTraffic(ctx context.Context) {
 
 		// 隧道按用户收敛，再在内存里按名字匹配：单个用户的隧道数有限，
 		// 比把全表读进来便宜得多。
-		var tunnels []model.Tunnel
-		if err := s.DB.Where("user_id IN ?", userIDs).Find(&tunnels).Error; err != nil {
+		tunnels, err := queryInBatches[model.Tunnel](s.DB, "user_id", userIDs)
+		if err != nil {
 			log.Printf("[traffic] 载入隧道失败: %v", err)
 			return
 		}

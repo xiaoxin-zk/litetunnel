@@ -87,7 +87,7 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{
-		"message": "如果该账号存在且已绑定邮箱，我们已发送重置链接，请查收（30 分钟内有效）",
+		"message": "找回请求已受理；若账号符合条件，将发送重置链接。若长时间未收到，请稍后重新申请",
 	})
 }
 
@@ -239,8 +239,12 @@ func (h *Handler) SendEmailCode(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
+	message := "验证码已发送，请查收（10 分钟内有效）"
+	if req.Scene == service.EmailSceneReset {
+		message = "找回请求已受理；若邮箱符合条件，将发送验证码。若长时间未收到，请稍后重新申请"
+	}
 	httpx.OK(c, gin.H{
-		"message":   "验证码已发送，请查收（10 分钟内有效）",
+		"message":   message,
 		"expire_in": 600,
 	})
 }

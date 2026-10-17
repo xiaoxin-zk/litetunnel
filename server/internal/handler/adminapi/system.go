@@ -100,6 +100,7 @@ func (h *Handler) SystemMetrics(c *gin.Context) {
 		// 不需要在前端再硬编码一份——两处写死迟早会不一致。
 		"sample_interval": int(monitor.SampleInterval.Seconds()),
 		"max_samples":     monitor.MaxSamples,
+		"recovery":        h.svc.RecoveryStats(),
 	})
 }
 

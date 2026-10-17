@@ -143,8 +143,9 @@ type Services struct {
 
 	// mailWake 用于唤醒发信协程（邮件本身存在发件箱表里，不走内存队列：
 	// 内存队列重启即丢，而验证码/重置链接一旦丢了，用户就找不回账号）。
-	mailWake   chan struct{}
-	recoveryCh chan recoveryRequest
+	mailWake         chan struct{}
+	recoveryCh       chan recoveryRequest
+	recoveryCounters *recoveryCounters
 	// mailerOverride 仅供测试注入发信替身，非 nil 时优先于真实 SMTP 配置。
 	mailerOverride mailSender
 
@@ -286,13 +287,14 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		// 每次启动重新生成——重启后的实例本来就不该继承上一个进程的租约。
 		instanceID: newInstanceID(),
 
-		Monitor:    monitor.New(cfg.MonitorDiskPath),
-		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
-		loginFails: newLoginFailureCounter(),
-		mailWake:   make(chan struct{}, 1),
-		recoveryCh: make(chan recoveryRequest, recoveryBuffer),
-		fwPending:  map[int]pendingFW{},
-		fwKick:     make(chan struct{}, 1),
+		Monitor:          monitor.New(cfg.MonitorDiskPath),
+		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
+		loginFails:       newLoginFailureCounter(),
+		mailWake:         make(chan struct{}, 1),
+		recoveryCh:       make(chan recoveryRequest, recoveryBuffer),
+		recoveryCounters: &recoveryCounters{},
+		fwPending:        map[int]pendingFW{},
+		fwKick:           make(chan struct{}, 1),
 	}
 }
 

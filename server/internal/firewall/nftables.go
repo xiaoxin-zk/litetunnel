@@ -39,12 +39,12 @@ func (n *Nftables) ensureTable() error {
 	return err
 }
 
-func (n *Nftables) compatible() error {
+func (n *Nftables) compatible(target ...int) error {
 	out, err := run("nft", "-j", "list", "ruleset")
 	if err != nil {
 		return err
 	}
-	return checkNftInputCompatibility([]byte(out))
+	return checkNftInputCompatibility([]byte(out), target...)
 }
 
 type nftChainSpec struct {
@@ -56,14 +56,15 @@ type nftChainSpec struct {
 	Policy string `json:"policy"`
 }
 
-func checkNftInputCompatibility(raw []byte) error {
+func checkNftInputCompatibility(raw []byte, target ...int) error {
 	var dump struct {
 		Objects []struct {
 			Chain *nftChainSpec `json:"chain"`
 			Rule  *struct {
-				Family string `json:"family"`
-				Table  string `json:"table"`
-				Chain  string `json:"chain"`
+				Family string                       `json:"family"`
+				Table  string                       `json:"table"`
+				Chain  string                       `json:"chain"`
+				Expr   []map[string]json.RawMessage `json:"expr"`
 			} `json:"rule"`
 		} `json:"nftables"`
 	}
@@ -89,6 +90,17 @@ func checkNftInputCompatibility(raw []byte) error {
 		if owned {
 			if c.Type != "filter" || c.Hook != "input" || c.Policy != "accept" {
 				return fmt.Errorf("nftables 专属链规格不兼容，未修改规则")
+			}
+			continue
+		}
+		if c.Type == "nat" && c.Hook == "prerouting" && c.Policy == "accept" && (c.Family == "ip" || c.Family == "ip6" || c.Family == "inet") {
+			if len(target) > 0 {
+				for _, object := range dump.Objects {
+					r := object.Rule
+					if r != nil && r.Family == c.Family && r.Table == c.Table && !nftNATRuleSafe(r.Expr, target[0]) {
+						return fmt.Errorf("nftables NAT 表 %s/%s 可能改写或拦截端口 %d，未修改规则", c.Family, c.Table, target[0])
+					}
+				}
 			}
 			continue
 		}
@@ -160,7 +172,7 @@ func (n *Nftables) AddPort(port int, proto string) error {
 	if err != nil {
 		return err
 	}
-	if err := n.compatible(); err != nil {
+	if err := n.compatible(port); err != nil {
 		return err
 	}
 	if err := n.ensureTable(); err != nil {

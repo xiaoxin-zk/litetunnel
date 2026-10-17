@@ -79,6 +79,9 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 	}
 
 	u, err := s.findUserByAccount(account)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		s.recordRecoveryFailure()
+	}
 	if err != nil || u.Email == "" || !u.EmailVerified || u.Status != model.UserStatusActive {
 		// 静默返回，不区分具体原因。
 		//
@@ -91,6 +94,7 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 
 	plain, hash, err := newResetToken()
 	if err != nil {
+		s.recordRecoveryFailure()
 		log.Printf("[reset] 生成令牌失败: %v", err)
 		return nil
 	}
@@ -137,6 +141,9 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 		// 入队时的令牌版本：送达后激活时要拿它复核「期间有没有改过密码」。
 		TokenVersion: &tokenVersion,
 	}, mailQuota{cooldown: resetLinkCooldown, dailyLimit: resetLinkDailyPerEmail}); err != nil {
+		if !errors.Is(err, errMailQuotaCooldown) && !errors.Is(err, errMailQuotaDaily) {
+			s.recordRecoveryFailure()
+		}
 		log.Printf("[reset] 重置邮件未发出（账号 %d），原有令牌未受影响: %v", u.ID, err)
 		return nil
 	}

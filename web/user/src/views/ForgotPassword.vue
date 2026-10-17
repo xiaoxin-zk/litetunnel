@@ -126,7 +126,7 @@ async function sendCode() {
   try {
     // scene=reset：无论邮箱是否注册过都返回成功，避免这个接口变成账号枚举工具
     await authApi.sendEmailCode({ email: account, scene: 'reset' })
-    ElMessage.success('验证码已发送，请查收')
+    ElMessage.success('找回请求已受理；若长时间未收到验证码，请稍后重新申请')
     countdown.value = 60
     const timer = setInterval(() => {
       countdown.value -= 1

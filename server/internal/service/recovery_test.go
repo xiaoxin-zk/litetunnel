@@ -42,6 +42,9 @@ func TestRecoveryPublicRequestsDoNotQueryAccounts(t *testing.T) {
 	if queries == 0 {
 		t.Fatal("数据库故障必须在后台路径触发")
 	}
+	if svc.RecoveryStats()["failed"] != 4 {
+		t.Fatal("所有后台数据库故障都必须计数")
+	}
 }
 
 func TestRecoveryQueueFullIsAccountIndependent(t *testing.T) {
@@ -55,6 +58,9 @@ func TestRecoveryQueueFullIsAccountIndependent(t *testing.T) {
 	}
 	if err := svc.SendEmailCode("any@example.com", EmailSceneReset, "127.0.0.1"); !errors.Is(err, ErrMailQueueFull) {
 		t.Fatal(err)
+	}
+	if svc.RecoveryStats()["rejected"] != 3 {
+		t.Fatal("队列满必须计数")
 	}
 }
 

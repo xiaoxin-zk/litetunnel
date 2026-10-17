@@ -3,10 +3,32 @@ package service
 import (
 	"context"
 	"log"
+	"sync/atomic"
 	"time"
 )
 
 const recoveryBuffer = 256
+
+type recoveryCounters struct {
+	rejected atomic.Uint64
+	failed   atomic.Uint64
+}
+
+func (s *Services) RecoveryStats() map[string]uint64 {
+	return map[string]uint64{
+		"queued":   uint64(len(s.recoveryCh)),
+		"capacity": uint64(cap(s.recoveryCh)),
+		"rejected": s.recoveryCounters.rejected.Load(),
+		"failed":   s.recoveryCounters.failed.Load(),
+	}
+}
+
+func (s *Services) recordRecoveryFailure() {
+	if s.recoveryCounters != nil {
+		s.recoveryCounters.failed.Add(1)
+	}
+	log.Printf("[recovery] 后台处理失败，请求可能未进入发件箱；用户需要重新申请")
+}
 
 // 请求预处理队列不含凭据，重启前尚未写入发件箱的请求需要用户重新申请。
 // 已写入发件箱的邮件仍由持久化队列保证重试与恢复。
@@ -25,6 +47,10 @@ func (s *Services) enqueueRecovery(req recoveryRequest) error {
 	case s.recoveryCh <- req:
 		return nil
 	default:
+		if s.recoveryCounters != nil {
+			s.recoveryCounters.rejected.Add(1)
+		}
+		log.Printf("[recovery] 请求队列已满，拒绝受理")
 		return ErrMailQueueFull
 	}
 }
@@ -37,7 +63,7 @@ func (s *Services) processRecovery(req recoveryRequest) {
 		err = s.requestPasswordReset(req.account, req.ip, req.baseURL)
 	}
 	if err != nil {
-		log.Printf("[recovery] 请求处理失败，请稍后重新申请")
+		s.recordRecoveryFailure()
 	}
 }
 
@@ -56,7 +82,7 @@ func (s *Services) StartRecoveryWorker(ctx context.Context) {
 					return
 				}
 				workCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				worker := &Services{DB: s.DB.WithContext(workCtx), Cfg: s.Cfg, Settings: s.Settings, mailWake: s.mailWake}
+				worker := &Services{DB: s.DB.WithContext(workCtx), Cfg: s.Cfg, Settings: s.Settings, mailWake: s.mailWake, recoveryCounters: s.recoveryCounters}
 				worker.processRecovery(req)
 				cancel()
 			}

@@ -127,6 +127,7 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 			Select("id", "token_version").
 			Where("lower(email) = ? AND email_verified = ?", strings.ToLower(email), true).
 			First(&u).Error; err != nil {
+			s.recordRecoveryFailure()
 			log.Printf("[emailcode] 读取找回验证码的账号版本失败，本次不发送（对外仍返回成功）: %v", err)
 			return nil
 		}
@@ -141,6 +142,7 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		// 但接口层会把它转成一次失败响应）。注册/换绑场景必须如实报错——
 		// 用户需要知道验证码没发出去，而且那里本来就要告知邮箱占用。
 		if scene == EmailSceneReset {
+			s.recordRecoveryFailure()
 			log.Printf("[emailcode] 生成找回验证码失败，本次不发送（对外仍返回成功）: %v", err)
 			return nil
 		}
@@ -184,6 +186,9 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		// 找回场景必须保持「不暴露账号是否存在、是否被限流」：这里已经走完了
 		// 账号判断，返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
 		if scene == EmailSceneReset {
+			if !errors.Is(err, errMailQuotaCooldown) && !errors.Is(err, errMailQuotaDaily) {
+				s.recordRecoveryFailure()
+			}
 			log.Printf("[emailcode] 找回密码的验证码未发出（邮箱 %s）: %v", maskEmail(email), err)
 			return nil
 		}

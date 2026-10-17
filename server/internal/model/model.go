@@ -467,6 +467,12 @@ type FirewallPending struct {
 	Open bool `gorm:"not null" json:"open"`
 	// Attempts 已重试次数，达到上限后放弃并记录日志。
 	Attempts int `gorm:"not null;default:0" json:"attempts"`
+	// Exhausted 为 true 表示重试已到上限、自动处理终止：
+	// 记录保留在管理页上，等管理员手工处理。
+	//
+	// 以前到上限是直接删记录，只留一行日志——日志一滚动就什么线索都没有了，
+	// 「该收回的端口一直开着」这件事从此在界面上任何地方都看不出来。
+	Exhausted bool `gorm:"not null;default:0" json:"exhausted"`
 	// LastErr 最后一次失败原因，供排查用。
 	LastErr   string    `gorm:"size:255" json:"last_err"`
 	CreatedAt time.Time `json:"created_at"`

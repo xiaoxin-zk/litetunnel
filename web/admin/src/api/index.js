@@ -134,7 +134,9 @@ export const firewallApi = {
   status: () => http.get('/firewall/status'),
   rescan: () => http.post('/firewall/rescan'),
   open: (port, proto) => http.post('/firewall/ports', { port, proto }),
-  close: (port, proto) => http.delete('/firewall/ports', { data: { port, proto } })
+  close: (port, proto) => http.delete('/firewall/ports', { data: { port, proto } }),
+  // 清除一条重试已终止的失败记录：只在管理员人工处理完之后用。
+  clearFailed: (port) => http.post('/firewall/failed/clear', { port })
 }
 
 export const settingsApi = {

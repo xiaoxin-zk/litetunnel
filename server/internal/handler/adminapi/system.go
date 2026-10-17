@@ -226,6 +226,26 @@ func (h *Handler) FirewallClosePort(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "端口已关闭"})
 }
 
+// FirewallClearFailed 清除一条重试已终止的失败记录。
+//
+// 语义是「管理员已经人工处理完了，不再需要界面提醒」，而不是「再试一次」：
+// 后台对终态记录不再自动重试，修好宿主机后想让它补做，用上面的
+// 手工放行/关闭，或重新触发一次隧道状态变更。
+func (h *Handler) FirewallClearFailed(c *gin.Context) {
+	var req firewallPortReq
+	if err := c.ShouldBindJSON(&req); err != nil || req.Port <= 0 {
+		httpx.BadRequest(c, "请填写端口号")
+		return
+	}
+	if err := h.svc.ClearFirewallFailed(req.Port); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "firewall.clear_failed", "firewall", strconv.Itoa(req.Port),
+		fmt.Sprintf("清除已终止的失败记录（端口 %d）", req.Port))
+	httpx.OK(c, gin.H{"message": "记录已清除"})
+}
+
 // FirewallRescan 重新扫描端口占用并输出可用区间，供管理页刷新用。
 func (h *Handler) FirewallRescan(c *gin.Context) {
 	httpx.OK(c, gin.H{

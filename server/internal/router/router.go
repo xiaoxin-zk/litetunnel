@@ -324,6 +324,7 @@ func New(
 		adminSuper.POST("/firewall/rescan", adminH.FirewallRescan)
 		adminSuper.POST("/firewall/ports", adminH.FirewallOpenPort)
 		adminSuper.DELETE("/firewall/ports", adminH.FirewallClosePort)
+		adminSuper.POST("/firewall/failed/clear", adminH.FirewallClearFailed)
 
 		// 域名与证书的下发会改宿主机上的 Caddyfile / frps.toml 并重建容器，
 		// 配错直接等于「网站打不开、隧道全断」，因此仅超级管理员可操作。

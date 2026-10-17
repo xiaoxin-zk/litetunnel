@@ -66,6 +66,60 @@
       />
     </div>
 
+    <!-- ============ 重试与失败 ============ -->
+    <!-- 有待重试或已终止的记录才显示这一块：平时不占版面 -->
+    <div
+      v-if="(fw.pending_ops?.length || 0) + (fw.failed_ops?.length || 0) > 0"
+      class="lt-card"
+      style="margin-top: 16px"
+    >
+      <div class="lt-card-title">重试与失败</div>
+
+      <el-alert
+        v-if="fw.pending_ops?.length"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 12px"
+        :title="`有 ${fw.pending_ops.length} 个端口操作正在后台重试`"
+        :description="`当前队列：${fw.pending_ops.join('，')}。这些是建隧道/停用时因 helper 暂时不可用而没有生效的规则，后台会自动补做，无需处理。`"
+      />
+
+      <template v-if="fw.failed_ops?.length">
+        <el-alert
+          type="error"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+          title="以下端口操作已重试耗尽，面板不再自动处理"
+          description="该放行的端口没有放行（用户隧道连不上），该收回的端口一直开着（隧道已删、规则残留）。请按「补做」重试一次（走手工路径，会如实报错），修好宿主机后再操作；处理完成后可清除记录。"
+        />
+        <el-table :data="fw.failed_ops" size="small" stripe>
+          <el-table-column label="端口" prop="port" width="90" />
+          <el-table-column label="协议" width="80">
+            <template #default="{ row }">
+              <el-tag size="small" effect="plain">{{ row.proto.toUpperCase() }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="待办操作" width="100">
+            <template #default="{ row }">{{ row.open ? '放行' : '收回' }}</template>
+          </el-table-column>
+          <el-table-column label="重试次数" prop="attempts" width="90" />
+          <el-table-column label="最后一次错误" min-width="220">
+            <template #default="{ row }">
+              <span class="mono">{{ row.last_err || '-' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="150">
+            <template #default="{ row }">
+              <el-button link type="primary" :loading="acting" @click="retryFailed(row)">补做</el-button>
+              <el-button link type="danger" @click="clearFailed(row)">清除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+    </div>
+
     <!-- ============ 端口池 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">端口池使用情况</div>
@@ -320,6 +374,39 @@ async function closePort(row) {
   )
   await firewallApi.close(row.port, row.proto)
   ElMessage.success('端口已关闭')
+  await load()
+}
+
+// 终态失败的「补做」：走手工放行/关闭路径——那是管理员明确点的按钮，
+// 成功失败都会如实反馈，不会像自动路径那样静默跳过。
+// 成功后顺手清掉这条终态记录：意图已经由管理员亲手完成了。
+async function retryFailed(row) {
+  acting.value = true
+  try {
+    if (row.open) {
+      await firewallApi.open(row.port, row.proto)
+      ElMessage.success('端口已放行')
+    } else {
+      await firewallApi.close(row.port, row.proto)
+      ElMessage.success('端口已收回')
+    }
+    await firewallApi.clearFailed(row.port).catch(() => {})
+    await load()
+  } finally {
+    acting.value = false
+  }
+}
+
+// 只清记录、不动规则：管理员确认「这件事不需要面板再惦记」时用。
+async function clearFailed(row) {
+  await ElMessageBox.confirm(
+    `清除 ${row.port}/${row.proto} 的失败记录后，面板不再提示这个端口。` +
+      '请确认该端口的规则已由你手工处理（或本来就不需要处理）。',
+    '清除失败记录',
+    { type: 'warning', confirmButtonText: '确认清除', cancelButtonText: '取消' }
+  )
+  await firewallApi.clearFailed(row.port)
+  ElMessage.success('记录已清除')
   await load()
 }
 

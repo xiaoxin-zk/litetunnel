@@ -160,10 +160,11 @@ func portsOfTunnels(tunnels []model.Tunnel) []portProto {
 // 之后用户又把它启用了（要放行），若两条记录并存，后台重试会照着旧的
 // 那条把端口关掉，正好关掉刚启用的隧道。
 type pendingFW struct {
-	open     bool
-	proto    string
-	attempts int
-	lastErr  string
+	open      bool
+	proto     string
+	attempts  int
+	lastErr   string
+	exhausted bool
 }
 
 const (
@@ -172,7 +173,9 @@ const (
 	// pendingFWMaxAttempts 是同一端口的最大重试次数。
 	//
 	// 必须有上限：有些失败是**永久性**的（端口在保护列表里、不在端口池内），
-	// 无限重试只会每两分钟刷一次同样的日志。到上限后放弃并明确要求人工清理。
+	// 无限重试只会每两分钟刷一次同样的日志。到上限后终止自动处理——
+	// 记录保留下来（exhausted=true），由管理页暴露给管理员，而不是
+	// 像以前那样删掉记录、只留一行迟早被滚动掉的日志。
 	pendingFWMaxAttempts = 5
 	// pendingFWLimit 是待重试队列的长度上限，防止异常情况下无限增长。
 	pendingFWLimit = 512
@@ -184,12 +187,20 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) {
 	if s.fwPending == nil {
 		s.fwPending = map[int]pendingFW{}
 	}
-	_, exists := s.fwPending[port]
+	prev, exists := s.fwPending[port]
 	// 已有记录时**覆盖**为最新意图（而不是保留旧的）：见 pendingFW 的注释。
 	// 覆盖时保留已累计的重试次数，避免「意图反复变化」把上限重置掉。
+	//
+	// 例外：旧意图已经重试耗尽、而这回是**另一个**意图时，从零开始计——
+	// 意图已经变了，说明端口的世界变了（新隧道启用、旧的已删），
+	// 新意图该有自己完整的一轮预算；沿用旧计数会让它第一次失败就再次
+	// 被判为终态。同一意图的再次尝试不在此列，那正是上限要拦的。
 	attempts := 0
 	if exists {
-		attempts = s.fwPending[port].attempts
+		attempts = prev.attempts
+		if prev.exhausted && (prev.open != open || prev.proto != proto) {
+			attempts = 0
+		}
 	} else if len(s.fwPending) >= pendingFWLimit {
 		s.fwMu.Unlock()
 		log.Printf("[firewall] 待处理端口操作已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
@@ -208,15 +219,16 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) {
 // 只是这次重启后会丢——比让整个防火墙操作失败要好）。
 func (s *Services) persistPending(port int, item pendingFW) {
 	rec := model.FirewallPending{
-		Port:     port,
-		Proto:    item.proto,
-		Open:     item.open,
-		Attempts: item.attempts,
-		LastErr:  truncate(item.lastErr, 255),
+		Port:      port,
+		Proto:     item.proto,
+		Open:      item.open,
+		Attempts:  item.attempts,
+		Exhausted: item.exhausted,
+		LastErr:   truncate(item.lastErr, 255),
 	}
 	if err := s.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "port"}},
-		DoUpdates: clause.AssignmentColumns([]string{"proto", "open", "attempts", "last_err"}),
+		DoUpdates: clause.AssignmentColumns([]string{"proto", "open", "attempts", "exhausted", "last_err"}),
 	}).Create(&rec).Error; err != nil {
 		log.Printf("[firewall] 待办落库失败（端口 %d，重启后会丢失这条意图）: %v", port, err)
 	}
@@ -254,6 +266,7 @@ func (s *Services) loadPendingFirewall() {
 	for _, r := range recs {
 		s.fwPending[r.Port] = pendingFW{
 			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
+			exhausted: r.Exhausted,
 		}
 	}
 	n := len(s.fwPending)
@@ -363,12 +376,18 @@ func (s *Services) portIntentValid(port int, open bool) (bool, error) {
 	return (t.Status == model.TunnelStatusActive) == open, nil
 }
 
-// PendingFirewallOps 返回待处理的端口操作（形如 "20001/tcp 待收回"），供管理页展示。
+// PendingFirewallOps 返回仍在重试的端口操作（形如 "20001/tcp 待收回"），供管理页展示。
+//
+// 只含**还没到终态**的；已耗尽的由 FailedFirewallOps 单独展示——
+// 两类东西的处置完全不同：前者等下一轮重试就行，后者必须管理员出手。
 func (s *Services) PendingFirewallOps() []string {
 	s.fwMu.Lock()
 	defer s.fwMu.Unlock()
 	out := make([]string, 0, len(s.fwPending))
 	for port, item := range s.fwPending {
+		if item.exhausted {
+			continue
+		}
 		action := "待收回"
 		if item.open {
 			action = "待放行"
@@ -379,11 +398,69 @@ func (s *Services) PendingFirewallOps() []string {
 	return out
 }
 
+// FirewallFailedOp 是一条重试已终止、等待人工处理的端口操作，供管理页展示。
+type FirewallFailedOp struct {
+	Port     int    `json:"port"`
+	Proto    string `json:"proto"`
+	Open     bool   `json:"open"`
+	Attempts int    `json:"attempts"`
+	LastErr  string `json:"last_err,omitempty"`
+}
+
+// FailedFirewallOps 返回已耗尽重试、保留待人工处理的端口操作。
+//
+// 这里只做快照，不重查数据库现状：终态记录的过时清理由重试循环
+// 每轮做一次（见 retryPendingFirewall），展示层重复一遍只会让一次
+// GET 也具备写语义。
+func (s *Services) FailedFirewallOps() []FirewallFailedOp {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	out := make([]FirewallFailedOp, 0, len(s.fwPending))
+	for port, item := range s.fwPending {
+		if !item.exhausted {
+			continue
+		}
+		out = append(out, FirewallFailedOp{
+			Port:     port,
+			Proto:    item.proto,
+			Open:     item.open,
+			Attempts: item.attempts,
+			LastErr:  truncate(item.lastErr, 255),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
+	return out
+}
+
+// ClearFirewallFailed 清除一条已终止的失败记录。
+//
+// 管理员人工处理完（手工放行/关闭了端口、或确认那条规则本来就不存在）
+// 之后调用。只允许清除终态记录：还在重试队列里的条目被清掉，
+// 就等于替管理员取消了「后台说改好了、其实没改」的那件事本身。
+func (s *Services) ClearFirewallFailed(port int) error {
+	// 与重试循环同一把端口锁 + 锁序，避免清除与终态写入互相踩。
+	pl := s.portLock(port)
+	pl.Lock()
+	defer pl.Unlock()
+
+	s.fwMu.Lock()
+	item, ok := s.fwPending[port]
+	s.fwMu.Unlock()
+	if !ok || !item.exhausted {
+		return fmt.Errorf("%w: 端口 %d 没有已终止的失败记录", ErrNotFound, port)
+	}
+	s.dropPending(port)
+	return nil
+}
+
 // retryPendingFirewall 重试所有待处理的端口操作，返回仍在等待的数量。
 //
 // 只处理「我们自己记下来的」端口，不做全表扫描：收回比放行危险得多，
 // 扫全表去猜哪些规则是多余的，很容易把管理员自己的连接也关掉
 // （这也是 ReconcileFirewall 刻意不收回端口的原因）。
+//
+// 返回值只数**还没到终态**的：已耗尽的不再重试，数量里也不含它们，
+// 否则每轮日志都会报「仍有 N 个待处理」，而其中有些永远不会成功。
 func (s *Services) retryPendingFirewall() int {
 	s.fwMu.Lock()
 	ports := make([]int, 0, len(s.fwPending))
@@ -392,6 +469,7 @@ func (s *Services) retryPendingFirewall() int {
 	}
 	s.fwMu.Unlock()
 
+	waiting := 0
 	for _, port := range ports {
 		// 整段临界区都在端口锁内：读意图 → 校验 → 执行 → 提交待办状态。
 		//
@@ -411,6 +489,23 @@ func (s *Services) retryPendingFirewall() int {
 		item, ok := s.fwPending[port]
 		s.fwMu.Unlock()
 		if !ok {
+			pl.Unlock()
+			continue
+		}
+
+		// 已到终态的不再动手，但**每轮都校验一次意图是否还有效**：
+		// 端口可能已被新隧道复用、或隧道状态已经反过来，此时那条失败
+		// 记录描述的事早已不复存在，继续展示只会误导管理员。校验发现
+		// 过时就顺手作废；仍然有效就留着，等管理员处理。
+		if item.exhausted {
+			valid, verr := s.portIntentValid(port, item.open)
+			if verr == nil && !valid {
+				s.dropPending(port)
+				pl.Unlock()
+				log.Printf("[firewall] 端口 %d 的终态失败记录已过时（当前状态与%s不符），已作废",
+					port, actionName(item.open))
+				continue
+			}
 			pl.Unlock()
 			continue
 		}
@@ -442,9 +537,17 @@ func (s *Services) retryPendingFirewall() int {
 			item.attempts++
 			item.lastErr = err.Error()
 			if item.attempts >= pendingFWMaxAttempts {
-				s.dropPending(port)
+				// 终态：记录保留（内存 + 落库），由管理页展示，
+				// 管理员修完宿主机后手工处理或清除记录。
+				// 不能直接删：删了之后这条「本该收回却一直开着」的端口
+				// 就再也不会出现在任何界面上，只剩一行迟早被滚动掉的日志。
+				item.exhausted = true
+				s.fwMu.Lock()
+				s.fwPending[port] = item
+				s.fwMu.Unlock()
+				s.persistPending(port, item)
 				pl.Unlock()
-				log.Printf("[firewall] 端口 %d 连续 %d 次处理失败，放弃自动重试，需要人工清理（最后错误: %v）",
+				log.Printf("[firewall] 端口 %d 连续 %d 次处理失败，已停止自动重试并将保留在管理页（最后错误: %v）",
 					port, item.attempts, err)
 				continue
 			}
@@ -466,7 +569,12 @@ func (s *Services) retryPendingFirewall() int {
 
 	s.fwMu.Lock()
 	defer s.fwMu.Unlock()
-	return len(s.fwPending)
+	for _, item := range s.fwPending {
+		if !item.exhausted {
+			waiting++
+		}
+	}
+	return waiting
 }
 
 // closePorts 逐个回收端口。
@@ -604,6 +712,13 @@ type FirewallStatus struct {
 	// 「后台说改好了，其实没改」。
 	PendingOps []string `json:"pending_ops,omitempty"`
 
+	// FailedOps 是重试已耗尽、自动处理终止的端口操作。
+	//
+	// 这些比 PendingOps 更要紧：后台已经彻底不管它们了——该放行的端口
+	// 永远没放行（用户的隧道连不上），该收回的端口永远开着（隧道早删了、
+	// 规则还在）。以前它们到上限就被删掉，只剩一行日志，界面无从知晓。
+	FailedOps []FirewallFailedOp `json:"failed_ops,omitempty"`
+
 	Error string `json:"error,omitempty"`
 }
 
@@ -616,6 +731,7 @@ func (s *Services) FirewallStatusOf() *FirewallStatus {
 		PoolStart:  s.Cfg.PortRangeStart,
 		PoolEnd:    s.Cfg.PortRangeEnd,
 		PendingOps: s.PendingFirewallOps(),
+		FailedOps:  s.FailedFirewallOps(),
 	}
 
 	be := s.FirewallBackend()

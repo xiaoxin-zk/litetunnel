@@ -157,6 +157,10 @@ async function sendCode() {
 async function submit() {
   if (mailEnabled.value === null || loading.value) return
   error.value = ''
+  if (mailEnabled.value && !isEmail(form.account.trim())) {
+    error.value = '请输入有效的注册邮箱，验证码流程不支持用户名'
+    return
+  }
   if (!await formRef.value.validate().catch(() => false)) return
 
   if (mailEnabled.value && !form.email_code.trim()) {

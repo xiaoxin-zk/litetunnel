@@ -128,6 +128,25 @@ describe('找回密码页面', () => {
     expect(push).toHaveBeenCalledWith('/login')
   })
 
+  it('密码不够长或确认不一致时真实表单阻止提交', async () => {
+    authApi.mailStatus.mockResolvedValue({ mail_enabled: true })
+    mountPage()
+    await flushPromises()
+    await wrapper.find('input[placeholder="请输入已验证的注册邮箱"]').setValue('registered@example.com')
+    await wrapper.find('input[placeholder="6 位验证码"]').setValue('123456')
+    const passwords = wrapper.findAll('input[type="password"]')
+    await passwords[0].setValue('short')
+    await passwords[1].setValue('short')
+    await button('重置密码').trigger('click')
+    await flushPromises()
+    expect(authApi.resetPassword).not.toHaveBeenCalled()
+    await passwords[0].setValue('NewPassw0rd!')
+    await passwords[1].setValue('different')
+    await button('重置密码').trigger('click')
+    await flushPromises()
+    expect(authApi.resetPassword).not.toHaveBeenCalled()
+  })
+
   it('确认未启用邮件后才允许旧密码模式，空旧密码不提交', async () => {
     authApi.mailStatus.mockResolvedValue({ mail_enabled: false })
     mountPage()

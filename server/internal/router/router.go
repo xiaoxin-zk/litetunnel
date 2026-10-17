@@ -49,7 +49,15 @@ func New(
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.SecurityHeaders())
-	r.Use(middleware.LimitBodySize(middleware.MaxRequestBodyBytes))
+	// 全局 1 MiB，只给安装包上传开一个口子。
+	//
+	// 上传路由同样是普通 POST，会经过这条中间件：不开口子的话，一个 30 MB
+	// 的客户端包在读取 FormFile 时就会失败，而错误信息只会说"请求体过大"，
+	// 看起来像接口出了问题。上限按「文件上限 + multipart 余量」给，
+	// 文件本身的约束仍由 service.SaveClientPackage 负责。
+	r.Use(middleware.LimitBodySizeFor(middleware.MaxRequestBodyBytes, map[string]int64{
+		"POST /api/admin/client-packages": service.MaxClientPackageSize + middleware.MultipartOverheadBytes,
+	}))
 	r.Use(middleware.CORSDevOnly(cfg.IsProd()))
 
 	// 只信任反代地址的转发头，防止客户端伪造来源 IP 绕过限流与白名单。

@@ -79,9 +79,34 @@ func SecurityHeaders() gin.HandlerFunc {
 	}
 }
 
+// MultipartOverheadBytes 是 multipart 请求里给表头与 boundary 预留的余量。
+//
+// 上传安装包时，请求体不只有文件本身：还有 boundary、每段的头部、以及可能的
+// 其它表单字段。上限卡在「文件大小」这个数上，会让一个刚好等于上限的文件因为
+// 多出来的几十个字节被拒——错误还是「请求体过大」，与真正的原因差得很远。
+const MultipartOverheadBytes = 1 << 20
+
 // LimitBodySize 限制请求体大小，防止内存耗尽型攻击。
 func LimitBodySize(limit int64) gin.HandlerFunc {
+	return LimitBodySizeFor(limit, nil)
+}
+
+// LimitBodySizeFor 是带例外的请求体上限：routes 的键是 "METHOD 路径"（精确
+// 匹配 URL.Path），命中时用它的上限，其余请求仍走 fallback。
+//
+// 为什么需要例外：安装包上传是几十 MB，而全局 1 MiB 会在读取 FormFile 时
+// 直接失败——一个功能被一条与本意无关的通用限制悄悄关掉，而且报错看起来
+// 像「请求格式不对」。反过来把全局上限抬高更糟：那等于让每个 JSON 接口
+// 都能收几十 MB。
+//
+// 刻意用精确路径而不是前缀/通配：哪些接口可以收大包必须是一条能被读出来的
+// 清单，而不是一条需要推断的规则。
+func LimitBodySizeFor(fallback int64, routes map[string]int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		limit := fallback
+		if v, ok := routes[c.Request.Method+" "+c.Request.URL.Path]; ok {
+			limit = v
+		}
 		if c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 		}

@@ -70,7 +70,12 @@ type Sample struct {
 	DiskReadRate  float64 `json:"disk_read_rate"`
 	DiskWriteRate float64 `json:"disk_write_rate"`
 
-	// ---- 磁盘容量（根分区）----
+	// ---- 磁盘容量 ----
+	//
+	// DiskPath 是统计所针对的挂载点（LT_MONITOR_DISK_PATH，默认 /）。
+	// 必须一起返回：容器里 / 是镜像的 overlay，/data 才是挂出来的数据盘，
+	// 只给一个百分比等于没说清「这是哪块盘」。
+	DiskPath  string `json:"disk_path,omitempty"`
 	DiskTotal uint64 `json:"disk_total"`
 	DiskUsed  uint64 `json:"disk_used"`
 
@@ -87,9 +92,9 @@ type Sample struct {
 // 这些数据只有 Go 能精确提供（堆分配、GC、协程数），
 // 从 /proc 读不到——而排查「面板自己内存涨了」时它们最有用。
 type RuntimeStats struct {
-	HeapBytes  uint64  `json:"heap_bytes"`  // 当前堆占用
-	RSSBytes   uint64  `json:"rss_bytes"`   // 常驻内存（含非堆部分）
-	SysBytes   uint64  `json:"sys_bytes"`   // 向操作系统申请的总量
+	HeapBytes  uint64  `json:"heap_bytes"` // 当前堆占用
+	RSSBytes   uint64  `json:"rss_bytes"`  // 常驻内存（含非堆部分）
+	SysBytes   uint64  `json:"sys_bytes"`  // 向操作系统申请的总量
 	Goroutines int     `json:"goroutines"`
 	GCCount    uint32  `json:"gc_count"`
 	GCPauseMS  float64 `json:"gc_pause_ms"` // 最近一次 GC 停顿
@@ -332,8 +337,8 @@ func readDiskCounters() (read, write uint64) {
 		if !want[fields[2]] {
 			continue
 		}
-		rs, e1 := strconv.ParseUint(fields[5], 10, 64)  // sectors_read
-		ws, e2 := strconv.ParseUint(fields[9], 10, 64)  // sectors_written
+		rs, e1 := strconv.ParseUint(fields[5], 10, 64) // sectors_read
+		ws, e2 := strconv.ParseUint(fields[9], 10, 64) // sectors_written
 		if e1 != nil || e2 != nil {
 			continue
 		}

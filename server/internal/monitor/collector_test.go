@@ -71,10 +71,10 @@ func TestParseSelfStatRejectsShortInput(t *testing.T) {
 // readCPUCounters 已把 iowait 累加进 idle，本函数只负责算比例。
 func TestCPUPercent(t *testing.T) {
 	cases := []struct {
-		name                        string
-		prevTotal, prevIdle         uint64
-		curTotal, curIdle           uint64
-		want                        float64
+		name                string
+		prevTotal, prevIdle uint64
+		curTotal, curIdle   uint64
+		want                float64
 	}{
 		{"空闲 70%", 1000, 500, 2000, 1200, 30},
 		{"全忙", 1000, 500, 2000, 500, 100},
@@ -89,6 +89,58 @@ func TestCPUPercent(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s: got %.1f, want %.1f", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestSelfCPUPercent 验证面板进程自身的 CPU 占用算法。
+//
+// 这里最容易错的是分母：必须用同一段时间里的**系统**总增量。曾经传的是
+// 「进程增量 / 进程增量」——只要进程用了一点 CPU 就恒等于 100%，
+// 管理页上那个长期不变的 100% 就是这么来的。
+//
+// 期望值按「100% = 占满一个核」计算：进程增量 / 系统增量 × 核数 × 100。
+// 系统增量在这段时间内恒等于 elapsed×cores×HZ，所以不必知道 HZ。
+func TestSelfCPUPercent(t *testing.T) {
+	cases := []struct {
+		name                string
+		prevProc, curProc   uint64
+		prevTotal, curTotal uint64
+		cores               int
+		want                float64
+	}{
+		// 2 核 5 秒：系统增量 1000 jiffies（假设 HZ=100），进程用了 50 jiffies。
+		{"2 核上占 10% 单核", 0, 50, 0, 1000, 2, 10},
+		// 进程吃满一个核：500 jiffies / 1000 × 2 × 100 = 100%。
+		{"占满一个核", 0, 500, 0, 1000, 2, 100},
+		// 多核并行可以超过 100%。
+		{"占满两个核", 0, 1000, 0, 1000, 2, 200},
+		{"完全空闲", 100, 100, 1000, 2000, 4, 0},
+		{"系统计数器未推进", 0, 50, 1000, 1000, 2, 0},
+		{"进程计数器回绕", 100, 50, 1000, 2000, 2, 0},
+		// 读数异常时钳制到 cores×100，不在界面上显示 800%。
+		{"越界时钳制", 0, 5000, 0, 1000, 2, 200},
+		{"核数非法时按 1 核", 0, 500, 0, 1000, 0, 50},
+	}
+	for _, tc := range cases {
+		got := selfCPUPercent(tc.prevProc, tc.curProc, tc.prevTotal, tc.curTotal, tc.cores)
+		if got != tc.want {
+			t.Errorf("%s: got %.1f, want %.1f", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNewNormalizesDiskPath 验证磁盘统计路径的默认值。
+//
+// 容器里 / 是镜像 overlay，所以路径必须可配（LT_MONITOR_DISK_PATH）；
+// 配了空值/空白时退回根分区，而不是去 Statfs("")。
+func TestNewNormalizesDiskPath(t *testing.T) {
+	for _, in := range []string{"", "   "} {
+		if got := New(in).diskPath; got != "/" {
+			t.Errorf("空路径 %q 应归一为 /，实际 %q", in, got)
+		}
+	}
+	if got := New("/data").diskPath; got != "/data" {
+		t.Errorf("应保留配置的路径，实际 %q", got)
 	}
 }
 

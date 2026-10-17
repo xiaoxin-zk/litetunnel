@@ -25,7 +25,10 @@ type tunnelErr struct {
 	at  time.Time
 }
 
-// syncInterval 是后台自动同步的间隔。
+// syncInterval 是两轮后台同步之间的间隔（从**上一轮结束**算起）。
+//
+// 不是「固定节拍」：一轮最长 45 秒，用固定 ticker 会积压信号，
+// 导致这轮刚结束就立刻开始下一轮（见 startAutoSync）。
 //
 // 取 20 秒是折中：用户在网页端加完隧道再切回客户端，基本已经同步好了；
 // 而每次同步是「一次接入信息 + 每条隧道一次配置」的轻量 GET（配置那几个
@@ -57,15 +60,21 @@ var syncRoundTimeout = 45 * time.Second
 // 于是「隧道明明建好了却连不上」，用户只会认为产品坏了。
 func (a *App) startAutoSync(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(syncInterval)
-		defer ticker.Stop()
+		// 用「上一轮结束后再等 20 秒」而不是固定 ticker。
+		//
+		// ticker 会在一轮没收工时先攒下一个信号：一轮最长 45 秒，等于攒了
+		// 两个，这轮一结束就立刻开始下一轮——慢服务器或隧道多的时候，客户端
+		// 会连着不停地发同步请求，而每一轮本来就已经压在 45 秒上限上了。
+		timer := time.NewTimer(syncInterval)
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				a.autoSyncOnce()
+			case <-timer.C:
 			}
+			a.autoSyncOnce()
+			timer.Reset(syncInterval)
 		}
 	}()
 }

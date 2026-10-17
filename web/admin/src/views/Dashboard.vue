@@ -233,9 +233,11 @@ const metricCards = computed(() => {
   // 会让管理员以为磁盘空着。
   if (m.disk_total > 0) {
     list.push({
-      label: '根分区',
+      label: '磁盘',
       value: diskPercent.toFixed(1) + '%',
-      sub: `${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}`,
+      // 带上挂载路径：容器里 / 是镜像的 overlay，/data 才是数据卷，两者
+      // 容量常常不同，不写路径就看不出这个百分比说的是哪块盘。
+      sub: `${m.disk_path || '/'} · ${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}`,
       percent: diskPercent,
       color: diskPercent >= 90 ? '#dc2626' : diskPercent >= 75 ? '#d97706' : '#059669'
     })

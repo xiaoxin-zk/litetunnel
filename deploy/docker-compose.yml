@@ -61,6 +61,10 @@ services:
       LT_ADMIN_WEB_DIR: "/app/web/admin"
       LT_CLIENT_DIST_DIR: "/data/clients"
       LT_FRPS_API_ADDR: "127.0.0.1:7500"
+      # 管理页「磁盘」统计哪块盘。容器里的 / 是镜像自带的 overlay，
+      # 容量既不等于宿主机根分区也不等于数据盘；/data 才是挂出来的数据卷
+      # （宿主机 ./data/panel 所在分区），数据增长真正影响的就是它。
+      LT_MONITOR_DISK_PATH: "/data"
     volumes:
       - ./data/panel:/data
     read_only: true

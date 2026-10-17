@@ -4,16 +4,26 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+// shortLine 截断一行文本用于日志展示。
+//
+// 必须按字符边界切：直接 s[:64] 会切在 UTF-8 中间，中文一行 22 个字就到
+// 64 字节，「隧道名 + 中文说明」经常正好落在切口上，显示成半个乱码（�）。
 func shortLine(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > 64 {
-		return s[:64] + "…"
+	const max = 64
+	if len(s) <= max {
+		return s
 	}
-	return s
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // emitLog 往运行日志里追加一行客户端自身的说明（不带隧道前缀）。

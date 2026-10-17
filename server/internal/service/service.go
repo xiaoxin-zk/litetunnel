@@ -256,7 +256,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Captchas:   NewCaptchaStore(),
 		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),
 
-		Monitor:    monitor.New(),
+		Monitor:    monitor.New(cfg.MonitorDiskPath),
 		loginLogCh: make(chan model.LoginLog, loginLogBuffer),
 		loginFails: newLoginFailureCounter(),
 		mailWake:   make(chan struct{}, 1),

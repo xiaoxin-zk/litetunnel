@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestLogQueueDropsOldestAndCounts 覆盖「待推送队列无界增长」。
@@ -71,6 +72,28 @@ func TestTakeLogBatchCapsAtMaxLogBatch(t *testing.T) {
 	}
 	if rest[0] != fmt.Sprintf("line-%d", maxLogBatch) {
 		t.Fatalf("剩余部分应当接着往后取，实际从 %q 开始", rest[0])
+	}
+}
+
+// TestShortLineKeepsValidUTF8 覆盖「按字节硬切中文」。
+//
+// 直接 s[:64] 会切在 UTF-8 字符中间：中文 22 个字就到 64 字节，
+// 「隧道名 + 中文说明」这类行经常正好落在切口上，日志里显示成半个乱码（�）。
+func TestShortLineKeepsValidUTF8(t *testing.T) {
+	s := shortLine(strings.Repeat("中文隧道说明", 10))
+	if !utf8.ValidString(s) {
+		t.Fatalf("截断后必须是合法 UTF-8，实际 %q", s)
+	}
+	if !strings.HasSuffix(s, "…") {
+		t.Fatalf("超长行应带省略号，实际 %q", s)
+	}
+	if len(strings.TrimSuffix(s, "…")) > 64 {
+		t.Fatalf("截断后仍超过 64 字节：%d", len(s))
+	}
+
+	// 短行保持原样（只去首尾空白）。
+	if got := shortLine("  短行  "); got != "短行" {
+		t.Fatalf("短行应原样返回，实际 %q", got)
 	}
 }
 

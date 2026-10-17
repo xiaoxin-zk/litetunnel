@@ -31,18 +31,24 @@ type Collector struct {
 	samples []Sample // 环形缓冲，长度不超过 MaxSamples
 	latest  Sample
 
+	// diskPath 是磁盘容量统计所针对的路径（见 Config.MonitorDiskPath）。
+	diskPath string
+
 	// prev 是上一次的累计计数器，用于把累计值换算成速率。
-	prev      counters
-	havePrev  bool
-	prevAt    time.Time
-	prevSelf  processSample
-	prevSelfAt time.Time
+	prev     counters
+	havePrev bool
+	prevAt   time.Time
+	prevSelf processSample
 }
 
-// New 构造采集器。
-func New() *Collector {
+// New 构造采集器。diskPath 为空时统计根分区。
+func New(diskPath string) *Collector {
+	if strings.TrimSpace(diskPath) == "" {
+		diskPath = "/"
+	}
 	return &Collector{
-		samples: make([]Sample, 0, MaxSamples),
+		samples:  make([]Sample, 0, MaxSamples),
+		diskPath: diskPath,
 	}
 }
 
@@ -131,7 +137,14 @@ func (c *Collector) collect() {
 			s.SwapUsed = st - sf
 		}
 	}
-	s.DiskTotal, s.DiskUsed = diskUsage("/")
+	// 磁盘容量按配置的路径统计（默认 /）。
+	//
+	// 容器里 / 是镜像自带的 overlay，容量既不等于宿主机根分区，也不等于
+	// 数据盘；Docker 部署把面板数据挂在 /data，compose 里就把这里指到 /data。
+	// 值本身仍可能不代表「宿主机」，所以 Sample 里带上路径，界面上写清楚
+	// 统计的是哪块盘——比显示一个没有主语的百分比诚实。
+	s.DiskPath = c.diskPath
+	s.DiskTotal, s.DiskUsed = diskUsage(c.diskPath)
 
 	// 速率：由累计计数器求差。首次采样没有基线，速率留 0。
 	if c.havePrev {
@@ -144,6 +157,9 @@ func (c *Collector) collect() {
 			s.DiskWriteRate = rateOf(c.prev.diskWrite, diskWrite, elapsed)
 		}
 	}
+	// 进程 CPU 的分母是「同一段时间里的系统总增量」，要在 c.prev 被覆盖前取。
+	prevTotal := c.prev.cpuTotal
+
 	c.prev = counters{
 		cpuTotal: total, cpuIdle: idle,
 		netRx: netRx, netTx: netTx,
@@ -152,7 +168,7 @@ func (c *Collector) collect() {
 	c.prevAt = now
 	c.havePrev = true
 
-	s.Self = c.collectSelf(now)
+	s.Self = c.collectSelf(prevTotal, total)
 
 	c.mu.Lock()
 	c.latest = s
@@ -166,7 +182,10 @@ func (c *Collector) collect() {
 }
 
 // collectSelf 采集面板进程自身的运行时指标。
-func (c *Collector) collectSelf(now time.Time) *RuntimeStats {
+//
+// prevTotal / curTotal 是**系统**CPU 总计数（前后两次采样），
+// 用于把进程占用换算成百分比，见 selfCPUPercent。
+func (c *Collector) collectSelf(prevTotal, curTotal uint64) *RuntimeStats {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -187,20 +206,42 @@ func (c *Collector) collectSelf(now time.Time) *RuntimeStats {
 	// 排查「面板内存涨了」时最需要看的。
 	cpu, rss := readSelfStat()
 	out.RSSBytes = rss
-	if c.prevSelfAt.IsZero() {
-		out.CPUPercent = 0
-	} else {
-		elapsed := now.Sub(c.prevSelfAt).Seconds()
-		if elapsed > 0 {
-			out.CPUPercent = cpuPercent(c.prevSelf.cpu, 0, cpu, 0)
-		}
-	}
+	out.CPUPercent = selfCPUPercent(c.prevSelf.cpu, cpu, prevTotal, curTotal, runtime.NumCPU())
 	c.prevSelf = processSample{cpu: cpu}
-	c.prevSelfAt = now
 	return out
 }
 
 type processSample struct{ cpu uint64 }
+
+// selfCPUPercent 计算面板进程自身的 CPU 占用百分比（100% = 占满一个核）。
+//
+// 不能沿用 cpuPercent(prevProc, 0, curProc, 0)：那是「系统使用率」的口径，
+// 分母必须是同一段时间里的**系统**总增量。把空闲量填 0 进去，分母就恒等于
+// 分子——进程只要用了一点 CPU 就恒等于 100%。管理页上那个长期 100% 的
+// 「进程 CPU」就是这么来的。
+//
+// 系统总增量在 elapsed 秒内恒等于 elapsed×cores×HZ，本进程增量是消耗掉的
+// jiffies；两者相除时 HZ 正好约掉，所以不需要知道 CLK_TCK——它并不总是 100，
+// 写死会在某些架构上把结果整体放大或缩小。
+//
+// 返回值可以超过 100（多核并行时最高 cores×100），与 top 的口径一致。
+func selfCPUPercent(prevProc, curProc, prevTotal, curTotal uint64, cores int) float64 {
+	if cores < 1 {
+		cores = 1
+	}
+	if curProc <= prevProc || curTotal <= prevTotal {
+		return 0
+	}
+	deltaProc := float64(curProc - prevProc)
+	deltaTotal := float64(curTotal - prevTotal)
+	p := deltaProc / deltaTotal * float64(cores) * 100
+	// 两个计数器都单调递增，理论上不会越界；真越界说明读数异常，
+	// 钳住而不是把「800%」显示给管理员。
+	if max := float64(cores) * 100; p > max {
+		p = max
+	}
+	return p
+}
 
 // readSelfStat 读取本进程的 CPU 时间（jiffies）与常驻内存（字节）。
 //
@@ -275,5 +316,3 @@ func rateOf(prev, cur uint64, elapsedSeconds float64) float64 {
 	}
 	return float64(cur-prev) / elapsedSeconds
 }
-
-

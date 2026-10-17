@@ -119,6 +119,14 @@ type Config struct {
 
 	TrafficPollInterval time.Duration
 
+	// MonitorDiskPath 是管理页「磁盘」指标统计的文件系统路径
+	// （LT_MONITOR_DISK_PATH，默认 /）。
+	//
+	// 为什么要可配：容器里的 / 是镜像自带的 overlay，既不是宿主机根分区，
+	// 也不是数据盘。数据规模真正有意义的那块盘通常挂在 /data（compose 里的
+	// 数据卷），所以 Docker 部署把它指到 /data；裸机部署留默认即可。
+	MonitorDiskPath string
+
 	UserJWTExpire  time.Duration
 	AdminJWTExpire time.Duration
 
@@ -219,6 +227,7 @@ func Load() (*Config, error) {
 		},
 
 		TrafficPollInterval: time.Duration(envInt("LT_TRAFFIC_POLL_INTERVAL", 30)) * time.Second,
+		MonitorDiskPath:     strings.TrimSpace(env("LT_MONITOR_DISK_PATH", "/")),
 		UserJWTExpire:       12 * time.Hour,
 		AdminJWTExpire:      4 * time.Hour,
 	}

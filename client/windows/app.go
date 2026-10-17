@@ -147,9 +147,9 @@ type App struct {
 	//
 	// 必须按隧道分开存：整份配置属于「全部隧道」，任何一条隧道变更都会
 	// 让整份文本不同，于是所有隧道一起重启——那正是要摆脱的行为。
-	applied map[uint]string
-	lastSyncAt    time.Time
-	syncErr       string
+	applied    map[uint]string
+	lastSyncAt time.Time
+	syncErr    string
 
 	// syncMu 串行化同步操作。后台定时同步与用户的开关操作可能同时发生，
 	// 两者都会写配置文件、起停进程；重叠执行会让同一时刻出现
@@ -246,16 +246,16 @@ func NewApp() *App {
 	}
 
 	app := &App{
-		cfg:        cfg,
-		mgr:        frpc.New(exePath),
-		applied:    map[uint]string{},
-		tunnelErrs: map[uint]tunnelErr{},
-		retries:    map[uint]*retryState{},
+		cfg:          cfg,
+		mgr:          frpc.New(exePath),
+		applied:      map[uint]string{},
+		tunnelErrs:   map[uint]tunnelErr{},
+		retries:      map[uint]*retryState{},
 		registered:   map[uint]bool{},
 		registeredAt: map[uint]time.Time{},
 		errEmitAt:    map[uint]time.Time{},
 		logKick:      make(chan struct{}, 1),
-		startedAt:  time.Now(),
+		startedAt:    time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
 		},

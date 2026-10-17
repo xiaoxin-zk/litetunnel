@@ -628,6 +628,8 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 	//
 	// 内存清理放进事务回调里的话，事务一旦失败就会出现「缓存已清、库里还在」
 	// 的不一致；多连接数据库上还可能与并发回调抢跑。
+	// 注销也是管理路径的直写：先递增版本号让在途的后台刷新让路。
+	s.Runtime.BumpGuardVer()
 	s.Runtime.SetQuotaExceeded(userID, false)
 	s.Runtime.SetUserBlocked(userID, false)
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)

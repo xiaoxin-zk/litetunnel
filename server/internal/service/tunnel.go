@@ -134,7 +134,6 @@ func (s *Services) reloadUserWithGroupTx(tx *gorm.DB, userID uint) (*model.User,
 // 等死自己。
 func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, error) {
 	// 分组已过期或未绑定：回落默认分组（与 EffectiveGroup 一致）。
-	// 默认分组不允许删除（见 DeleteGroup），普通读即可。
 	if u.GroupExpireAt != nil && u.GroupExpireAt.Before(time.Now()) {
 		return s.defaultGroupTx(tx), nil
 	}
@@ -154,9 +153,14 @@ func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, e
 }
 
 // defaultGroupTx 是 defaultGroup 的事务内版本，原因同上。
+//
+// 默认分组同样加行锁：它虽不可删除，但套餐（协议、隧道数、域名权限）
+// 仍可被 UpdateGroup 调整。不加锁的话，回落到默认分组的用户在并发调组
+// 时会按调整前的权限建出隧道——与普通分组路径的锁语义必须一致。
 func (s *Services) defaultGroupTx(tx *gorm.DB) *model.Group {
 	var g model.Group
-	if err := tx.Where("is_default = ?", true).First(&g).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("is_default = ?", true).First(&g).Error; err != nil {
 		return nil
 	}
 	return &g

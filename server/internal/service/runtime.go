@@ -61,7 +61,22 @@ type Runtime struct {
 	// 标记并在**同一事务**里跳过这些用户——清零时刻之前的增量全部丢弃，
 	// 边界明确。标记先于清零写库登记，因此任何在清零提交后落库的增量
 	// 都会被至少一轮的跳过覆盖住。
+	//
+	// 两个失败路径都要覆盖：
+	//   - 清零写库失败 → 登记方撤销标记（UnmarkTrafficResetPending），
+	//     否则后续采集会错误丢弃一轮真实用量；
+	//   - 采集事务失败 → flushTraffic 把取走的标记**归还**（Restore...），
+	//     否则基线还停在旧值、标记却没了，下一轮照样把清零前的增量加回。
 	pendingTrafficReset map[uint]bool
+
+	// guardVer 是准入标记（超额/禁用）的版本号。
+	//
+	// 后台配额刷新按「读库快照 → 逐个写标记」两步走，两步之间管理员的
+	// 改动（调低配额并置超额）可能被旧快照覆盖掉；而插件热路径只认内存，
+	// 若后续采集恰好持续失败，错误状态会一直保留。任何管理路径写标记前
+	// 都递增版本号（BumpGuardVer），刷新以「读库前取的版本号」做条件写
+	// （SetGuardFlagsIfVer）：版本变了就整轮让路，下一轮快照自然是最新的。
+	guardVer uint64
 
 	// blocked 记录「账号被禁用/封禁」。
 	//
@@ -358,6 +373,69 @@ func (r *Runtime) takePendingTrafficResets() map[uint]bool {
 	return out
 }
 
+// UnmarkTrafficResetPending 撤销登记：清零写库失败时由登记方调用，
+// 避免后续采集错误丢弃一轮真实用量。
+func (r *Runtime) UnmarkTrafficResetPending(userID uint) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.pendingTrafficReset, userID)
+}
+
+// RestorePendingTrafficResets 归还取走未消费的标记：采集事务失败时由
+// flushTraffic 调用。合并而不是覆盖——归还期间可能有新的清零登记进来。
+func (r *Runtime) RestorePendingTrafficResets(m map[uint]bool) {
+	if len(m) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingTrafficReset == nil {
+		r.pendingTrafficReset = m
+		return
+	}
+	for uid := range m {
+		r.pendingTrafficReset[uid] = true
+	}
+}
+
+// BumpGuardVer 递增准入标记版本号：管理路径写标记前必须调用，
+// 让在途的后台刷新识别「快照已过时」并让路。
+func (r *Runtime) BumpGuardVer() {
+	r.mu.Lock()
+	r.guardVer++
+	r.mu.Unlock()
+}
+
+// GuardVer 取当前版本号。刷新流程在**读库之前**取，
+// 之后用 SetGuardFlagsIfVer 条件写。
+func (r *Runtime) GuardVer() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.guardVer
+}
+
+// SetGuardFlagsIfVer 按版本号条件写入超额与禁用标记。
+// 版本已变化（返回 false）时什么都不写：内存里是管理员刚写的权威值，
+// 旧快照不得覆盖。
+func (r *Runtime) SetGuardFlagsIfVer(userID uint, exceeded, blocked bool, ver uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.guardVer != ver {
+		return false
+	}
+	if exceeded {
+		r.exceeded[userID] = true
+	} else {
+		delete(r.exceeded, userID)
+	}
+	if blocked {
+		r.blocked[userID] = true
+	} else {
+		delete(r.blocked, userID)
+	}
+	return true
+}
+
 // IsUserBlocked 查询账号是否被禁用/封禁。
 func (r *Runtime) IsUserBlocked(userID uint) bool {
 	r.mu.RLock()
@@ -638,6 +716,11 @@ func (s *Services) flushTraffic(
 	now := time.Now()
 	today := now.Format("2006-01-02")
 
+	// 在事务**外**取走清零标记：事务失败时要在下面归还。取走即消费
+	// 只对成功提交成立；放在事务回调里的话，回调中途返回错误时标记
+	// 已经不在了，想归还也拿不回来。
+	skipUsers := s.Runtime.takePendingTrafficResets()
+
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		if !seed {
 			for id, d := range tunnelDeltas {
@@ -662,10 +745,10 @@ func (s *Services) flushTraffic(
 
 			// 管理员清零与采集增量的协调（见 pendingTrafficReset）：
 			// 清零后紧邻一轮的增量是清零前采样的旧流量，加回去等于
-			// 「清零完又冒出来」。取走标记并在同一事务里跳过这些用户——
-			// 清零时刻之前的增量全部丢弃。隧道级统计照常累加：
-			// 清零的是用户的周期用量，隧道的累计与日明细不受影响。
-			skipUsers := s.Runtime.takePendingTrafficResets()
+			// 「清零完又冒出来」。标记已在事务外取走（skipUsers），
+			// 这里按它跳过——清零时刻之前的增量全部丢弃。
+			// 隧道级统计照常累加：清零的是用户的周期用量，
+			// 隧道的累计与日明细不受影响。
 			for uid, delta := range userDeltas {
 				if delta <= 0 || skipUsers[uid] {
 					continue
@@ -740,7 +823,14 @@ func (s *Services) flushTraffic(
 		}
 		return nil
 	})
-	return err
+	if err != nil {
+		// 事务失败（含提交失败）：基线还停在旧值，标记必须归还，
+		// 否则下一轮把清零前的增量原样加回——「清零完又冒出来」
+		// 正是要防的。合并归还，不覆盖期间新登记的清零。
+		s.Runtime.RestorePendingTrafficResets(skipUsers)
+		return err
+	}
+	return nil
 }
 
 // loadTrafficBaseline 把当天的采样基线读回内存。返回是否读取成功。
@@ -804,6 +894,10 @@ func (s *Services) loadTrafficBaseline() bool {
 // 只查内存，不在这里补齐的话，已禁用的账号在重启后会重新被放行，
 // 直到管理员再动一次那个账号。
 func (s *Services) refreshQuotaFlags() error {
+	// 版本号在**读库之前**取：管理员改动（BumpGuardVer）只要发生在本次
+	// 读库之后，下面的条件写就会识别为「快照已过时」而让路——旧快照
+	// 覆盖掉管理员刚写的超额标记，正是这一版要防的竞态。
+	ver := s.Runtime.GuardVer()
 	var users []model.User
 	if err := s.DB.Preload("Group").Find(&users).Error; err != nil {
 		log.Printf("[quota] 刷新超额标记失败: %v", err)
@@ -811,8 +905,12 @@ func (s *Services) refreshQuotaFlags() error {
 	}
 	for i := range users {
 		s.EnsureTrafficPeriod(&users[i])
-		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
-		s.Runtime.SetUserBlocked(users[i].ID, users[i].Status != model.UserStatusActive)
+		// 快照期间该用户被管理员动过：跳过，内存里保留管理员写的权威值，
+		// 下一轮再用新快照覆盖（那时读到的已是新状态）。
+		s.Runtime.SetGuardFlagsIfVer(users[i].ID,
+			s.QuotaExceeded(&users[i]),
+			users[i].Status != model.UserStatusActive,
+			ver)
 	}
 	// 整表刷完才算「状态已知」：中途失败会提前返回，此时只覆盖了一部分账号，
 	// 把剩下那些当成「没超额」正是要防的事。

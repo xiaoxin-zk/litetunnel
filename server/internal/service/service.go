@@ -424,8 +424,11 @@ func (s *Services) EnsureTrafficPeriod(u *model.User) {
 	}
 	if res.RowsAffected == 0 {
 		// 已被并发方重置或 reset_at 被改动：内存快照过时，重读最终状态。
+		// 必须 Preload("Group")：调用方（如 refreshQuotaFlags）拿着这个
+		// 对象继续算 EffectiveGroup/QuotaExceeded，整体覆盖掉原来的
+		// 分组关联会让配额回落到默认分组——该轮标记就算错了。
 		var fresh model.User
-		if err := s.DB.First(&fresh, u.ID).Error; err == nil {
+		if err := s.DB.Preload("Group").First(&fresh, u.ID).Error; err == nil {
 			*u = fresh
 		}
 		return

@@ -843,6 +843,9 @@ func (s *Services) AdminDeleteUser(id uint) error {
 	//     并登记会话，事务提交后又留下一条内存会话。
 	//
 	// 内存态清理，避免已删除用户仍占用超额/禁用标记或身份缓存。
+	// 所有管理路径写准入标记前都递增版本号（见 Runtime.guardVer），
+	// 让在途的后台刷新识别「快照已过时」并让路。
+	s.Runtime.BumpGuardVer()
 	s.Runtime.SetQuotaExceeded(id, false)
 	s.Runtime.SetUserBlocked(id, false)
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
@@ -886,12 +889,14 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 借用的写法有个致命后果：超额标记会被每轮流量采集按配额重算，
 		// 于是「配额没超限的禁用用户」会在下一次成功采集后被重新放行——
 		// 禁用是否生效取决于采集有没有跑过，现象随机且无法复现。
+		s.Runtime.BumpGuardVer()
 		s.Runtime.SetUserBlocked(id, true)
 		// 同时撤销其运行时会话：插件热路径命中会话后只看这两个标记，
 		// 但会话本身留着也没有意义——账号都禁用了。
 		s.Runtime.DropUserSessions(id)
 		return nil
 	}
+	s.Runtime.BumpGuardVer()
 	s.Runtime.SetUserBlocked(id, false)
 
 	// 重新启用时**立即**按真实配额重算，而不是等下一轮流量采集。
@@ -941,11 +946,16 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 		"traffic_reset_at": time.Now().AddDate(0, 1, 0),
 	})
 	if res.Error != nil {
+		// 清零没写进去，登记的标记必须撤销：留着它，后续采集会错误地
+		// 丢弃一轮**真实**用量。
+		s.Runtime.UnmarkTrafficResetPending(id)
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
+		s.Runtime.UnmarkTrafficResetPending(id)
 		return ErrNotFound
 	}
+	s.Runtime.BumpGuardVer()
 	s.Runtime.SetQuotaExceeded(id, false)
 	return nil
 }
@@ -1041,11 +1051,15 @@ func (s *Services) AdminResetUserSecret(id uint) (string, error) {
 }
 
 // refreshQuotaFor 刷新单个用户的超额标记。
+//
+// 这是管理路径的直写：先递增版本号（见 Runtime.guardVer），
+// 让在途的后台整表刷新识别「快照已过时」并让路。
 func (s *Services) refreshQuotaFor(id uint) {
 	u, err := s.LoadUser(id)
 	if err != nil {
 		return
 	}
+	s.Runtime.BumpGuardVer()
 	s.Runtime.SetQuotaExceeded(u.ID, s.QuotaExceeded(u))
 }
 
@@ -1179,6 +1193,9 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 // 一次查询取出该组全部用户（带分组），而不是逐个 LoadUser：
 // 一个分组可能有成百上千个用户，逐个查会把一次管理操作变成一串查询。
 func (s *Services) refreshQuotaForGroup(groupID uint) {
+	// 版本号在读库之前取：这是管理路径的直写，同样要让在途的后台
+	// 整表刷新让路（见 Runtime.guardVer）。
+	s.Runtime.BumpGuardVer()
 	var users []model.User
 	if err := s.DB.Preload("Group").Where("group_id = ?", groupID).Find(&users).Error; err != nil {
 		log.Printf("[quota] 刷新分组 %d 的配额标记失败: %v", groupID, err)

@@ -122,7 +122,20 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 		username = info.Nickname
 	}
 
+	// 先落盘、成功后再发布内存状态。
+	//
+	// 原先顺序相反：内存先改成「已登录」，saveConfig 失败时只返回错误、
+	// 不回滚——界面显示已登录，后台自动同步还拿着这个 API Key 启动隧道，
+	// 而凭据并没有保存下来，重启后全部消失。回滚虽然啰嗦，但「内存状态
+	// 必须以磁盘为准」这条不变量值得用代码守着。
 	a.mu.Lock()
+	oldKey, oldURL := a.cfg.APIKey, a.cfg.ServerURL
+	oldUser, oldMask := a.username, a.apiKeyMask
+	oldHost, oldPort, oldDomain := a.gatewayHost, a.gatewayPort, a.tunnelDomain
+	oldTunnels := a.tunnels
+	oldUsed, oldQuota, oldExceeded := a.trafficUsed, a.trafficQuota, a.exceeded
+	oldGroup, oldPay, oldBal := a.group, a.paymentEnabled, a.balanceCents
+
 	a.cfg.APIKey = apiKey
 	a.cfg.ServerURL = base
 	a.username = username
@@ -144,6 +157,15 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.mu.Unlock()
 
 	if err := saveConfig(a.cfg); err != nil {
+		a.mu.Lock()
+		a.cfg.APIKey, a.cfg.ServerURL = oldKey, oldURL
+		a.username, a.apiKeyMask = oldUser, oldMask
+		a.gatewayHost, a.gatewayPort, a.tunnelDomain = oldHost, oldPort, oldDomain
+		a.tunnels = oldTunnels
+		a.trafficUsed, a.trafficQuota, a.exceeded = oldUsed, oldQuota, oldExceeded
+		a.group, a.paymentEnabled, a.balanceCents = oldGroup, oldPay, oldBal
+		a.lastError = "接入信息保存失败：" + err.Error()
+		a.mu.Unlock()
 		return a.GetState(), err
 	}
 

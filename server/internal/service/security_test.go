@@ -481,6 +481,97 @@ func TestAdminCannotEnableTunnelWithoutHTTPSEntry(t *testing.T) {
 	}
 }
 
+// newSuperAdmin 造一个启用的超级管理员。
+func newSuperAdmin(t *testing.T, svc *Services, name string) *model.Admin {
+	t.Helper()
+	a := &model.Admin{
+		Username: name, Password: "not-used", Nickname: name,
+		Role: "super", Status: "active", TokenVersion: 1,
+	}
+	if err := svc.DB.Create(a).Error; err != nil {
+		t.Fatalf("建管理员 %s 失败: %v", name, err)
+	}
+	return a
+}
+
+// countActiveSupers 数一下还剩几个可用的超级管理员。
+func countActiveSupers(t *testing.T, svc *Services) int64 {
+	t.Helper()
+	var n int64
+	if err := svc.DB.Model(&model.Admin{}).
+		Where("role = ? AND status = ?", "super", "active").
+		Count(&n).Error; err != nil {
+		t.Fatalf("统计超级管理员失败: %v", err)
+	}
+	return n
+}
+
+// TestLastSuperAdminDemotionIsAtomic 覆盖「两名超级管理员并发互相降级」。
+//
+// UpdateAdmin 原先有两处「先数一数、再改」：函数开头的快速检查，和最后那条
+// 独立的 UPDATE。两者之间没有事务、也没有串行化，于是两个互相降级的请求都会
+// 读到「还有对方在」，双双通过 —— 最终一个可用的超级管理员都不剩，
+// 谁都登不进后台，只能改数据库才能恢复。
+func TestLastSuperAdminDemotionIsAtomic(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newSuperAdmin(t, svc, "super-a")
+	b := newSuperAdmin(t, svc, "super-b")
+
+	demote := func(target, operator *model.Admin) error {
+		role := "operator"
+		return svc.UpdateAdmin(target.ID, operator.ID, AdminUpdateInput{Role: &role})
+	}
+
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = demote(b, a) }()
+	go func() { defer wg.Done(); errs[1] = demote(a, b) }()
+	wg.Wait()
+
+	// 恰好成功一次：两次都成功就是上面那个死锁，两次都失败说明守卫把
+	// 本来就合法的操作也挡住了。
+	ok := 0
+	for _, err := range errs {
+		if err == nil {
+			ok++
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("并发互相降级应当恰好成功一次，实际成功 %d 次（errs=%v）", ok, errs)
+	}
+	if n := countActiveSupers(t, svc); n < 1 {
+		t.Fatalf("必须至少保留一个可用的超级管理员，实际剩 %d 个", n)
+	}
+}
+
+// TestLastSuperAdminDeleteIsAtomic 同上，走删除路径。
+func TestLastSuperAdminDeleteIsAtomic(t *testing.T) {
+	svc := newTestServices(t, nil)
+	a := newSuperAdmin(t, svc, "super-a")
+	b := newSuperAdmin(t, svc, "super-b")
+
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = svc.DeleteAdmin(b.ID, a.ID) }()
+	go func() { defer wg.Done(); errs[1] = svc.DeleteAdmin(a.ID, b.ID) }()
+	wg.Wait()
+
+	ok := 0
+	for _, err := range errs {
+		if err == nil {
+			ok++
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("并发互相删除应当恰好成功一次，实际成功 %d 次（errs=%v）", ok, errs)
+	}
+	if n := countActiveSupers(t, svc); n < 1 {
+		t.Fatalf("必须至少保留一个可用的超级管理员，实际剩 %d 个", n)
+	}
+}
+
 // TestAdminSetUserGroupDoesNotDeadlock 覆盖 SQLite 单连接下的自锁。
 //
 // AdminSetUserGroup 曾经在事务里调用 refreshQuotaFor，而后者要用**主连接**

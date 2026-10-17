@@ -495,7 +495,9 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 	if len(updates) == 0 {
 		return nil
 	}
-	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+	// 真正的守卫在 applyAdminUpdate 里：上面那次数量检查只负责给出准确的报错，
+	// 并发下它可能已经过时。
+	if err := s.applyAdminUpdate(id, target, updates); err != nil {
 		return err
 	}
 	// 角色或状态变更后，让该账号的旧令牌立即失效。
@@ -503,7 +505,55 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 	return nil
 }
 
+// applyAdminUpdate 在串行化保护内应用管理员变更。
+//
+// 「系统里至少留一个可用的超级管理员」不能只靠变更前的一次 count：两名超级
+// 管理员并发互相降级时，两个请求都会读到「还有对方在」，于是双双通过检查，
+// 最终一个可用的超级管理员都不剩——而这是**谁都无法再登录后台**的死锁，
+// 只能改数据库才能恢复。
+//
+// 所以这里做三件事：
+//  1. 进程内互斥：控制面是单进程，这组操作因此串行；
+//  2. 检查与 UPDATE 放进同一个事务，对其它写路径原子；
+//  3. 检查用 tx 而不是主连接——SQLite 默认只开一条连接，在事务里用主连接
+//     重新查询会永久等它释放（AdminSetUserGroup 就踩过这个自锁）。
+func (s *Services) applyAdminUpdate(id uint, target *model.Admin, updates map[string]any) error {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := assertSuperAdminRemainsAfterUpdate(tx, target, updates); err != nil {
+			return err
+		}
+		return tx.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error
+	})
+}
+
+// assertSuperAdminRemainsAfterUpdate 复核「改完之后系统里还有可用的超级管理员」。
+//
+// 只有「本来是启用的超级管理员、改完不是了」才需要复核；改昵称、把别人升成
+// 超级管理员都不可能减少可用超级管理员的数量。
+func assertSuperAdminRemainsAfterUpdate(tx *gorm.DB, target *model.Admin, updates map[string]any) error {
+	if target.Role != "super" || target.Status != "active" {
+		return nil
+	}
+	role, status := target.Role, target.Status
+	if v, ok := updates["role"].(string); ok {
+		role = v
+	}
+	if v, ok := updates["status"].(string); ok {
+		status = v
+	}
+	if role == "super" && status == "active" {
+		return nil
+	}
+	return assertNotLastSuperAdminIn(tx, target.ID, "降级或禁用")
+}
+
 // DeleteAdmin 删除管理员。不允许删除自己，也不允许删除最后一个超级管理员。
+//
+// 「最后一个」的判断与删除本身必须原子：只是「先查后删」的话，两名超级管理员
+// 并发互相删除会双双通过检查，最终谁都不剩。
 func (s *Services) DeleteAdmin(id, operatorID uint) error {
 	if id == operatorID {
 		return fmt.Errorf("%w: 不能删除当前登录的账号", ErrInvalidParam)
@@ -512,12 +562,23 @@ func (s *Services) DeleteAdmin(id, operatorID uint) error {
 	if err != nil {
 		return err
 	}
+	// 快速检查，负责给出准确的报错文案；权威判断在下面的临界区里。
 	if target.Role == "super" {
 		if err := s.assertNotLastSuperAdmin(id, "删除"); err != nil {
 			return err
 		}
 	}
-	if err := s.DB.Delete(&model.Admin{}, id).Error; err != nil {
+
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if target.Role == "super" {
+			if err := assertNotLastSuperAdminIn(tx, target.ID, "删除"); err != nil {
+				return err
+			}
+		}
+		return tx.Delete(&model.Admin{}, target.ID).Error
+	}); err != nil {
 		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
@@ -571,12 +632,23 @@ func (s *Services) AdminClearTOTP(id uint) error {
 
 // assertNotLastSuperAdmin 确保系统里始终至少保留一个可用的超级管理员，
 // 否则会出现「谁都进不去后台」的死锁。
+//
+// 这一份走主连接，只用于变更前的快速检查（给出准确的报错文案）。
+// 权威判断在 applyAdminUpdate / DeleteAdmin 的事务里用 tx 重新数一次——
+// 变更前这次 count 在并发下可能已经过时。
 func (s *Services) assertNotLastSuperAdmin(excludeID uint, action string) error {
+	return assertNotLastSuperAdminIn(s.DB, excludeID, action)
+}
+
+// assertNotLastSuperAdminIn 在给定的连接或事务上统计剩余可用超级管理员。
+//
+// 必须能接受 tx：SQLite 默认只开一条连接，在事务里用主连接重新查询会永久
+// 等它释放（AdminSetUserGroup 就踩过这个自锁）。
+func assertNotLastSuperAdminIn(db *gorm.DB, excludeID uint, action string) error {
 	var n int64
-	err := s.DB.Model(&model.Admin{}).
+	if err := db.Model(&model.Admin{}).
 		Where("role = ? AND status = ? AND id <> ?", "super", "active", excludeID).
-		Count(&n).Error
-	if err != nil {
+		Count(&n).Error; err != nil {
 		return err
 	}
 	if n == 0 {

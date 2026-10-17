@@ -2,6 +2,7 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -77,6 +78,46 @@ func TestIdentityCacheBumpedOnPasswordReset(t *testing.T) {
 	}
 	if _, ver := svc.ResolveUserIdentity(u.ID); ver != 4 {
 		t.Fatalf("重新解析应拿到新令牌版本 4，实际 %d", ver)
+	}
+}
+
+// TestIdentityGenNotReusedAfterGC 覆盖「代次被 GC 回收之后不会被复用」。
+//
+// 代次若按「本身份 +1」推进，GC 删掉条目后下一次失效又从 1 开始：一个
+// 还捏着旧代次 1 的在途解析回填时会被判为「代次没变」，把失效前的状态与
+// 旧令牌版本重新写回缓存。解析查询没有硬超时，宽限期保证不了「在途请求
+// 一定已经结束」，所以不能靠宽限期兜底——代次必须永不重复。
+func TestIdentityGenNotReusedAfterGC(t *testing.T) {
+	r := NewRuntime()
+	const (
+		kind = IdentityKindUser
+		id   = uint(42)
+	)
+
+	r.InvalidateIdentity(kind, id)
+	gen := r.IdentityGen(kind, id)
+	if gen == 0 {
+		t.Fatal("失效之后应有一个非零代次")
+	}
+	r.SetCachedIdentity(kind, id, true, 1)
+
+	// 时间推到远超缓存 TTL 与代次宽限期之后，让 GC 把这两个条目都清掉。
+	r.mu.Lock()
+	r.gcIdentitiesLocked(time.Now().Add(identityTTL + identityGenGrace + time.Minute))
+	r.mu.Unlock()
+	if got := r.IdentityGen(kind, id); got != 0 {
+		t.Fatalf("GC 之后代次条目应已回收，实际 %d", got)
+	}
+
+	// 再次失效：新代次必须是**从未出现过**的值。
+	r.InvalidateIdentity(kind, id)
+	if again := r.IdentityGen(kind, id); again == 0 || again == gen {
+		t.Fatalf("回收后的新代次 %d 与旧代次 %d 相同：在途解析会误以为没发生过失效", again, gen)
+	}
+
+	// 迟到的在途解析拿着旧代次回填，必须被拒绝。
+	if r.SetCachedIdentityIfGen(kind, id, true, 1, gen) {
+		t.Fatal("回收之后用旧代次回填必须被拒绝，否则失效前的状态会被写回缓存")
 	}
 }
 

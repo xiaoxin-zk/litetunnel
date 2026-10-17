@@ -195,6 +195,17 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox) {
 	}
 
 	if err != nil {
+		// 先看父 ctx：停服取消不是发送失败。
+		// 这是**统一**判断，不能只写在上面的 Done 分支里——取消时
+		// Send 往往也以 context.Canceled 返回，两个分支同时就绪，
+		// select 选中 done 的话会走到这里。把停服记成一次失败并
+		// attempts+1，反复重启就足以耗尽尝试次数，把一封好信永久置为失败。
+		// 这里不落库：邮件既没送达也没失败，保持待发，下次启动重发。
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			log.Printf("[mail] 发送被停服中断，邮件保留待发（收件人 %s，类型 %s，id=%d）",
+				maskEmail(row.To), row.Kind, row.ID)
+			return
+		}
 		s.failMail(row, err)
 		return
 	}

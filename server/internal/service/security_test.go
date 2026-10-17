@@ -2563,9 +2563,13 @@ func TestRetryWaitsForPortLock(t *testing.T) {
 
 // TestCreateTunnelTakesPortLock 覆盖建隧道侧的结构前提。
 //
-// 取锁必须发生在**提交之前**：待办重试会先查数据库确认这个端口确实不该开着，
-// 若此时创建事务尚未提交，它查不到这条新隧道就会认为可以关——随后我们提交、
-// 放行，它紧接着把端口关掉。
+// 取锁必须发生在**事务提交之前**：待办重试会先查数据库确认这个端口确实不该
+// 开着，若此时创建事务尚未提交，它查不到这条新隧道就会认为可以关——随后
+// 我们提交、放行，它紧接着把端口关掉。
+//
+// 并且必须在**事务开始之前**取：SQLite 只有一条连接，在事务里等端口锁会
+// 把唯一连接一起占住，而「持有端口锁 → 查库」的那一侧（手工关闭端口、
+// 待办重试）此时正等连接——两边都不超时，整个面板卡死。
 func TestCreateTunnelTakesPortLock(t *testing.T) {
 	// 指定端口必须落在配置的端口池范围内，所以这里给一个覆盖测试端口的区间。
 	svc := newTestServices(t, &config.Config{PortRangeStart: 20000, PortRangeEnd: 20100})
@@ -2600,6 +2604,23 @@ func TestCreateTunnelTakesPortLock(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("建隧道应等待该端口的锁（实际立即返回，err=%v）", err)
 	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 此刻建隧道正停在端口锁上。数据库必须仍然可用：它若在事务内等锁，
+	// 就会占住 SQLite 那唯一一条连接，而手工关闭端口（端口锁内查库）
+	// 与待办重试正需要这条连接——两边互相等，谁也不超时。
+	dbDone := make(chan error, 1)
+	go func() {
+		var n int64
+		dbDone <- svc.DB.Model(&model.Tunnel{}).Where("user_id = ?", u.ID).Count(&n).Error
+	}()
+	select {
+	case err := <-dbDone:
+		if err != nil {
+			t.Fatalf("等待端口锁期间数据库查询失败: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待端口锁期间数据库被占住：建隧道不得在持有事务连接时等端口锁")
 	}
 
 	pl.Unlock()

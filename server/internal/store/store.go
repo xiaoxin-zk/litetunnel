@@ -74,6 +74,9 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.User{},
 		&model.Admin{},
 		&model.Tunnel{},
+		// 隧道清单修订号：客户端分页同步时靠它判断多页之间有没有发生变化。
+		// 由触发器维护，见 ensureTunnelListRevTriggers。
+		&model.TunnelListRev{},
 		&model.RedeemCode{},
 		&model.RedeemRecord{},
 		&model.AuditLog{},
@@ -105,7 +108,107 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("创建端口唯一索引失败: %w", err)
 	}
 
+	// 隧道清单修订号由触发器维护，见 ensureTunnelListRevTriggers 的说明。
+	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
+		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)
+	}
+
 	return db, nil
+}
+
+// tunnelListRevColumns 是参与清单版本的隧道字段，必须与客户端对账时
+// 用到的字段一致（model.Tunnel 里改动这些字段时同步改这里）。
+//
+// 刻意**不含** traffic_used / last_online_at / remark / updated_at：
+// 采集器每轮都写流量与在线时间，把它们计入版本会让客户端的多页同步
+// 被无谓地反复打断。user_id 在列里是为了「隧道改归属」也能被看见。
+var tunnelListRevColumns = []string{
+	"status", "name", "type",
+	"local_ip", "local_port", "remote_port",
+	"domain", "subdomain",
+	"bandwidth_limit",
+	"use_encryption", "use_compression",
+	"user_id",
+}
+
+// ensureTunnelListRevTriggers 创建维护 lt_tunnel_list_revs 的触发器。
+//
+// 为什么用触发器而不是在业务代码里递增：写隧道的入口有十来处（建、改、
+// 删、启停、批量、管理员改归属、兑换改套餐、删除用户），漏掉任何一处都
+// 只会让客户端「少发现一次变更」，而且很难测出来。触发器覆盖所有写入
+// （包括将来新增的路径与批量 SQL），且与数据变更在同一个事务里。
+//
+// 两个驱动都不支持对方的触发器语法，所以分驱动写。语句都是幂等的
+// （IF NOT EXISTS / CREATE OR REPLACE + DROP IF EXISTS），每次启动重放无妨。
+func ensureTunnelListRevTriggers(db *gorm.DB, driver string) error {
+	cols := strings.Join(tunnelListRevColumns, ", ")
+
+	var stmts []string
+	switch driver {
+	case "sqlite":
+		stmts = []string{
+			`CREATE TRIGGER IF NOT EXISTS lt_tunnels_rev_ins AFTER INSERT ON lt_tunnels
+BEGIN
+	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (NEW.user_id, 1)
+		ON CONFLICT (user_id) DO UPDATE SET rev = rev + 1;
+END`,
+			fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS lt_tunnels_rev_upd AFTER UPDATE OF %s ON lt_tunnels
+BEGIN
+	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (NEW.user_id, 1)
+		ON CONFLICT (user_id) DO UPDATE SET rev = rev + 1;
+END`, cols),
+			// 改归属时，旧用户那一侧也要变：否则旧用户的清单版本不动，
+			// 客户端会把「少了一条」当成还没同步完。
+			`CREATE TRIGGER IF NOT EXISTS lt_tunnels_rev_mv AFTER UPDATE OF user_id ON lt_tunnels
+WHEN OLD.user_id <> NEW.user_id
+BEGIN
+	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (OLD.user_id, 1)
+		ON CONFLICT (user_id) DO UPDATE SET rev = rev + 1;
+END`,
+			`CREATE TRIGGER IF NOT EXISTS lt_tunnels_rev_del AFTER DELETE ON lt_tunnels
+BEGIN
+	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (OLD.user_id, 1)
+		ON CONFLICT (user_id) DO UPDATE SET rev = rev + 1;
+END`,
+		}
+	case "postgres":
+		stmts = []string{
+			`CREATE OR REPLACE FUNCTION lt_tunnels_rev_bump() RETURNS trigger AS $lt$
+BEGIN
+	IF TG_OP = 'DELETE' THEN
+		INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (OLD.user_id, 1)
+			ON CONFLICT (user_id) DO UPDATE SET rev = lt_tunnel_list_revs.rev + 1;
+		RETURN OLD;
+	END IF;
+	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (NEW.user_id, 1)
+		ON CONFLICT (user_id) DO UPDATE SET rev = lt_tunnel_list_revs.rev + 1;
+	IF TG_OP = 'UPDATE' AND OLD.user_id IS DISTINCT FROM NEW.user_id THEN
+		INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (OLD.user_id, 1)
+			ON CONFLICT (user_id) DO UPDATE SET rev = lt_tunnel_list_revs.rev + 1;
+	END IF;
+	RETURN NEW;
+END
+$lt$ LANGUAGE plpgsql`,
+			`DROP TRIGGER IF EXISTS lt_tunnels_rev_ins ON lt_tunnels`,
+			`CREATE TRIGGER lt_tunnels_rev_ins AFTER INSERT ON lt_tunnels
+	FOR EACH ROW EXECUTE FUNCTION lt_tunnels_rev_bump()`,
+			`DROP TRIGGER IF EXISTS lt_tunnels_rev_upd ON lt_tunnels`,
+			fmt.Sprintf(`CREATE TRIGGER lt_tunnels_rev_upd AFTER UPDATE OF %s ON lt_tunnels
+	FOR EACH ROW EXECUTE FUNCTION lt_tunnels_rev_bump()`, cols),
+			`DROP TRIGGER IF EXISTS lt_tunnels_rev_del ON lt_tunnels`,
+			`CREATE TRIGGER lt_tunnels_rev_del AFTER DELETE ON lt_tunnels
+	FOR EACH ROW EXECUTE FUNCTION lt_tunnels_rev_bump()`,
+		}
+	default:
+		return fmt.Errorf("不支持的数据库驱动: %s", driver)
+	}
+
+	for _, stmt := range stmts {
+		if err := db.Exec(stmt).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Seed 播种默认分组与初始管理员（幂等）。

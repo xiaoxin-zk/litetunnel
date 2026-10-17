@@ -2,6 +2,7 @@ package service
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -17,7 +18,10 @@ import (
 // 撞上；而真撞上 5 次说明池子已经接近占满，继续重试也没意义。
 const portAllocAttempts = 5
 
-// isPortConflict 判断错误是否来自「端口唯一索引冲突」。
+// isPortConflict 判断错误是否来自「该端口已被别人占用」。
+//
+// 两种来源：端口唯一索引冲突，以及建隧道前的复核（assertPortFree）。
+// 后者是「加锁前挑好的候选端口在进事务前被抢走」的必然结果。
 //
 // 两个驱动的报错文本不同，但都会带上端口这个标识：
 //
@@ -30,6 +34,12 @@ const portAllocAttempts = 5
 func isPortConflict(err error) bool {
 	if err == nil {
 		return false
+	}
+	// 建隧道前会复核候选端口是否仍空着（见 createTunnelLocked）：加锁之前
+	// 读到的候选可能已被并发请求占掉。这与唯一索引冲突是同一件事的两种
+	// 表现，自动分配路径应当换个端口重试，而不是把错误直接抛给用户。
+	if errors.Is(err, ErrPortInUse) {
+		return true
 	}
 	msg := strings.ToLower(err.Error())
 	if !strings.Contains(msg, "unique") && !strings.Contains(msg, "duplicate key") {

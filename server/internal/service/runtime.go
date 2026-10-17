@@ -123,6 +123,16 @@ type Runtime struct {
 	// identityGenAt 记录代次最后一次推进的时刻，供 GC 判断能否清理。
 	identityGen   map[identityKey]uint64
 	identityGenAt map[identityKey]time.Time // 账号有效性短缓存
+
+	// identitySeq 是代次的**全局**单调来源。
+	//
+	// 代次不能每身份各自从 1 开始递增：GC 会删掉长期不用的条目
+	// （见 gcIdentitiesLocked），删掉之后下一次失效又从 1 开始，
+	// 一个还捏着旧代次 1 的在途解析就会在回填时被判定「代次没变」
+	// ——禁用前的状态被重新写回缓存，直到下一个 TTL 才纠正。
+	// 全局计数器保证任何一个代次值在进程生命周期内只出现一次，
+	// 回收与复用的问题一起消失。
+	identitySeq uint64
 }
 
 // 账号有效性缓存的命名空间。
@@ -141,8 +151,12 @@ const identityTTL = 10 * time.Second
 // identityGenGrace 是失效代次在 GC 中的保留期。
 //
 // 代次只在「有在途解析可能还拿着它」时有意义：一次解析只是读一次库，
-// 耗时远小于此。超过这个期限且没有缓存条目在用的代次可以安全删除——
-// 万一真有一个异常迟到的解析，它看到代次对不上只会放弃回填（安全方向）。
+// 耗时远小于此，超过这个期限且没有缓存条目在用的代次就可以删掉。
+//
+// 这个期限**不**承担正确性：解析查询本身没有硬超时，真要有一个异常迟到的
+// 解析，宽限期也保证不了它已经结束。安全性来自「代次取自全局单调计数器」
+// （见 identitySeq）：条目被回收之后，任何新的失效都拿到一个从未出现过的
+// 值，迟到的解析必然对不上，只会放弃回填。
 const identityGenGrace = 5 * time.Minute
 
 type identityKey struct {
@@ -236,7 +250,10 @@ func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
 	if r.identityGenAt == nil {
 		r.identityGenAt = map[identityKey]time.Time{}
 	}
-	r.identityGen[key]++
+	// 代次取自全局单调计数器，而不是「本身份 +1」：后者在 GC 回收条目后
+	// 会从 1 重新开始，与在途解析手里的旧代次撞上（见 identitySeq）。
+	r.identitySeq++
+	r.identityGen[key] = r.identitySeq
 	r.identityGenAt[key] = time.Now()
 	delete(r.identities, key)
 }

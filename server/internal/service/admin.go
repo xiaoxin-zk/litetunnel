@@ -823,6 +823,11 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Where("user_id = ?", id).Delete(&model.Tunnel{}).Error; err != nil {
 			return err
 		}
+		// 清单修订号随账号一起清掉：删隧道会让触发器再补一行
+		// （见 store.ensureTunnelListRevTriggers），不删就是一条永久孤儿。
+		if err := tx.Where("user_id = ?", id).Delete(&model.TunnelListRev{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("user_id = ?", id).Delete(&model.TrafficDaily{}).Error; err != nil {
 			return err
 		}

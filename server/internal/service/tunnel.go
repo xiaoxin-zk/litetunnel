@@ -3,7 +3,6 @@ package service
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net"
 	"strings"
@@ -51,19 +50,28 @@ func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
 //
 // 同时返回总数与**清单版本**：只比条数会漏过「数量相抵」的并发变更
 // （分页期间删掉一条已取到的、同时新增一条 id 更大的：总数不变，但
-// 新隧道落在游标之前，永远取不到）。版本是对账相关字段的摘要，见
-// tunnelListVersionTx。
+// 新隧道落在游标之前，永远取不到）。版本连「启用切停用」「改端口/域名」
+// 这类不增删记录的变更也要反映，见 tunnelListVersionTx。
 //
-// 版本与页面数据在**同一个只读事务**里读：SQLite 只有一条连接，事务内
-// 看到的是同一个快照；即便别的数据库上是逐语句快照，跨页比对版本也能
-// 发现期间的变化，最坏只是多重取一轮。
+// 版本与页面数据在**同一个事务、同一个快照**里读：跨页比对版本能发现
+// 期间的变化，最坏只是多重取一轮。
 func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []model.Tunnel, total int64, version string, err error) {
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		v, n, verr := s.tunnelListVersionTx(tx, userID)
-		if verr != nil {
-			return verr
+		// 版本与页面数据必须来自**同一个快照**。
+		//
+		// 反过来（先算版本、再读页面）时，两条语句之间提交的变更会让这一页
+		// 出现「旧版本 + 新数据」：客户端跨页比对版本时看到各页一致，就把
+		// 这组页面当成一致清单接受——最后一页更是没有后续页可以对照，
+		// 那份不一致会一直留到下一轮同步。
+		//
+		// SQLite 只有一条连接、整个事务共用同一个快照；PostgreSQL 默认
+		// READ COMMITTED 是逐语句快照，所以这里显式提到 REPEATABLE READ。
+		// 语句必须是事务里的第一条，因此放在这里、任何查询之前。
+		if tx.Dialector.Name() == "postgres" {
+			if err := tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").Error; err != nil {
+				return err
+			}
 		}
-		version, total = v, n
 
 		q := tx.Where("user_id = ?", userID).Order("id desc")
 		if beforeID > 0 {
@@ -72,7 +80,18 @@ func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []mod
 		if limit > 0 {
 			q = q.Limit(limit)
 		}
-		return q.Find(&list).Error
+		if err := q.Find(&list).Error; err != nil {
+			return err
+		}
+
+		// 先读页面、再读版本：即使某个驱动上快照隔离没生效，这个顺序也只
+		// 会让版本比页面「更新」（客户端重取一轮），不会出现「页面新、版本旧」。
+		v, n, verr := s.tunnelListVersionTx(tx, userID)
+		if verr != nil {
+			return verr
+		}
+		version, total = v, n
+		return nil
 	})
 	if err != nil {
 		return nil, 0, "", err
@@ -80,29 +99,34 @@ func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []mod
 	return list, total, version, nil
 }
 
-// tunnelListVersionTx 计算用户隧道清单的版本，覆盖**客户端对账用到的
-// 全部字段**，而不只是条数与 id。
+// tunnelListVersionTx 取用户隧道清单的版本与总数。
 //
-// 只算「总数 + 最大 id」发现不了「启用切停用」「改了端口/域名」这类不增删
-// 记录的变更：多页同步期间状态翻转时，各页版本仍然一致，客户端会按旧
-// 状态启停进程，直到下一轮同步才纠正。
+// 版本 = 总数 : 修订号。修订号由数据库触发器在「对账相关字段」变化时与
+// 数据变更**同事务**递增（见 model.TunnelListRev 与 store 里的
+// ensureTunnelListRevTriggers），所以这里只是一次主键读。
 //
-// 摘要里**不含** updated_at 与流量/在线字段：采集器每轮都会写这些列，
-// 让它们参与版本会让版本无谓地抖动，多页同步被反复打断。
+// 旧实现是把该用户全部隧道读出来逐行哈希：隧道数为 N 时，一次分页同步
+// 会对同一批行重复扫描 ceil(N/200) 次，代价随 N 线性放大；而现在的读法
+// 与 N 无关（总数那一次 count 走 user_id 索引，只做计数不取行）。
+//
+// 版本里仍然拼上总数：万一某条写路径绕过了触发器（例如有人手工改表），
+// 增删至少还能让客户端发现一部分变化。
 func (s *Services) tunnelListVersionTx(tx *gorm.DB, userID uint) (string, int64, error) {
-	var rows []model.Tunnel
-	if err := tx.Model(&model.Tunnel{}).
-		Select("id, status, name, type, local_ip, local_port, remote_port, domain, subdomain, bandwidth_limit, use_encryption, use_compression").
-		Where("user_id = ?", userID).Order("id asc").Find(&rows).Error; err != nil {
+	var revs []int64
+	if err := tx.Model(&model.TunnelListRev{}).
+		Where("user_id = ?", userID).Pluck("rev", &revs).Error; err != nil {
 		return "", 0, err
 	}
-	h := fnv.New64a()
-	for _, t := range rows {
-		fmt.Fprintf(h, "%d|%s|%s|%s|%s|%d|%d|%s|%s|%d|%t|%t;",
-			t.ID, t.Status, t.Name, t.Type, t.LocalIP, t.LocalPort, t.RemotePort,
-			t.Domain, t.Subdomain, t.BandwidthLimit, t.UseEncryption, t.UseCompression)
+	var rev int64
+	if len(revs) > 0 {
+		rev = revs[0]
 	}
-	return fmt.Sprintf("%d:%016x", len(rows), h.Sum64()), int64(len(rows)), nil
+
+	var total int64
+	if err := tx.Model(&model.Tunnel{}).Where("user_id = ?", userID).Count(&total).Error; err != nil {
+		return "", 0, err
+	}
+	return fmt.Sprintf("%d:%d", total, rev), total, nil
 }
 
 // GetTunnel 按 ID 与归属校验后取隧道。
@@ -245,9 +269,41 @@ func (s *Services) defaultGroupTx(tx *gorm.DB) *model.Group {
 func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow bool) (*model.Tunnel, error) {
 	var created model.Tunnel
 
-	// portUnlock 在事务内取到端口锁之后赋值，事务结束（无论成败）后释放。
-	// 之所以要在**提交之前**取锁，见下面取锁处的说明。
+	// # 先定端口、先加锁，再开事务
+	//
+	// 锁序固定为「用户锁 → 端口锁 → 数据库事务」。
+	//
+	// 为什么不能在事务里等端口锁：SQLite 上数据库只有**一条**连接
+	// （store.Open 里 SetMaxOpenConns(1)），事务会一直占着它。在事务内等
+	// 端口锁就是「持有唯一连接 → 等端口锁」，而手工关闭端口
+	// （FirewallManualClose：端口锁内统计活跃隧道）与待办重试是
+	// 「持有端口锁 → 查库」，两边都不超时，直接死锁。
+	// 手工关闭一个空闲端口、恰好有人把隧道建到该端口，就能稳定触发。
+	//
+	// 所以端口必须在事务**开始之前**定下来并加锁：
+	//   - 指定端口：直接用它，进事务后复核是否已被占用；
+	//   - 自动分配：先在事务外读一次当前占用（不持锁的普通查询）挑一个
+	//     候选，拿到候选端口的锁之后再进事务复核。候选被别人抢走的窗口
+	//     由 CreateTunnel 的「撞车重试」换个端口重来兜底。
+	port := 0
+	if isPortTunnelType(in.Type) {
+		port = in.RemotePort
+		if port == 0 {
+			p, err := s.allocatePort(s.DB, u.ID)
+			if err != nil {
+				return nil, err
+			}
+			port = p
+		}
+	}
+
+	// 事务结束（无论成败）后释放；防火墙放行也在这把锁之内（见函数末尾）。
 	var portUnlock func()
+	if port > 0 {
+		pl := s.portLock(port)
+		pl.Lock()
+		portUnlock = pl.Unlock
+	}
 	defer func() {
 		if portUnlock != nil {
 			portUnlock()
@@ -291,33 +347,15 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 					return ErrPortLimit
 				}
 			}
-			port := normalized.RemotePort
-			if port == 0 {
-				p, err := s.allocatePort(tx, u.ID)
-				if err != nil {
-					return err
-				}
-				port = p
-			} else if err := s.assertPortFree(tx, port); err != nil {
+			// 端口已在事务外选定并加锁（见函数开头的说明），这里只复核
+			// 它确实还空着：候选端口是加锁之前读到的，别的事务可能刚把
+			// 它占掉。撞车时返回 ErrPortInUse，交给 CreateTunnel 换个端口重来。
+			if err := s.assertPortFree(tx, port); err != nil {
 				return err
 			}
 			normalized.RemotePort = port
 		} else {
 			normalized.RemotePort = 0
-		}
-
-		// 拿到该端口的锁，并持有到下面的放行完成。
-		//
-		// 必须在**提交之前**取：一条「收回 20001」的待办重试时，会先查数据库
-		// 确认这个端口确实不该开着。如果本事务还没提交，它查不到这条新隧道，
-		// 于是认为可以关——然后我们提交、放行，它紧接着把端口关掉。
-		// 新隧道的规则就这样被一条过时任务关掉了，用户看到「刚建好就连不上」。
-		//
-		// 取锁顺序是「用户锁 → 端口锁」，与删除路径一致，不会死锁。
-		if normalized.RemotePort > 0 {
-			pl := s.portLock(normalized.RemotePort)
-			pl.Lock()
-			portUnlock = pl.Unlock
 		}
 
 		normalized.UserID = u.ID
@@ -343,12 +381,27 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 	// 失败不影响隧道本身——管理员仍可去云安全组手工放行，
 	// 而把建隧道整体失败掉会让用户完全无从下手。
 	//
-	// 用 Locked 版本：该端口的锁已经在事务里拿到了（见上面取锁处），
+	// 用 Locked 版本：该端口的锁已经拿到了（见函数开头），
 	// 这里再调一次会重复加锁、直接死锁。
+	//
+	// 锁一直持有到放行结束，跨过事务提交：一条「收回 20001」的待办重试
+	// 会先查库确认这个端口确实不该开着。若提交后才放锁，它可能在本事务
+	// 提交前查不到新隧道、判定该关，然后在放行之后把端口关掉——新隧道
+	// 刚建好就连不上。现在它只能在「提交 + 放行」整段结束之后才动得了。
 	if firewallNow && created.RemotePort > 0 {
 		s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true)
 	}
 	return &created, nil
+}
+
+// isPortTunnelType 判断协议是否占用公网端口（TCP/UDP）。
+// 入参按 normalizeInput 的口径处理：小写、去掉首尾空白。
+func isPortTunnelType(tunnelType string) bool {
+	switch strings.ToLower(strings.TrimSpace(tunnelType)) {
+	case model.ProxyTypeTCP, model.ProxyTypeUDP:
+		return true
+	}
+	return false
 }
 
 // UpdateTunnel 更新隧道。端口与协议不可变更，避免影响已下发的客户端配置。

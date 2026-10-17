@@ -169,6 +169,25 @@ type Tunnel struct {
 // TableName 固定表名。
 func (Tunnel) TableName() string { return "lt_tunnels" }
 
+// TunnelListRev 是某个用户隧道清单的修订号，供客户端分页同步时对账。
+//
+// 由**数据库触发器**维护（见 store.Open 里的 lt_tunnels_rev_* 触发器），
+// 而不是由业务代码在每条写路径上手工递增：写隧道的入口有十来处
+// （建 / 改 / 删 / 启停 / 批量 / 管理员改归属 / 兑换改套餐 / 删除用户），
+// 漏掉任何一处都只会让客户端「少发现一次变更」，很难测出来。
+// 触发器与数据变更在同一事务里，天然原子。
+//
+// 触发条件只覆盖**对账相关字段**：traffic_used、last_online_at 由采集器
+// 每轮写入，计入版本会让客户端的多页同步被反复打断。改字段清单时
+// 别忘了同步触发器里的 UPDATE OF 列表（见 store.tunnelListRevTriggers）。
+type TunnelListRev struct {
+	UserID uint  `gorm:"primaryKey;autoIncrement:false" json:"user_id"`
+	Rev    int64 `gorm:"not null;default:0" json:"rev"`
+}
+
+// TableName 固定表名。
+func (TunnelListRev) TableName() string { return "lt_tunnel_list_revs" }
+
 // RedeemCode 兑换码。
 type RedeemCode struct {
 	ID      uint   `gorm:"primarykey" json:"id"`

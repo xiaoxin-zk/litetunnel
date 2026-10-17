@@ -1212,6 +1212,8 @@ func (s *Services) AdminSetTunnelStatus(id uint, status string) error {
 }
 
 // AdminDeleteTunnel 删除任意隧道并回收其端口。
+//
+// 持隧道归属者的用户锁：与该用户的编辑、启停隧道共用（见 UpdateTunnel）。
 func (s *Services) AdminDeleteTunnel(id uint) error {
 	// 端口要在删除前读出来：记录删掉之后就查不回来了，
 	// 而防火墙规则会一直留在宿主机上。
@@ -1222,6 +1224,12 @@ func (s *Services) AdminDeleteTunnel(id uint) error {
 		}
 		return err
 	}
+
+	// 锁在读完归属者之后取：与 setTunnelStatus、DeleteTunnel 的锁序一致
+	// （先读记录、再按归属者锁住整个变更段）。
+	lock := s.userLock(t.UserID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	res := s.DB.Where("id = ?", id).Delete(&model.Tunnel{})
 	if res.Error != nil {

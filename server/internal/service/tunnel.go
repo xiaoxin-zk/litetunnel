@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 
@@ -206,7 +207,30 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput) (*model.Tun
 }
 
 // UpdateTunnel 更新隧道。端口与协议不可变更，避免影响已下发的客户端配置。
+//
+// # 为什么不能整行 Save
+//
+// Save(t) 会把**整条记录**写回去，而采集器（见 runtime.go）正并发更新同一条
+// 记录的流量与在线时间：编辑读到旧快照、采集器写入新值、Save 再用旧快照
+// 覆盖回去——流量凭空缩水。同理，并发停用写回的「停用」状态也会被编辑
+// 快照里的「启用」改回去。
+//
+// 更糟的是删除竞态：删除先完成后，GORM 的 Save 在更新影响行数为零时会
+// 回退为插入——已删除的隧道被这次「编辑」复活，且防火墙意图不会跟着
+// 这次复活重新应用。
+//
+// 因此只更新本次允许修改的字段（状态、端口、流量等一概不碰），
+// 用 id + user_id 圈定目标并检查影响行数：删掉了就返回 NotFound，
+// 绝不重新插入。编辑与删除、状态变更共用用户锁（userLock），
+// 同一用户的这三类操作只能先后发生。
 func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.Tunnel, error) {
+	// 与「删除该用户」「删除隧道」「启停隧道」互斥（见 userLock）：
+	// 这些操作都以「读状态 → 改数据」的模式工作，交错时各自的读
+	// 都可能过时。
+	lock := s.userLock(u.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	t, err := s.GetTunnel(u.ID, id)
 	if err != nil {
 		return nil, err
@@ -227,29 +251,46 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 		return nil, fmt.Errorf("%w: 本地地址格式不正确", ErrInvalidParam)
 	}
 
-	t.LocalIP = localIP
-	t.LocalPort = in.LocalPort
-	t.Remark = truncate(in.Remark, 200)
-	t.UseEncryption = in.UseEncryption
-	t.UseCompression = in.UseCompression
-
+	updates := map[string]any{
+		"local_ip":        localIP,
+		"local_port":      in.LocalPort,
+		"remark":          truncate(in.Remark, 200),
+		"use_encryption":  in.UseEncryption,
+		"use_compression": in.UseCompression,
+	}
 	if t.Type == model.ProxyTypeHTTP || t.Type == model.ProxyTypeHTTPS {
 		domain, sub, err := s.normalizeDomain(g, in)
 		if err != nil {
 			return nil, err
 		}
-		t.Domain = domain
-		t.Subdomain = sub
+		updates["domain"] = domain
+		updates["subdomain"] = sub
 	}
 
-	if err := s.DB.Save(t).Error; err != nil {
-		return nil, err
+	res := s.DB.Model(&model.Tunnel{}).
+		Where("id = ? AND user_id = ?", id, u.ID).
+		Updates(updates)
+	if res.Error != nil {
+		return nil, res.Error
 	}
-	return t, nil
+	if res.RowsAffected == 0 {
+		// 记录在编辑期间被删除（或从未属于该用户）：如实报不存在。
+		// 这里绝不能像 Save 的零行回退那样把它重新插回去。
+		return nil, ErrNotFound
+	}
+	return s.GetTunnel(u.ID, id)
 }
 
 // DeleteTunnel 删除隧道并释放端口。
+//
+// 全程持有该用户的锁：与「编辑隧道」「启停隧道」共用（见 UpdateTunnel）。
+// 删除是「读状态 → 删记录 → 收端口」三步，中间插进一次编辑或状态切换，
+// 那次操作的副作用（比如按启用状态放行的端口）会建立在已被删除的记录上。
 func (s *Services) DeleteTunnel(userID, id uint) error {
+	lock := s.userLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	// 先取出端口信息：记录删掉之后就查不到了，
 	// 而防火墙需要它才能收回对应的放行规则。
 	var t model.Tunnel
@@ -322,6 +363,13 @@ func (s *Services) assertTunnelCanEnable(t *model.Tunnel, status string) error {
 // 这些必须与状态变更保持同一份代码，否则新增一条入口（管理员批量操作、
 // 命令行工具）就会漏掉其中一项。
 func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
+	// 与编辑、删除互斥（见 UpdateTunnel 的说明）：这些都是「读状态 → 改数据」
+	// 的操作，交错时各自的读都可能过时。锁按隧道**归属者**取，
+	// 用户侧与管理员侧两条路径共用，谁也不会漏。
+	lock := s.userLock(t.UserID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if err := s.assertTunnelCanEnable(t, status); err != nil {
 		return err
 	}
@@ -344,10 +392,25 @@ func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
 	return nil
 }
 
+// truncate 按字节上限截断，但绝不切断多字节字符。
+//
+// 输入是用户填的备注、错误信息这类文本，中文一个字占三个字节：直接按
+// 字节切片的话，切点落在字符中间，存进库的是一段以替换字符收尾的乱码
+// ——界面上看起来像数据损坏。这里从上限处向前回退到最近的 UTF-8
+// 字符起始字节，最多回退 3 个字节（UTF-8 单字符最长 4 字节，回退
+// 已覆盖所有合法前缀）。入参本身仍是字节上限，调用方的约束不变。
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	cut := s[:n]
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }

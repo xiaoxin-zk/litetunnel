@@ -11,13 +11,13 @@ import (
 // 这个文件守的是「后台刷新与管理员直写内存准入标记之间的竞态」，
 // 以及「清零协调标记必须与数据库事务同生共死」。
 
-// TestRefreshGuardAfterTrafficOnlyTouchesAffected 覆盖「每轮全表刷新」的成本。
+// TestRefreshGuardForTrafficOnlyTouchesAffected 覆盖「每轮全表刷新」的成本。
 //
-// 常规采集轮只该刷新本轮有流量（或周期到期）的用户。全量读所有用户连分组
-// 一起进内存，在用户规模上来之后是每 30 秒一次的纯浪费。
+// 常规采集轮只该刷新本轮有流量的用户。全量读所有用户连分组一起进内存，
+// 在用户规模上来之后是每 30 秒一次的纯浪费。
 // 这里同时守住反面：没被刷新的用户**不能**被顺手改成「未超额」——
 // 那等于用一份不完整的快照覆盖事实。
-func TestRefreshGuardAfterTrafficOnlyTouchesAffected(t *testing.T) {
+func TestRefreshGuardForTrafficOnlyTouchesAffected(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	mkUser := func(name string, used int64) *model.User {
@@ -34,11 +34,7 @@ func TestRefreshGuardAfterTrafficOnlyTouchesAffected(t *testing.T) {
 	active := mkUser("activeuser", 200) // 已超额，本轮有流量
 	other := mkUser("otheruser", 200)   // 也已超额，但本轮没有它的流量
 
-	// 就绪 + 刚校准过：模拟稳态（否则会触发一次全量校准，正是要避免每轮发生的事）。
-	svc.Runtime.markAccessGuardReady()
-	svc.guardFullAt.Store(time.Now().UnixNano())
-
-	svc.refreshGuardAfterTraffic(map[uint]int64{active.ID: 10})
+	svc.refreshGuardForTraffic(map[uint]int64{active.ID: 10})
 
 	if !svc.Runtime.IsQuotaExceeded(active.ID) {
 		t.Fatal("本轮有流量的超额用户必须被标成超额")
@@ -48,12 +44,12 @@ func TestRefreshGuardAfterTrafficOnlyTouchesAffected(t *testing.T) {
 	}
 }
 
-// TestRefreshGuardAfterTrafficResetsDuePeriod 覆盖「到期用户没有流量就永远解不开」。
+// TestRefreshGuardDueResetsPeriod 覆盖「到期用户没有流量就永远解不开」。
 //
 // 超额用户的连接会被拦，于是不再产生流量；若只刷新「有流量的用户」，
 // 他的计费周期永远不会清零，标记也就一直停在超额上——死循环。
-// 到期用户必须被单独找出来清零并重算。
-func TestRefreshGuardAfterTrafficResetsDuePeriod(t *testing.T) {
+// 到期用户必须被单独找出来清零并重算，且这条路径**不依赖 frps 是否可用**。
+func TestRefreshGuardDueResetsPeriod(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	u := &model.User{
@@ -67,8 +63,8 @@ func TestRefreshGuardAfterTrafficResetsDuePeriod(t *testing.T) {
 	svc.Runtime.markAccessGuardReady()
 	svc.guardFullAt.Store(time.Now().UnixNano())
 
-	// 本轮没有任何流量。
-	svc.refreshGuardAfterTraffic(nil)
+	// 本轮没有任何流量，也没有 frps 数据参与——到期刷新独立执行。
+	svc.refreshGuardDue()
 
 	var fresh model.User
 	if err := svc.DB.First(&fresh, u.ID).Error; err != nil {
@@ -110,13 +106,13 @@ func TestDueGuardUsersIncludesExpiredGroup(t *testing.T) {
 	fresh := mk("groupfresh", &future)
 	never := mk("groupnever", nil)
 
-	ids, err := svc.dueGuardUsers()
+	_, groupDue, err := svc.dueGuardUsers()
 	if err != nil {
 		t.Fatalf("查询到期用户失败: %v", err)
 	}
 
-	got := make(map[uint]bool, len(ids))
-	for _, id := range ids {
+	got := make(map[uint]bool, len(groupDue))
+	for _, id := range groupDue {
 		got[id] = true
 	}
 	if !got[expired.ID] {
@@ -124,6 +120,65 @@ func TestDueGuardUsersIncludesExpiredGroup(t *testing.T) {
 	}
 	if got[fresh.ID] || got[never.ID] {
 		t.Fatal("分组未到期的用户不该被筛出来（否则每轮又变成全量）")
+	}
+}
+
+// TestRefreshGuardDueMigratesExpiredGroup 覆盖「到期分组用户被每轮反复扫出来」。
+//
+// 只「按默认分组算配额」而不改数据的话，这些行会一直满足
+// group_expire_at <= now：每轮都被扫出、每轮都重算，历史上过期过的用户越多，
+// 增量刷新的开销越大——等于把全表扫描换成了「全历史过期扫描」。
+// 落库到默认分组并清掉到期时间之后，条件不再命中。
+func TestRefreshGuardDueMigratesExpiredGroup(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	def := &model.Group{Name: "默认分组", IsDefault: true, TrafficQuota: 100}
+	if err := svc.DB.Create(def).Error; err != nil {
+		t.Fatalf("建默认分组失败: %v", err)
+	}
+	paid := &model.Group{Name: "付费分组", TrafficQuota: 100000}
+	if err := svc.DB.Create(paid).Error; err != nil {
+		t.Fatalf("建付费分组失败: %v", err)
+	}
+
+	past := time.Now().Add(-time.Hour)
+	u := &model.User{
+		Username: "expiredgroup", Password: "not-used", Status: model.UserStatusActive,
+		GroupID:        paid.ID,
+		GroupExpireAt:  &past,
+		TrafficUsed:    500, // 超过默认分组配额 100
+		TrafficResetAt: time.Now().AddDate(0, 1, 0),
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	svc.refreshGuardDue()
+
+	var fresh model.User
+	if err := svc.DB.First(&fresh, u.ID).Error; err != nil {
+		t.Fatalf("重读用户失败: %v", err)
+	}
+	if fresh.GroupID != def.ID {
+		t.Fatalf("到期用户应被落回默认分组，实际 group_id=%d（期望 %d）", fresh.GroupID, def.ID)
+	}
+	if fresh.GroupExpireAt != nil {
+		t.Fatal("迁移后必须清掉到期时间，否则每轮都会被重新扫出来")
+	}
+	// 迁移之后按默认分组（配额 100）算，用量 500 已超额。
+	if !svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("落回默认分组后应按默认组配额判定为超额")
+	}
+
+	// 下一轮不该再出现在到期集合里：集合必须收敛到零，而不是每轮原样再来一遍。
+	_, groupDue, err := svc.dueGuardUsers()
+	if err != nil {
+		t.Fatalf("查询到期用户失败: %v", err)
+	}
+	for _, id := range groupDue {
+		if id == u.ID {
+			t.Fatal("迁移后的用户不该再被扫出来（否则每轮都在重算同一批历史过期用户）")
+		}
 	}
 }
 

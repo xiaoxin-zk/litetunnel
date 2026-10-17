@@ -190,7 +190,7 @@ type Services struct {
 	// guardFullAt 是上一次**全量**准入标记校准的时刻（UnixNano）。
 	//
 	// 常规采集轮次只刷新「本轮有流量」与「计费周期到期」的用户，
-	// 全量校准低频执行（见 refreshGuardAfterTraffic）。
+	// 全量校准低频执行（见 refreshGuardDue）。
 	// 用原子变量而不是普通字段：写入在采集协程，读取可能来自启动路径。
 	guardFullAt atomic.Int64
 }

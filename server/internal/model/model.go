@@ -59,7 +59,7 @@ type User struct {
 	// TrafficResetAt 是周期结束时刻，流量采集每轮按「已到期」筛出需要清零的用户。
 	//
 	// 必须建索引：不筛的话每轮都得把全部用户读出来才能发现谁到期了，
-	// 而那正是要避免的全表成本（见 refreshGuardAfterTraffic）。
+	// 而那正是要避免的全表成本（见 refreshGuardDue）。
 	TrafficResetAt time.Time `gorm:"index" json:"traffic_reset_at"`
 
 	// 余额（单位：分）

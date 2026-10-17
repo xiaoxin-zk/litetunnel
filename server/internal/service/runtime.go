@@ -724,6 +724,11 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// 到期准入刷新放在采集**之前**、且不看采集成败：
+				// 它是时间驱动的，与 frps 管理接口是否可用无关。
+				// 挂在采集流程里的话，frps 一挂，到期用户的标记就停在旧值
+				// （清零后仍被拒 / 默认组配额调低后仍被放行）。
+				s.refreshGuardDue()
 				if !guardReady {
 					// 与基线一样只在恢复时打一行：数据库长时间不可用时，
 					// 每轮都打只会把日志刷满。
@@ -939,8 +944,9 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	}
 	// 配额标记无论落库成败都要重算：它读的是库里**已有**的用量，
 	// 与这一次写入是否成功无关。跳过它只会让超额状态更久不收敛。
-	// 常规轮次只刷新受影响的用户，全量校准低频执行（见 refreshGuardAfterTraffic）。
-	s.refreshGuardAfterTraffic(userDeltas)
+	// 这里只处理「本轮有流量」的用户；到期用户与全量校准由 refreshGuardDue
+	// 在采集之外执行（frps 挂掉时也必须继续跑）。
+	s.refreshGuardForTraffic(userDeltas)
 }
 
 // quotaFullRefresh 是全量准入标记校准的间隔。
@@ -953,50 +959,72 @@ func (s *Services) collectTraffic(ctx context.Context) {
 // 代价是最多延迟这么久才纠正。
 const quotaFullRefresh = 10 * time.Minute
 
-// refreshGuardAfterTraffic 是流量采集每轮结束时的准入标记刷新。
+// refreshGuardForTraffic 刷新本轮产生流量的用户的准入标记。
 //
-// 只刷新两类用户：
-//
-//   - 本轮产生流量的：超额与否只可能因用量变化；
-//   - 计费周期刚到期、需要清零的：这类用户往往**没有流量**（超额后连接被拦），
-//     不专门把到期的人找出来，他们会永远卡在「超额」上——流量不走、周期不清、
-//     标记不动，是个死循环。
-//
-// 其余变化由低频全量校准兜住；准入状态尚未就绪时（启动时数据库不可用）
-// 每轮都走全量，避免数据库恢复后还要再干等一个校准周期。
-func (s *Services) refreshGuardAfterTraffic(userDeltas map[uint]int64) {
+// 只刷新这些用户：超额与否只可能因用量变化，没流量的账号这一轮的输入没变。
+// 「到期」用户由 refreshGuardDue 单独处理——它必须能在 frps 不可用时照常跑。
+func (s *Services) refreshGuardForTraffic(userDeltas map[uint]int64) {
+	if len(userDeltas) == 0 {
+		return
+	}
 	ids := make([]uint, 0, len(userDeltas))
 	for id := range userDeltas {
 		ids = append(ids, id)
 	}
+	if err := s.refreshQuotaFlagsFor(ids); err != nil {
+		log.Printf("[quota] 刷新超额标记失败: %v", err)
+	}
+}
 
-	due, err := s.dueGuardUsers()
+// refreshGuardDue 处理「到期」用户的准入标记，并在到点时做一次全量校准。
+//
+// 与流量采集**解耦**执行：到期是时间驱动的，与 frps 管理接口是否可用无关。
+// 挂在采集里的话（采集在 ListProxies 失败时直接返回），frps 一挂，到期用户的
+// 标记就停在旧值——周期清零之后仍被拒绝，或者默认组配额调低之后仍被放行，
+// 而插件的新连接准入只看这份内存标记。
+func (s *Services) refreshGuardDue() {
+	periodDue, groupDue, err := s.dueGuardUsers()
 	if err != nil {
-		log.Printf("[quota] 查询到期用户失败（本轮照常刷新有流量的用户）: %v", err)
-	}
-	ids = append(ids, due...)
-
-	// 去重：有流量的用户也可能正好到期，同一轮不必查两遍。
-	seen := make(map[uint]bool, len(ids))
-	uniq := ids[:0]
-	for _, id := range ids {
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		uniq = append(uniq, id)
+		log.Printf("[quota] 查询到期用户失败: %v", err)
 	}
 
-	if len(uniq) > 0 {
-		if err := s.refreshQuotaFlagsFor(uniq); err != nil {
-			log.Printf("[quota] 刷新超额标记失败: %v", err)
+	if len(groupDue) > 0 {
+		// 先落库再算标记：把到期用户迁到默认分组之后，他们不会再被每轮扫出来。
+		if err := s.migrateExpiredGroups(groupDue); err != nil {
+			log.Printf("[quota] 迁移到期分组用户失败（本轮仍按默认分组算标记）: %v", err)
 		}
 	}
 
-	if !s.Runtime.AccessGuardReady() || s.guardFullRefreshDue() {
+	if ids := append(periodDue, groupDue...); len(ids) > 0 {
+		if err := s.refreshQuotaFlagsFor(ids); err != nil {
+			log.Printf("[quota] 刷新到期用户标记失败: %v", err)
+		}
+	}
+
+	if s.guardFullRefreshDue() {
 		// 失败时内部已记日志，这里不重复。
 		_ = s.refreshQuotaFlags()
 	}
+}
+
+// migrateExpiredGroups 把分组已到期的用户落到默认分组，并清掉到期时间。
+//
+// 只「按默认分组算配额」而不改数据是不够的：那些行会一直满足
+// group_expire_at <= now，于是每一轮都被扫出来重算——历史上过期过的用户越多，
+// 增量刷新的每轮开销越大，等于把「全表扫描」换成了「全历史过期扫描」。
+// 落库之后条件不再命中，集合自然收敛到零；用户从此跟随默认分组，
+// 管理员调整默认分组也会连带覆盖到他们（refreshQuotaForGroup 按 group_id 匹配）。
+//
+// 条件更新里重复了「已到期」这个前提：并发改派分组/延长有效期的操作会让它
+// 落空，此时本函数什么都不做，下一次调度按新状态重新判断。
+func (s *Services) migrateExpiredGroups(ids []uint) error {
+	g := s.defaultGroup()
+	if g == nil {
+		return errors.New("没有默认分组，无法把到期用户落回默认分组")
+	}
+	return s.DB.Model(&model.User{}).
+		Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", ids, time.Now()).
+		Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error
 }
 
 // dueGuardUsers 返回本轮到期的用户 ID：计费周期结束需要清零的，
@@ -1007,23 +1035,24 @@ func (s *Services) refreshGuardAfterTraffic(userDeltas map[uint]int64) {
 // 代价与到期用户数相关，与总用户数无关。
 //
 // traffic_reset_at 为初始零值的用户同样会命中——那正是需要初始化周期起点的人。
-func (s *Services) dueGuardUsers() ([]uint, error) {
+//
+// 两类分开返回：分组到期的那批要额外做一次「落回默认分组」的写入，
+// 周期到期的只需要重算标记。合在一起会让调用方分不清该不该做迁移。
+func (s *Services) dueGuardUsers() (periodDue, groupDue []uint, err error) {
 	now := time.Now()
 
-	var periodDue []uint
 	if err := s.DB.Model(&model.User{}).
 		Where("traffic_reset_at <= ?", now).
 		Pluck("id", &periodDue).Error; err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var groupDue []uint
 	if err := s.DB.Model(&model.User{}).
 		Where("group_expire_at IS NOT NULL AND group_expire_at <= ?", now).
 		Pluck("id", &groupDue).Error; err != nil {
-		return periodDue, err
+		return periodDue, nil, err
 	}
-	return append(periodDue, groupDue...), nil
+	return periodDue, groupDue, nil
 }
 
 // guardFullRefreshDue 报告是否到了全量校准的时点；到点则顺手记下本次时刻。

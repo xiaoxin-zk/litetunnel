@@ -119,8 +119,10 @@ type Runtime struct {
 	guardReady bool
 
 	identities map[identityKey]identityState
-	// identityGen 是每个身份的失效代次，见 InvalidateIdentity 的说明。
-	identityGen map[identityKey]uint64 // 账号有效性短缓存
+	// identityGen 是每个身份的失效代次，见 InvalidateIdentity 的说明；
+	// identityGenAt 记录代次最后一次推进的时刻，供 GC 判断能否清理。
+	identityGen   map[identityKey]uint64
+	identityGenAt map[identityKey]time.Time // 账号有效性短缓存
 }
 
 // 账号有效性缓存的命名空间。
@@ -135,6 +137,13 @@ const (
 // 10 秒的窗口在安全性与吞吐之间取得平衡：账号被禁用后最多 10 秒令牌失效，
 // 同时把每请求一次查询降为每个账号每 10 秒一次。
 const identityTTL = 10 * time.Second
+
+// identityGenGrace 是失效代次在 GC 中的保留期。
+//
+// 代次只在「有在途解析可能还拿着它」时有意义：一次解析只是读一次库，
+// 耗时远小于此。超过这个期限且没有缓存条目在用的代次可以安全删除——
+// 万一真有一个异常迟到的解析，它看到代次对不上只会放弃回填（安全方向）。
+const identityGenGrace = 5 * time.Minute
 
 type identityKey struct {
 	kind uint8
@@ -151,14 +160,15 @@ type identityState struct {
 // NewRuntime 构造内存态。
 func NewRuntime() *Runtime {
 	return &Runtime{
-		sessions:    make(map[string]sessionInfo),
-		exceeded:    make(map[uint]bool),
-		blocked:     make(map[uint]bool),
-		online:      make(map[uint]bool),
-		lastStat:    make(map[string]trafficPair),
-		touchAt:     make(map[string]time.Time),
-		identities:  make(map[identityKey]identityState),
-		identityGen: make(map[identityKey]uint64),
+		sessions:      make(map[string]sessionInfo),
+		exceeded:      make(map[uint]bool),
+		blocked:       make(map[uint]bool),
+		online:        make(map[uint]bool),
+		lastStat:      make(map[string]trafficPair),
+		touchAt:       make(map[string]time.Time),
+		identities:    make(map[identityKey]identityState),
+		identityGen:   make(map[identityKey]uint64),
+		identityGenAt: make(map[identityKey]time.Time),
 	}
 }
 
@@ -223,7 +233,11 @@ func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
 	if r.identityGen == nil {
 		r.identityGen = map[identityKey]uint64{}
 	}
+	if r.identityGenAt == nil {
+		r.identityGenAt = map[identityKey]time.Time{}
+	}
 	r.identityGen[key]++
+	r.identityGenAt[key] = time.Now()
 	delete(r.identities, key)
 }
 
@@ -605,7 +619,8 @@ func (r *Runtime) setOnlineTunnels(m map[uint]bool) {
 
 // GC 清理长时间无心跳的会话。
 func (r *Runtime) GC(maxIdle time.Duration) {
-	cutoff := time.Now().Add(-maxIdle)
+	now := time.Now()
+	cutoff := now.Add(-maxIdle)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, v := range r.sessions {
@@ -620,6 +635,33 @@ func (r *Runtime) GC(maxIdle time.Duration) {
 	for k, at := range r.touchAt {
 		if at.Before(cutoff) {
 			delete(r.touchAt, k)
+		}
+	}
+
+	// 身份缓存与失效代次同样要清：过期的 identities 条目以前只判未命中、
+	// 不删除，identityGen 更是只增不减——长期运行、账号不断增删时，这两张
+	// 表会按历史身份数一直长下去。拆出 gcIdentitiesLocked 便于测试用
+	// 可控的时间点验证清理边界。
+	r.gcIdentitiesLocked(now)
+}
+
+// gcIdentitiesLocked 清理过期身份缓存与失效代次（调用方须持有 r.mu）。
+func (r *Runtime) gcIdentitiesLocked(now time.Time) {
+	for k, st := range r.identities {
+		if now.Sub(st.at) > identityTTL {
+			delete(r.identities, k)
+		}
+	}
+	for k, at := range r.identityGenAt {
+		if _, cached := r.identities[k]; cached {
+			continue // 还有缓存条目在用这个代次
+		}
+		// 留一段宽限期再清：在途解析可能已经取走了这个代次，过早删除会让
+		// 它的条件写「代次对不上」而被拒绝（安全方向，只是白读一次）。
+		// 宽限期远大于一次解析的耗时，实际不会误伤。
+		if now.Sub(at) > identityGenGrace {
+			delete(r.identityGen, k)
+			delete(r.identityGenAt, k)
 		}
 	}
 }

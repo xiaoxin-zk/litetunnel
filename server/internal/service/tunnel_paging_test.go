@@ -123,6 +123,67 @@ func TestListTunnelsPageVersionDetectsCompensatingChange(t *testing.T) {
 	}
 }
 
+// TestListTunnelsPageVersionTracksStatusAndEdit 覆盖「状态/配置变更也进版本」。
+//
+// 只算「总数 + 最大 id」时，启用切停用、改端口/域名都不会改变版本：
+// 多页同步期间状态翻转，各页版本仍然一致，客户端按旧状态启停进程，
+// 直到下一轮同步才纠正。
+func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "pagever2", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "t", Type: model.ProxyTypeTCP, LocalIP: "127.0.0.1",
+		LocalPort: 25565, RemotePort: 24000, Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+
+	verOf := func() string {
+		t.Helper()
+		_, _, v, err := svc.ListTunnelsPage(u.ID, 0, 10)
+		if err != nil {
+			t.Fatalf("取版本失败: %v", err)
+		}
+		return v
+	}
+
+	v1 := verOf()
+
+	// 状态变更（启用 → 停用）：必须改变版本。
+	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
+		Update("status", model.TunnelStatusDisabled).Error; err != nil {
+		t.Fatal(err)
+	}
+	v2 := verOf()
+	if v2 == v1 {
+		t.Fatal("状态变更必须反映到清单版本，否则多页同步会按旧状态对账")
+	}
+
+	// 配置变更（改远程端口）：必须改变版本。
+	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
+		Update("remote_port", 24001).Error; err != nil {
+		t.Fatal(err)
+	}
+	v3 := verOf()
+	if v3 == v2 {
+		t.Fatal("配置变更必须反映到清单版本")
+	}
+
+	// 流量/在线这类采集字段不影响对账，不应让版本抖动。
+	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
+		Update("traffic_used", 12345).Error; err != nil {
+		t.Fatal(err)
+	}
+	if v4 := verOf(); v4 != v3 {
+		t.Fatal("采集字段变更不应改变清单版本（会让多页同步被无谓打断）")
+	}
+}
+
 // TestListTunnelsPageStableUnderDeletion 覆盖「分页期间删除不导致漏项」。
 //
 // offset 分页在删除后会跳过一条：删掉第 1 页的某条之后，第 2 页的

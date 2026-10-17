@@ -67,7 +67,10 @@ func (m *Mailer) Send(ctx context.Context, to, subject, htmlBody string) error {
 	)
 	if m.cfg.TLS == "ssl" {
 		// 465：隐式 TLS，连上就是加密的。
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
+		// 走 tls.Dialer.DialContext 而不是 tls.DialWithDialer：
+		// ctx 取消时拨号能立刻放弃，不必等到 deadline。
+		td := &tls.Dialer{NetDialer: dialer, Config: tlsConf}
+		conn, err = td.DialContext(ctx, "tcp", addr)
 	} else {
 		conn, err = dialer.DialContext(ctx, "tcp", addr)
 	}
@@ -82,6 +85,20 @@ func (m *Mailer) Send(ctx context.Context, to, subject, htmlBody string) error {
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
+
+	// ctx 取消时**立刻关闭连接**，而不是只靠 socket deadline：
+	// 服务停止时队列会放弃等待发送协程，若 SMTP 会话还跑到截止时间，
+	// 期间邮件可能已经送达、状态却仍停在待发送，重启后会重复投递。
+	// （关闭会让阻塞中的读写立刻返回错误，Send 随即返回。）
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
 
 	client, err := smtp.NewClient(conn, m.cfg.Host)
 	if err != nil {

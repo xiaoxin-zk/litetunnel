@@ -622,6 +622,13 @@ func (s *Services) FirewallManualClose(port int, proto string) error {
 	if err := s.FirewallGuard().CheckRemove(port); err != nil {
 		return err
 	}
+	// 检查与关闭必须在该端口的锁内完成，与自动放行（applyPortIntent）
+	// 使用同一把锁：否则「统计为 0 → 并发启用隧道 → 自动放行 → 手工关闭」
+	// 会让最终状态变成「隧道启用但端口关闭」。
+	pl := s.portLock(port)
+	pl.Lock()
+	defer pl.Unlock()
+
 	n, err := s.activeTunnelPortCount(port, proto)
 	if err != nil {
 		return err

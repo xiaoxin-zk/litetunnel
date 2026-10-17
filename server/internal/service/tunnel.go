@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"strings"
@@ -50,35 +51,58 @@ func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
 //
 // 同时返回总数与**清单版本**：只比条数会漏过「数量相抵」的并发变更
 // （分页期间删掉一条已取到的、同时新增一条 id 更大的：总数不变，但
-// 新隧道落在游标之前，永远取不到）。版本用「总数 + 最大 id」概括——
-// 新增必然推高最大 id，删除必然减少总数，客户端逐页比对，不一致就
-// 整轮重取。
+// 新隧道落在游标之前，永远取不到）。版本是对账相关字段的摘要，见
+// tunnelListVersionTx。
 //
-// 不用 MAX(updated_at) 参与版本：SQLite 把它当作文本返回、Postgres
-// 返回时间，跨库扫描类型不一致；而「改个名字」本就不影响清单完整性，
-// 下一轮同步自然会带上。
+// 版本与页面数据在**同一个只读事务**里读：SQLite 只有一条连接，事务内
+// 看到的是同一个快照；即便别的数据库上是逐语句快照，跨页比对版本也能
+// 发现期间的变化，最坏只是多重取一轮。
 func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []model.Tunnel, total int64, version string, err error) {
-	var agg struct {
-		Total int64
-		MaxID uint
-	}
-	if err = s.DB.Model(&model.Tunnel{}).Where("user_id = ?", userID).
-		Select("COUNT(*) AS total, COALESCE(MAX(id), 0) AS max_id").
-		Scan(&agg).Error; err != nil {
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		v, n, verr := s.tunnelListVersionTx(tx, userID)
+		if verr != nil {
+			return verr
+		}
+		version, total = v, n
+
+		q := tx.Where("user_id = ?", userID).Order("id desc")
+		if beforeID > 0 {
+			q = q.Where("id < ?", beforeID)
+		}
+		if limit > 0 {
+			q = q.Limit(limit)
+		}
+		return q.Find(&list).Error
+	})
+	if err != nil {
 		return nil, 0, "", err
 	}
-	total = agg.Total
-	version = fmt.Sprintf("%d:%d", total, agg.MaxID)
+	return list, total, version, nil
+}
 
-	q := s.DB.Where("user_id = ?", userID).Order("id desc")
-	if beforeID > 0 {
-		q = q.Where("id < ?", beforeID)
+// tunnelListVersionTx 计算用户隧道清单的版本，覆盖**客户端对账用到的
+// 全部字段**，而不只是条数与 id。
+//
+// 只算「总数 + 最大 id」发现不了「启用切停用」「改了端口/域名」这类不增删
+// 记录的变更：多页同步期间状态翻转时，各页版本仍然一致，客户端会按旧
+// 状态启停进程，直到下一轮同步才纠正。
+//
+// 摘要里**不含** updated_at 与流量/在线字段：采集器每轮都会写这些列，
+// 让它们参与版本会让版本无谓地抖动，多页同步被反复打断。
+func (s *Services) tunnelListVersionTx(tx *gorm.DB, userID uint) (string, int64, error) {
+	var rows []model.Tunnel
+	if err := tx.Model(&model.Tunnel{}).
+		Select("id, status, name, type, local_ip, local_port, remote_port, domain, subdomain, bandwidth_limit, use_encryption, use_compression").
+		Where("user_id = ?", userID).Order("id asc").Find(&rows).Error; err != nil {
+		return "", 0, err
 	}
-	if limit > 0 {
-		q = q.Limit(limit)
+	h := fnv.New64a()
+	for _, t := range rows {
+		fmt.Fprintf(h, "%d|%s|%s|%s|%s|%d|%d|%s|%s|%d|%t|%t;",
+			t.ID, t.Status, t.Name, t.Type, t.LocalIP, t.LocalPort, t.RemotePort,
+			t.Domain, t.Subdomain, t.BandwidthLimit, t.UseEncryption, t.UseCompression)
 	}
-	err = q.Find(&list).Error
-	return list, total, version, err
+	return fmt.Sprintf("%d:%016x", len(rows), h.Sum64()), int64(len(rows)), nil
 }
 
 // GetTunnel 按 ID 与归属校验后取隧道。

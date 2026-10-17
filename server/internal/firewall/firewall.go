@@ -16,6 +16,7 @@ package firewall
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -186,23 +187,36 @@ func (g *Guard) Protected() []int {
 
 // ---- 命令执行 ----
 
-// run 执行命令并返回合并后的输出。带超时，避免命令挂死拖垮控制面。
-func run(name string, args ...string) (string, error) {
+var run = runCommand
+
+type commandError struct {
+	message string
+	cause   error
+}
+
+func (e *commandError) Error() string { return e.message }
+func (e *commandError) Unwrap() error { return e.cause }
+
+func runCommand(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-	out := strings.TrimSpace(buf.String())
+	out := strings.TrimSpace(stdout.String())
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return out, fmt.Errorf("执行 %s 超时（可能 iptables 锁被占用）", name)
+			return out, &commandError{message: fmt.Sprintf("执行 %s 超时", name), cause: ctx.Err()}
 		}
-		return out, fmt.Errorf("执行 %s 失败: %s", name, firstLine(out, err))
+		diagnostic := strings.TrimSpace(stderr.String() + "\n" + out)
+		return out, &commandError{
+			message: fmt.Sprintf("执行 %s 失败: %s", name, firstLine(diagnostic, err)),
+			cause:   err,
+		}
 	}
 	return out, nil
 }
@@ -234,6 +248,13 @@ func firstLine(out string, err error) string {
 func notExistErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	var commandErr *commandError
+	if errors.As(err, &commandErr) {
+		var exitErr *exec.ExitError
+		if !errors.As(commandErr.cause, &exitErr) {
+			return false
+		}
 	}
 	msg := strings.ToLower(err.Error())
 	for _, s := range []string{

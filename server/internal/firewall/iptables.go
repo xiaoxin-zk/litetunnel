@@ -28,11 +28,17 @@ func (t *IPTables) Available() bool { return hasCmd("iptables") }
 // ensureChain 确保专属链存在且已从 INPUT 跳入。幂等，每次写操作前调用。
 func (t *IPTables) ensureChain() error {
 	if _, err := run("iptables", "-L", ChainName); err != nil {
+		if !notExistErr(err) {
+			return err
+		}
 		if _, err := run("iptables", "-N", ChainName); err != nil {
 			return err
 		}
 	}
 	if _, err := run("iptables", "-C", "INPUT", "-j", ChainName); err != nil {
+		if !notExistErr(err) {
+			return err
+		}
 		// 插到 INPUT 最前面：若 INPUT 策略为 DROP 或有前置拦截规则，
 		// 追加到末尾会导致我们的放行规则永远不生效。
 		if _, err := run("iptables", "-I", "INPUT", "1", "-j", ChainName); err != nil {
@@ -77,12 +83,16 @@ func (t *IPTables) ListRules() ([]Rule, error) {
 	// 1) 专属链：本面板管理的规则
 	if out, err := run("iptables", "-S", ChainName); err == nil {
 		rules = append(rules, parseIptablesRules(out, true)...)
+	} else if !notExistErr(err) {
+		return nil, err
 	}
 
 	// 2) INPUT 上的直接放行规则：他人添加的，只读展示
-	if out, err := run("iptables", "-S", "INPUT"); err == nil {
-		rules = append(rules, parseIptablesRules(out, false)...)
+	out, err := run("iptables", "-S", "INPUT")
+	if err != nil {
+		return nil, err
 	}
+	rules = append(rules, parseIptablesRules(out, false)...)
 
 	return dedupeRules(rules), nil
 }
@@ -137,6 +147,8 @@ func (t *IPTables) AddPort(port int, proto string) error {
 	check := append([]string{"-C", ChainName}, spec...)
 	if _, err := run("iptables", check...); err == nil {
 		return nil
+	} else if !notExistErr(err) {
+		return err
 	}
 
 	add := append([]string{"-A", ChainName}, spec...)
@@ -160,7 +172,10 @@ func (t *IPTables) RemovePort(port int, proto string) error {
 
 	for i := 0; i < 8; i++ {
 		if _, err := run("iptables", check...); err != nil {
-			return nil // 已不存在
+			if notExistErr(err) {
+				return nil
+			}
+			return err
 		}
 		if _, err := run("iptables", del...); err != nil {
 			return err

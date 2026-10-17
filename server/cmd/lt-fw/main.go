@@ -191,7 +191,13 @@ func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 GET"})
 		return
 	}
-	rules, err := firewall.ListResolvedRules()
+	var rules []firewall.Rule
+	var err error
+	if _, ok := s.backend.(*firewall.IPTables); ok {
+		rules, err = firewall.ListResolvedRules()
+	} else {
+		rules, err = s.backend.ListRules()
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return

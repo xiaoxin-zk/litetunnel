@@ -1,60 +1,113 @@
 package firewall
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 )
 
-// 面板专属的 nftables 表与链。
-//
-// 与 iptables 后端同理：所有规则写在自己的表里，
-// 不改动系统既有的 inet filter 表，避免与管理员的手工规则互相干扰。
 const (
 	nftTable = "litetunnel"
 	nftChain = "input"
 )
 
-// Nftables 通过自建表管理入站端口。
-//
-// 优先级设为 -1：保证我们的 accept 规则先于系统默认 filter 链执行，
-// 否则当默认链策略为 drop 时，放行规则永远不会被命中。
 type Nftables struct{}
 
 func (n *Nftables) Name() string { return "nftables" }
 
 func (n *Nftables) Available() bool {
-	if !hasCmd("nft") {
-		return false
-	}
-	_, err := run("nft", "list", "tables")
-	return err == nil
+	return hasCmd("nft")
 }
 
 func (n *Nftables) ensureTable() error {
-	if _, err := run("nft", "list", "table", "inet", nftTable); err == nil {
-		return nil
+	if _, err := run("nft", "list", "table", "inet", nftTable); err != nil {
+		if !notExistErr(err) {
+			return err
+		}
+		if _, err := run("nft", "add", "table", "inet", nftTable); err != nil {
+			return err
+		}
 	}
-	if _, err := run("nft", "add", "table", "inet", nftTable); err != nil {
+	if _, err := run("nft", "list", "chain", "inet", nftTable, nftChain); err == nil {
+		return nil
+	} else if !notExistErr(err) {
 		return err
 	}
-	// 链规格必须作为**单个参数**传入：它是 nft 的复合语法，
-	// 拆成多个参数会被解析成不同的 token 而失败。
 	spec := "{ type filter hook input priority -1 ; policy accept ; }"
-	if _, err := run("nft", "add", "chain", "inet", nftTable, nftChain, spec); err != nil {
-		// 链已存在（并发或上次残留）时忽略
-		if _, e := run("nft", "list", "chain", "inet", nftTable, nftChain); e != nil {
-			return err
+	_, err := run("nft", "add", "chain", "inet", nftTable, nftChain, spec)
+	return err
+}
+
+func (n *Nftables) compatible() error {
+	out, err := run("nft", "-j", "list", "ruleset")
+	if err != nil {
+		return err
+	}
+	return checkNftInputCompatibility([]byte(out))
+}
+
+type nftChainSpec struct {
+	Family string `json:"family"`
+	Table  string `json:"table"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Hook   string `json:"hook"`
+	Policy string `json:"policy"`
+}
+
+func checkNftInputCompatibility(raw []byte) error {
+	var dump struct {
+		Objects []struct {
+			Chain *nftChainSpec `json:"chain"`
+			Rule  *struct {
+				Family string `json:"family"`
+				Table  string `json:"table"`
+				Chain  string `json:"chain"`
+			} `json:"rule"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		return fmt.Errorf("解析 nftables 规则集失败: %w", err)
+	}
+	if dump.Objects == nil {
+		return fmt.Errorf("nftables 规则集缺少 nftables 数组")
+	}
+	key := func(family, table, chain string) string { return family + "/" + table + "/" + chain }
+	rules := make(map[string]int)
+	for _, object := range dump.Objects {
+		if r := object.Rule; r != nil {
+			rules[key(r.Family, r.Table, r.Chain)]++
+		}
+	}
+	for _, object := range dump.Objects {
+		c := object.Chain
+		if c == nil {
+			continue
+		}
+		owned := c.Family == "inet" && c.Table == nftTable && c.Name == nftChain
+		if owned {
+			if c.Type != "filter" || c.Hook != "input" || c.Policy != "accept" {
+				return fmt.Errorf("nftables 专属链规格不兼容，未修改规则")
+			}
+			continue
+		}
+		if c.Hook != "input" || (c.Family != "inet" && c.Family != "ip" && c.Family != "ip6") {
+			continue
+		}
+		// 独立基链中的 accept 不能覆盖其他基链的 drop；非空链可能包含跳转、
+		// verdict map 或条件拒绝。未实现完整求值时，仅接受空的 accept 基链。
+		if c.Type != "filter" || c.Policy != "accept" || rules[key(c.Family, c.Table, c.Name)] != 0 {
+			return fmt.Errorf("nftables input 基链 %s 不兼容：无法保证专属链的放行生效，请由现有防火墙管理器放行端口", key(c.Family, c.Table, c.Name))
 		}
 	}
 	return nil
 }
 
-// Status 判断专属表与链是否存在。
-//
-// 只有「表/链不存在」能断定未启用；其余失败（超时、权限、nft 不可用）
-// 都是「查不到」，必须把错误交给上层，而不是报成一个明确的 false。
 func (n *Nftables) Status() (bool, error) {
+	if err := n.compatible(); err != nil {
+		return false, err
+	}
 	if _, err := run("nft", "list", "chain", "inet", nftTable, nftChain); err != nil {
 		if notExistErr(err) {
 			return false, nil
@@ -64,20 +117,23 @@ func (n *Nftables) Status() (bool, error) {
 	return true, nil
 }
 
-// nftRuleRe 匹配 `tcp dport 20001 accept` 与 `udp dport 20002 accept`
 var nftRuleRe = regexp.MustCompile(`(tcp|udp)\s+dport\s+(\d+)\s+accept`)
 
 func (n *Nftables) ListRules() ([]Rule, error) {
 	var rules []Rule
-
-	if out, err := run("nft", "list", "chain", "inet", nftTable, nftChain); err == nil {
-		rules = append(rules, parseNftRules(out, true)...)
+	for _, chain := range []struct{ table, name string; managed bool }{
+		{nftTable, nftChain, true},
+		{"filter", "input", false},
+	} {
+		out, err := run("nft", "list", "chain", "inet", chain.table, chain.name)
+		if err != nil {
+			if notExistErr(err) {
+				continue
+			}
+			return nil, err
+		}
+		rules = append(rules, parseNftRules(out, chain.managed)...)
 	}
-	// 同时读系统默认 filter 链，让管理员看到全貌（只读）
-	if out, err := run("nft", "list", "chain", "inet", "filter", "input"); err == nil {
-		rules = append(rules, parseNftRules(out, false)...)
-	}
-
 	return dedupeRules(rules), nil
 }
 
@@ -98,11 +154,17 @@ func (n *Nftables) AddPort(port int, proto string) error {
 	if err != nil {
 		return err
 	}
+	if err := n.compatible(); err != nil {
+		return err
+	}
 	if err := n.ensureTable(); err != nil {
 		return err
 	}
-	// 先检查是否已存在，保持幂等
-	if n.exists(port, proto) {
+	handle, err := n.findHandle(port, proto)
+	if err != nil {
+		return err
+	}
+	if handle != "" {
 		return nil
 	}
 	_, err = run("nft", "add", "rule", "inet", nftTable, nftChain,
@@ -115,10 +177,11 @@ func (n *Nftables) RemovePort(port int, proto string) error {
 	if err != nil {
 		return err
 	}
-	// 用 handle 删除：nft 只能按 handle 精确删除规则。
-	// 循环若干次以清掉可能存在的重复规则。
 	for i := 0; i < 8; i++ {
-		handle := n.findHandle(port, proto)
+		handle, err := n.findHandle(port, proto)
+		if err != nil {
+			return err
+		}
 		if handle == "" {
 			return nil
 		}
@@ -129,24 +192,21 @@ func (n *Nftables) RemovePort(port int, proto string) error {
 	return fmt.Errorf("端口 %d 的 nft 规则异常重复，请手工检查", port)
 }
 
-func (n *Nftables) exists(port int, proto string) bool {
-	return n.findHandle(port, proto) != ""
-}
-
-// nftHandleRe 匹配带 handle 的规则行，如
-// `tcp dport 20001 accept # handle 5`
 var nftHandleRe = regexp.MustCompile(`(tcp|udp)\s+dport\s+(\d+)\s+accept.*#\s*handle\s+(\d+)`)
 
-func (n *Nftables) findHandle(port int, proto string) string {
+func (n *Nftables) findHandle(port int, proto string) (string, error) {
 	out, err := run("nft", "-a", "list", "chain", "inet", nftTable, nftChain)
 	if err != nil {
-		return ""
+		if notExistErr(err) {
+			return "", nil
+		}
+		return "", err
 	}
 	want := strconv.Itoa(port)
 	for _, m := range nftHandleRe.FindAllStringSubmatch(out, -1) {
 		if m[1] == proto && m[2] == want {
-			return m[3]
+			return m[3], nil
 		}
 	}
-	return ""
+	return "", nil
 }

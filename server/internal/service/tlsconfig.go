@@ -405,7 +405,15 @@ func (s *Services) DomainHelper() *tlscfg.Client {
 // 这里刻意不接受任何参数来覆盖配置：面板是配置的唯一权威来源，
 // 而 helper 只认白名单内的键。否则「界面上保存的」与「实际生效的」
 // 会立刻分叉，而这套部署里最难的排查就是「两份配置不一样」。
+//
+// 全程持有 domainMu：从读取变量、调 helper 到记录「已生效」是一整个临界区
+// （为什么必须整个流程一起锁，见 service.go 里 domainMu 的说明）。helper
+// 那边也有自己的互斥，但这只保证单次渲染原子；保证不了两次下发的先后
+// 与「已生效」标记的先后一致。
 func (s *Services) ApplyDomainConfig(apply bool) (tlscfg.RenderResult, error) {
+	s.domainMu.Lock()
+	defer s.domainMu.Unlock()
+
 	client := s.DomainHelper()
 	if !client.Configured() {
 		return tlscfg.RenderResult{}, fmt.Errorf("%w: %s", ErrDomainApply, client.Reason())

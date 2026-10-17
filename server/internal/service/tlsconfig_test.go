@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -422,4 +423,69 @@ func TestTunnelWriteErrorClassification(t *testing.T) {
 	if got := describeTunnelWriteError(raw); got != raw {
 		t.Fatalf("端口冲突不该被改写，得到 %v", got)
 	}
+}
+
+// TestApplyDomainConfigWaitsForDomainMu 覆盖「下发流程整段互斥」。
+//
+// 两次「保存并应用」交错时，可能后到的那次先完成：宿主机上跑的是旧配置，
+// 「已生效」标记却写成了先到那份的，或反过来。竞态本身无法稳定复现
+// （SQLite 单连接天然串行化数据库层），所以这里沿用 TestCreateTunnelWaitsForUserLock
+// 的思路——直接验证「下发确实会先取 domainMu」这个结构前提。
+func TestApplyDomainConfigWaitsForDomainMu(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	svc.domainMu.Lock() // 模拟「另一次下发正在进行」
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = svc.ApplyDomainConfig(true) // helper 未配置，会快速返回错误
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("另一个下发还没结束时，第二次下发不应当进入临界区")
+	case <-time.After(50 * time.Millisecond):
+		// 仍在等锁：符合预期。
+	}
+
+	svc.domainMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("锁释放后下发应当继续完成")
+	}
+}
+
+// TestUpdateSettingsDomainSaveWaitsForApply 覆盖「保存与下发互斥」的范围：
+// 改「域名与证书」的保存必须排在一次进行中的下发后面——下发是逐个 key
+// 读设置，读到一半插进一次保存会把「从未保存过的组合」原样下发出去；
+// 而改无关设置的保存不该被下发拖住。
+func TestUpdateSettingsDomainSaveWaitsForApply(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	svc.domainMu.Lock() // 模拟「下发正在进行」
+	defer svc.domainMu.Unlock()
+
+	// 无关设置的保存：不必等下发，立刻就能完成。
+	doneOther := make(chan error, 1)
+	go func() { doneOther <- svc.UpdateSettings(map[SettingKey]string{KeySiteAnnouncement: "维护通知"}) }()
+	select {
+	case err := <-doneOther:
+		if err != nil {
+			t.Fatalf("无关设置的保存不该被下发阻塞，也不该失败: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("与域名无关的保存被不必要地挡在了一次下发后面")
+	}
+
+	// 改「域名与证书」的保存：必须等下发结束。
+	doneDomain := make(chan error, 1)
+	go func() { doneDomain <- svc.UpdateSettings(map[SettingKey]string{KeyDomainACMEEmail: "ops@example.com"}) }()
+	select {
+	case <-doneDomain:
+		t.Fatal("改域名组的保存不该在下发进行中完成")
+	case <-time.After(50 * time.Millisecond):
+		// 仍在等锁：符合预期。
+	}
+	// 不释放锁直接返回：doneDomain 里的协程会在测试结束后拿到锁并退出。
 }

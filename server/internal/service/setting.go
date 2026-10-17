@@ -576,6 +576,17 @@ func (s *SettingStore) AllForAdmin() map[string]string {
 // 校验基于「当前值 + 本次提交」的合并视图，因此可以跨字段判断
 // （例如：只提交了开关、SMTP 参数沿用旧值时也能正确判断参数是否齐全）。
 func (s *Services) UpdateSettings(in map[SettingKey]string) error {
+	// 本次提交改了「域名与证书」这一组时，与下发流程互斥（domainMu）：
+	// 下发是逐个 key 读设置再渲染，读到一半插进一次保存，会把
+	// 「从未作为整体保存过」的组合原样下发并记为已生效。
+	//
+	// 只在这一组**确实被改**时才取锁：下发可能持续数分钟，
+	// 不能让改个公告的普通保存排在它后面。
+	if touchesDomainSettings(in) {
+		s.domainMu.Lock()
+		defer s.domainMu.Unlock()
+	}
+
 	view := func(k SettingKey) string {
 		if v, ok := in[k]; ok && v != SecretMask {
 			return strings.TrimSpace(v)
@@ -763,6 +774,31 @@ func validateDomainSettings(view, current func(SettingKey) string) error {
 		return fmt.Errorf("%w: 配置服务访问令牌至少 16 个字符，否则本机任意进程都能让它重写 TLS 配置并重启容器", ErrInvalidParam)
 	}
 	return nil
+}
+
+// domainSettingKeys 是「域名与证书」里参与渲染下发的键，与 domainVars 同源。
+//
+// 以此判断一次保存要不要与下发互斥。helper 地址与令牌不在其中：
+// 它们决定「找哪个 helper」，不进 Caddyfile / frps.toml，也不进已生效的
+// 摘要——保存它们与一次进行中的下发交错，不会产生「从未保存过的组合」。
+var domainSettingKeys = []SettingKey{
+	KeyDomainPanel,
+	KeyDomainTunnel,
+	KeyDomainACMEEmail,
+	KeyDomainDNSProvider,
+	KeyDomainDNSArgs,
+	KeyDomainDNSCredential,
+	KeyDomainHTTPSMode,
+}
+
+// touchesDomainSettings 报告一次设置提交是否改动了「域名与证书」的渲染输入。
+func touchesDomainSettings(in map[SettingKey]string) bool {
+	for _, k := range domainSettingKeys {
+		if _, ok := in[k]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ParsePortList 解析 "22,80,443,10000-10100" 形式的端口列表。

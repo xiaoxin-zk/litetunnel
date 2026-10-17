@@ -35,6 +35,13 @@ func sameDay(a, b time.Time) bool {
 type trafficPair struct {
 	in  int64
 	out int64
+	// tunnelID 是这条代理对应的隧道行 ID，用于识别「同名隧道被删除后重建」。
+	//
+	// 代理名只由「用户 ID + 隧道名」组成：删了再建同名隧道，代理名一模一样，
+	// 但 frps 侧的当日累计从 0 重新开始。没有这个标识时，采集会拿旧代理的
+	// 基线去减新代理的计数——旧基线更大时走「跨零点」分支（把新计数整个记一遍），
+	// 更小时则把新隧道前段的流量整段吃掉。两种情况都算错。
+	tunnelID uint
 	// seenAt 是这个名字最后一次出现在 frps 列表里的时刻。
 	//
 	// 只用于「本轮没出现的代理要不要保留基线」，不参与增量计算：
@@ -922,8 +929,14 @@ func (s *Services) collectTraffic(ctx context.Context) {
 			continue
 		}
 
-		cur := trafficPair{in: p.Status.TodayTrafficIn, out: p.Status.TodayTrafficOut, seenAt: now}
+		cur := trafficPair{in: p.Status.TodayTrafficIn, out: p.Status.TodayTrafficOut,
+			seenAt: now, tunnelID: t.ID}
 		prev := lastStat[p.Name]
+		// 同名隧道被删除后重建：代理名没变，但这是一条**新的**代理，
+		// frps 侧的当日累计从 0 起算。拿旧基线相减会算错，这里按「从未见过」处理。
+		if prev.tunnelID != 0 && prev.tunnelID != t.ID {
+			prev = trafficPair{}
+		}
 		din, dout := cur.in-prev.in, cur.out-prev.out
 		// frps 的当日统计跨零点归零，此时当前值本身就是增量。
 		if din < 0 {
@@ -1289,10 +1302,12 @@ func (s *Services) flushTraffic(
 				Date:      today,
 				InBytes:   cur.in,
 				OutBytes:  cur.out,
+				// 记下隧道行 ID：同名隧道删了重建时，靠它认出「这不是原来那条代理」。
+				TunnelID: cur.tunnelID,
 			}
 			if err := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "proxy_name"}},
-				DoUpdates: clause.AssignmentColumns([]string{"date", "in_bytes", "out_bytes"}),
+				DoUpdates: clause.AssignmentColumns([]string{"date", "in_bytes", "out_bytes", "tunnel_id"}),
 			}).Create(&row).Error; err != nil {
 				return err
 			}
@@ -1355,7 +1370,8 @@ func (s *Services) loadTrafficBaseline() bool {
 	now := time.Now()
 	m := make(map[string]trafficPair, len(rows))
 	for _, r := range rows {
-		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes, seenAt: now}
+		m[r.ProxyName] = trafficPair{in: r.InBytes, out: r.OutBytes,
+			seenAt: now, tunnelID: r.TunnelID}
 	}
 
 	s.Runtime.mu.Lock()

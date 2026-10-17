@@ -166,6 +166,9 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	// 入队后复核：上面的冷却与每日上限都是「先查后写」，并发请求会同时
 	// 读到「还没满」而各自发出。把刚写入的这封也算进去再判一次，
 	// 超了就把它作废——用户收不到，限流才真正生效。
+	//
+	// 此时这封还是草稿（worker 不会取），所以「复核」真的发生在发送之前：
+	// 先发后查的话，作废只能拦住凭据生效，拦不住收件人收到一个无效验证码。
 	if qerr := s.recheckEmailCodeQuota(row); qerr != nil {
 		s.voidMail(row.ID, qerr.Error())
 		if scene == EmailSceneReset {
@@ -173,6 +176,15 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			return nil
 		}
 		return qerr
+	}
+	if !s.releaseMail(row.ID) {
+		// 释放失败（多半是数据库写不进去）：这封信不会发出去，
+		// 必须如实报错——否则用户会一直等一封永远不会来的验证码。
+		if scene == EmailSceneReset {
+			log.Printf("[emailcode] 找回密码验证码释放失败（邮箱 %s），已按未发送处理", maskEmail(email))
+			return nil
+		}
+		return ErrMailQueueFull
 	}
 	return nil
 }
@@ -214,11 +226,11 @@ func (s *Services) recheckEmailCodeQuota(row *model.MailOutbox) error {
 
 // voidMail 作废一封尚未投递的邮件：不再发送，正文与参数一并清掉。
 //
-// 条件更新（仅 pending）：如果它已经被 worker 取走发出去了，
+// 条件更新（仅 draft / pending）：如果它已经被 worker 取走发出去了，
 // 这里不改状态——那封信的凭据动作会由激活环节按当前账号状态再判一次。
 func (s *Services) voidMail(id uint, reason string) {
 	if err := s.DB.Model(&model.MailOutbox{}).
-		Where("id = ? AND status = ?", id, model.MailPending).
+		Where("id = ? AND status IN ?", id, []string{model.MailDraft, model.MailPending}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",

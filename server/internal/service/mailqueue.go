@@ -73,8 +73,10 @@ func (s *Services) queueMail(to, subject, body, kind string, payload any) (*mode
 		Body:    body,
 		Kind:    kind,
 		Payload: string(raw),
-		Status:  model.MailPending,
-		NextAt:  time.Now(),
+		// 先写成草稿：worker 只认 pending，所以这封信此刻发不出去。
+		// 调用方复核完额度（并在这里就作废超额的那一封）之后再调 releaseMail。
+		Status: model.MailDraft,
+		NextAt: time.Now(),
 	}
 	if err := s.DB.Create(&rec).Error; err != nil {
 		// 用「稍后重试」的口径对外：对用户来说这与队列繁忙是一回事，
@@ -82,10 +84,28 @@ func (s *Services) queueMail(to, subject, body, kind string, payload any) (*mode
 		log.Printf("[mail] 写入发件箱失败（收件人 %s）: %v", maskEmail(to), err)
 		return nil, ErrMailQueueFull
 	}
-	s.kickMailWorker()
 	// 返回刚写入的记录：调用方要拿它做「入队后复核额度」，
 	// 拿到 ID 才能把超额的那一封作废掉（见 emailcode.go）。
 	return &rec, nil
+}
+
+// releaseMail 把草稿邮件转为待发送，并唤醒发信协程。
+//
+// 条件更新（仅 draft）：若这封已被作废，就不该再放出去。
+// 返回是否真的释放了。
+func (s *Services) releaseMail(id uint) bool {
+	res := s.DB.Model(&model.MailOutbox{}).
+		Where("id = ? AND status = ?", id, model.MailDraft).
+		Updates(map[string]any{"status": model.MailPending, "next_at": time.Now()})
+	if res.Error != nil {
+		log.Printf("[mail] 释放邮件失败（id=%d）: %v", id, res.Error)
+		return false
+	}
+	if res.RowsAffected == 0 {
+		return false
+	}
+	s.kickMailWorker()
+	return true
 }
 
 // kickMailWorker 唤醒发送协程，不必等下一个轮询周期。
@@ -397,6 +417,10 @@ func (s *Services) finishMail(id uint, f mailFinish) {
 func (s *Services) pruneMailOutbox() {
 	s.pruneTable("已送达邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailSent, time.Now().Add(-mailSentRetention))
+	// 未释放的草稿：正常路径在同一次调用里就会被释放或作废，留下的只可能是
+	// 「进程在写完草稿与复核之间崩溃」。它们永远不会被发送，直接清掉。
+	s.pruneTable("未释放的邮件草稿", &model.MailOutbox{},
+		"status = ? AND created_at < ?", model.MailDraft, time.Now().Add(-time.Hour))
 }
 
 // maskEmail 对日志中的邮箱做脱敏，避免日志成为邮箱收集来源。

@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -115,26 +116,41 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	}
 
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		if !skipLimits {
+			// 额度预留：先按**固定顺序**锁住额度键，再统计，再写入。
+			//
+			// 锁必须赶在统计之前拿到。PostgreSQL 默认 READ COMMITTED 下，
+			// 「先数、后插」的两个事务看不到彼此尚未提交的行——两边都会读到
+			// 「还剩最后一个名额」并各自提交，最终超额。锁住同一个键之后，
+			// 后一个事务要等前一个提交，随后的统计才看得到那一条。
+			//
+			// 顺序固定（排序后再取）是为了避免两个并发注册互相等对方的键。
+			keys := make([]string, 0, 2)
+			if in.IP != "" {
+				keys = append(keys, "register:ip:"+in.IP)
+			}
+			if domain != "" {
+				keys = append(keys, "register:domain:"+domain)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if err := s.lockRegisterQuota(tx, k); err != nil {
+					return err
+				}
+			}
+			if err := s.checkRegisterRate(tx, in.IP, false); err != nil {
+				return err
+			}
+			if err := s.checkDomainRate(tx, domain, false); err != nil {
+				return err
+			}
+		}
 		if codeRec != nil {
 			if cerr := s.consumeEmailCode(tx, codeRec.ID); cerr != nil {
 				return cerr
 			}
 		}
-		if err := s.insertUserTx(tx, user); err != nil {
-			return err
-		}
-		// 预留式复核：上面的计数与这次写入之间可能插进了并发注册，
-		// 两边都读到「还没满」就会一起写进去。把自己也算进去再判一次，
-		// 超了就让整个事务回滚——用户与验证码都不留下痕迹。
-		if !skipLimits {
-			if err := s.checkRegisterRate(tx, in.IP, true); err != nil {
-				return err
-			}
-			if err := s.checkDomainRate(tx, domain, true); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.insertUserTx(tx, user)
 	})
 	if err != nil {
 		return nil, err
@@ -353,6 +369,21 @@ func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) e
 		return ErrDomainRegisterLimited
 	}
 	return nil
+}
+
+// lockRegisterQuota 在事务内按「额度键」加锁，把同键的并发注册串行化。
+//
+// PostgreSQL 用事务级 advisory lock：键相同的事务排队，后一个拿到锁时前一个
+// 已经提交，随后的统计才看得到它。SQLite 不需要——store.Open 里连接池只有
+// 一个连接，事务天然串行。
+//
+// hashtext 有 32 位碰撞可能：撞了只是让两组无关的注册多串行一会儿，
+// 不影响正确性。
+func (s *Services) lockRegisterQuota(tx *gorm.DB, key string) error {
+	if s.Cfg == nil || !strings.EqualFold(strings.TrimSpace(s.Cfg.DBDriver), "postgres") {
+		return nil
+	}
+	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", key).Error
 }
 
 // overLimit 判断计数是否已超出注册上限。
@@ -733,7 +764,7 @@ func purgeEmailCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", email,
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailDelivered}).
+			[]string{model.MailDraft, model.MailPending, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",
@@ -818,7 +849,7 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?", strings.ToLower(email),
 			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
 				model.MailKindEmailCodeRegister, model.MailKindEmailCodeChange},
-			[]string{model.MailPending, model.MailDelivered}).
+			[]string{model.MailDraft, model.MailPending, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":   model.MailFailed,
 			"body":     "",

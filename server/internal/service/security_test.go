@@ -3085,6 +3085,62 @@ func TestCollectTrafficKeepsBaselineForAbsentProxy(t *testing.T) {
 	}
 }
 
+// TestCollectTrafficResetsBaselineForRecreatedTunnel 覆盖「同名隧道删了重建」。
+//
+// 代理名只由「用户 ID + 隧道名」组成：删掉隧道再建一条同名的，代理名一模一样，
+// 但 frps 侧的当日累计从 0 重新开始。基线若只按代理名保留，就会拿旧代理的值去
+// 减新代理的计数——旧基线更大时按「跨零点」处理（把新计数整个记一遍），
+// 更小时把新隧道前段的流量整段吃掉。基线带隧道行 ID 才能认出这是新代理。
+func TestCollectTrafficResetsBaselineForRecreatedTunnel(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+
+	u := &model.User{Username: "recreateuser", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	proxy := FrpUserOf(u.ID) + ".mc"
+	frps := newFakeFrpsTraffic(proxy)
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	newTunnel := func() *model.Tunnel {
+		tun := &model.Tunnel{
+			UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+			LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20001,
+			Status: model.TunnelStatusActive,
+		}
+		if err := svc.DB.Create(tun).Error; err != nil {
+			t.Fatalf("建隧道失败: %v", err)
+		}
+		return tun
+	}
+
+	ctx := context.Background()
+	old := newTunnel()
+	frps.total.Store(5000)
+	svc.collectTraffic(ctx)
+	if got := tunnelTrafficUsed(t, svc, old.ID); got != 5000 {
+		t.Fatalf("首轮应记 5000，实际 %d", got)
+	}
+
+	// 删掉旧隧道，建一条同名的：代理名不变，但这是**新的**代理，
+	// frps 侧的当日累计从 0 重新开始。
+	if err := svc.DB.Delete(&model.Tunnel{}, old.ID).Error; err != nil {
+		t.Fatalf("删隧道失败: %v", err)
+	}
+	fresh := newTunnel()
+	frps.total.Store(6000)
+	svc.collectTraffic(ctx)
+
+	if got := tunnelTrafficUsed(t, svc, fresh.ID); got != 6000 {
+		t.Fatalf("新隧道的当日累计应完整记入 6000，实际 %d"+
+			"（沿用旧代理基线会只记 1000）", got)
+	}
+}
+
 // TestCollectTrafficKeepsBaselineWhenFlushFails 覆盖「落库失败永久漏记流量」。
 //
 // 采样基线（Runtime.lastStat）如果先推进、再落库，事务失败时那一轮的增量

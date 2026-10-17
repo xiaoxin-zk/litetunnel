@@ -391,6 +391,11 @@ func (PasswordResetToken) TableName() string { return "lt_password_reset_tokens"
 
 // 发件箱状态。
 const (
+	// MailDraft 已写好但**还不能发**：调用方要复核发送额度之后再释放。
+	//
+	// 两段式是必要的：入队即发的话，等额度复核做完，信可能已经在路上，
+	// 作废只能拦住凭据生效，拦不住收件人收到一个无效验证码。
+	MailDraft = "draft"
 	// MailPending 待发送（含等待重试）。
 	MailPending = "pending"
 	// MailDelivered 邮件已送达，但凭据动作还没完成。
@@ -483,8 +488,14 @@ type TrafficBaseline struct {
 	// Date 是基线所属日期（本地时区 YYYY-MM-DD）。
 	Date string `gorm:"size:10;not null;index" json:"date"`
 	// InBytes / OutBytes 是采样时刻 frps 上报的当日累计值。
-	InBytes   int64     `gorm:"not null;default:0" json:"in_bytes"`
-	OutBytes  int64     `gorm:"not null;default:0" json:"out_bytes"`
+	InBytes  int64 `gorm:"not null;default:0" json:"in_bytes"`
+	OutBytes int64 `gorm:"not null;default:0" json:"out_bytes"`
+	// TunnelID 是采样时这条代理对应的隧道行 ID。
+	//
+	// 代理名只由「用户 ID + 隧道名」组成：删掉隧道再建一条同名的，
+	// 代理名完全相同但 frps 侧的当日累计从 0 重新开始。没有这个标识的话，
+	// 采集会拿旧代理的基线去减新代理的计数，把新隧道前段流量算丢。
+	TunnelID  uint      `gorm:"index" json:"tunnel_id"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

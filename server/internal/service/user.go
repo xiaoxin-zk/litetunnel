@@ -894,6 +894,16 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁住用户行，与「给该账号建隧道」的事务串行（那里也锁这一行）。
+		// 只靠进程内的 userLock 挡不住另一台实例：它可能在删号事务删完隧道
+		// 之后、提交之前插入一条新隧道，那条隧道会残留且不在回收清单里。
+		var locked model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
 		var tunnels []model.Tunnel
 		if err := tx.Where("user_id = ? AND remote_port > 0", userID).Find(&tunnels).Error; err != nil {
 			return err
@@ -944,6 +954,9 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 	s.Runtime.DropUserSessions(userID)
 
 	// 隧道没了，主机防火墙上的放行规则也要收回。
+	//
+	// 不会漏掉「并发新建、晚于本事务快照」的隧道：建隧道的事务同样要先锁
+	// 用户行，本事务提交前它插不进来，提交后它读到账号已不存在而整体失败。
 	s.closePorts(ports)
 	return nil
 }

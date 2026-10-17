@@ -811,9 +811,16 @@ func (s *Services) AdminDeleteUser(id uint) error {
 	var ports []portProto
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// 锁住用户行：userLock 只在进程内互斥，多副本下挡不住另一台实例
+		// 同时在给这个账号建隧道。建隧道的事务也锁这一行（见 CreateTunnel），
+		// 锁上之后两者只剩先后关系——要么隧道已在端口清单里，要么建隧道
+		// 等删号提交后发现账号不存在而失败，不会留下孤儿隧道。
 		var u model.User
-		if err := tx.First(&u, id).Error; err != nil {
-			return ErrNotFound
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&u, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
 		}
 		var tunnels []model.Tunnel
 		if err := tx.Where("user_id = ? AND remote_port > 0", id).Find(&tunnels).Error; err != nil {
@@ -873,10 +880,10 @@ func (s *Services) AdminDeleteUser(id uint) error {
 	// 放在事务提交之后：回收失败（helper 不可达、端口受保护）不该让
 	// 已经完成的删除回滚；失败会记日志，由人工清理。
 	//
-	// 残留窗口说明：并发创建且晚于本事务快照的隧道，在 READ COMMITTED
-	// 下仍可能被 DELETE 删掉而没进 ports（SQL 没有「删除并返回」的统一
-	// 写法，RETURNING 也不是所有方言都支持）。这个窗口比事务外读取小得多，
-	// 且需要「删除用户的同时另一路正在建隧道」才会命中。
+	// 并发建隧道的窗口已由事务开头的用户行锁关掉：建隧道的事务同样要先锁
+	// 用户行（见 createTunnelLocked 里的 reloadUserWithGroupTx），本事务提交
+	// 之前它插不进来；提交之后它重读用户会得到「不存在」而整体失败。
+	// 所以 ports 与这次 DELETE 删掉的隧道是同一批，不会漏出孤儿端口。
 	s.closePorts(ports)
 	return nil
 }

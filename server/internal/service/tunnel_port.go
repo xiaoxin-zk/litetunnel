@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 
 	"gorm.io/gorm"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -51,7 +53,7 @@ func isPortConflict(err error) bool {
 // isNameConflict 判断错误是否来自「同一用户下隧道名重复」（user_id + name）。
 //
 // 排除法是刻意的：PG 的报错里往往只有索引名，而索引名是建表时定的
-//（idx_user_tunnel），靠它反而更脆；带上 remote_port 的一定是端口冲突，
+// （idx_user_tunnel），靠它反而更脆；带上 remote_port 的一定是端口冲突，
 // 剩下的唯一约束冲突就只可能是名字。
 func isNameConflict(err error) bool {
 	if err == nil {
@@ -79,6 +81,30 @@ func describeTunnelWriteError(err error) error {
 	return err
 }
 
+// unavailablePorts 返回端口池里「不能分配」的端口：管理端保留的 + 系统正在监听的。
+//
+// 自动分配与手动指定必须共用这一份判断。只查数据库的话，会把系统正在监听
+// 或明确保留的端口发出去——用户建完隧道却绑不上（frpc 报 bind failed），
+// 而面板上一切正常，排查成本极高。展示页的空闲数也按它去重，避免同一个
+// 端口被「保留 + 监听 + 已分配」重复扣减。
+func (s *Services) unavailablePorts() map[int]struct{} {
+	out := make(map[int]struct{})
+	for p := range ParsePortList(s.Settings.Get(KeyPortReserved)) {
+		out[p] = struct{}{}
+	}
+	for key := range firewall.ListeningPortSet() {
+		// key 形如 "tcp|8080" / "udp|53"。
+		i := strings.IndexByte(key, '|')
+		if i < 0 {
+			continue
+		}
+		if p, err := strconv.Atoi(key[i+1:]); err == nil {
+			out[p] = struct{}{}
+		}
+	}
+	return out
+}
+
 // allocatePort 从端口池中**随机**分配一个未占用端口。
 //
 // 起点用随机数，而不是「按用户 ID 派生起点 + 顺序扫描」：
@@ -101,6 +127,10 @@ func (s *Services) allocatePort(tx *gorm.DB, userID uint) (int, error) {
 	}
 	set := make(map[int]struct{}, len(used))
 	for _, p := range used {
+		set[p] = struct{}{}
+	}
+	// 保留端口与系统正在监听的端口同样不能分配。
+	for p := range s.unavailablePorts() {
 		set[p] = struct{}{}
 	}
 
@@ -141,6 +171,11 @@ func randomOffset(span int) (int, error) {
 func (s *Services) assertPortFree(tx *gorm.DB, port int) error {
 	if port < s.Cfg.PortRangeStart || port > s.Cfg.PortRangeEnd {
 		return fmt.Errorf("%w: 端口需在 %d-%d 范围内", ErrInvalidParam, s.Cfg.PortRangeStart, s.Cfg.PortRangeEnd)
+	}
+	// 保留端口与系统正在监听的端口不能手工指定：这类端口即使没被隧道占用，
+	// 绑定时也会失败，必须在这里就拒绝并说清原因。
+	if _, blocked := s.unavailablePorts()[port]; blocked {
+		return fmt.Errorf("%w: 端口 %d 为保留端口或已被系统占用，请换一个", ErrPortInUse, port)
 	}
 	var n int64
 	if err := tx.Model(&model.Tunnel{}).Where("remote_port = ?", port).Count(&n).Error; err != nil {

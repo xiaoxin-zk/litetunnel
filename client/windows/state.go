@@ -98,10 +98,43 @@ func (a *App) setTunnelRegistered(id uint, up bool) {
 	if up {
 		a.registered[id] = true
 		a.registeredAt[id] = time.Now()
+		// 连上了就不再是「等待中」：清掉起点，避免下次掉线时显示一个
+		// 从很久以前算起的等待时长。
+		delete(a.connectAt, id)
 		return
 	}
 	delete(a.registered, id)
 	delete(a.registeredAt, id)
+}
+
+// markConnectStart 记录某条隧道「本次连接从什么时候开始」。
+//
+// 用于长时间连不上的诊断：frpc 进程活着、既没成功也没报错时，界面只能显示
+// 「连接中」——用户不知道是刚起步还是已经卡了十分钟。记下起点后，界面可以
+// 显示已等待时长，并在超过阈值时提示去看日志。
+func (a *App) markConnectStart(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.connectAt == nil {
+		a.connectAt = map[uint]time.Time{}
+	}
+	a.connectAt[id] = time.Now()
+}
+
+// markReconnectStart 记录「曾经连上、现在又断开」的等待起点。
+//
+// 与 markConnectStart 的区别是不覆盖已有起点：这条路径每轮同步都会走一次，
+// 覆盖的话计时会永远停在「刚等了几秒」，反而看不出已经卡了多久。
+func (a *App) markReconnectStart(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.connectAt == nil {
+		a.connectAt = map[uint]time.Time{}
+	}
+	if _, ok := a.connectAt[id]; ok {
+		return
+	}
+	a.connectAt[id] = time.Now()
 }
 
 // registeredGrace 是本机「已注册」标记不被服务端结论推翻的宽限期。
@@ -143,6 +176,9 @@ func (a *App) calibrateRegistered(id uint, serverOnline bool) {
 	}
 
 	a.setTunnelRegistered(id, false)
+	// 从这里开始重新计时：frpc 进程还在，正在自己重连。没有起点的话，
+	// 界面只会显示「连接中」，用户分不清是刚掉线还是已经卡了很久。
+	a.markReconnectStart(id)
 	// 记原因，但不升级成「启动失败」：进程还在，frpc 自己会重连，
 	// 进退避只会让它更晚恢复。
 	if a.recordTunnelErrMsg(id, "服务端报告该隧道已离线（本机 frpc 仍在运行，可能正在重连）") {

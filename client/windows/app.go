@@ -46,6 +46,12 @@ type TunnelVO struct {
 	// 隧道被服务端停用等情况仍以它为准）。
 	Registered bool `json:"registered"`
 
+	// PendingSeconds 是「进程已启动、代理还没注册成功」已经等了多久（秒）。
+	//
+	// 只为诊断而存在：frpc 既没成功也没报错时，界面只能显示「连接中」，
+	// 用户分不清是刚起步还是卡了十分钟。0 表示不在连接中（已注册或未启动）。
+	PendingSeconds int `json:"pending_seconds,omitempty"`
+
 	// LastError 是最近一次从该隧道的 frpc 输出里识别到的错误原文。
 	//
 	// 为什么需要它：「连接中」这个状态本身不说明任何原因——凭据失效、
@@ -234,6 +240,12 @@ type App struct {
 	// 「服务端说离线」到底是它还没采到，还是这条隧道真的掉了。
 	registeredAt map[uint]time.Time
 
+	// connectAt 记录每条隧道「本次连接开始」的时刻（见 markConnectStart）。
+	//
+	// 用来诊断「进程活着但一直没注册成功」：没有起点的话，界面只能一直显示
+	// 「连接中」，用户分不清是刚起步还是已经卡了很久。
+	connectAt map[uint]time.Time
+
 	// errEmitAt 是「上一次因错误推送状态」的时间，用于限频。
 	//
 	// frpc 的日志现在走 console，一次连接失败可能瞬间刷出上千行错误；每行都
@@ -311,6 +323,7 @@ func NewApp() *App {
 		retries:      map[uint]*retryState{},
 		registered:   map[uint]bool{},
 		registeredAt: map[uint]time.Time{},
+		connectAt:    map[uint]time.Time{},
 		errEmitAt:    map[uint]time.Time{},
 		logKick:      make(chan struct{}, 1),
 		startedAt:    time.Now(),
@@ -535,6 +548,16 @@ func (a *App) GetState() State {
 	for i := range tunnels {
 		tunnels[i].Running = a.mgr.Running(tunnels[i].ID)
 		tunnels[i].Registered = a.registered[tunnels[i].ID]
+		// 进程在跑但还没注册成功：把已等待时长带出去，界面据此显示
+		// 「连接中 · 42 秒」，而不是一句没有信息量的「连接中」。
+		//
+		// 直接读 a.connectAt 而不是调 connectWaited：这里已经持有读锁，
+		// 再取一次读锁在有写者在排队时会卡住（Go 的 RWMutex 不保证重入）。
+		if tunnels[i].Running && !tunnels[i].Registered {
+			if at, ok := a.connectAt[tunnels[i].ID]; ok {
+				tunnels[i].PendingSeconds = int(time.Since(at).Seconds())
+			}
+		}
 		// 连上之后错误记录已被清掉，这里取不到就表示当前没有已知错误。
 		if e, ok := a.tunnelErrs[tunnels[i].ID]; ok {
 			at := e.at

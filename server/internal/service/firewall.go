@@ -866,7 +866,20 @@ func (s *Services) PortPoolUsageOf() *PortPoolUsage {
 		}
 	}
 
-	u.Free = u.Total - len(u.Reserved) - len(u.SystemListening) - len(u.Allocated)
+	// 空闲数按**端口集合**去重：同一个端口可能既被保留、又在监听、还被分配
+	// （端口池调小之后尤其常见），直接相减各列表长度会把它扣好几次，
+	// 把 Free 算成负数再夹到 0——看起来「没有空闲端口」，实际还有。
+	usedSet := make(map[int]struct{}, len(u.Reserved)+len(u.SystemListening)+len(u.Allocated))
+	for _, p := range u.Reserved {
+		usedSet[p] = struct{}{}
+	}
+	for _, p := range u.SystemListening {
+		usedSet[p] = struct{}{}
+	}
+	for _, p := range u.Allocated {
+		usedSet[p] = struct{}{}
+	}
+	u.Free = u.Total - len(usedSet)
 	if u.Free < 0 {
 		u.Free = 0
 	}

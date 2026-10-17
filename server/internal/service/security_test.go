@@ -36,8 +36,13 @@ import (
 // 于是首轮采集不记账——这些用例要测的是记账，所以先落下标记。
 func markTrafficBaselineReady(t *testing.T, svc *Services) {
 	t.Helper()
-	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
-		t.Fatalf("写基线迁移标记失败: %v", err)
+	// 两个迁移标记都要落：基线就绪与「清零代次标记已初始化」是独立状态，
+	// 缺任一个首轮都只记基线、不计增量。
+	if err := svc.Settings.SetInternal(map[SettingKey]string{
+		KeyTrafficBaselineReady:  "1",
+		KeyTrafficResetMarkReady: "1",
+	}); err != nil {
+		t.Fatalf("写迁移标记失败: %v", err)
 	}
 }
 
@@ -3354,6 +3359,186 @@ func TestBaselineReadFailureReleasesLease(t *testing.T) {
 	}
 	if lease.ExpiresAt.After(time.Now()) {
 		t.Fatal("读基线失败时应交还租约，让下一轮重新走接管流程")
+	}
+}
+
+// TestTrafficResetMarkSeedSkipsFirstRound 覆盖「旧库升级时标记表还是空的」。
+//
+// 基线就绪不代表标记就绪：旧库有基线、没有标记表。若停机期间清零过，
+// 首轮会把「没有记录」当成「代次没变」，把清零前的流量加回来。
+// 首轮按保守策略跳过增量，并落下标记。
+func TestTrafficResetMarkSeedSkipsFirstRound(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+	// 只声明基线已就绪，**不**声明清零代次标记就绪——模拟旧库升级。
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+		t.Fatalf("写基线标记失败: %v", err)
+	}
+
+	u := &model.User{Username: "resetseed", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	tun := &model.Tunnel{
+		UserID: u.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20131,
+		Status: model.TunnelStatusActive,
+	}
+	if err := svc.DB.Create(tun).Error; err != nil {
+		t.Fatalf("建隧道失败: %v", err)
+	}
+	frps := newFakeFrpsTraffic(FrpUserOf(u.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+
+	ctx := context.Background()
+	frps.total.Store(1000)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 0 {
+		t.Fatalf("清零代次标记首次启用时，首轮不该计增量，实际 %d", got)
+	}
+	if !svc.Settings.Bool(KeyTrafficResetMarkReady) {
+		t.Fatal("首轮成功后应落下清零代次迁移标记")
+	}
+
+	frps.total.Store(1300)
+	svc.collectTraffic(ctx)
+	if got := userTrafficUsed(t, svc, u.ID); got != 300 {
+		t.Fatalf("第二轮应正常计增量 300，实际 %d", got)
+	}
+}
+
+// TestTrafficResetMarkSeedCoversOfflineUsers 覆盖「升级时正好离线的用户」。
+//
+// 只把本轮采样到的用户写进标记表是不够的：升级时离线的用户不会被采样，
+// 等它下次上线时基线还是升级前那份，而「没有标记」会被当成「代次没变」，
+// 升级前（甚至停机期间）的清零就识别不出来。迁移时应把所有用户记为
+// 「代次未知」，并**落库**——只放内存的话，控制面重启一次就又回到老问题。
+func TestTrafficResetMarkSeedCoversOfflineUsers(t *testing.T) {
+	cfg := &config.Config{}
+	svc := newTestServices(t, cfg)
+	// 旧库升级：基线已就绪，标记表为空。
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyTrafficBaselineReady: "1"}); err != nil {
+		t.Fatalf("写基线标记失败: %v", err)
+	}
+
+	online := &model.User{Username: "seedonline", Password: "not-used", Status: model.UserStatusActive}
+	offline := &model.User{Username: "seedoffline", Password: "not-used", Status: model.UserStatusActive}
+	for _, u := range []*model.User{online, offline} {
+		if err := svc.DB.Create(u).Error; err != nil {
+			t.Fatalf("建用户失败: %v", err)
+		}
+	}
+	onlineTun := &model.Tunnel{
+		UserID: online.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20133,
+		Status: model.TunnelStatusActive,
+	}
+	offlineTun := &model.Tunnel{
+		UserID: offline.ID, Name: "mc", Type: model.ProxyTypeTCP,
+		LocalIP: "127.0.0.1", LocalPort: 25565, RemotePort: 20134,
+		Status: model.TunnelStatusActive,
+	}
+	for _, tun := range []*model.Tunnel{onlineTun, offlineTun} {
+		if err := svc.DB.Create(tun).Error; err != nil {
+			t.Fatalf("建隧道失败: %v", err)
+		}
+	}
+	// 升级前留下的基线：离线用户这条代理当时还在跑。
+	offlineProxy := FrpUserOf(offline.ID) + ".mc"
+	if err := svc.DB.Create(&model.TrafficBaseline{
+		ProxyName: offlineProxy, Date: time.Now().Format("2006-01-02"),
+		InBytes: 500, TunnelID: offlineTun.ID,
+	}).Error; err != nil {
+		t.Fatalf("写旧基线失败: %v", err)
+	}
+
+	// 播种轮：frps 只上报在线用户，离线用户这一轮不会被采样。
+	frps := newFakeFrpsTraffic(FrpUserOf(online.ID) + ".mc")
+	defer frps.Close()
+	cfg.FrpsAPIAddr = frps.URL
+	svc.Frps = NewFrpsClient(cfg)
+	frps.total.Store(1000)
+	svc.collectTraffic(context.Background())
+	if !svc.Settings.Bool(KeyTrafficResetMarkReady) {
+		t.Fatal("播种轮后应落下清零代次迁移标记")
+	}
+
+	// 离线用户的标记必须是「未知」哨兵，而且已经落库。
+	var mark model.TrafficResetMark
+	if err := svc.DB.Where("user_id = ?", offline.ID).First(&mark).Error; err != nil {
+		t.Fatalf("离线用户的标记应已写入: %v", err)
+	}
+	if mark.Gen != resetGenUnknown {
+		t.Fatalf("离线用户应记为代次未知 %d，实际 %d", resetGenUnknown, mark.Gen)
+	}
+
+	// 控制面重启：哨兵必须能从库里读回来。
+	restarted := New(svc.DB, cfg)
+	restarted.Frps = NewFrpsClient(cfg)
+	if !restarted.loadTrafficBaseline() {
+		t.Fatal("基线应能恢复")
+	}
+	if err := svc.DB.Model(&model.RuntimeLease{}).
+		Where("name = ?", leaseTrafficCollector).
+		Update("expires_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("释放采集租约失败: %v", err)
+	}
+
+	// 离线用户上线：这一轮增量横跨「代次未知」，必须丢弃。
+	onlineFrps := newFakeFrpsTraffic(offlineProxy)
+	defer onlineFrps.Close()
+	cfg.FrpsAPIAddr = onlineFrps.URL
+	restarted.Frps = NewFrpsClient(cfg)
+	onlineFrps.total.Store(900)
+	restarted.collectTraffic(context.Background())
+	if got := userTrafficUsed(t, restarted, offline.ID); got != 0 {
+		t.Fatalf("代次未知时这一轮增量应丢弃，实际 %d", got)
+	}
+
+	// 下一轮恢复正常：900 → 1000 只记 100。
+	onlineFrps.total.Store(1000)
+	restarted.collectTraffic(context.Background())
+	if got := userTrafficUsed(t, restarted, offline.ID); got != 100 {
+		t.Fatalf("代次确定后应正常计增量 100，实际 %d", got)
+	}
+}
+
+// TestPortAllocationSkipsReservedPorts 覆盖「自动/手动分配落到保留端口」。
+func TestPortAllocationSkipsReservedPorts(t *testing.T) {
+	svc := newTestServices(t, &config.Config{PortRangeStart: 30000, PortRangeEnd: 30005})
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyPortReserved: "30000-30003",
+	}); err != nil {
+		t.Fatalf("设置保留端口失败: %v", err)
+	}
+
+	// 手动指定保留端口必须被拒。
+	//
+	// 事务必须显式提交/回滚：SQLite 上只开一条连接（store.Open 里
+	// SetMaxOpenConns(1)），留着不关会让后面每个 Begin 都永远等不到连接。
+	tx := svc.DB.Begin()
+	err := svc.assertPortFree(tx, 30000)
+	tx.Rollback()
+	if !errors.Is(err, ErrPortInUse) {
+		t.Fatalf("保留端口应被拒绝，实际 %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "保留") {
+		t.Fatalf("错误信息应说明是保留/系统占用，实际 %v", err)
+	}
+
+	// 自动分配不能落到保留端口上。
+	for i := 0; i < 50; i++ {
+		tx := svc.DB.Begin()
+		p, aerr := svc.allocatePort(tx, 1)
+		tx.Rollback()
+		if aerr != nil {
+			break // 池子里的可用端口已试完（可能被系统监听占用）
+		}
+		if p >= 30000 && p <= 30003 {
+			t.Fatalf("自动分配不应返回保留端口 %d", p)
+		}
 	}
 }
 

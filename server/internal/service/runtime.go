@@ -154,6 +154,13 @@ type Runtime struct {
 	// 不对称：少记一轮最多丢两分钟的账，重复计入是实打实的双倍扣费）。
 	baselineSeedPending bool
 
+	// resetMarkSeedPending 表示「清零代次标记表首次启用后的第一轮」尚未完成。
+	//
+	// 与 baselineSeedPending 分开记：基线就绪不代表标记就绪。旧库升级上来时
+	// 有基线、没有标记，若停机期间清零过，首轮会把「没有记录」当成「没变」，
+	// 把清零前的流量加回来。首轮按保守策略跳过增量、顺带写入标记即可。
+	resetMarkSeedPending bool
+
 	// pendingTrafficReset 登记了「管理员刚清零用量」的用户。
 	//
 	// 为什么需要它：清零写的是绝对值（traffic_used = 0），采集写的是增量。
@@ -180,7 +187,9 @@ type Runtime struct {
 	// 进程内的 pendingTrafficReset 只对当前实例可见；清零请求落在别的实例时，
 	// 采集侧只能靠库里的代次发现「这中间被清零过」。没有上次记录的用户
 	// （刚启动/刚接管）按「没变」处理——宁可少丢一轮，也不要一次重启吞掉
-	// 所有人的一轮用量。
+	// 所有人的一轮用量。唯一的例外是标记表首次启用时写下的哨兵值
+	// （见 resetGenUnknown）：那表示「这份基线对应的代次无从判断」，
+	// 必须按变过处理。
 	lastResetGen map[uint]int64
 
 	// resetSeq 是清零登记的单调代次；resetVoid 记录每个用户最后一次
@@ -623,6 +632,20 @@ func (s *Services) PrimeSessionGuard(runID string, u *model.User) {
 		u.Status != model.UserStatusActive,
 		s.QuotaExceeded(u))
 }
+
+// resetGenUnknown 是「这份基线对应的清零代次未知」的哨兵值。
+//
+// 真实代次只会在清零时从 0 往上加（见 AdminResetUserTraffic），-1 永远不可能
+// 与它相等，因此 changedResetGens 一定把它判成「变过」：下一次采样到这个
+// 用户时，这一轮增量被丢弃、代次随即被写成真实值，之后恢复正常。
+//
+// 为什么需要它：标记表是后续版本才加的，旧库升级上来时表里是空的。只把
+// 「本轮采样到的用户」的代次写进去是不够的——升级时正好离线的用户不会被
+// 采样，等它下次上线时基线还是升级前那份，而「没有标记」在
+// changedResetGens 里会被当成「代次没变」，升级前（甚至停机期间）的清零
+// 就识别不出来，清零前的流量被重新计入。哨兵把这个判断变成「未知」，
+// 方向取保守的一侧：最多少记一轮，绝不重复计入。
+const resetGenUnknown int64 = -1
 
 // changedResetGens 返回「清零代次与上次提交时不同」的用户集合。
 //
@@ -1362,7 +1385,9 @@ func (s *Services) collectTraffic(ctx context.Context) {
 	} else {
 		s.Runtime.mu.Lock()
 		s.Runtime.lastStat = nextStat
+		seedReset := s.Runtime.resetMarkSeedPending
 		s.Runtime.baselineSeedPending = false
+		s.Runtime.resetMarkSeedPending = false
 		s.Runtime.mu.Unlock()
 		if seedBaseline {
 			// 首次迁移的基线写成功了，落下迁移标记。
@@ -1372,6 +1397,15 @@ func (s *Services) collectTraffic(ctx context.Context) {
 				log.Printf("[traffic] 写入基线迁移标记失败（下轮仍按首次迁移处理）: %v", err)
 			} else {
 				log.Printf("[traffic] 首次基线已建立，后续采集恢复正常计增量")
+			}
+		}
+		if seedReset {
+			// 本轮已经把采样到的清零代次写进标记表（见 flushTraffic），
+			// 现在可以宣告「标记已初始化」，下一轮恢复正常计增量。
+			if err := s.Settings.SetInternal(map[SettingKey]string{KeyTrafficResetMarkReady: "1"}); err != nil {
+				log.Printf("[traffic] 写入清零代次迁移标记失败（下轮仍按首次处理）: %v", err)
+			} else {
+				log.Printf("[traffic] 清零代次标记已初始化，后续采集恢复正常计增量")
 			}
 		}
 	}
@@ -1738,8 +1772,14 @@ func (s *Services) flushTraffic(
 		// 期间被清零的用户（本地快照判定「变过」或条件更新没命中）：
 		// 把库里**当前**的代次记为「本轮基线对应的代次」。
 		// 记旧值的话，下一轮还会再判一次「变过」，白丢一轮清零后的真实流量。
-		for uid := range fence.resetChanged {
-			missedReset[uid] = true
+		//
+		// 播种轮（seed）跳过这一步：本轮只写基线、不计增量，此时把「代次
+		// 未知」的哨兵改写成当前值，等于宣告「这份基线对应的就是当前代次」，
+		// 而它恰恰可能是升级前那份——正好丢掉这条迁移要保住的信息。
+		if !seed {
+			for uid := range fence.resetChanged {
+				missedReset[uid] = true
+			}
 		}
 		for uid := range missedReset {
 			var cur int64
@@ -1838,6 +1878,9 @@ func (s *Services) loadTrafficBaseline() bool {
 	// 读标记失败按「需要播种」处理：宁可少记一轮增量，也不能重复计入
 	// ——两种错误方向不对称。
 	seed := !s.Settings.Bool(KeyTrafficBaselineReady)
+	// 清零代次标记有自己的迁移状态：旧库有基线但没有标记表，首轮同样要
+	// 保守跳过增量，否则「停机期间清零过」的那部分旧流量会被重新计入。
+	seedReset := !s.Settings.Bool(KeyTrafficResetMarkReady)
 
 	today := time.Now().Format("2006-01-02")
 	var rows []model.TrafficBaseline
@@ -1868,10 +1911,18 @@ func (s *Services) loadTrafficBaseline() bool {
 	for _, mk := range marks {
 		gens[mk.UserID] = mk.Gen
 	}
+	// 首次启用标记表：除已有真实标记的用户外，其余全部记为「代次未知」。
+	// 只依赖「本轮采样到的用户」会让升级时离线的用户在下次上线时被当成
+	// 「代次没变」，见 resetGenUnknown 的说明。
+	if seedReset {
+		s.seedUnknownResetGens(gens)
+	}
 
 	s.Runtime.mu.Lock()
 	s.Runtime.lastStat = m
-	s.Runtime.baselineSeedPending = seed
+	// 任一迁移标记缺失都按「首轮播种」处理：只写基线、不计增量。
+	s.Runtime.baselineSeedPending = seed || seedReset
+	s.Runtime.resetMarkSeedPending = seedReset
 	s.Runtime.lastResetGen = gens
 	s.Runtime.mu.Unlock()
 
@@ -1881,7 +1932,46 @@ func (s *Services) loadTrafficBaseline() bool {
 	if seed {
 		log.Printf("[traffic] 未发现基线迁移标记，第一轮采集只记录基线、不计流量增量")
 	}
+	if seedReset {
+		log.Printf("[traffic] 未发现清零代次标记，第一轮采集只记录基线、不计流量增量")
+	}
 	return true
+}
+
+// seedUnknownResetGens 把库里所有用户都记为「清零代次未知」。
+//
+// 只在标记表首次启用（旧库升级）时调用一次，见 resetGenUnknown。
+// 已有真实标记的用户不动：那份标记是上一版本采集器写的，可信。
+//
+// 哨兵必须**落库**：只放内存的话，控制面在那些用户上线之前重启一次，
+// 这份「未知」就丢了，又回到「没有记录 = 代次没变」的老问题。
+func (s *Services) seedUnknownResetGens(gens map[uint]int64) {
+	var ids []uint
+	if err := s.DB.Model(&model.User{}).Pluck("id", &ids).Error; err != nil {
+		// 读不到用户列表也不阻断采集：本轮采样到的用户仍会被写进标记表，
+		// 只是「离线用户」这一部分退化成原来的行为。
+		log.Printf("[traffic] 读取用户列表失败，本次只按采样到的用户初始化清零代次: %v", err)
+		return
+	}
+	marks := make([]model.TrafficResetMark, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := gens[id]; ok {
+			continue
+		}
+		gens[id] = resetGenUnknown
+		marks = append(marks, model.TrafficResetMark{UserID: id, Gen: resetGenUnknown})
+	}
+	if len(marks) == 0 {
+		return
+	}
+	// DoNothing：并发启动的另一个实例可能已经写过真实值，不能覆盖。
+	// 分批写：用户量大时一次 INSERT 的绑定参数会超过驱动的上限。
+	if err := s.DB.Clauses(clause.OnConflict{DoNothing: true}).
+		CreateInBatches(&marks, 200).Error; err != nil {
+		log.Printf("[traffic] 写入清零代次哨兵失败（本次仍按未知处理，重启后会丢失）: %v", err)
+		return
+	}
+	log.Printf("[traffic] 已为 %d 个用户写入「清零代次未知」标记，下次采样时保守跳过一轮增量", len(marks))
 }
 
 // refreshQuotaFlags 刷新内存中的超额与禁用标记，供 frps 插件实时拦截。

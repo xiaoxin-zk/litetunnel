@@ -171,6 +171,17 @@ const (
 	// （见 loadTrafficBaseline 与 collectTraffic）。之后这张表再怎么空
 	// 都是正常状态（frps 重启归零、当天没有代理），恢复正常计增量。
 	KeyTrafficBaselineReady SettingKey = "traffic.baseline_ready"
+
+	// KeyTrafficResetMarkReady 是「清零代次标记已初始化」的一次性迁移标记。
+	//
+	// 与基线标记必须分开：基线就绪只说明「有基线可以相减」，不能证明
+	// 「基线对应的清零代次已经记下」。升级前的旧库有基线、没有标记表，
+	// 若此时控制面停机期间发生过清零，升级后首轮会拿「没有记录」当成
+	// 「代次没变」，把清零前的流量重新计入——用量虚高，甚至触发超额。
+	//
+	// 缺失 = 首次启用：第一轮只写基线、不计增量（与基线迁移同样的保守策略），
+	// 顺带把当轮采样到的代次写进标记表，然后置位。
+	KeyTrafficResetMarkReady SettingKey = "traffic.reset_mark_ready"
 )
 
 // SecretMask 是敏感字段回显给前端时的占位符。
@@ -311,8 +322,9 @@ var settingSpecs = []settingSpec{
 	{Key: KeyDomainAppliedMode, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyDomainAppliedDigest, Internal: true, Default: func(*config.Config) string { return "" }},
 
-	// 流量采集迁移标记：见 KeyTrafficBaselineReady 的说明。
+	// 流量采集迁移标记：见 KeyTrafficBaselineReady 与 KeyTrafficResetMarkReady。
 	{Key: KeyTrafficBaselineReady, Internal: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyTrafficResetMarkReady, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 // settingByKey 便于 O(1) 查找白名单项。

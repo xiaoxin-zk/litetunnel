@@ -131,6 +131,67 @@ func TestRevokedSessionIsNotResurrectedByPing(t *testing.T) {
 	}
 }
 
+// TestLoginSessionWriteFailureDoesNotCacheSession 覆盖「会话写库失败仍登记内存」。
+//
+// 写库失败却把会话记成可信的话，后续 Ping 的准入刷新会因为「查不到可信会话」
+// 把它永久拒绝——而缓存命中路径不会重新写库，数据库恢复也救不回来。
+// 正确做法是：写库成功才登记，失败就当没登录过，下一次连接重新走凭据复核。
+func TestLoginSessionWriteFailureDoesNotCacheSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{
+		Env:          "test",
+		LogLevel:     "warn",
+		DBDriver:     "sqlite",
+		DBDSN:        filepath.Join(t.TempDir(), "login.db"),
+		APIKeyEncKey: "test-api-key-enc-key",
+	}
+	db, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("取数据库连接失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	svc := service.New(db, cfg)
+	if !svc.LoadAccessGuard() {
+		t.Fatal("加载准入状态失败")
+	}
+	h := New(svc, nil)
+	r := gin.New()
+	r.POST("/plugin", h.Handle)
+
+	u := &model.User{
+		Username:     "loginwrite",
+		Password:     "not-used",
+		Status:       model.UserStatusActive,
+		ClientSecret: "secret-for-login",
+	}
+	if err := db.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	// 模拟「会话表写不进去」：直接删表。
+	if err := db.Migrator().DropTable(&model.ClientSession{}); err != nil {
+		t.Fatalf("删表失败: %v", err)
+	}
+
+	const runID = "run-login-write"
+	body := fmt.Sprintf(
+		`{"op":"Login","content":{"user":%q,"run_id":%q,"metas":{"%s":%q}}}`,
+		service.FrpUserOf(u.ID), runID, service.MetaTokenKey, u.ClientSecret)
+	res := decodeResponse(t, postPlugin(t, r, body))
+	if res.Reject {
+		t.Fatalf("凭据正确时登录本身应放行（只是会话没落库）: %s", body)
+	}
+	if _, ok := svc.Runtime.LookupSession(runID); ok {
+		t.Fatal("会话没写进数据库就不该登记到内存：否则后续 Ping 会把它永久拒绝")
+	}
+}
+
 // TestCallbacksFailClosedBeforeGuardLoaded 覆盖「准入状态未知」这一档。
 //
 // 超额与禁用标记只在内存里，由后台采集维护。采集没跑成时（数据库刚起来、

@@ -53,6 +53,46 @@ func TestRetryGateBlocksAfterFailure(t *testing.T) {
 	}
 }
 
+// TestReconnectStartDoesNotResetTimer 覆盖「已等待时长」的起点语义。
+//
+// 同步流程每轮都会对「服务端说离线、本机进程还在」的隧道调一次重连计时。
+// 若每次都覆盖起点，界面上的时长会永远停在「刚等了几秒」，反而看不出
+// 已经卡了多久——那正是这个诊断信息要回答的问题。
+func TestReconnectStartDoesNotResetTimer(t *testing.T) {
+	a := &App{connectAt: map[uint]time.Time{}}
+
+	a.markConnectStart(1)
+	first := a.connectAt[1]
+	time.Sleep(2 * time.Millisecond)
+	a.markReconnectStart(1)
+	if !a.connectAt[1].Equal(first) {
+		t.Fatal("重连路径不该覆盖已有起点：否则计时永远停在「刚等了几秒」")
+	}
+
+	// 进程被真正重新拉起时应当重新计时：那是新的一次连接。
+	a.markConnectStart(1)
+	if !a.connectAt[1].After(first) {
+		t.Fatal("重新拉起进程后应重新计时")
+	}
+	if _, ok := a.connectAt[2]; ok {
+		t.Fatal("不该给别的隧道记起点")
+	}
+}
+
+// TestRegisteredClearsConnectTimer 覆盖「连上之后计时归零」。
+func TestRegisteredClearsConnectTimer(t *testing.T) {
+	a := &App{
+		registered:   map[uint]bool{},
+		registeredAt: map[uint]time.Time{},
+		connectAt:    map[uint]time.Time{},
+	}
+	a.markConnectStart(1)
+	a.setTunnelRegistered(1, true)
+	if _, ok := a.connectAt[1]; ok {
+		t.Fatal("注册成功后应清掉等待起点，否则下次掉线会显示一个从很久以前算起的时长")
+	}
+}
+
 // TestRetryStateIsPerTunnel 确认退避按隧道隔离。
 //
 // 共用一份状态的话，一条隧道反复失败会把其他隧道的重试一起推迟——

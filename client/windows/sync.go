@@ -659,6 +659,9 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	if err := a.mgr.Start(t.ID, t.Name, path); err != nil {
 		return err
 	}
+	// 记下「这次连接从什么时候开始」：frpc 进程活着但一直没注册成功时，
+	// 界面要能显示已经等了多久，而不是永远一句「连接中」。
+	a.markConnectStart(t.ID)
 
 	// 记下这次写入的原文。下一次同步据此判断「配置有没有变」——
 	// 不记的话每次同步都会判定为变化并重启一遍，连接会一直抖。

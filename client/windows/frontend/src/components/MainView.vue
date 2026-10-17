@@ -834,7 +834,20 @@ function tagText(t) {
   if (t.registered || t.online) return '运行中'
   // 有错误就不是「还在连」，而是「连不上」。这两者要给不同的提示：
   // 前者让用户等，后者让用户去查（凭据、地址、网络）。
-  return t.last_error ? '连接失败' : '连接中'
+  if (t.last_error) return '连接失败'
+  // 带上已等待时长：frpc 活着却迟迟没注册成功时，只写「连接中」用户
+  // 分不清是刚起步还是卡了很久。
+  const waited = Number(t.pending_seconds || 0)
+  if (waited > 0) return `连接中 · ${fmtWaited(waited)}`
+  return '连接中'
+}
+
+/** 把秒数格式化成「12 秒 / 3 分 5 秒」，用于连接耗时展示。 */
+function fmtWaited(sec) {
+  if (sec < 60) return `${sec} 秒`
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return s ? `${m} 分 ${s} 秒` : `${m} 分`
 }
 
 function tagClass(t) {
@@ -857,7 +870,15 @@ function tagHint(t) {
     return '本机 frpc 已报告代理注册成功；服务端状态按采集周期（约 30 秒）更新，可能略滞后'
   }
   if (t.online) return '服务端已确认这条代理在线'
-  return t.last_error ? '最近一次错误：' + t.last_error : '正在连接'
+  if (t.last_error) return '最近一次错误：' + t.last_error
+  // 长时间没连上又没有报错：给出排查方向，而不是让用户干等。
+  // 注意不在这里重启进程——frpc 自己还在重连，打断反而更慢。
+  const waited = Number(t.pending_seconds || 0)
+  if (waited >= 60) {
+    return `已等待 ${fmtWaited(waited)}，仍未见注册成功。请检查服务端地址是否可达、` +
+      `本机是否被防火墙拦截，或展开日志查看 frpc 输出`
+  }
+  return waited > 0 ? `正在连接，已等待 ${fmtWaited(waited)}` : '正在连接'
 }
 
 /** 把时间戳格式化成 HH:MM:SS，用于「最后一次失败发生在什么时候」。 */

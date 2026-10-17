@@ -356,13 +356,21 @@ func (h *Handler) authenticateByMeta(frpUser, runID string, metas map[string]str
 	}
 
 	if runID != "" {
-		h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
-		h.svc.PrimeSessionGuard(runID, u)
+		// 先落库、再登记内存会话：写库失败时不能把会话记成可信——后续 Ping 的
+		// 准入刷新会因为「查不到可信会话」把它永久拒绝，而缓存命中路径不会
+		// 重新写库，数据库恢复也救不回来。不登记的话，下一次连接会重新走
+		// 这条凭据复核路径，天然重试。
 		// 传空串表示「这些字段本次拿不到」——UpsertClientSession 会
 		// 保留登录时记录的真实值，不会把它们抹成空。
-		h.UpsertClientSession(u.ID, u.Username, runID, "", "", "", "")
+		if err := h.UpsertClientSession(u.ID, u.Username, runID, "", "", "", ""); err != nil {
+			log.Printf("[plugin] 用户 %s 的会话未能落库（run_id=%q），本次不登记内存会话，下次连接重试",
+				u.Username, runID)
+		} else {
+			h.svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+			h.svc.PrimeSessionGuard(runID, u)
+			log.Printf("[plugin] 用户 %s 通过凭据复核补登记会话（run_id=%q）", u.Username, runID)
+		}
 	}
-	log.Printf("[plugin] 用户 %s 通过凭据复核补登记会话（run_id=%q）", u.Username, runID)
 	return u, true
 }
 
@@ -409,9 +417,15 @@ func (h *Handler) onLogin(req *request) response {
 		return allow()
 	}
 
+	// 同样先落库、再登记内存会话（理由见 resolveUser 的补登记分支）。
+	if err := h.UpsertClientSession(u.ID, u.Username, content.RunID,
+		content.ClientAddress, content.Version, content.Os, content.Arch); err != nil {
+		log.Printf("[plugin] 用户 %s 的登录会话未能落库（run_id=%q），本次不登记内存会话，下次连接重试",
+			u.Username, content.RunID)
+		return allow()
+	}
 	h.svc.Runtime.RecordLogin(content.RunID, u.ID, u.Username)
 	h.svc.PrimeSessionGuard(content.RunID, u)
-	h.UpsertClientSession(u.ID, u.Username, content.RunID, content.ClientAddress, content.Version, content.Os, content.Arch)
 	return allow()
 }
 
@@ -657,13 +671,17 @@ func (h *Handler) onNewUserConn(req *request) response {
 
 // ---- 会话落库 ----
 
-// UpsertClientSession 记录/更新一次客户端登录会话。
+// UpsertClientSession 记录/更新一次客户端登录会话，返回写库是否成功。
 //
 // 只有 onLogin 在凭据校验通过后才会调用本方法，
 // 因此该表是后续插件回调判断身份可信度的唯一依据。
-func (h *Handler) UpsertClientSession(userID uint, username, runID, addr, version, osName, arch string) {
+//
+// 返回错误必须被调用方处理：写库失败却把会话登记进内存的话，这个会话会被
+// 后续 Ping 的准入刷新判为「查不到可信会话」而**永久**拒绝——而缓存命中
+// 路径不会重新执行会话写入，数据库恢复也救不回来。
+func (h *Handler) UpsertClientSession(userID uint, username, runID, addr, version, osName, arch string) error {
 	if runID == "" {
-		return
+		return nil
 	}
 	now := time.Now()
 	s := model.ClientSession{
@@ -703,5 +721,9 @@ func (h *Handler) UpsertClientSession(userID uint, username, runID, addr, versio
 		fields["arch"] = arch
 	}
 
-	h.svc.DB.Where("run_id = ?", runID).Assign(fields).FirstOrCreate(&s)
+	if err := h.svc.DB.Where("run_id = ?", runID).Assign(fields).FirstOrCreate(&s).Error; err != nil {
+		log.Printf("[plugin] 写入客户端会话失败（run_id=%s）: %v", runID, err)
+		return err
+	}
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -15,6 +16,22 @@ import (
 
 // 兑换码字符集：剔除 0/O、1/I/L 等易混淆字符，降低人工输入错误。
 const codeAlphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+// 单张兑换码面值的上限。
+//
+// 不设上限的话，一个手滑的超大 Value 会让兑换后的数值**溢出成负数**：
+// 流量配额变负后，EffectiveQuota 把非正值当成「继承分组配额」，
+// 超额保护对这个人直接失效。上限必须卡在「加到任何现存值上都不会溢出
+// int64」的量级，同时兑换时还会再查一次溢出（老数据里可能已存在
+// 超上限的码，见 Redeem）。
+const (
+	// maxRedeemTrafficValue 单张流量码上限：1 PiB。
+	maxRedeemTrafficValue = int64(1) << 50
+	// maxRedeemBalanceValue 单张余额码上限：1 亿元（以分为单位）。
+	maxRedeemBalanceValue = int64(10_000_000_00)
+	// maxRedeemDurationValue 单张时长码上限：100 年（天）。
+	maxRedeemDurationValue = int64(36500)
+)
 
 // GenerateCodesInput 批量生成入参。
 type GenerateCodesInput struct {
@@ -37,24 +54,29 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		if in.Value <= 0 {
 			return nil, fmt.Errorf("%w: 流量值必须大于 0", ErrInvalidParam)
 		}
+		if in.Value > maxRedeemTrafficValue {
+			return nil, fmt.Errorf("%w: 单张流量码上限为 %s", ErrInvalidParam, FormatBytes(maxRedeemTrafficValue))
+		}
 	case model.RedeemTypeBalance:
 		if in.Value <= 0 {
 			return nil, fmt.Errorf("%w: 金额必须大于 0", ErrInvalidParam)
+		}
+		if in.Value > maxRedeemBalanceValue {
+			return nil, fmt.Errorf("%w: 单张余额码上限为 %.2f 元", ErrInvalidParam, float64(maxRedeemBalanceValue)/100)
 		}
 	case model.RedeemTypeGroup:
 		if in.GroupID == 0 {
 			return nil, fmt.Errorf("%w: 升级分组必须指定目标分组", ErrInvalidParam)
 		}
-		var cnt int64
-		if err := s.DB.Model(&model.Group{}).Where("id = ?", in.GroupID).Count(&cnt).Error; err != nil {
-			return nil, err
-		}
-		if cnt == 0 {
-			return nil, fmt.Errorf("%w: 目标分组不存在", ErrInvalidParam)
-		}
+		// 分组存在性检查移到了下面的写事务里（对分组行 FOR UPDATE）：
+		// 事务外检查、稍后才插入码的话，删除分组可能从检查通过之后
+		// 插进来，生成一批指向已删除分组的码——又是废纸。
 	case model.RedeemTypeDuration:
 		if in.Value <= 0 {
 			return nil, fmt.Errorf("%w: 天数必须大于 0", ErrInvalidParam)
+		}
+		if in.Value > maxRedeemDurationValue {
+			return nil, fmt.Errorf("%w: 单张时长码上限为 %d 天", ErrInvalidParam, maxRedeemDurationValue)
 		}
 	default:
 		return nil, fmt.Errorf("%w: 不支持的兑换码类型", ErrInvalidParam)
@@ -95,6 +117,29 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 			CreatedBy: adminID,
 			Remark:    truncate(in.Remark, 200),
 		})
+	}
+
+	// 分组升级码：分组存在性检查与写码放进同一事务，并对分组行 FOR UPDATE
+	// ——与 DeleteGroup、AdminSetUserGroup 用同一把分组行锁互斥。
+	// 不锁的话，删除分组可以插进「检查通过 → 插入码」之间，
+	// 生成一批指向已删除分组的码；锁住行之后，删除会等到本事务提交，
+	// 提交后那批码是未核销状态，DeleteGroup 的检查会拦住它。
+	if in.Type == model.RedeemTypeGroup {
+		err := s.DB.Transaction(func(tx *gorm.DB) error {
+			var g model.Group
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&g, in.GroupID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("%w: 目标分组不存在", ErrInvalidParam)
+				}
+				return err
+			}
+			return tx.Create(&codes).Error
+		})
+		if err != nil {
+			return nil, err
+		}
+		return codes, nil
 	}
 
 	// 唯一索引冲突时整批回滚，避免生成半截数据。
@@ -175,8 +220,22 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			return err
 		}
 
+		// ---- 锁住用户行（全局锁序：用户行 → 分组行）----
+		//
+		// 配额、余额、有效期都是「读快照 → 覆盖写回」，而码的 CAS 只保护
+		// UsedCount：同一用户并发兑换两张流量码时，两个事务会读到同一个
+		// 旧配额，各自写回「旧值 + 自己那张」——两张码都被核销，
+		// 权益只多了一份（丢失更新）。
+		//
+		// FOR UPDATE 让同一用户的权益变更在此串行：后来者读到的一定是
+		// 前者提交后的值。SQLite 单连接天然串行（锁子句是空操作）；
+		// Postgres 下真正生效。
+		//
+		// 先用户后分组的顺序与 AdminSetUserGroup 一致；反过来
+		// （分组 → 用户）的话，「改分组」与「兑换」交叉等待会成死锁。
 		var u model.User
-		if err := tx.First(&u, userID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&u, userID).Error; err != nil {
 			return ErrNotFound
 		}
 
@@ -187,27 +246,37 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 			base := u.TrafficQuota
 			if base == 0 {
 				var g model.Group
-				if err := tx.First(&g, u.GroupID).Error; err == nil {
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					First(&g, u.GroupID).Error; err == nil {
 					base = g.TrafficQuota
 				}
+			}
+			// 溢出检查：负的配额会被 EffectiveQuota 当成「继承分组配额」，
+			// 超额保护直接失效。生成侧已有面值上限，这里兜住老数据里
+			// 可能存在的超上限码。
+			if c.Value > math.MaxInt64-base {
+				return fmt.Errorf("%w: 流量额度已达上限，无法再兑换这张码", ErrCodeInvalid)
 			}
 			updates["traffic_quota"] = base + c.Value
 			result = RedeemResult{Type: c.Type, Value: c.Value,
 				Message: fmt.Sprintf("流量额度已增加 %s", FormatBytes(c.Value))}
 
 		case model.RedeemTypeBalance:
+			if c.Value > math.MaxInt64-u.Balance {
+				return fmt.Errorf("%w: 余额已达上限，无法再兑换这张码", ErrCodeInvalid)
+			}
 			updates["balance"] = u.Balance + c.Value
 			result = RedeemResult{Type: c.Type, Value: c.Value,
 				Message: fmt.Sprintf("余额已增加 %.2f 元", float64(c.Value)/100)}
 
 		case model.RedeemTypeGroup:
-			// FOR UPDATE 锁住分组行：与 DeleteGroup 的事务互斥。
-			// 不锁的话有个窄窗口——这里读到分组存在，删除分组随后提交，
-			// 我们再把 group_id 写上去：用户拿到一个指向已删除分组的悬空
-			// 引用，运行期只能回落到默认分组，界面上却显示「已升级」。
-			// Postgres 下 FOR UPDATE 会让 DeleteGroup 的删除等到本事务提交；
-			// SQLite 全库锁，天然串行。分组确实已删时仍按「码无效」处理，
-			// 核销随事务回滚，码还能用。
+			// FOR UPDATE 锁住分组行（锁序 user → group）：与 DeleteGroup
+			// 的事务互斥。不锁的话有个窄窗口——这里读到分组存在，删除分组
+			// 随后提交，我们再把 group_id 写上去：用户拿到一个指向已删除
+			// 分组的悬空引用，运行期只能回落到默认分组，界面上却显示
+			// 「已升级」。Postgres 下 FOR UPDATE 会让 DeleteGroup 的删除
+			// 等到本事务提交；SQLite 全库锁，天然串行。分组确实已删时
+			// 仍按「码无效」处理，核销随事务回滚，码还能用。
 			var g model.Group
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				First(&g, c.GroupID).Error; err != nil {
@@ -223,6 +292,8 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 				Message: fmt.Sprintf("已升级到分组「%s」", g.Name)}
 
 		case model.RedeemTypeDuration:
+			// 从「现有到期时间」顺延：读的是加锁后的最新快照，
+			// 并发兑换多张时长码时依次叠加，不会互相覆盖。
 			base := time.Now()
 			if u.GroupExpireAt != nil && u.GroupExpireAt.After(base) {
 				base = *u.GroupExpireAt

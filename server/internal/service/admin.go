@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -914,13 +915,30 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 }
 
 // AdminSetUserGroup 调整用户分组与到期时间。
+//
+// 分组的存在性检查、用户行的更新放进同一事务，并按全局锁序
+// （用户行 → 分组行，与 Redeem 一致）对两张行加 FOR UPDATE：
+// 只在事务外查一下分组的话，「检查通过 → 更新用户」之间分组可能被删，
+// 写出一个悬空的 group_id。
 func (s *Services) AdminSetUserGroup(id, groupID uint, expireAt *time.Time) error {
-	var g model.Group
-	if err := s.DB.First(&g, groupID).Error; err != nil {
-		return fmt.Errorf("%w: 分组不存在", ErrInvalidParam)
-	}
-
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var u model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&u, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		var g model.Group
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&g, groupID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: 分组不存在", ErrInvalidParam)
+			}
+			return err
+		}
+
 		updates := map[string]any{"group_id": groupID}
 		if expireAt != nil {
 			updates["group_expire_at"] = *expireAt
@@ -1149,8 +1167,13 @@ func (s *Services) refreshQuotaForGroup(groupID uint) {
 // 这两个步骤看到的是同一个数据库状态。
 func (s *Services) DeleteGroup(id uint) error {
 	return s.DB.Transaction(func(tx *gorm.DB) error {
+		// FOR UPDATE 锁住分组行：GenerateCodes 与 AdminSetUserGroup 对
+		// 同一行加锁（见 Redeem 里的全局锁序说明）。不锁的话，
+		// 生成一批升级码或分配用户可以插进「计数检查 → 删除」之间，
+		// 检查看到的是旧快照，删掉的分组背后已经挂上了新引用。
 		var g model.Group
-		if err := tx.First(&g, id).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&g, id).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotFound
 			}

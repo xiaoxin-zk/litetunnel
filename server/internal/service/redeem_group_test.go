@@ -1,8 +1,11 @@
 package service
 
 import (
+	"errors"
+	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -100,5 +103,141 @@ func TestGenerateCodesBatchNoUniqueWithinSameSecond(t *testing.T) {
 	// 批次号仍应以 B + 时间开头：按时间前缀筛选的用法不能被破坏。
 	if !strings.HasPrefix(first[0].BatchNo, "B") || len(first[0].BatchNo) < 15 {
 		t.Fatalf("批次号格式异常: %s", first[0].BatchNo)
+	}
+}
+
+// TestGenerateCodesValueCapRejected 覆盖生成侧的面值上限。
+func TestGenerateCodesValueCapRejected(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	_, err := svc.GenerateCodes(1, GenerateCodesInput{
+		Count: 1, Type: model.RedeemTypeTraffic, Value: maxRedeemTrafficValue + 1,
+	})
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("超上限的流量值应被拒绝，实际 %v", err)
+	}
+	_, err = svc.GenerateCodes(1, GenerateCodesInput{
+		Count: 1, Type: model.RedeemTypeDuration, Value: maxRedeemDurationValue + 1,
+	})
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("超上限的天数应被拒绝，实际 %v", err)
+	}
+	_, err = svc.GenerateCodes(1, GenerateCodesInput{
+		Count: 1, Type: model.RedeemTypeGroup, GroupID: 99999,
+	})
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("指向不存在分组的码应被拒绝，实际 %v", err)
+	}
+}
+
+// TestRedeemOverflowRejected 覆盖兑换侧的溢出兜底。
+//
+// 生成侧的面值上限管不住已存在的老数据：直接往库里塞一张超上限的码
+// （绕过 GenerateCodes 的校验，模拟历史数据），兑换必须拒绝，
+// 且码不能被核销——事务回滚后它还得能正常兑换。
+func TestRedeemOverflowRejected(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "rich", Password: "not-used", Status: model.UserStatusActive,
+		TrafficQuota: math.MaxInt64 - 10}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	code := &model.RedeemCode{
+		Code: "OVERFLOW1", BatchNo: "B1", Type: model.RedeemTypeTraffic,
+		Value: 100, MaxUses: 1, Status: model.RedeemStatusUnused,
+	}
+	if err := svc.DB.Create(code).Error; err != nil {
+		t.Fatalf("建码失败: %v", err)
+	}
+
+	_, err := svc.Redeem(u.ID, code.Code, "127.0.0.1")
+	if !errors.Is(err, ErrCodeInvalid) {
+		t.Fatalf("溢出兑换应被拒绝，实际 %v", err)
+	}
+
+	// 拒绝后码必须原样保留：核销随事务回滚。
+	var after model.RedeemCode
+	if err := svc.DB.First(&after, code.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.RedeemStatusUnused || after.UsedCount != 0 {
+		t.Fatalf("被拒绝的码不应被核销: status=%s used=%d", after.Status, after.UsedCount)
+	}
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.TrafficQuota != math.MaxInt64-10 {
+		t.Fatalf("配额不应被改写，实际 %d", got.TrafficQuota)
+	}
+}
+
+// TestRedeemDurationStacksSequentially 覆盖时长码的顺延。
+//
+// 顺延基于「现有到期时间」：第二张必须从第一张的结果继续叠加，
+// 而不是各自从当前时间起算。行锁保证并发兑换时读到的也是前一张
+// 提交后的值（并发本身无法在 SQLite 单连接下复现，这里守住语义）。
+func TestRedeemDurationStacksSequentially(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	base := time.Now().AddDate(0, 0, 10)
+	u := &model.User{Username: "dur", Password: "not-used", Status: model.UserStatusActive,
+		GroupExpireAt: &base}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		code := &model.RedeemCode{
+			Code: "DURATION1" + string(rune('A'+i)), BatchNo: "B1",
+			Type: model.RedeemTypeDuration, Value: 30,
+			MaxUses: 1, Status: model.RedeemStatusUnused,
+		}
+		if err := svc.DB.Create(code).Error; err != nil {
+			t.Fatalf("建码失败: %v", err)
+		}
+		if _, err := svc.Redeem(u.ID, code.Code, "127.0.0.1"); err != nil {
+			t.Fatalf("第 %d 次兑换失败: %v", i+1, err)
+		}
+	}
+
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 10 天 + 30 + 30，允许几秒的时钟误差。
+	want := base.AddDate(0, 0, 60)
+	if diff := got.GroupExpireAt.Sub(want); diff > 2*time.Minute || diff < -2*time.Minute {
+		t.Fatalf("到期时间应顺延到 %v，实际 %v", want, *got.GroupExpireAt)
+	}
+}
+
+// TestAdminSetUserGroupWithMissingGroupFails 覆盖「分配时分组已不存在」。
+func TestAdminSetUserGroupWithMissingGroupFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	g := &model.Group{Name: "gone", AllowProtocols: "tcp"}
+	if err := svc.DB.Create(g).Error; err != nil {
+		t.Fatalf("建分组失败: %v", err)
+	}
+	u := &model.User{Username: "assignme", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	if err := svc.DeleteGroup(g.ID); err != nil {
+		t.Fatalf("删除分组失败: %v", err)
+	}
+
+	err := svc.AdminSetUserGroup(u.ID, g.ID, nil)
+	if !errors.Is(err, ErrInvalidParam) {
+		t.Fatalf("向已删除分组分配用户应被拒绝，实际 %v", err)
+	}
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.GroupID == g.ID {
+		t.Fatal("悬空的 group_id 不应被写入")
 	}
 }

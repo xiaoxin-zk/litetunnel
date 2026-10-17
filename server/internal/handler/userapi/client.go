@@ -206,31 +206,38 @@ func (h *Handler) ClientConfig(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	tunnels, err := h.svc.ListTunnels(u.ID)
-	if err != nil {
-		shared.Fail(c, err)
-		return
-	}
+	// 带 tunnel_id 时按 ID 直查，不带时才取全量。
+	//
+	// 以前是无条件 ListTunnels 再线性扫一遍找那条隧道。客户端给每条隧道单独
+	// 起一个 frpc 进程，同步一轮就是「隧道数」次这样的请求：每次都把用户
+	// 全部隧道读出来、建一遍对象，只为拿其中一条。隧道一多，这部分开销
+	// 完全是无谓的——按主键查一条是 O(1)，全量查是 O(n) 加一次大分配。
+	var tunnels []model.Tunnel
 	if raw := strings.TrimSpace(c.Query("tunnel_id")); raw != "" {
 		id, err := strconv.ParseUint(raw, 10, 64)
 		if err != nil || id == 0 {
 			shared.Fail(c, service.ErrInvalidParam)
 			return
 		}
-		// 只在该用户自己的隧道里找：他人的隧道 ID 一律按「不存在」处理，
-		// 不给出「存在但不属于你」这种能用来探测 ID 的差别。
-		one := make([]model.Tunnel, 0, 1)
-		for i := range tunnels {
-			if uint64(tunnels[i].ID) == id {
-				one = append(one, tunnels[i])
-				break
-			}
-		}
-		if len(one) == 0 {
+		// 归属校验交给 GetTunnel 的 where 条件：他人的隧道 ID 一律按
+		// 「不存在」处理，不给出「存在但不属于你」这种能用来探测 ID 的差别。
+		// 超出 uint 表示范围的 ID 同样按不存在处理，避免截断后指向另一条隧道。
+		if uint64(uint(id)) != id {
 			shared.Fail(c, service.ErrNotFound)
 			return
 		}
-		tunnels = one
+		one, err := h.svc.GetTunnel(u.ID, uint(id))
+		if err != nil {
+			shared.Fail(c, err)
+			return
+		}
+		tunnels = []model.Tunnel{*one}
+	} else {
+		tunnels, err = h.svc.ListTunnels(u.ID)
+		if err != nil {
+			shared.Fail(c, err)
+			return
+		}
 	}
 	text, err := h.svc.BuildFrpcConfig(u, tunnels)
 	if err != nil {

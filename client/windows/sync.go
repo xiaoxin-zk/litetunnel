@@ -8,8 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
 )
 
 // retryState 是一条隧道的重试退避状态。
@@ -27,8 +27,16 @@ type tunnelErr struct {
 // syncInterval 是后台自动同步的间隔。
 //
 // 取 20 秒是折中：用户在网页端加完隧道再切回客户端，基本已经同步好了；
-// 而每次同步只是两个轻量 GET，不会给服务端造成压力。
+// 而每次同步是「一次接入信息 + 每条隧道一次配置」的轻量 GET（配置那几个
+// 并发发出、且有上限，见 configFetchConcurrency），不会给服务端造成压力。
 const syncInterval = 20 * time.Second
+
+// configFetchConcurrency 是同一轮同步里并发拉取隧道配置的上限。
+//
+// 取 6 是折中：隧道数量通常是个位数，6 路并发就能把「隧道数 × 往返时间」
+// 压成接近「一两轮往返」；再往上加，收益会被本机与家用带宽吃光，
+// 反而更容易触发服务端的限流。
+const configFetchConcurrency = 6
 
 // startAutoSync 启动后台自动同步，随应用退出而结束。
 //
@@ -211,6 +219,9 @@ func (a *App) applySync() (changed bool, err error) {
 		a.noteStartFailure(t.ID, t.Name, msg)
 	}
 
+	// 第一遍：只做与配置无关的决定——离线校准、停用即停进程、退避跳过。
+	// 这些都在改本地状态，必须留在串行路径上。
+	var pending []TunnelVO
 	for _, t := range tunnels {
 		// 先校准「已注册」标记：本机还挂着「注册成功」的印象、而服务端已经
 		// 报告离线时，以服务端为准（详见 calibrateRegistered 的说明）。
@@ -232,9 +243,21 @@ func (a *App) applySync() (changed bool, err error) {
 		if !a.mgr.Running(t.ID) && !a.retryAllowed(t.ID) {
 			continue
 		}
+		pending = append(pending, t)
+	}
 
-		cfgText, err := a.fetchTunnelConfig(base, apiKey, t.ID)
-		if err != nil {
+	// 第二遍：并发把要用的配置取回来。
+	//
+	// 只并发「取配置」这一件事：后面的写文件、起停进程、记退避、记失败都在改
+	// 同一批共享状态，把它们并发化得把这套状态机重新设计一遍，风险远大于收益。
+	// 而延迟的大头恰恰是网络往返——逐条串行时整轮耗时约为「隧道数 × 响应时间」，
+	// 隧道一多就会明显拖长，界面上只剩一个「连接中」。
+	cfgs, cfgErrs := a.fetchTunnelConfigs(base, apiKey, pending)
+
+	// 第三遍：按原顺序逐条处理，日志与失败顺序与串行版本保持一致。
+	for _, t := range pending {
+		cfgText := cfgs[t.ID]
+		if err := cfgErrs[t.ID]; err != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
 			failSync(t, "拉取配置失败："+err.Error())
@@ -299,6 +322,73 @@ func (a *App) fetchTunnelConfig(base, apiKey string, id uint) (string, error) {
 	return strings.TrimSpace(text), nil
 }
 
+// fetchTunnelConfigs 并发拉取一批隧道的配置，结果按隧道 ID 回填。
+//
+// 为什么值得单独做这一步：逐条串行时整轮同步的耗时约等于「隧道数 × 单次往返」，
+// 十几条隧道就能让界面长时间停在「连接中」。而这一步只读网络、不碰本地状态，
+// 是整条链路上唯一能安全并发的一段。
+//
+// 出错也**不中断**：错误按 ID 收集起来，交给调用方按原顺序逐条记录，
+// 这样一条隧道拉取失败不会掩盖其他隧道的对账，日志顺序也和串行版本一致。
+// 单次请求的超时由 a.http 自己的 Timeout 兜底，这里不再套一层 context：
+// 并发数已经有上限，最坏情况也就是「上限个请求各等一次超时」。
+func (a *App) fetchTunnelConfigs(base, apiKey string, tunnels []TunnelVO) (map[uint]string, map[uint]error) {
+	cfgs := make(map[uint]string, len(tunnels))
+	errs := make(map[uint]error, len(tunnels))
+	if len(tunnels) == 0 {
+		return cfgs, errs
+	}
+
+	type cfgResult struct {
+		id   uint
+		text string
+		err  error
+	}
+
+	workers := configFetchConcurrency
+	if workers > len(tunnels) {
+		workers = len(tunnels)
+	}
+
+	jobs := make(chan TunnelVO)
+	// 结果通道带足缓冲：worker 写完就能去领下一个任务，不会因为主协程
+	// 还在处理上一条结果而空等。
+	results := make(chan cfgResult, len(tunnels))
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for t := range jobs {
+				text, err := a.fetchTunnelConfig(base, apiKey, t.ID)
+				results <- cfgResult{id: t.ID, text: text, err: err}
+			}
+		}()
+	}
+
+	// 派发与收集分开：派发放在独立协程里，主协程专心收结果。
+	// 若在这里同步派发，jobs 写满时就会和收结果互相卡死。
+	go func() {
+		for _, t := range tunnels {
+			jobs <- t
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	// 只在主协程写这两个 map，因此不需要锁。
+	for r := range results {
+		if r.err != nil {
+			errs[r.id] = r.err
+			continue
+		}
+		cfgs[r.id] = r.text
+	}
+	return cfgs, errs
+}
+
 // writeAndStart 落盘配置并启动该隧道的 frpc 进程。
 //
 // 启动成功与否由回调里的日志体现（frpc 会打印自己的连接过程），
@@ -312,12 +402,6 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
 		return err
 	}
-	// 清退避要放在**启动之前**，不能等启动成功之后再清。
-	//
-	// 进程退出回调是异步的：frpc 因为凭据失效之类的原因秒退时，回调可能
-	// 在 Start 返回之后、我们清退避之前就把新退避登记好了——随后那次清理
-	// 会把它抹掉，下一轮同步立刻又拉起进程，退避形同不存在。
-	// 放在启动前，最坏情况也只是「刚失败过一次又立刻重试一次」。
 	// 清退避要放在**启动之前**，不能等启动成功之后再清。
 	//
 	// 进程退出回调是异步的：frpc 因为凭据失效之类的原因秒退时，回调可能

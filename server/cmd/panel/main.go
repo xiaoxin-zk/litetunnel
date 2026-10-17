@@ -54,6 +54,15 @@ func main() {
 
 	svc := service.New(db, cfg)
 
+	// 准入状态必须在开始监听**之前**同步加载完。
+	//
+	// 超额与禁用标记只在内存里，由后台采集维护；而插件热路径查不到它时，
+	// 「没有这一条」与「该账号没问题」是同一个样子。异步启动采集意味着
+	// 从监听开始到第一次采集成功之间有一段窗口：那时所有客户端都在重连，
+	// 超额用户与已禁用账号会被照常放行。所以这里同步取一次（失败也不阻断
+	// 启动，但状态保持「未知」，插件会拒绝，由采集协程重试）。
+	svc.LoadAccessGuard()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

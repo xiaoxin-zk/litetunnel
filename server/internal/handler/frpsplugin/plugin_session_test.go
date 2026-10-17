@@ -54,6 +54,12 @@ func TestRevokedSessionIsNotResurrectedByPing(t *testing.T) {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	svc := service.New(db, cfg)
+	// 与 cmd/panel/main.go 一致：准入状态要在处理回调之前加载完。
+	// 少了这一步，插件会以「状态未知」拒绝所有放行请求，用例就测不到
+	// 它真正关心的凭据与会话逻辑了。
+	if !svc.LoadAccessGuard() {
+		t.Fatal("加载准入状态失败")
+	}
 	h := New(svc, nil)
 	r := gin.New()
 	r.POST("/plugin", h.Handle)
@@ -122,5 +128,71 @@ func TestRevokedSessionIsNotResurrectedByPing(t *testing.T) {
 	res := decodeResponse(t, postPlugin(t, r, body))
 	if !res.Reject {
 		t.Fatalf("凭据已轮换，旧连接不该还能建代理: %s", body)
+	}
+}
+
+// TestCallbacksFailClosedBeforeGuardLoaded 覆盖「准入状态未知」这一档。
+//
+// 超额与禁用标记只在内存里，由后台采集维护。采集没跑成时（数据库刚起来、
+// frps 管理 API 不可达、采样基线读不出来），内存就是空的——而在这套数据结构
+// 里，「查不到」与「没超额」完全一样。照常放行等于关掉准入控制，且发生时
+// 恰恰是控制面刚重启、所有客户端集中重连的那一刻。
+//
+// 这里挑的是配额断流的实时拦截点（NewUserConn）：内存里有一条真实会话，
+// 状态就绪时这条请求会被放行，因此能证明拦截确实来自准入状态本身。
+func TestCallbacksFailClosedBeforeGuardLoaded(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{
+		Env:          "test",
+		LogLevel:     "warn",
+		DBDriver:     "sqlite",
+		DBDSN:        filepath.Join(t.TempDir(), "guard.db"),
+		APIKeyEncKey: "test-api-key-enc-key",
+	}
+	db, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("取数据库连接失败: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	// 刻意**不**调用 LoadAccessGuard：模拟「已经能接回调，但准入状态还没
+	// 加载完」的那段窗口。
+	svc := service.New(db, cfg)
+	h := New(svc, nil)
+	r := gin.New()
+	r.POST("/plugin", h.Handle)
+
+	u := &model.User{
+		Username:     "guarduser",
+		Password:     "not-used",
+		Status:       model.UserStatusActive,
+		ClientSecret: "not-used-either",
+	}
+	if err := db.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	const runID = "run-guard"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+
+	if svc.Runtime.AccessGuardReady() {
+		t.Fatal("前置条件：没有加载过准入状态，不该已经是「已知」")
+	}
+
+	body := fmt.Sprintf(`{"op":"NewUserConn","content":{"user":{"run_id":%q}}}`, runID)
+	if res := decodeResponse(t, postPlugin(t, r, body)); !res.Reject {
+		t.Fatal("准入状态尚未加载时不能放行：此时「查不到」与「没超额」无法区分")
+	}
+
+	// 加载完成后必须恢复正常，否则这条拒绝会变成永久性的。
+	if !svc.LoadAccessGuard() {
+		t.Fatal("加载准入状态失败")
+	}
+	if res := decodeResponse(t, postPlugin(t, r, body)); res.Reject {
+		t.Fatalf("准入状态就绪后应当放行，实际被拒: %s", body)
 	}
 }

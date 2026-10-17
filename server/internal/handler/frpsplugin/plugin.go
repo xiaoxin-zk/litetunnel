@@ -367,6 +367,9 @@ func (h *Handler) onLogin(req *request) response {
 	if err := json.Unmarshal(req.Content, &content); err != nil {
 		return deny("登录参数解析失败")
 	}
+	if r, notReady := h.denyUntilGuardReady(); notReady {
+		return r
+	}
 
 	userID, ok := service.UserIDFromFrpUser(content.User)
 	if !ok {
@@ -407,10 +410,32 @@ func (h *Handler) onLogin(req *request) response {
 	return allow()
 }
 
+// denyUntilGuardReady 在准入状态（超额与禁用标记）尚未加载完成时给出拒绝响应。
+//
+// 这条判断必须出现在每一个「放行」的入口上（登录、建代理、新建用户连接），
+// 且方向是拒绝而不是放行：此时内存里既没有超额标记也没有禁用标记，
+// 「查不到」与「没超额」在数据结构上完全一样。控制面刚启动、或数据库一度
+// 不可用之后就是这种状态，而那一刻恰恰所有客户端都在重连——按放行处理，
+// 等于在最该拦截的时候把超额与已禁用的账号全部放进来。
+//
+// 状态只在整表加载成功后置位（见 service.LoadAccessGuard），所以这里的拒绝
+// 是短暂的：数据库恢复后采集协程会把它翻回来，不需要人工干预。
+func (h *Handler) denyUntilGuardReady() (response, bool) {
+	if h.svc.Runtime.AccessGuardReady() {
+		return response{}, false
+	}
+	// 不在热路径打日志：数据库长时间不可用时，每个连接都会走到这里，
+	// 刷屏只会淹没真正的原因。加载失败本身在 service 侧已经记过了。
+	return deny("服务正在加载账号状态，请稍后重试"), true
+}
+
 func (h *Handler) onNewProxy(req *request) response {
 	var content newProxyContent
 	if err := json.Unmarshal(req.Content, &content); err != nil {
 		return deny("代理参数解析失败")
+	}
+	if r, notReady := h.denyUntilGuardReady(); notReady {
+		return r
 	}
 
 	// 传 metas：首次登录时会话尚未登记，需要靠它复核凭据。
@@ -559,6 +584,9 @@ func (h *Handler) onNewUserConn(req *request) response {
 		// 与未知操作的处理保持一致（fail-closed）。
 		log.Printf("[plugin] NewUserConn 请求体解析失败，已拒绝: %v", err)
 		return deny("请求格式非法")
+	}
+	if r, notReady := h.denyUntilGuardReady(); notReady {
+		return r
 	}
 
 	// 优先走会话缓存；缓存未命中时才回落数据库。

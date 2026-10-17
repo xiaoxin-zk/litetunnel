@@ -54,6 +54,18 @@ type Runtime struct {
 	// 采集是否跑过，现象随机。
 	blocked map[uint]bool
 
+	// guardReady 表示「超额与禁用标记」是否已经成功从数据库加载过至少一次。
+	//
+	// 为什么需要一个显式的就绪位：这两个标记只由流量采集维护，而采集会在
+	// 数据库不可用、采样基线读不出来、frps 管理 API 不可达时**整轮跳过**
+	// （这是有意的，见 collectTraffic）。跳过时内存里就是「谁都没超额、
+	// 谁都没被禁用」，而插件热路径把「查不到」当成「没超额」放行——
+	// 控制面刚启动、第一次采集还没跑成的那段时间里，超额用户与已禁用账号
+	// 重连都能照常建隧道，而那一刻恰恰是所有客户端都在重连的时候。
+	//
+	// 所以把「状态未知」变成一个可查询的事实，由插件显式拒绝（fail-closed）。
+	guardReady bool
+
 	identities map[identityKey]identityState // 账号有效性短缓存
 }
 
@@ -265,6 +277,26 @@ func (r *Runtime) DropUserSessions(userID uint) int {
 	return n
 }
 
+// AccessGuardReady 报告准入状态（超额与禁用标记）是否已加载完成。
+//
+// 返回 false 时内存里的两个标记都不可信，调用方必须按「不该放行」处理：
+// 此时「查不到」与「没超额」在数据结构上完全一样，放行等于关掉准入控制。
+func (r *Runtime) AccessGuardReady() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.guardReady
+}
+
+// markAccessGuardReady 在整表加载成功后置位。
+//
+// 只在成功时置位、失败时不撤销：拿过一份完整快照之后，「已知但可能略旧」
+// 仍然比「未知」可信——未知会被当成「没超额」而放行。
+func (r *Runtime) markAccessGuardReady() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.guardReady = true
+}
+
 // IsQuotaExceeded 查询用户是否超额。
 func (r *Runtime) IsQuotaExceeded(userID uint) bool {
 	r.mu.RLock()
@@ -358,6 +390,14 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 		// 读失败时**必须跳过采集**，而不是「读不到就当空基线」：空基线的效果
 		// 与「没有基线」完全一样——当天累计值会被整个记成新增量，正是这条
 		// 逻辑要防的事。数据库读失败通常是瞬时的，等下一轮重试即可。
+		// 准入状态再兜一次，并且**与采集解耦**。
+		//
+		// main.go 在开始监听之前已经同步加载过一次，但那一次可能恰好撞上
+		// 数据库不可用。此后如果只在「采集成功」时才刷新它，那么 frps 管理
+		// API 一挂，配额判断就永远停在「未知」——按 fail-closed 会拒绝所有人，
+		// 而这本来只是 frps 的问题，与谁超额无关。
+		guardReady := s.LoadAccessGuard()
+
 		baselineReady := s.loadTrafficBaseline()
 		if baselineReady {
 			// 启动即跑一次，避免控制台首屏空白。
@@ -371,6 +411,13 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if !guardReady {
+					// 与基线一样只在恢复时打一行：数据库长时间不可用时，
+					// 每轮都打只会把日志刷满。
+					if guardReady = s.LoadAccessGuard(); guardReady {
+						log.Printf("[quota] 准入状态已就绪，恢复按配额与账号状态拦截")
+					}
+				}
 				if !baselineReady {
 					// 只在恢复时打一行：数据库长时间不可用时，每轮都打
 					// 只会把日志刷满，而结论一直是同一个。
@@ -667,15 +714,37 @@ func (s *Services) loadTrafficBaseline() bool {
 // 放在这里同步「禁用」是为了覆盖重启：进程重启后内存是空的，而插件热路径
 // 只查内存，不在这里补齐的话，已禁用的账号在重启后会重新被放行，
 // 直到管理员再动一次那个账号。
-func (s *Services) refreshQuotaFlags() {
+func (s *Services) refreshQuotaFlags() error {
 	var users []model.User
 	if err := s.DB.Preload("Group").Find(&users).Error; err != nil {
 		log.Printf("[quota] 刷新超额标记失败: %v", err)
-		return
+		return err
 	}
 	for i := range users {
 		s.EnsureTrafficPeriod(&users[i])
 		s.Runtime.SetQuotaExceeded(users[i].ID, s.QuotaExceeded(&users[i]))
 		s.Runtime.SetUserBlocked(users[i].ID, users[i].Status != model.UserStatusActive)
 	}
+	// 整表刷完才算「状态已知」：中途失败会提前返回，此时只覆盖了一部分账号，
+	// 把剩下那些当成「没超额」正是要防的事。
+	s.Runtime.markAccessGuardReady()
+	return nil
+}
+
+// LoadAccessGuard 从数据库加载准入状态（超额与禁用标记），返回是否成功。
+//
+// 必须在开始接受请求**之前**同步调用一次（见 cmd/panel/main.go）：插件热路径
+// 只查内存，而这两个标记只由它维护。少了这一步，控制面从启动到第一次成功
+// 采集之间的窗口里，「内存里什么都没有」会被当成「谁都没超额」，超额用户与
+// 已禁用账号照样能建隧道——而重启后所有客户端都在重连，正是准入控制最该
+// 生效的时刻。
+//
+// 失败时不阻断启动：准入状态保持「未知」，插件会显式拒绝（fail-closed），
+// 采集协程持续重试直到数据库恢复。
+func (s *Services) LoadAccessGuard() bool {
+	if err := s.refreshQuotaFlags(); err != nil {
+		log.Printf("[quota] 加载准入状态失败，在成功加载前将拒绝新建隧道: %v", err)
+		return false
+	}
+	return true
 }

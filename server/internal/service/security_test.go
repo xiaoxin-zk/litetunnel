@@ -277,6 +277,68 @@ func TestRefreshQuotaFlagsSyncsBlockedFromDB(t *testing.T) {
 	}
 }
 
+// TestAccessGuardIsUnknownUntilLoaded 覆盖「准入状态未知」不能当成「没超额」。
+//
+// 超额与禁用标记只在内存里，由后台采集维护；而采集在数据库不可用、
+// frps 管理 API 不可达、采样基线读不出来时会**整轮跳过**。跳过期间内存里
+// 什么标记都没有，而插件热路径把「查不到」当成「没超额」放行——控制面刚
+// 启动、所有客户端同时重连的那段时间，超额与已禁用账号会被一并放进来。
+// 所以状态必须可查询，且只有整表加载成功才算「已知」。
+func TestAccessGuardIsUnknownUntilLoaded(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "quotaover", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Updates(map[string]any{"traffic_quota": 1, "traffic_used": 2}).Error; err != nil {
+		t.Fatalf("设置配额失败: %v", err)
+	}
+
+	// 刚启动：谁都不知道。
+	if svc.Runtime.AccessGuardReady() {
+		t.Fatal("前置条件：新建的服务不该已经处于「准入状态已知」")
+	}
+	if svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("前置条件：内存里不该有超额标记")
+	}
+
+	// 加载之后：如实反映库里的现状，并把状态翻成「已知」。
+	if !svc.LoadAccessGuard() {
+		t.Fatal("加载准入状态失败")
+	}
+	if !svc.Runtime.AccessGuardReady() {
+		t.Fatal("加载成功后必须标记为已知，否则插件会一直拒绝所有人")
+	}
+	if !svc.Runtime.IsQuotaExceeded(u.ID) {
+		t.Fatal("已用 2 > 配额 1 的账号必须被标记，否则它仍能建隧道")
+	}
+}
+
+// TestLoadAccessGuardKeepsUnknownOnDBError 覆盖加载失败时不能假装知道。
+//
+// 失败却置位，插件就会按「内存里没有 ⇒ 没超额」放行，准入控制等于关掉；
+// 正确行为是保持未知、让插件显式拒绝，由采集协程重试到数据库恢复。
+func TestLoadAccessGuardKeepsUnknownOnDBError(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	sqlDB, err := svc.DB.DB()
+	if err != nil {
+		t.Fatalf("取数据库连接失败: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("关闭数据库失败: %v", err)
+	}
+
+	if svc.LoadAccessGuard() {
+		t.Fatal("数据库不可用时不该报告加载成功")
+	}
+	if svc.Runtime.AccessGuardReady() {
+		t.Fatal("加载失败后状态必须保持「未知」：置位等于按「谁都没超额」放行")
+	}
+}
+
 // TestAdminSetUserGroupDoesNotDeadlock 覆盖 SQLite 单连接下的自锁。
 //
 // AdminSetUserGroup 曾经在事务里调用 refreshQuotaFor，而后者要用**主连接**

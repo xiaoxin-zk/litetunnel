@@ -829,31 +829,9 @@ func (s *Services) AdminDeleteUser(id uint) error {
 		if err := tx.Where("user_id = ?", id).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
-		// 重置令牌与验证码一并删除：账号都没了，留下的令牌不该还能
-		// 走完「重置密码」的流程（否则会返回一个空洞的「重置成功」）。
-		if err := tx.Where("user_id = ?", id).Delete(&model.PasswordResetToken{}).Error; err != nil {
+		// 重置令牌、验证码与待发凭据邮件一并清理（与自助注销共用）。
+		if err := purgeAccountCredentialsTx(tx, id, u.Email); err != nil {
 			return err
-		}
-		if u.Email != "" {
-			if err := tx.Where("email = ?", u.Email).Delete(&model.EmailCode{}).Error; err != nil {
-				return err
-			}
-			// 待发送/待激活的凭据邮件一并作废：账号已删除，邮件再送达
-			// 只会把用户引向一个不存在的账号。正文与参数里是明文凭据，
-			// 作废时立刻清掉。
-			if err := tx.Model(&model.MailOutbox{}).
-				Where("to_addr = ? AND kind IN ? AND status IN ?", u.Email,
-					[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
-						model.MailKindEmailCodeRegister},
-					[]string{model.MailPending, model.MailDelivered}).
-				Updates(map[string]any{
-					"status":   model.MailFailed,
-					"body":     "",
-					"payload":  "",
-					"last_err": "账号已删除，邮件作废",
-				}).Error; err != nil {
-				return err
-			}
 		}
 		return tx.Delete(&model.User{}, id).Error
 	})
@@ -980,6 +958,16 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 // 顺序反过来（先清零后登记）会有一个窗口：增量恰好插在两步之间落库，
 // 标记拦不住它。
 func (s *Services) AdminResetUserTraffic(id uint) error {
+	// 「登记 + 清零写库（+ 失败撤销）」整段与采集的「快照 → 提交」互斥。
+	//
+	// 只让撤销拿锁还不够：采集可能已经取到**不含本用户标记**的快照，
+	// 管理员随后清零写库，采集再提交那份快照里的旧增量——清零后的用量
+	// 又被加回，正是这套标记要防的事。持有协调锁之后，两者只可能是
+	// 先后关系：要么清零先落地（采集快照一定包含标记），要么采集先提交
+	// （清零随后写绝对值 0，结果仍然正确）。
+	unlockReset := s.Runtime.lockTrafficReset()
+	defer unlockReset()
+
 	// 记下本次登记的代次：撤销只能作用于这一笔。同一用户可能有并发的
 	// 另一笔清零已成功登记，按用户整体撤销会把它的标记一并作废，
 	// 那一笔清零前的旧增量随后就会被加回。
@@ -990,12 +978,13 @@ func (s *Services) AdminResetUserTraffic(id uint) error {
 	})
 	if res.Error != nil {
 		// 清零没写进去，登记的标记必须撤销：留着它，后续采集会错误地
-		// 丢弃一轮**真实**用量。
-		s.Runtime.UnmarkTrafficResetPending(id, gen)
+		// 丢弃一轮**真实**用量。已在协调区间内，用加锁版本撤销——
+		// 再取一次 resetMu 会自死锁。
+		s.Runtime.unmarkTrafficResetPendingLocked(id, gen)
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		s.Runtime.UnmarkTrafficResetPending(id, gen)
+		s.Runtime.unmarkTrafficResetPendingLocked(id, gen)
 		return ErrNotFound
 	}
 	s.Runtime.BumpGuardVer()

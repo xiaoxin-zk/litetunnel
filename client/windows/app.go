@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/client/internal/frpc"
@@ -155,6 +156,16 @@ type App struct {
 	// 两者都会写配置文件、起停进程；重叠执行会让同一时刻出现
 	// 「刚停掉又被拉起来」的反复闪断。
 	syncMu sync.Mutex
+
+	// syncSeq 发放给每次拉取到的清单快照，appliedSyncSeq 记录已应用的最大
+	// 序号（由 syncMu 保护）。
+	//
+	// 接入流程与后台同步各自拉清单：接入先拉、后台后拉，但后台可能先应用。
+	// 若接入随后把旧清单应用上去，会把它拉取之后才新建的隧道当成「服务端
+	// 已删除」而停掉进程、删掉配置——下一轮同步才恢复。序号让过期快照
+	// 被直接拒绝（见 syncWithData）。
+	syncSeq        atomic.Uint64
+	appliedSyncSeq uint64
 
 	// domReadyOnce 保证「打开即连」只跑一次。
 	//

@@ -205,6 +205,14 @@ func (a *App) fetchClientInfoOnce(ctx context.Context, base, apiKey string) (*cl
 	if err := appendPage(first.Tunnels); err != nil {
 		return nil, err
 	}
+	if len(all) == 0 {
+		// 服务端先查总数、再单独查列表，两次查询之间隧道可能被删空：
+		// 响应就成了「总数 > 0、列表为空」。这里绝不能进入游标计算
+		// （对空切片取末元素会 panic，自动同步协程里的 panic 会直接
+		// 终止客户端），按「清单已变化」重取。
+		return nil, fmt.Errorf("%w：服务端报告 %d 条但本页为空",
+			errTunnelListChanged, first.TunnelTotal)
+	}
 
 	for int64(len(all)) < first.TunnelTotal {
 		// 游标 = 已取到的最小 id，下一页取比它更小的（服务端按 id 倒序）。

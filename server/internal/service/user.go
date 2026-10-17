@@ -577,6 +577,36 @@ func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 	return nil
 }
 
+// purgeAccountCredentialsTx 清理账号关联的凭据与待发邮件（在事务内执行）。
+//
+// 管理员删除与自助注销共用：留着这些记录，用户会收到指向不存在账号的
+// 重置邮件——激活阶段虽然也会发现账号不在（见 activateResetToken），
+// 但信已经发出去了，用户看到的是「链接无效」而不是「账号已注销」；
+// 队列还会为一个不存在的账号反复投递。邮件正文与参数里是明文凭据，
+// 作废时立刻清掉。
+func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
+	if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
+		return err
+	}
+	if email == "" {
+		return nil
+	}
+	if err := tx.Where("email = ?", email).Delete(&model.EmailCode{}).Error; err != nil {
+		return err
+	}
+	return tx.Model(&model.MailOutbox{}).
+		Where("to_addr = ? AND kind IN ? AND status IN ?", email,
+			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset,
+				model.MailKindEmailCodeRegister},
+			[]string{model.MailPending, model.MailDelivered}).
+		Updates(map[string]any{
+			"status":   model.MailFailed,
+			"body":     "",
+			"payload":  "",
+			"last_err": "账号已删除，邮件作废",
+		}).Error
+}
+
 // DeleteAccount 用户注销自己的账号。
 //
 // 需要提供登录密码二次确认：注销不可恢复，必须防止令牌被盗后被恶意注销。
@@ -614,7 +644,9 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		if err := tx.Where("user_id = ?", userID).Delete(&model.ClientSession{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", userID).Delete(&model.PasswordResetToken{}).Error; err != nil {
+		// 凭据类数据（重置令牌、邮箱验证码、待发凭据邮件）与管理员
+		// 删除路径共用同一套清理，避免两条路径各行其是、漏掉其中一类。
+		if err := purgeAccountCredentialsTx(tx, userID, u.Email); err != nil {
 			return err
 		}
 		// 兑换流水与登录日志保留：它们属于审计数据，删除会让风控出现盲区。

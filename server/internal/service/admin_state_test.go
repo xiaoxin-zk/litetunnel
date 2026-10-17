@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -143,6 +144,112 @@ func TestFlushTrafficHoldsResetLock(t *testing.T) {
 	unlock()
 	if err := <-done; err != nil {
 		t.Fatalf("释放锁后应正常落库: %v", err)
+	}
+}
+
+// TestAdminResetHoldsResetLock 覆盖「成功清零也在协调区间内」。
+//
+// 只让撤销拿锁不够：采集可能已经取到不含该用户标记的快照，管理员随后
+// 写零，采集再提交那份快照里的旧增量——清零后的用量又被加回。清零的
+// 「登记 + 写库」必须和采集的「快照 → 提交」互斥。
+func TestAdminResetHoldsResetLock(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "resetlock", Password: "not-used",
+		Status: model.UserStatusActive, TrafficUsed: 4096}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	unlock := svc.Runtime.lockTrafficReset()
+	done := make(chan error, 1)
+	go func() { done <- svc.AdminResetUserTraffic(u.ID) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("协调锁被采集占用时清零不应完成: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("释放锁后清零应成功: %v", err)
+	}
+
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.TrafficUsed != 0 {
+		t.Fatalf("清零后用量应为 0，实际 %d", got.TrafficUsed)
+	}
+	// 标记仍在，等待下一轮采集消费（跳过清零前的旧增量）。
+	if taken := svc.Runtime.takePendingTrafficResets(); len(taken) != 1 {
+		t.Fatalf("清零后应留下待协调标记，实际 %v", taken)
+	}
+}
+
+// TestDeleteAccountPurgesCredentials 覆盖「自助注销同样清理凭据与待发邮件」。
+//
+// 管理员删除已经清理了这些数据；自助注销曾经漏掉，注销后队列仍会投递
+// 一封指向不存在账号的重置邮件，验证码也留在库里。
+func TestDeleteAccountPurgesCredentials(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	hashed, err := auth.HashPassword("Passw0rd12345")
+	if err != nil {
+		t.Fatalf("生成密码失败: %v", err)
+	}
+	u := &model.User{Username: "selfpurge", Password: hashed,
+		Status: model.UserStatusActive, Email: "selfpurge@example.com"}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	if err := svc.DB.Create(&model.PasswordResetToken{
+		UserID: u.ID, TokenHash: "self-token", ExpireAt: time.Now().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DB.Create(&model.EmailCode{
+		Email: u.Email, Scene: "reset", CodeHash: "self-code",
+		ExpireAt: time.Now().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	mail := model.MailOutbox{
+		To: u.Email, Subject: "s", Kind: model.MailKindResetLink,
+		Body: "code=123456", Payload: `{"user_id":1}`,
+		Status: model.MailPending, NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(&mail).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.DeleteAccount(u.ID, "Passw0rd12345"); err != nil {
+		t.Fatalf("注销失败: %v", err)
+	}
+
+	var tokens, codes int64
+	if err := svc.DB.Model(&model.PasswordResetToken{}).
+		Where("user_id = ?", u.ID).Count(&tokens).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DB.Model(&model.EmailCode{}).
+		Where("email = ?", u.Email).Count(&codes).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tokens != 0 || codes != 0 {
+		t.Fatalf("注销后不应留下令牌/验证码，实际 %d / %d 条", tokens, codes)
+	}
+	var got model.MailOutbox
+	if err := svc.DB.First(&got, mail.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.MailFailed {
+		t.Fatalf("待发邮件应作废，实际状态 %q", got.Status)
+	}
+	if got.Body != "" || got.Payload != "" {
+		t.Fatal("作废时正文与参数（含明文凭据）必须清空")
 	}
 }
 

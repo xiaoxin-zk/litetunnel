@@ -124,6 +124,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	if err != nil {
 		return a.GetState(), err
 	}
+	// 给这份快照发序号：拉取到这里之间，后台同步可能已经应用了更新的
+	// 清单；随后应用旧快照会把新清单里的隧道当成已删除而停掉进程。
+	seq := a.nextSyncSeq()
 
 	username := info.Username
 	if username == "" {
@@ -185,7 +188,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	//
 	// 直接复用上面那次 /client/info 的响应：它就是刚取回来的最新状态，
 	// 再请求一次只会白等一个往返（隧道一多，这一等还要串起所有配置请求）。
-	if _, err := a.syncWithData(info); err != nil {
+	if _, err := a.syncWithData(info, seq); err != nil {
 		// 同步失败不阻塞接入：凭据已经保存，界面能显示账号信息，
 		// 错误通过 SyncErr 呈现，下一个自动同步周期还会重试。
 		a.setSyncErr(err)

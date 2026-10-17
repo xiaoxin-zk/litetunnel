@@ -459,6 +459,15 @@ func (r *Runtime) UnmarkTrafficResetPending(userID uint, gen uint64) {
 	// 与采集的「校验 → 提交」互斥，见 resetMu 的说明。
 	r.resetMu.Lock()
 	defer r.resetMu.Unlock()
+	r.unmarkTrafficResetPendingLocked(userID, gen)
+}
+
+// unmarkTrafficResetPendingLocked 与 UnmarkTrafficResetPending 语义相同，
+// 但要求调用方**已持有** resetMu。
+//
+// 清零路径（AdminResetUserTraffic）在协调区间内写库失败后要撤销登记：
+// 它已经持有 resetMu，若再走公开版本会自己把自己锁死。
+func (r *Runtime) unmarkTrafficResetPendingLocked(userID uint, gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.resetVoidUntil == nil {

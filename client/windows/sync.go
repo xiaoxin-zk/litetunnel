@@ -107,14 +107,28 @@ func (a *App) syncLocked() (changed bool, err error) {
 	return a.applySync()
 }
 
+// nextSyncSeq 给刚拉到的清单快照发一个单调序号。
+func (a *App) nextSyncSeq() uint64 {
+	return a.syncSeq.Add(1)
+}
+
 // syncWithData 与 syncLocked 相同，但接入流程已经拿到过一份 client/info
 // 响应时，直接把它交给同步，省掉一次重复的网络往返。
-func (a *App) syncWithData(data *clientInfoData) (changed bool, err error) {
+//
+// seq 是那份快照的序号（见 nextSyncSeq）。接入流程的拉取发生在拿到
+// syncMu **之前**：期间后台同步可能已经拉到并应用了更新的清单。若这里
+// 照旧应用旧快照，会把新清单里的隧道当成「已删除」而停掉进程。序号更小
+// 的过期快照一律不应用，改为重新拉一轮——这时的目标就是「把本机对齐到
+// 最新状态」，重拉一次最直接，也省得区分哪些差异是过期造成的。
+func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err error) {
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
+	if seq <= a.appliedSyncSeq {
+		return a.applySync()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), syncRoundTimeout)
 	defer cancel()
-	return a.applySyncData(ctx, data)
+	return a.applySyncData(ctx, data, seq)
 }
 
 // applySync 拉取隧道清单，并把本机的 frpc 进程对账到服务端说的状态。
@@ -149,14 +163,23 @@ func (a *App) applySync() (changed bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	return a.applySyncData(ctx, data)
+	// 本轮在 syncMu 内拉取，序号必然最新（见 nextSyncSeq 的说明）。
+	return a.applySyncData(ctx, data, a.nextSyncSeq())
 }
 
 // applySyncData 执行对账。data 是本轮要采纳的接入信息快照——
 // 正常路径来自刚请求的 /client/info，接入路径来自 Connect 已验证
 // Key 有效的同一次响应。ctx 是本轮的截止上下文（见 syncRoundTimeout），
 // 已消耗的时间计入同一笔预算。
-func (a *App) applySyncData(ctx context.Context, data *clientInfoData) (changed bool, err error) {
+//
+// seq 是快照的单调序号：比已应用的更旧就整份丢弃（调用方须持有 syncMu）。
+// 过期清单绝不能参与对账——它会停掉拉取之后才新建的隧道。
+func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint64) (changed bool, err error) {
+	if seq <= a.appliedSyncSeq {
+		return false, nil
+	}
+	a.appliedSyncSeq = seq
+
 	base := a.serverBase()
 
 	a.mu.RLock()

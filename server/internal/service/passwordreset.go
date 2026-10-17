@@ -187,10 +187,22 @@ func (s *Services) ResetPassword(token, newPassword, ip string) error {
 
 	now := time.Now()
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		// 条件更新：并发下只有一个请求能把 used_at 从 NULL 改成功，
-		// 从而保证令牌只能被使用一次。
+		// 先锁用户行、再消费令牌：activateResetToken 用的是同一个顺序
+		// （用户行 → 令牌行）。反过来的话，两条并发事务各持一把、各等对方，
+		// PostgreSQL 会判定死锁并回滚其中一条。
+		var u model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&u, tok.UserID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrResetTokenInvalid
+			}
+			return err
+		}
+
+		// 锁内复核并消费：条件更新保证并发下只有一个请求能把 used_at
+		// 从 NULL 改成功；过期也在这里再判一次，避免读到校验之后才过期。
 		res := tx.Model(&model.PasswordResetToken{}).
-			Where("id = ? AND used_at IS NULL", tok.ID).
+			Where("id = ? AND used_at IS NULL AND expire_at > ?", tok.ID, now).
 			Update("used_at", now)
 		if res.Error != nil {
 			return res.Error
@@ -217,9 +229,15 @@ func (s *Services) ResetPassword(token, newPassword, ip string) error {
 		}
 
 		// 该用户已建立的客户端会话全部标记离线，迫使其重新认证。
-		return tx.Model(&model.ClientSession{}).
+		if err := tx.Model(&model.ClientSession{}).
 			Where("user_id = ?", tok.UserID).
-			Update("online", false).Error
+			Update("online", false).Error; err != nil {
+			return err
+		}
+
+		// 同一账号的其他恢复凭据（别的链接、找回验证码、待发邮件）一并作废：
+		// 改密之后它们都不该再能用。
+		return revokePasswordResetTx(tx, tok.UserID, u.Email)
 	})
 	if err != nil {
 		return err
@@ -429,26 +447,42 @@ func (s *Services) applyPasswordResetTx(tx *gorm.DB, userID uint, hashed, newSec
 // 调用方必须已在同一事务里锁住用户行：activateResetToken 同样先锁这一行，
 // 于是两边只剩先后关系，不会出现「撤销之后又插入一条可用令牌」。
 func revokePasswordResetTx(tx *gorm.DB, userID uint, email string) error {
+	now := time.Now()
+	// 1) 链接方式：撤销尚未使用的重置令牌。
 	if err := tx.Model(&model.PasswordResetToken{}).
 		Where("user_id = ? AND used_at IS NULL", userID).
-		Update("used_at", time.Now()).Error; err != nil {
+		Update("used_at", now).Error; err != nil {
 		return err
 	}
 	if email == "" {
 		return nil
 	}
-	// 只动「重置链接」这一类，且只动还没走完的：已送达的邮件记录保留，
-	// 它对应的令牌已在上面撤销，用户点开只会看到「链接无效」。
+	lower := strings.ToLower(email)
+
+	// 2) 验证码方式：找回密码用的验证码同样是一条独立的恢复凭据，
+	//    改密后必须一并作废（ResetPasswordByEmailCode 只看验证码本身）。
+	if err := tx.Model(&model.EmailCode{}).
+		Where("lower(email) = ? AND scene = ? AND used_at IS NULL", lower, EmailSceneReset).
+		Update("used_at", now).Error; err != nil {
+		return err
+	}
+
+	// 3) 还没走完的找回类邮件：待发 / 发送中 / 激活中 / 已送达但凭据动作未完成。
+	//
+	// delivered 必须包含在内：它的含义正是「信已经发出、凭据动作还没做」。
+	// 漏掉它，一封升级前送达的邮件会在改密之后照常激活，把刚撤销的链接
+	// 又创建回来（旧载荷没有版本快照，激活时的版本比对也拦不住）。
 	return tx.Model(&model.MailOutbox{}).
-		Where("lower(to_addr) = ? AND kind = ? AND status IN ?",
-			strings.ToLower(email), model.MailKindResetLink,
-			[]string{model.MailPending, model.MailSending, model.MailActivating}).
+		Where("lower(to_addr) = ? AND kind IN ? AND status IN ?",
+			lower,
+			[]string{model.MailKindResetLink, model.MailKindEmailCodeReset},
+			[]string{model.MailPending, model.MailSending, model.MailActivating, model.MailDelivered}).
 		Updates(map[string]any{
 			"status":      model.MailFailed,
 			"claim_token": "",
 			"body":        "",
 			"payload":     "",
-			"last_err":    "密码已修改，重置邮件作废",
+			"last_err":    "密码已修改，重置凭据作废",
 		}).Error
 }
 

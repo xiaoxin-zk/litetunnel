@@ -27,6 +27,12 @@ type emailCodePayload struct {
 	// TTLSeconds 是验证码自**送达**起的有效秒数。
 	TTLSeconds int    `json:"ttl_seconds"`
 	IP         string `json:"ip"`
+	// TokenVersion 是找回密码验证码**入队时**用户的令牌版本。
+	//
+	// 验证码同样是送达后才创建的（见 activateEmailCode），改密时撤销不到
+	// 还不存在的记录。激活时比对版本：不一致说明期间改过密码，这封邮件作废。
+	// 指针用于兼容升级前入队的邮件（nil 表示没有快照）。
+	TokenVersion *int `json:"token_version,omitempty"`
 }
 
 // resetLinkPayload 是「重置密码链接」类邮件的凭据参数。
@@ -151,6 +157,12 @@ func (s *Services) activateEmailCode(row model.MailOutbox, token string) error {
 			if !u.EmailVerified {
 				return errMailActionObsolete
 			}
+			// 改密会递增 TokenVersion：排队期间用户改过密码的话，这个找回
+			// 验证码必须作废——否则改密后旧码还能再改一次密码。
+			// 判断放在用户行锁内，与改密事务（同样先锁这一行）只剩先后关系。
+			if p.TokenVersion != nil && u.TokenVersion != *p.TokenVersion {
+				return errMailActionObsolete
+			}
 		}
 
 		// 幂等重放：激活成功但写终态失败时，这一步会按原参数再跑一遍。
@@ -246,7 +258,15 @@ func (s *Services) activateResetToken(row model.MailOutbox, token string) error 
 		//
 		// 这里必须在**锁住用户行之后**判断：撤销令牌与插入令牌都以此为序，
 		// 早一步判断会漏掉「改密事务正在提交」的窗口。
-		if p.TokenVersion != nil && u.TokenVersion != *p.TokenVersion {
+		//
+		// 没有版本快照（升级前入队的邮件）时：版本仍为初始值 1 说明这个账号
+		// 从未改过密码，链接不存在「改密后仍有效」的问题，按原行为放行；
+		// 否则无法证明期间没改过密码，按作废处理（重新申请一次即可）。
+		if p.TokenVersion == nil {
+			if u.TokenVersion > 1 {
+				return errMailActionObsolete
+			}
+		} else if u.TokenVersion != *p.TokenVersion {
 			return errMailActionObsolete
 		}
 		// 幂等重放：同一令牌仍在（同一摘要，或同一封信激活过——即便

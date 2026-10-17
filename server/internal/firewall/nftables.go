@@ -50,9 +50,16 @@ func (n *Nftables) ensureTable() error {
 	return nil
 }
 
+// Status 判断专属表与链是否存在。
+//
+// 只有「表/链不存在」能断定未启用；其余失败（超时、权限、nft 不可用）
+// 都是「查不到」，必须把错误交给上层，而不是报成一个明确的 false。
 func (n *Nftables) Status() (bool, error) {
 	if _, err := run("nft", "list", "chain", "inet", nftTable, nftChain); err != nil {
-		return false, nil
+		if notExistErr(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }

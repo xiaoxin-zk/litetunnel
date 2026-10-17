@@ -102,10 +102,18 @@ func (f *Firewalld) Available() bool {
 	return err == nil
 }
 
+// Status 判断 firewalld 是否在运行。
+//
+// 「not running」（守护进程没起来）是明确的未启用；超时、权限不足、
+// 命令缺失则属于「查不到」，必须把错误交给上层，否则界面会把一次
+// 查询失败显示成「未生效」。
 func (f *Firewalld) Status() (bool, error) {
 	out, err := run("firewall-cmd", "--state")
 	if err != nil {
-		return false, nil
+		if notExistErr(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return strings.Contains(out, "running"), nil
 }

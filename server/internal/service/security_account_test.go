@@ -1067,6 +1067,22 @@ func TestPasswordChangeRevokesPendingResetLinks(t *testing.T) {
 		t.Fatalf("建重置邮件失败: %v", err)
 	}
 
+	// 另一条恢复通道：找回密码的邮箱验证码（含一封排队中的对应邮件）。
+	code := &model.EmailCode{
+		Email: u.Email, Scene: EmailSceneReset, CodeHash: "reset-code-hash",
+		ExpireAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := svc.DB.Create(code).Error; err != nil {
+		t.Fatalf("建找回验证码失败: %v", err)
+	}
+	codeMail := &model.MailOutbox{
+		To: u.Email, Subject: "code", Kind: model.MailKindEmailCodeReset,
+		Status: model.MailPending, NextAt: time.Now(),
+	}
+	if err := svc.DB.Create(codeMail).Error; err != nil {
+		t.Fatalf("建找回验证码邮件失败: %v", err)
+	}
+
 	if err := svc.UpdatePassword(u.ID, "OldPass123", "NewPass456"); err != nil {
 		t.Fatalf("改密失败: %v", err)
 	}
@@ -1088,6 +1104,22 @@ func TestPasswordChangeRevokesPendingResetLinks(t *testing.T) {
 	}
 	if m.Payload != "" {
 		t.Fatal("作废的邮件必须清掉载荷里的凭据参数")
+	}
+
+	// 验证码这条恢复通道同样要撤销：ResetPasswordByEmailCode 只看验证码本身。
+	var c model.EmailCode
+	if err := svc.DB.First(&c, code.ID).Error; err != nil {
+		t.Fatalf("读验证码失败: %v", err)
+	}
+	if c.UsedAt == nil {
+		t.Fatal("改密后未使用的找回验证码必须作废")
+	}
+	var cm model.MailOutbox
+	if err := svc.DB.First(&cm, codeMail.ID).Error; err != nil {
+		t.Fatalf("读验证码邮件失败: %v", err)
+	}
+	if cm.Status != model.MailFailed {
+		t.Fatalf("排队中的找回验证码邮件应作废，实际状态 %q", cm.Status)
 	}
 
 	if err := svc.ResetPassword("old-link-token", "Another123"); !errors.Is(err, ErrResetTokenInvalid) {

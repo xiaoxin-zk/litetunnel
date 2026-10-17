@@ -95,6 +95,20 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 		return nil
 	}
 
+	// 找回场景额外记下当前的令牌版本：验证码是送达后才创建的，改密时
+	// 撤销不到它；激活时比对版本才能拦住「改密后旧码仍可用」。
+	var resetVersion *int
+	if scene == EmailSceneReset {
+		var u model.User
+		if err := s.DB.Model(&model.User{}).
+			Select("id", "token_version").
+			Where("lower(email) = ? AND email_verified = ?", strings.ToLower(email), true).
+			First(&u).Error; err == nil {
+			v := u.TokenVersion
+			resetVersion = &v
+		}
+	}
+
 	code, err := newNumericCode(6)
 	if err != nil {
 		return err
@@ -125,6 +139,8 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 			// 实际上一到手就失效了。
 			TTLSeconds: int(emailCodeTTL.Seconds()),
 			IP:         truncate(ip, 64),
+			// 仅找回场景有值：激活时用它复核期间是否改过密码。
+			TokenVersion: resetVersion,
 		}, mailQuota{
 			cooldown:   emailCodeResendCooldown,
 			dailyLimit: emailCodeDailyPerEmail,

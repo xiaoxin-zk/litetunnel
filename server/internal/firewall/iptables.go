@@ -43,12 +43,22 @@ func (t *IPTables) ensureChain() error {
 }
 
 // Status 判断专属链是否已建立并接入 INPUT。
+//
+// 只有「链不存在」能断定未启用；超时、权限不足、命令缺失都属于「查不到」，
+// 必须把错误交给上层（面板据此显示「未知」）。全部吞成 false 的话，
+// 一次 iptables 锁冲突就会被显示成「规则未生效」，把排查方向带偏。
 func (t *IPTables) Status() (bool, error) {
 	if _, err := run("iptables", "-L", ChainName); err != nil {
-		return false, nil
+		if notExistErr(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	if _, err := run("iptables", "-C", "INPUT", "-j", ChainName); err != nil {
-		return false, nil
+		if notExistErr(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }
@@ -158,5 +168,3 @@ func (t *IPTables) RemovePort(port int, proto string) error {
 	}
 	return fmt.Errorf("端口 %d 的规则异常重复，已删除 8 条仍未清空，请手工检查", port)
 }
-
-

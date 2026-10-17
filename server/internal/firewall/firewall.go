@@ -98,10 +98,10 @@ func Detect(prefer string) Backend {
 // 此时面板不应该因此无法启动。
 type None struct{ reason string }
 
-func (n *None) Name() string             { return "none" }
-func (n *None) Available() bool          { return true }
-func (n *None) Status() (bool, error)    { return false, nil }
-func (n *None) Reason() string           { return n.reason }
+func (n *None) Name() string               { return "none" }
+func (n *None) Available() bool            { return true }
+func (n *None) Status() (bool, error)      { return false, nil }
+func (n *None) Reason() string             { return n.reason }
 func (n *None) ListRules() ([]Rule, error) { return nil, nil }
 func (n *None) AddPort(int, string) error  { return ErrNoBackend }
 func (n *None) RemovePort(int, string) error {
@@ -221,6 +221,32 @@ func firstLine(out string, err error) string {
 		return out[:i]
 	}
 	return out
+}
+
+// notExistErr 判断命令失败是否**明确**表示「目标链/表不存在」。
+//
+// 只有这一类能断定「未启用」：iptables 对不存在的链、nft 对不存在的表、
+// firewalld 在守护进程没起来时，都会给出这类固定措辞。
+//
+// 超时、权限不足、命令缺失同样表现为非零退出，但它们说明的是「查不到」。
+// 把「查不到」当成「未启用」，界面就会显示成一个明确的结论，而管理员
+// 会照着这个结论去排查规则——真实原因只是这次没读成。
+func notExistErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"no chain/target/match",     // iptables：链不存在
+		"does not exist",            // nft：表/链不存在
+		"no such file or directory", // nft 在部分版本上的措辞
+		"not running",               // firewalld：守护进程没起来
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeProto 统一协议写法，只接受 tcp / udp。

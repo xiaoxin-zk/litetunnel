@@ -1,0 +1,188 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+)
+
+// writeAndStart 落盘配置并启动该隧道的 frpc 进程。
+//
+// 启动成功与否由回调里的日志体现（frpc 会打印自己的连接过程），
+// 这里不做额外等待：frpc 从启动到真正建好代理要一两秒，
+// 阻塞在界面上等它只会让「连接」这个动作显得很慢。
+func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
+	path, err := frpcConfigPath(t.ID)
+	if err != nil {
+		return err
+	}
+	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
+		return err
+	}
+	// 清退避要放在**启动之前**，不能等启动成功之后再清。
+	//
+	// 进程退出回调是异步的：frpc 因为凭据失效之类的原因秒退时，回调可能
+	// 在 Start 返回之后、我们清退避之前就把新退避登记好了——随后那次清理
+	// 会把它抹掉，下一轮同步立刻又拉起进程，退避形同不存在。
+	// 放在启动前，最坏情况也只是「刚失败过一次又立刻重试一次」。
+	a.clearRetry(t.ID)
+	// 重新拉起之前先清掉「已注册」：旧进程的注册已经作废，新的要等 frpc
+	// 再报一次 start proxy success。不清的话重连期间界面会一直显示「运行中」。
+	a.setTunnelRegistered(t.ID, false)
+
+	// 把配置路径一起打出来：隧道起不来时，第一件要确认的就是
+	// 「客户端到底用了哪份配置」，而这份配置是每条隧道一份的。
+	a.emitTunnelLog(t.Name, "开始加载隧道配置："+path)
+
+	// 起点必须在**启动之前**记下：frpc 可能在 Start 返回之前就打印
+	// start proxy success，注册回调会清掉起点；若在 Start 之后再写，
+	// 等于把一次已经结束的等待又贴回来，之后掉线重连显示的时长里
+	// 会混进那段早就连上的时间。
+	a.markConnectStart(t.ID)
+	if err := a.mgr.Start(t.ID, t.Name, path); err != nil {
+		// 没起来就不算「连接中」：留着起点会让界面显示一段并不存在的等待。
+		a.clearConnectStart(t.ID)
+		return err
+	}
+
+	// 记下这次写入的原文。下一次同步据此判断「配置有没有变」——
+	// 不记的话每次同步都会判定为变化并重启一遍，连接会一直抖。
+	// 服务端摘要(ConfigRev)一并记下:下一次同步据此判断「要不要重新拉」。
+	// 只有配置**真的写进磁盘了**才记这笔账——失败路径上什么都不记,所以
+	// 下一轮仍会重新拉取,而不是拿「服务端说没变」跳过一次没写成的配置。
+	a.mu.Lock()
+	a.applied[t.ID] = cfgText
+	a.mu.Unlock()
+	a.setConfigRev(t.ID, t.ConfigRev)
+	return nil
+}
+
+// setConfigRev 更新某条隧道记录的配置摘要。
+//
+// 空摘要表示「服务端没给」——必须**删除**旧值，而不是留着不动：
+// 留着的话，下一轮会拿这个旧摘要去比对清单，而它描述的文本可能已经不是
+// 磁盘上那份了（老服务端期间配置被改过）。删掉之后 cachedConfig 一律不命中，
+// 该隧道退回逐轮拉取：慢一点，但不会把旧配置当成新的。
+func (a *App) setConfigRev(id uint, rev string) {
+	a.mu.Lock()
+	if rev == "" {
+		delete(a.cfgRev, id)
+	} else {
+		a.cfgRev[id] = rev
+	}
+	a.mu.Unlock()
+}
+
+// startTunnelProcess 为用户主动点「连接」的隧道拉配置并启动。
+//
+// ctx 是这次开关操作的整笔预算（见 manualOpTimeout）：请求失败或超时都要
+// 如实返回，界面据此提示，而不是让按钮一直转。
+func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
+	if a.mgr.Running(t.ID) {
+		return nil
+	}
+	if !a.mgr.Available() {
+		return errors.New("未找到 frpc 可执行文件，请将 frpc.exe 放到程序同目录")
+	}
+	base, apiKey, err := a.currentCredential()
+	if err != nil {
+		return err
+	}
+	// 手动点连接一律重新拉取,不受摘要缓存影响。
+	//
+	// 「用户刚刚在网页端改了配置、然后点连接」是最常见的操作顺序,而这中间
+	// 客户端可能还没跑过一轮同步(清单里的 config_rev 还是旧的)。用摘要跳过
+	// 就等于让用户拿到改之前的配置——他改了端口却连到旧端口,而且日志里
+	// 没有任何异常。一次往返换一个「点了就是最新的」,这个代价值得。
+	cfgText, servedRev, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
+	if err != nil {
+		return err
+	}
+	if cfgText == "" {
+		return errors.New("服务端未返回该隧道的配置")
+	}
+	t.ConfigRev = servedRev
+	return a.writeAndStart(t, cfgText)
+}
+
+// stopTunnelProcess 停掉某条隧道的进程。
+func (a *App) stopTunnelProcess(t TunnelVO) error {
+	a.emitTunnelLog(t.Name, "隧道已断开")
+	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
+	a.setTunnelRegistered(t.ID, false)
+	return a.mgr.Stop(t.ID)
+}
+
+// retryDelay 计算第 n 次失败之后的重试等待。
+//
+// 起点必须**大于**后台同步周期（20 秒）。比它小的话退避等于不存在：
+// 每个同步周期都会重新拉起一次，日志被同样的失败刷屏，而问题一点没变。
+func retryDelay(attempts int) time.Duration {
+	const maxDelay = 5 * time.Minute
+	if attempts < 1 {
+		attempts = 1
+	}
+	d := 30 * time.Second
+	for i := 1; i < attempts; i++ {
+		d *= 2
+		if d >= maxDelay {
+			return maxDelay
+		}
+	}
+	return d
+}
+
+// retryAllowed 判断这条隧道当前是否允许再次拉起。
+func (a *App) retryAllowed(id uint) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	st := a.retries[id]
+	return st == nil || time.Now().After(st.nextAt)
+}
+
+// noteStartFailure 记一次失败并安排下次重试时间。
+func (a *App) noteStartFailure(id uint, name, reason string) {
+	a.mu.Lock()
+	if a.retries == nil {
+		a.retries = map[uint]*retryState{}
+	}
+	st := a.retries[id]
+	if st == nil {
+		st = &retryState{}
+		a.retries[id] = st
+	}
+	st.attempts++
+	delay := retryDelay(st.attempts)
+	st.nextAt = time.Now().Add(delay)
+	attempts := st.attempts
+	a.mu.Unlock()
+
+	// 把「什么时候再试」说清楚。不说的话，用户只看到反复失败，
+	// 分不清客户端是在退避还是已经放弃。
+	a.emitTunnelLog(name, fmt.Sprintf("%s（第 %d 次失败，%s 后重试）",
+		reason, attempts, delay.Round(time.Second)))
+}
+
+// clearRetry 清掉一条隧道的退避状态。
+func (a *App) clearRetry(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.retries, id)
+}
+
+func writeFrpcConfig(tunnelID uint, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return errors.New("服务端返回的配置为空")
+	}
+	path, err := frpcConfigPath(tunnelID)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		return fmt.Errorf("写入客户端配置失败: %w", err)
+	}
+	return nil
+}

@@ -307,6 +307,7 @@ func (s *stagedFile) commit() error {
 			return fmt.Errorf("备份旧文件失败: %w", err)
 		}
 		s.backup = backup
+		syncDirBestEffort(filepath.Dir(s.path))
 	}
 	if err := os.Rename(s.tmp, s.path); err != nil {
 		// 替换失败：把旧文件放回原位。恢复也失败时，磁盘上连旧文件都没了，
@@ -316,7 +317,32 @@ func (s *stagedFile) commit() error {
 		}
 		return err
 	}
+	// 目录项变更也要落盘：文件内容的 fsync 只覆盖「数据」，rename 之后
+	// 断电仍可能看不到新名字（见 syncDirBestEffort 的说明）。
+	syncDirBestEffort(filepath.Dir(s.path))
 	return nil
+}
+
+// syncDirBestEffort 尽力把目录项变更刷到磁盘。
+//
+// 只对文件做 fsync 是不够的：rename / unlink 这些**目录项**变更由目录本身
+// 记录，不同步父目录的话，突然断电后可能出现「.env 已经是新内容、批次记录
+// 却不见了」——批次恢复失去唯一依据，磁盘停在半套配置上。
+//
+// 实现是「尽力而为」：Windows 无法以可 flush 的方式打开目录（返回
+// ERROR_INVALID_HANDLE 之类），NTFS 的目录项更新由文件系统日志保证，
+// 这里静默跳过。也就是说 Windows 上的恢复保证覆盖进程被强杀与正常掉电，
+// 不承诺磁盘写缓存被整体丢弃的极端情形。
+func syncDirBestEffort(dir string) {
+	if dir == "" {
+		return
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // restore 回滚：把备份的旧文件放回原位。返回错误表示恢复失败——这时磁盘上
@@ -328,6 +354,7 @@ func (s *stagedFile) restore() error {
 			return err
 		}
 		s.backup = ""
+		syncDirBestEffort(filepath.Dir(s.path))
 		return nil
 	}
 	if !s.existed {

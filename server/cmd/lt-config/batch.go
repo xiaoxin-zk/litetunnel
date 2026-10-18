@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -45,6 +46,13 @@ const (
 	// batchStatusCommitted 表示这一批已经生效，启动时只清理、不回滚。
 	batchStatusCommitted = "committed"
 )
+
+// errBatchCleanupPending 表示「文件已经回到旧配置，但批次记录或备份没清掉」。
+//
+// 它**不是**回滚失败：磁盘是自洽的旧版本，只是现场还留着。
+// 调用方应当把它当作「已回滚」继续往下走（重建旧配置的容器），
+// 同时在结果里注明现场未清理——把两者混为一谈会让管理员以为配置还是新的。
+var errBatchCleanupPending = errors.New("批次现场未清理")
 
 // manifestEntry 记录一个文件在提交前的状态。
 type manifestEntry struct {

@@ -177,8 +177,14 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	if err := ctx.Err(); err != nil {
 		// 客户端已经走了：磁盘不能留在新配置上，否则下一次重建容器时
 		// 会突然按一份「谁也没确认过」的配置起来。
-		if rbErr := batch.revert(); rbErr != nil {
+		rbErr := batch.revert()
+		if rbErr != nil && !errors.Is(rbErr, errBatchCleanupPending) {
 			return res, fmt.Errorf("请求在写盘后中断，且回滚磁盘失败（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", err, rbErr)
+		}
+		if rbErr != nil {
+			// 文件已回到旧配置，只是记录没删掉：不影响下次启动，但它是一次
+			// 残留，应当让管理员知道（下次启动会自动清理）。
+			res.Warnings = append(res.Warnings, rbErr.Error())
 		}
 		return res, err
 	}
@@ -226,7 +232,10 @@ func (s *service) recoverFromFailedApply(ctx context.Context, batch *writeBatch,
 		detail = "\n" + detail
 	}
 
-	if rbErr := batch.revert(); rbErr != nil {
+	rbErr := batch.revert()
+	// 「文件已恢复、只是记录没清掉」不算回滚失败：磁盘是自洽的旧版本。
+	cleanupPending := errors.Is(rbErr, errBatchCleanupPending)
+	if rbErr != nil && !cleanupPending {
 		states := s.serviceStates(ctx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
@@ -234,10 +243,14 @@ func (s *service) recoverFromFailedApply(ctx context.Context, batch *writeBatch,
 			services: states,
 		}
 	}
+	note := ""
+	if cleanupPending {
+		note = "；批次记录未删除，重启后会自动清理"
+	}
 
 	// 文件已回到旧配置。再重建一次，尽量让容器也回到旧版本。
 	if reOut, reErr := s.composeUp(ctx); reErr == nil {
-		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置，可修改后重试）%s", upErr, detail)
+		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置%s，可修改后重试）%s", upErr, note, detail)
 	} else {
 		states := s.serviceStates(ctx)
 		return &partialApplyError{
@@ -448,7 +461,17 @@ func (b *writeBatch) revert() error {
 		// 恢复失败：记录与备份必须留着，它们是下次启动唯一能依的现场。
 		return err
 	}
-	b.removeManifest(b.manifest)
+	if !b.removeManifest(b.manifest) {
+		// 文件已经回到旧配置，但记录还在。此时**不能**清备份：
+		// 下次启动会看到这份「未提交」记录，再回滚一遍——如果那次发现
+		// 某个文件仍停在中间态（例如 restore 之后又被别的东西写过），
+		// 备份就是唯一的材料。清掉它等于把「还能修」变成「只能手工拼」。
+		//
+		// 回滚本身是成功的，所以返回哨兵错误而不是普通错误：调用方要
+		// 继续按旧配置重建容器，只是别把这次操作报成「磁盘还是新配置」。
+		return fmt.Errorf("%w: 文件已恢复为旧配置，但批次记录未能删除（备份已保留，重启后会自动清理）",
+			errBatchCleanupPending)
+	}
 	b.discard()
 	for _, st := range b.staged {
 		st.cleanupBackup()

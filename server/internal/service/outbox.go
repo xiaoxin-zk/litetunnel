@@ -239,13 +239,12 @@ func (s *Services) executePortIntentsAfterCommit(intents []portIntent) (pending 
 		// 失败，待办也已经是「内存 + 数据库」双份，管理页立刻可见。
 		s.adoptPendingIntent(it.port, it.proto, it.open, it.gen)
 
-		acted, err := s.applyPortIntent(it.port, it.proto, it.open)
+		// 这里不关心 acted（是否真的动了手）：成功路径上两种情况都要撤销这条
+		// 意图——acted 表示规则已到位，!acted 表示意图已过时或状态读不出来
+		// （后者 applyPortIntent 内部已用更新的代次重新登记，按本次代次删除
+		// 不会误删那条新待办）。所以只用 _ 接住，避免误以为它参与判断。
+		_, err := s.applyPortIntent(it.port, it.proto, it.open)
 		if err == nil {
-			// 无论 acted 与否都撤销这条意图：
-			//   - acted：规则已经到位，待办没有存在意义；
-			//   - !acted：意图已过时（端口被新隧道复用）或状态读不出来。
-			//     前者本来就不该执行，后者 applyPortIntent 内部已用**更新的
-			//     代次**重新登记，按本次代次删除不会误删那条新待办。
 			s.dropPending(it.port, it.gen)
 			continue
 		}

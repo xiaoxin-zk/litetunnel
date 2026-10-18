@@ -787,9 +787,21 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install
-        working-directory: web/${{ matrix.app }}
-        run: npm install --no-audit --no-fund
+      # 用 lockfile 锁定安装：同一提交必须解析出同一套传递依赖，
+      # 否则构建结果与依赖审计都会随「今天 npm 解析到什么」而变。
+      #
+      # 用户端需要 --legacy-peer-deps：npm 10 解析 vitest 4 + jsdom 的
+      # peer 图时会报 "Cannot read properties of null (reading 'edgesOut')"，
+      # lockfile 也是用同样的参数生成的，两边必须一致。
+      - name: Install (user)
+        if: matrix.app == 'user'
+        working-directory: web/user
+        run: npm ci --no-audit --no-fund --legacy-peer-deps
+
+      - name: Install (admin)
+        if: matrix.app == 'admin'
+        working-directory: web/admin
+        run: npm ci --no-audit --no-fund
 
       - name: Test user UI
         if: matrix.app == 'user'

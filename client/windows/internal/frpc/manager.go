@@ -103,6 +103,16 @@ type Manager struct {
 	// 都不可靠——秒级时间戳分不出先后，内容更可能与新日志相同。
 	logSeq uint64
 
+	// pending 是待投递的日志，由投递协程按入队顺序取出。
+	//
+	// 回调不能在持锁时调用：上层收到「start proxy success」会顺手写一条
+	// 说明日志（emitTunnelLog → AppendRaw），那会再次请求这把不可重入的锁，
+	// 直接死锁。也不能在解锁后直接调用：两条隧道并发输出时序号会乱序，
+	// 调用方按序号去重就会丢掉迟到的较小序号。因此「加锁入队、解锁后
+	// 由单一协程按序投递」。
+	pending  []logEntry
+	emitWake chan struct{}
+
 	// onLog 收到的行已经带好前缀；seq 是该行的单调序号。
 	onLog func(tunnelID uint, tunnelName string, seq uint64, line string)
 	// onExit 在某个隧道的进程退出时调用。
@@ -119,7 +129,13 @@ func New(exePath string) *Manager {
 	if exePath == "" {
 		exePath = findFrpc()
 	}
-	return &Manager{exePath: exePath, procs: map[uint]*process{}}
+	m := &Manager{
+		exePath:  exePath,
+		procs:    map[uint]*process{},
+		emitWake: make(chan struct{}, 1),
+	}
+	go m.dispatchLogs()
+	return m
 }
 
 // SetCallbacks 注册日志与退出回调。回调会在后台协程中被调用。
@@ -538,8 +554,8 @@ func (m *Manager) AppendRaw(line string) {
 
 	m.mu.Lock()
 	e := logEntry{seq: m.recordTextLocked(line), text: line}
-	// 与 appendLog 同理：锁内投递，保证调用方看到的顺序与序号一致。
-	emitLogs(m.onLog, []logEntry{e})
+	// 与 appendLog 同理：加锁入队、解锁后由投递协程按序调用回调。
+	m.enqueueEmitLocked([]logEntry{e})
 	m.mu.Unlock()
 }
 
@@ -564,26 +580,66 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	if key == m.repeatKey && now.Sub(m.repeatAt) < logRepeatWindow {
 		m.repeatCount++
 		m.repeatAt = now
-		emitLogs(m.onLog, out)
+		m.enqueueEmitLocked(out)
 		m.mu.Unlock()
 		return
 	}
 	m.repeatKey, m.repeatAt = key, now
 	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
 	out = append(out, m.recordLocked(tunnelID, tunnelName, line, now))
-	// 回调在锁内执行：序号分配与投递必须是同一个原子步骤。
-	// 放到锁外的话，两条隧道并发输出时较大的序号可能先到，调用方按序号
-	// 去重就会把随后迟到的较小序号当成重复丢掉。
-	emitLogs(m.onLog, out)
+	// 加锁入队、解锁后投递：既保证调用方按序号收到，又允许回调重入 Manager。
+	m.enqueueEmitLocked(out)
 	m.mu.Unlock()
 }
 
-func emitLogs(cb func(uint, string, uint64, string), entries []logEntry) {
-	if cb == nil {
+// maxPendingEmits 是待投递日志的上限。
+//
+// 回调极慢时（例如上层在回调里同步做了别的事）队列会堆积；日志本身已有
+// 行数与字节上限，这里只需要保证内存不失控，丢弃最旧的即可。
+const maxPendingEmits = 4096
+
+// enqueueEmitLocked 在持锁状态下把日志排进投递队列。
+func (m *Manager) enqueueEmitLocked(entries []logEntry) {
+	if len(entries) == 0 || m.emitWake == nil {
 		return
 	}
-	for _, e := range entries {
-		cb(e.id, e.name, e.seq, e.text)
+	m.pending = append(m.pending, entries...)
+	if over := len(m.pending) - maxPendingEmits; over > 0 {
+		m.pending = append(m.pending[:0], m.pending[over:]...)
+	}
+	select {
+	case m.emitWake <- struct{}{}:
+	default:
+		// 已有待处理的唤醒信号：投递协程醒来会一次取走全部。
+	}
+}
+
+// dispatchLogs 按入队顺序调用日志回调。
+//
+// 在锁外调用回调是关键：上层收到「start proxy success」会写一条说明日志，
+// 那会再次请求 Manager 的锁；持锁调用就是死锁。
+func (m *Manager) dispatchLogs() {
+	for range m.emitWake {
+		for {
+			m.mu.Lock()
+			batch := m.pending
+			m.pending = nil
+			cb := m.onLog
+			m.mu.Unlock()
+
+			if cb != nil {
+				for _, e := range batch {
+					cb(e.id, e.name, e.seq, e.text)
+				}
+			}
+
+			m.mu.Lock()
+			more := len(m.pending) > 0
+			m.mu.Unlock()
+			if !more {
+				break
+			}
+		}
 	}
 }
 

@@ -330,6 +330,18 @@ func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
 	}
 	wg.Wait()
 
+	// 投递是异步的：等队列排空再断言。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(seqs)
+		mu.Unlock()
+		if n >= 400 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	if len(seqs) != 400 {
@@ -342,15 +354,46 @@ func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
 	}
 }
 
+// TestLogCallbackCanReenterManager 覆盖「回调里再写日志」。
+//
+// 上层收到 start proxy success 会补一条说明日志（emitTunnelLog → AppendRaw）。
+// 若回调在持锁时执行，这把不可重入的锁会被再次请求，日志、状态查询与隧道
+// 操作会一起卡死。
+func TestLogCallbackCanReenterManager(t *testing.T) {
+	m := testManager(t)
+	m.SetCallbacks(func(_ uint, _ string, _ uint64, line string) {
+		if strings.Contains(line, "start proxy success") {
+			m.AppendRaw("15:04:05  Tunnel/mc  隧道启动成功")
+		}
+	}, nil)
+
+	m.appendLog(1, "mc", "start proxy success")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		logs := m.Logs()
+		if len(logs) >= 2 && strings.Contains(logs[1], "隧道启动成功") {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("回调重入 Manager 后未能写入日志（可能已死锁）")
+}
+
 // TestAppendRawSharesHistoryAndSeq 覆盖「客户端自身日志不进历史」。
 //
 // 两条来源必须落进同一份缓冲、共用同一个序号：否则重新加载日志时
 // 客户端说明会消失，而且实时显示的顺序与快照顺序可能不一致。
 func TestAppendRawSharesHistoryAndSeq(t *testing.T) {
 	m := testManager(t)
-	var seqs []uint64
+	var (
+		mu   sync.Mutex
+		seqs []uint64
+	)
 	m.SetCallbacks(func(_ uint, _ string, seq uint64, _ string) {
+		mu.Lock()
 		seqs = append(seqs, seq)
+		mu.Unlock()
 	}, nil)
 
 	m.appendLog(1, "mc", "frpc line")
@@ -363,6 +406,19 @@ func TestAppendRawSharesHistoryAndSeq(t *testing.T) {
 	if !strings.Contains(logs[1], "启动同步完成") {
 		t.Fatalf("客户端说明缺失: %v", logs)
 	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(seqs)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
 	if len(seqs) != 2 || seqs[1] <= seqs[0] {
 		t.Fatalf("序号必须单调递增，实际 %v", seqs)
 	}

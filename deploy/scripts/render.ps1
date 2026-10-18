@@ -144,10 +144,19 @@ foreach ($k in $vars.Keys) {
 function Assert-VhostPort([string]$name, [string]$value, [string]$other) {
     if ([string]::IsNullOrWhiteSpace($value)) { return }
     $port = 0
-    if (-not [int]::TryParse($value, [ref]$port)) { throw "$name must be a number." }
-    $conflicts = @($vars['LT_GATEWAY_PORT'], $vars['LT_KCP_PORT'], $other, '80', '443')
-    if ($conflicts -contains $value) {
-        throw "$name=$value collides with a public entry port. Choose a loopback-only port."
+    if (-not [int]::TryParse($value, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "$name=$value is not a port between 1 and 65535."
+    }
+    # Every port this host actually listens on: a collision fails at startup.
+    $conflicts = @(
+        $vars['LT_GATEWAY_PORT'], $vars['LT_KCP_PORT'], $other,
+        $vars['LT_USER_PORT'], $vars['LT_FRPS_API_PORT'], '80', '443'
+    ) | Where-Object { $_ }
+    foreach ($c in $conflicts) {
+        $cp = 0
+        if ([int]::TryParse([string]$c, [ref]$cp) -and $cp -eq $port) {
+            throw "$name=$value collides with another listening port."
+        }
     }
     $start = [int]$vars['LT_PORT_RANGE_START']
     $end = [int]$vars['LT_PORT_RANGE_END']

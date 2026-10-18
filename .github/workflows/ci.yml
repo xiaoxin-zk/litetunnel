@@ -787,21 +787,24 @@ jobs:
         with:
           node-version: '22'
 
-      # 用 lockfile 锁定安装：同一提交必须解析出同一套传递依赖，
-      # 否则构建结果与依赖审计都会随「今天 npm 解析到什么」而变。
+      # 仓库里提交了 lockfile，npm install 会按它安装（版本因此是锁定的）。
       #
-      # 用户端需要 --legacy-peer-deps：npm 10 解析 vitest 4 + jsdom 的
-      # peer 图时会报 "Cannot read properties of null (reading 'edgesOut')"，
-      # lockfile 也是用同样的参数生成的，两边必须一致。
+      # 这里不用 npm ci：lockfile 是在 Windows 上生成的，其中 rollup 的原生
+      # 可选依赖只包含 win32 条目；npm ci 会严格照 lock 安装，在 Linux runner
+      # 上直接报 "Cannot find module @rollup/rollup-linux-x64-gnu"。
+      # npm install 会补齐当前平台的可选依赖，同时仍按 lock 里的版本解析。
+      #
+      # 用户端额外需要 --legacy-peer-deps：npm 10 解析 vitest 4 + jsdom 的
+      # peer 图时会报 "Cannot read properties of null (reading 'edgesOut')"。
       - name: Install (user)
         if: matrix.app == 'user'
         working-directory: web/user
-        run: npm ci --no-audit --no-fund --legacy-peer-deps
+        run: npm install --no-audit --no-fund --legacy-peer-deps
 
       - name: Install (admin)
         if: matrix.app == 'admin'
         working-directory: web/admin
-        run: npm ci --no-audit --no-fund
+        run: npm install --no-audit --no-fund
 
       - name: Test user UI
         if: matrix.app == 'user'

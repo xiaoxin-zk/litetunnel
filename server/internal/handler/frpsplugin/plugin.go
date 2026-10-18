@@ -12,7 +12,6 @@ package frpsplugin
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"

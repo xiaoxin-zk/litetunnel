@@ -212,11 +212,12 @@ func recoverBatch(dir string) bool {
 
 	var m batchManifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		// 记录本身读不懂时不能猜：删掉它，退回单文件规则清理，
-		// 至少保证下次启动不会一直卡在这份坏记录上。
-		log.Printf("[lt-config] 批次记录无法解析（%s），改按单文件规则清理: %v", path, err)
-		_ = os.Remove(path)
-		return true
+		// 记录本身读不懂时绝不能猜，更不能删除：它可能仍是多文件恢复现场
+		// 的唯一索引。退回单文件清理会删掉备份或留下新旧混合配置，之后再也
+		// 无法判断哪些文件属于同一批。保留原文件、备份和目标，让调用方进入
+		// 人工阻断状态。
+		log.Printf("[lt-config] 批次记录无法解析（%s），保留现场并阻断后续写盘: %v", path, err)
+		return false
 	}
 
 	if m.Status == batchStatusCommitted {

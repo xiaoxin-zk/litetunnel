@@ -243,11 +243,21 @@
     <div v-if="result" class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>下发结果</span>
-        <el-tag size="small" :type="result.applied ? 'success' : 'info'">
+        <el-tag v-if="result.partial" size="small" type="danger">部分应用，需人工处理</el-tag>
+        <el-tag v-else size="small" :type="result.applied ? 'success' : 'info'">
           {{ result.applied ? '已应用（容器已重建）' : '仅生成，未应用' }}
         </el-tag>
       </div>
 
+      <el-alert
+        v-if="result.partial"
+        type="error"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 10px"
+        title="配置与容器可能不在同一版本，已停止自动继续"
+        :description="result.message || '请根据下方容器状态与服务日志人工确认后再处理配置现场。'"
+      />
       <el-alert
         v-for="(w, i) in result.warnings || []"
         :key="i"
@@ -267,6 +277,26 @@
         </el-descriptions-item>
         <el-descriptions-item label="需放行的端口">
           {{ (result.required_ports || []).join(', ') || '-' }}
+        </el-descriptions-item>
+      </el-descriptions>
+
+      <el-descriptions
+        v-if="result.partial"
+        :column="3"
+        border
+        size="small"
+        title="容器实际状态"
+        style="margin-bottom: 12px"
+      >
+        <el-descriptions-item
+          v-for="svc in result.services || []"
+          :key="svc.name"
+          :label="svc.name"
+        >
+          {{ svc.state || '未知' }}
+        </el-descriptions-item>
+        <el-descriptions-item v-if="!(result.services || []).length" label="容器状态">
+          未能读取，请查看 lt-config 与 docker compose 日志
         </el-descriptions-item>
       </el-descriptions>
 

@@ -1,7 +1,9 @@
 package adminapi
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -37,8 +39,11 @@ func (h *Handler) DomainApply(c *gin.Context) {
 	// 但非空且解析失败必须是 400：以前这里忽略了解析错误，一段写坏的
 	// JSON（例如 apply 拼错）会被当成「没传参数」而按 apply=true 执行，
 	// 调用方本意可能是演练，结果真把容器重建了。
-	if c.Request.ContentLength != 0 && c.Request.Body != nil {
-		if err := c.ShouldBindJSON(&req); err != nil {
+	// 不用 ContentLength 判断是否为空：Chunked 请求的长度通常是 -1，
+	// 即使实际没有任何字节也会进入解析分支。解析时只有 EOF 才表示空 body，
+	// 其它错误都必须返回 400。
+	if c.Request.Body != nil {
+		if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 			httpx.BadRequest(c, "请求体不是合法 JSON")
 			return
 		}
@@ -48,7 +53,7 @@ func (h *Handler) DomainApply(c *gin.Context) {
 		apply = *req.Apply
 	}
 
-	res, err := h.svc.ApplyDomainConfig(apply)
+	res, err := h.svc.ApplyDomainConfig(c.Request.Context(), apply)
 	if err != nil {
 		h.audit(c, "domain.apply_failed", "domain", "", err.Error())
 		failWithReason(c, err)

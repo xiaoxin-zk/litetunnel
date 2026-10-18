@@ -440,7 +440,10 @@ func (s *Services) DomainHelper() *tlscfg.Client {
 // （为什么必须整个流程一起锁，见 service.go 里 domainMu 的说明）。helper
 // 那边也有自己的互斥，但这只保证单次渲染原子；保证不了两次下发的先后
 // 与「已生效」标记的先后一致。
-func (s *Services) ApplyDomainConfig(apply bool) (tlscfg.RenderResult, error) {
+func (s *Services) ApplyDomainConfig(ctx context.Context, apply bool) (tlscfg.RenderResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.domainMu.Lock()
 	defer s.domainMu.Unlock()
 
@@ -453,7 +456,7 @@ func (s *Services) ApplyDomainConfig(apply bool) (tlscfg.RenderResult, error) {
 		return tlscfg.RenderResult{}, err
 	}
 
-	res, err := client.Render(tlscfg.RenderRequest{
+	res, err := client.Render(ctx, tlscfg.RenderRequest{
 		Vars: vars,
 		// 凭据必须写回 .env：docker-compose 靠它把 DNS API 凭据注入容器，
 		// 而 Caddyfile 里写的是 {env.LT_CADDY_DNS_CREDENTIAL}。

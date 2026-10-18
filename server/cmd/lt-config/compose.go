@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -114,9 +115,10 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 
 // serviceStates 读取各 compose 容器的实际状态，用于「部分应用」时如实上报。
 //
-// 用 --format 取「服务名 + 状态」一行一条。老版本 compose 不认这个参数，
-// 那就返回空列表——宁可少给信息，也不要在这里再报一个错误掩盖真正的问题
-// （容器重建已经失败了，管理员需要的是原始错误）。
+// 用 --format 取「服务名 | 状态」一行一条。使用竖线而不是 Tab：
+// 不同 Compose 版本对转义序列的输出方式可能不同，固定分隔符能让解析
+// 明确失败而不是把整行静默塞进 Name、留下空 State。老版本 compose 不认
+// 这个参数时返回空列表——宁可少给信息，也不要掩盖真正的重建错误。
 func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -125,7 +127,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 		"compose",
 		"--env-file", s.paths.envFile,
 		"-f", s.paths.composeFile,
-		"ps", "-a", "--format", "{{.Service}}\t{{.State}}")
+		"ps", "-a", "--format", "{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}")
 	if err != nil {
 		return nil
 	}
@@ -135,13 +137,21 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 		if line == "" {
 			continue
 		}
-		name, state, ok := strings.Cut(line, "\t")
-		if !ok {
-			name, state = line, ""
+		parts := strings.Split(line, "|")
+		if len(parts) != 4 || strings.TrimSpace(parts[0]) == "" {
+			log.Printf("[lt-config] 无法解析 compose 状态行 %q", line)
+			continue
+		}
+		state := strings.TrimSpace(parts[1])
+		if health := strings.TrimSpace(parts[2]); health != "" {
+			state += " / health=" + health
+		}
+		if exitCode := strings.TrimSpace(parts[3]); exitCode != "" {
+			state += " / exit=" + exitCode
 		}
 		states = append(states, tlscfg.ServiceState{
-			Name:  strings.TrimSpace(name),
-			State: strings.TrimSpace(state),
+			Name:  strings.TrimSpace(parts[0]),
+			State: state,
 		})
 	}
 	return states
@@ -149,19 +159,31 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 
 // notRunningServices 返回当前不在运行状态的 composeServices。
 func (s *service) notRunningServices(ctx context.Context) ([]string, error) {
-	// compose ps 默认只列运行中的容器（--all 才包含已退出的），
-	// 所以不需要额外参数，老版本 compose 也能用。
+	// 用 --all + 明确分隔符读取状态、健康度和退出码；只看 --services 会把
+	// 「容器启动后立即退出」误认为服务存在并返回成功。
 	out, err := runDockerIn(ctx, s.paths.deployDir,
 		"compose",
 		"--env-file", s.paths.envFile,
 		"-f", s.paths.composeFile,
-		"ps", "--services")
+		"ps", "-a", "--format", "{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}")
 	if err != nil {
 		return nil, hostError(fmt.Errorf("重建后无法确认容器状态: %v\n%s", err, out))
 	}
 	running := make(map[string]bool, len(composeServices))
 	for _, line := range strings.Split(out, "\n") {
-		if name := strings.TrimSpace(line); name != "" {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) != 4 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return nil, hostError(fmt.Errorf("无法解析 compose 容器状态行 %q", line))
+		}
+		name := strings.TrimSpace(parts[0])
+		state := strings.ToLower(strings.TrimSpace(parts[1]))
+		health := strings.ToLower(strings.TrimSpace(parts[2]))
+		exitCode := strings.TrimSpace(parts[3])
+		if state == "running" && (health == "" || health == "healthy") && exitCode == "0" {
 			running[name] = true
 		}
 	}

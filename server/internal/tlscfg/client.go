@@ -131,9 +131,9 @@ func (c *Client) Available() bool {
 }
 
 // Render 让 helper 渲染并（可选）应用配置。
-func (c *Client) Render(req RenderRequest) (RenderResult, error) {
+func (c *Client) Render(ctx context.Context, req RenderRequest) (RenderResult, error) {
 	var out RenderResult
-	if err := c.do(context.Background(), http.MethodPost, "/render", req, &out, renderTimeout); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/render", req, &out, renderTimeout); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -143,9 +143,9 @@ func (c *Client) Render(req RenderRequest) (RenderResult, error) {
 //
 // 单独留一个入口是为了「保存成功但重启失败」这种常见情形：
 // 管理员修好宿主机问题后点一下重试即可，不必再走一遍渲染。
-func (c *Client) Apply() (RenderResult, error) {
+func (c *Client) Apply(ctx context.Context) (RenderResult, error) {
 	var out RenderResult
-	if err := c.do(context.Background(), http.MethodPost, "/apply", nil, &out, renderTimeout); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/apply", nil, &out, renderTimeout); err != nil {
 		return out, err
 	}
 	return out, nil

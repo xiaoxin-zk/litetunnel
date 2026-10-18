@@ -294,10 +294,53 @@ type service struct {
 	// 会把它们覆盖掉，所以整个进程拒绝写操作——宁可让管理员手动处理一次，
 	// 也不能让一次自动应用把还能修的现场变成无迹可寻。
 	blockedDirs []string
+	blockedMu    sync.RWMutex
+}
+
+// blockedDirsSnapshot 返回阻断目录的副本，供 health 响应使用。
+func (s *service) blockedDirsSnapshot() []string {
+	s.blockedMu.RLock()
+	defer s.blockedMu.RUnlock()
+	return append([]string(nil), s.blockedDirs...)
+}
+
+// registerDirtyScene 把运行过程中无法落定的现场加入阻断集合。
+//
+// 启动时发现现场只是第一种路径；/render 过程中也可能在容器已经按新配置
+// 启动后写不下 committed 状态。若这里只返回 partial 而不登记，当前进程的
+// 下一次请求仍会覆盖 manifest 与备份，正好抹掉人工恢复所需的最后证据。
+func (s *service) registerDirtyScene() {
+	dirs := make([]string, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	for _, f := range []string{s.paths.caddyOut, s.paths.frpsOut, s.paths.envFile} {
+		dir := filepath.Dir(f)
+		if dir != "" {
+			if _, ok := seen[dir]; !ok {
+				seen[dir] = struct{}{}
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	for _, dir := range dirs {
+		found := false
+		for _, existing := range s.blockedDirs {
+			if existing == dir {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.blockedDirs = append(s.blockedDirs, dir)
+		}
+	}
 }
 
 // dirtyDir 返回与本次写盘相关、且处于未收敛状态的目录；为空表示可以继续。
 func (s *service) dirtyDir() string {
+	s.blockedMu.RLock()
+	defer s.blockedMu.RUnlock()
 	if len(s.blockedDirs) == 0 {
 		return ""
 	}

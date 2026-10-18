@@ -264,11 +264,6 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 可能以不同顺序完成：数据库最后落到「已启用」，内存却被较早那笔
 	// 置成「已封禁」——用户看到账号正常，新连接却一直被拒。持有用户锁
 	// 之后，两者只可能是先后关系，内存标记随之与数据库一致。
-	// 记下「这次禁用生效的时刻」，用于断流时区分新旧代理（见 CloseUserProxies
-	// 的 notAfter）。取在实际写库之前：宁可多留一点余量，也不要漏掉一台实例上
-	// 更早写下的状态。
-	disabledAt := time.Now()
-
 	lock := s.userLock(id)
 	lock.Lock()
 
@@ -306,6 +301,9 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	if status != model.UserStatusActive {
+		// 时间点必须取在事务提交成功之后：锁等待期间可能已经有代理启动，
+		// 不能把它们误判成「禁用后启动」而跳过断流。
+		disabledAt := time.Now()
 		// 禁用/封禁走独立的标记，而不是借用超额标记。
 		//
 		// 借用的写法有个致命后果：超额标记会被每轮流量采集按配额重算，

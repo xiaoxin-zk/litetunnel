@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -482,7 +483,7 @@ func TestApplyDomainConfigWaitsForDomainMu(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = svc.ApplyDomainConfig(true) // helper 未配置，会快速返回错误
+		_, _ = svc.ApplyDomainConfig(context.Background(), true) // helper 未配置，会快速返回错误
 	}()
 
 	select {

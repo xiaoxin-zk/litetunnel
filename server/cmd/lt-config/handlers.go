@@ -41,7 +41,7 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h := tlscfg.Health{DeployDir: s.paths.deployDir, Available: true, BlockedDirs: s.blockedDirs}
+	h := tlscfg.Health{DeployDir: s.paths.deployDir, Available: true, BlockedDirs: s.blockedDirsSnapshot()}
 	if _, vars, err := readEnvFile(s.paths.envFile); err == nil {
 		h.Ports = tlscfg.Ports{
 			Gateway:    atoiOr(vars["LT_GATEWAY_PORT"], 0),

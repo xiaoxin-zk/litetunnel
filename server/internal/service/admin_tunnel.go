@@ -75,6 +75,16 @@ func (s *Services) AdminDeleteTunnel(id uint) error {
 	lock.Lock()
 	defer lock.Unlock()
 
+	// 归属者锁只能保护锁住之后的并发操作；锁前读取的 t 可能已经是旧快照。
+	// 加锁后重新读取，尤其要拿到最新 RemotePort/Type，避免按旧端口回收，
+	// 把并发更新留下的新防火墙规则永久留在宿主机上。
+	if err := s.DB.First(&t, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+
 	res := s.DB.Where("id = ?", id).Delete(&model.Tunnel{})
 	if res.Error != nil {
 		return res.Error

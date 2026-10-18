@@ -236,6 +236,35 @@ func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64
 				userID, dbGen, gen)
 			return
 		}
+		// 列表快照可能已经过时：同名代理在这里被重新注册后，直接按名称
+		// CloseProxy 会把新实例误关。关闭前再取一次状态，并用 frps 返回的
+		// clientID/lastStartAt 对齐同一个代理实例；无法确认身份时宁可漏关，
+		// 也不误伤刚重新启用的连接。
+		current, listErr := s.Frps.ListProxies(ctx)
+		if listErr != nil {
+			lock.Unlock()
+			log.Printf("[user] 关闭代理 %q 前复查状态失败，跳过以避免误关新实例: %v", p.Name, listErr)
+			continue
+		}
+		matched := false
+		for _, q := range current {
+			if q.Name != p.Name {
+				continue
+			}
+			if p.ClientID != "" && q.ClientID != p.ClientID {
+				continue
+			}
+			if p.Status.LastStartAt > 0 && q.Status.LastStartAt != p.Status.LastStartAt {
+				continue
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			lock.Unlock()
+			log.Printf("[user] 代理 %q 的实例身份已变化或已消失，跳过关闭", p.Name)
+			continue
+		}
 		err := s.Frps.CloseProxy(ctx, p.Name)
 		lock.Unlock()
 		if err != nil {

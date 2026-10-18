@@ -107,7 +107,10 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 		"LT_GATEWAY_PORT", "LT_KCP_PORT", "LT_VHOST_HTTP_PORT",
 		"LT_VHOST_HTTPS_PORT", "LT_FRPS_API_PORT", "LT_USER_PORT",
 	}
-	seenPort := make(map[int]string, len(portKeys))
+	seenPort := map[int]string{
+		80:  "固定 HTTP 入口",
+		443: "固定 HTTPS 入口",
+	}
 	usedPorts := make([]int, 0, len(portKeys))
 	for _, k := range portKeys {
 		p, err := strconv.Atoi(strings.TrimSpace(vars[k]))
@@ -115,9 +118,16 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 			return fmt.Errorf("%s 不是合法端口（当前 %q）", k, vars[k])
 		}
 		if prev, ok := seenPort[p]; ok {
-			return fmt.Errorf("%s 与 %s 使用了同一个端口 %d：同一台宿主机上它们必须互不相同", k, prev, p)
+			// 80/443 是 Caddy 的固定入口，分别允许由对应的 vhost
+			// 变量显式使用；其它变量仍不得占用，也不能互相占用。
+			allowedFixed := (p == 80 && k == "LT_VHOST_HTTP_PORT" && prev == "固定 HTTP 入口") ||
+				(p == 443 && k == "LT_VHOST_HTTPS_PORT" && prev == "固定 HTTPS 入口")
+			if !allowedFixed {
+				return fmt.Errorf("%s 与 %s 使用了同一个端口 %d：同一台宿主机上它们必须互不相同", k, prev, p)
+			}
+		} else {
+			seenPort[p] = k
 		}
-		seenPort[p] = k
 		usedPorts = append(usedPorts, p)
 	}
 

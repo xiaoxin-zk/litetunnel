@@ -30,6 +30,17 @@ var ErrAlreadyRunning = errors.New("该隧道的 frpc 已在运行")
 // 「同步在 StopAll 之后才把进程拉起来」这一类漏网。
 var ErrClosed = errors.New("客户端正在退出，不再启动 frpc")
 
+// exitLockShards 是「退出回调 ↔ 新进程登记」互斥锁的分片数。
+//
+// 固定分片没有清理问题；碰撞只让两条不相干隧道的启动多串行一点，
+// 而这类操作本来就很稀疏。
+const exitLockShards = 32
+
+// exitLock 返回某条隧道的退出回调锁。
+func (m *Manager) exitLock(tunnelID uint) *sync.Mutex {
+	return &m.exitMu[tunnelID%exitLockShards]
+}
+
 // process 是某一条隧道的 frpc 进程。
 type process struct {
 	// name 只用于日志前缀。进程本身不认隧道名，改名不影响运行中的连接。
@@ -69,16 +80,23 @@ type Manager struct {
 	// closed 表示已进入关闭流程：此后 Start 直接失败，见 Close。
 	closed bool
 
-	// exitMu 串行化「派发某条隧道的退出回调」与「为同一条隧道登记新进程」。
+	// exitMu 按隧道分片，串行化「派发某条隧道的退出回调」与「为同一条隧道
+	// 登记新进程」。
 	//
 	// 只靠 procs 里是否还有本进程来判断是不够的：Wait 协程删掉记录、关闭
 	// exitCh 之后，Stop 立刻返回，新进程可能在此刻完成登记，而旧回调还没
 	// 开始执行——它会把刚连上的隧道标成「未连接」。
-	// 两边都持这把锁之后，二者只可能是先后关系：要么旧回调先跑完再登记，
-	// 要么登记先完成、旧回调发现自己已过期而放弃。
+	// 两边都持同一分片的锁之后，二者只可能是先后关系。
+	//
+	// 分片而不是全局一把：回调会调用上层（发 Wails 事件、写日志、刷状态），
+	// 一次阻塞不该让**所有**隧道的启动与退出处理一起排队。
 	//
 	// 锁序固定为 exitMu → mu，与下面 Start 和 Wait 协程的取法一致。
-	exitMu sync.Mutex
+	exitMu [exitLockShards]sync.Mutex
+
+	// callbackWG 统计正在执行的退出回调。Close 要等它们结束：
+	// 关闭流程接下来会拆掉日志投递，回调若仍在往队列里写，收尾日志会丢。
+	callbackWG sync.WaitGroup
 
 	// gens 记录每条隧道最近一次启动的代次，进程退出后仍然保留：
 	// 它是「旧回调是否已过期」的唯一判据，删掉就等于失去判断依据。
@@ -221,12 +239,13 @@ func (m *Manager) AnyRunning() bool {
 // tunnelName 只用于日志前缀：进程本身只认配置文件，
 // 不依赖隧道名字，因此改名不影响正在运行的连接。
 func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
-	// 持 exitMu 直到本函数返回：这段时间里该隧道的旧退出回调不会执行，
-	// 因此不可能出现「回调先跑、把刚登记的新进程当成已退出」的覆盖。
+	// 持该隧道的 exitMu 分片直到本函数返回：这段时间里它的旧退出回调不会
+	// 执行，因此不可能出现「回调先跑、把刚登记的新进程当成已退出」的覆盖。
 	// 反过来若回调先拿到锁，它会先于本次登记执行完——那时新进程还不存在，
 	// 上层清掉的状态随后会被新进程的 start proxy success 重新置位。
-	m.exitMu.Lock()
-	defer m.exitMu.Unlock()
+	lock := m.exitLock(tunnelID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	m.mu.Lock()
 	// 关闭之后不再放行任何新进程：关闭流程是「关闸 → 停全部」，
@@ -363,22 +382,41 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 
 		// 上面那一步只保证了「本进程不再是表里的那一个」，并不保证
 		// 「还没有新进程登记」：停表与回调之间有窗口，Stop 已返回，
-		// 新进程可能刚好在这段时间里登记完成。持 exitMu 复查代次，
+		// 新进程可能刚好在这段时间里登记完成。持该隧道的 exitMu 复查代次，
 		// 与 Start 的登记互斥——复查通过即意味着直到回调结束都不会有
 		// 新进程把状态顶掉，回调也就不会覆盖它。
-		m.exitMu.Lock()
+		exitLock := m.exitLock(tunnelID)
+		exitLock.Lock()
+
 		m.mu.Lock()
 		stale := m.gens[tunnelID] != gen
+		closing := m.closed
+		if !stale && !closing && onExit != nil {
+			// 必须在 mu 内登记：Close 先置 closed 再 Wait，两条路径只可能
+			// 是先后关系——这里读到 false 并 Add 之后才会有人置 true，
+			// 而那时 Add 已经完成，Wait 一定能等到。
+			m.callbackWG.Add(1)
+		}
 		m.mu.Unlock()
+
 		if stale {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
-			m.exitMu.Unlock()
+			exitLock.Unlock()
+			return
+		}
+		if closing {
+			// 关闭阶段不再回调：接下来 Wails 运行时与日志投递都要拆掉，
+			// 回调里的状态写入与事件发送没有接收方，还可能落在一个
+			// 已经销毁的目标上。
+			m.appendLog(tunnelID, tunnelName, "frpc 已退出（客户端正在关闭，跳过退出回调）")
+			exitLock.Unlock()
 			return
 		}
 		if onExit != nil {
 			onExit(tunnelID, tunnelName, err, requested)
+			m.callbackWG.Done()
 		}
-		m.exitMu.Unlock()
+		exitLock.Unlock()
 	}()
 
 	return nil
@@ -464,6 +502,11 @@ func (m *Manager) Close() error {
 	m.mu.Unlock()
 	err := m.StopAll()
 
+	// StopAll 只等到 exitCh 关闭（进程确实退出），而退出回调是在那之后
+	// 才执行的。这里再等回调收尾：它们会写日志、发状态事件，而下面就要
+	// 停掉日志投递，上层随后还会销毁 Wails 运行时。
+	m.waitCallbacks(2 * time.Second)
+
 	// 停完进程再停投递：进程退出的收尾日志已经进了队列，
 	// 立刻掐掉投递协程会把它们吞掉。
 	m.emitOnce.Do(func() { close(m.emitQuit) })
@@ -479,6 +522,23 @@ func (m *Manager) Close() error {
 		log.Printf("[frpc] 日志投递未在 2 秒内退出，继续关闭")
 	}
 	return err
+}
+
+// waitCallbacks 等正在执行的退出回调结束，超过上限则记录并继续。
+//
+// 上限是必要的：回调会发 Wails 事件，运行时已经不可用时可能长时间不返回。
+// 日志可以丢，进程必须退——关闭流程不能被一个回调卡死。
+func (m *Manager) waitCallbacks(d time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		m.callbackWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		log.Printf("[frpc] 退出回调未在 %s 内结束，继续关闭", d)
+	}
 }
 
 // Closed 报告是否已进入关闭状态。

@@ -350,7 +350,9 @@ func (a *App) ServerMailEnabled(serverURL string) (bool, error) {
 	var out struct {
 		MailEnabled bool `json:"mail_enabled"`
 	}
-	if err := a.getJSON(context.Background(), base+"/api/public/settings", "", &out); err != nil {
+	// 未登录的公开请求同样走根上下文：应用退出时能被取消，而不是一直等到
+	// http.Client 的 15 秒超时。
+	if err := a.getJSON(a.rootContext(), base+"/api/public/settings", "", &out); err != nil {
 		return false, err
 	}
 	return out.MailEnabled, nil
@@ -366,7 +368,7 @@ func (a *App) SendEmailCode(serverURL, email, scene string) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.do(context.Background(), http.MethodPost, base+"/api/user/auth/send-email-code", "", payload)
+	_, err = a.do(a.rootContext(), http.MethodPost, base+"/api/user/auth/send-email-code", "", payload)
 	return err
 }
 
@@ -392,6 +394,6 @@ func (a *App) ResetPassword(serverURL, account, oldPassword, emailCode, newPassw
 	if err != nil {
 		return err
 	}
-	_, err = a.do(context.Background(), http.MethodPost, base+"/api/user/auth/reset-password", "", payload)
+	_, err = a.do(a.rootContext(), http.MethodPost, base+"/api/user/auth/reset-password", "", payload)
 	return err
 }

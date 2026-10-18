@@ -40,6 +40,11 @@ var syncRoundTimeout = 45 * time.Second
 // 更糟的是——即使点了，运行中的 frpc 也不会加载新配置，
 // 于是「隧道明明建好了却连不上」，用户只会认为产品坏了。
 func (a *App) startAutoSync(ctx context.Context) {
+	// 调度器是否该停，以根上下文（syncRoot）为准而不是 Wails 传入的 domReady
+	// context：退出流程取消的是 syncRoot，而窗口 context 未必会及时取消，绑定
+	// 它的话调度器可能继续空转唤醒、制造无效调度与状态事件。两者都监听，
+	// 任一取消即停。
+	root := a.rootContext()
 	go func() {
 		// 用「上一轮结束后再等 20 秒」而不是固定 ticker。
 		//
@@ -50,6 +55,8 @@ func (a *App) startAutoSync(ctx context.Context) {
 		defer timer.Stop()
 		for {
 			select {
+			case <-root.Done():
+				return
 			case <-ctx.Done():
 				return
 			case <-timer.C:

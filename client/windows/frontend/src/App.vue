@@ -35,8 +35,16 @@ const logs = ref([])
 // 字符串相等不会触发子组件的 watch，第二次提示就丢了。
 const notice = ref(null)
 
+// 快照请求代次：loadState / loadLogs 的异步结果可能晚于登出/重新接入返回。
+// 旧账号的慢响应若被放行，会把新账号的状态或日志覆盖掉——登录后短暂闪回
+// 上一个账号、或日志混入上一账号的行。只在「没有更新的写入发生」时才提交。
+let stateSeq = 0
+
 async function loadState() {
-  state.value = await api.getState()
+  const seq = ++stateSeq
+  const s = await api.getState()
+  if (seq !== stateSeq) return
+  state.value = s
 }
 
 // 日志代次：清空时主进程会递增它，并随每个批次下发。
@@ -46,9 +54,12 @@ const logEpoch = ref(0)
 // 已显示的最大日志序号。快照与实时事件可能包含同一行，
 // 只比代次会重复追加，必须按序号去重。
 const lastSeq = ref(0)
+let logSeq = 0
 
 async function loadLogs() {
+  const seq = ++logSeq
   const snap = await api.logs()
+  if (seq !== logSeq) return
   if (snap && Array.isArray(snap.lines)) {
     const seqs = snap.seqs || []
     let maxSeq = 0
@@ -131,11 +142,13 @@ function pushLog(payload) {
 }
 
 function onConnected(next) {
+  stateSeq++ // 使在途的 loadState 失效
   state.value = next
   loadLogs()
 }
 
 function onUpdate(next) {
+  stateSeq++
   if (next) state.value = next
   else loadState()
 }
@@ -144,6 +157,7 @@ function onUpdate(next) {
 // logs 数组如果不动，旧行会一直留在界面上，看起来就像「清空没生效」。
 // 待合并队列也要一起丢，否则 200ms 后它会把清空前的行重新补回来。
 async function onClearLogs() {
+  logSeq++ // 使在途的 loadLogs 失效：旧快照不该在清空后重新冒回来
   const res = await api.clearLogs()
   if (res && typeof res.epoch === 'number') {
     logEpoch.value = res.epoch
@@ -159,6 +173,7 @@ onMounted(async () => {
   // 先注册事件、再读快照：反过来的话，两次 await 之间主进程推送的状态
   // 和日志会被丢掉——它们不属于任何快照，只能靠事件到达。
   onEvent('state', (payload) => {
+    stateSeq++ // 事件状态比任何在途快照都新，让它们失效
     state.value = payload
   })
   onEvent('logs', pushLog)

@@ -373,11 +373,34 @@ func (m *Manager) Stop(tunnelID uint) error {
 }
 
 // StopAll 停止全部隧道的 frpc 进程，返回第一个错误。
+//
+// 并行发终止请求、统一等待：串行的话每条最多等 5 秒，N 条就是 5N 秒，
+// 大量隧道同时退出时注销或关窗会等几十秒。并行后总等待约为单个 5 秒超时。
+// 全局 deadline 再兜一层底：即使个别进程的等待卡住，也保证在 deadline 内返回。
 func (m *Manager) StopAll() error {
+	ids := m.RunningIDs()
+	if len(ids) == 0 {
+		return nil
+	}
+
+	deadline := time.After(6 * time.Second)
+	errCh := make(chan error, len(ids))
+	for _, id := range ids {
+		go func(id uint) {
+			errCh <- m.Stop(id)
+		}(id)
+	}
+
 	var firstErr error
-	for _, id := range m.RunningIDs() {
-		if err := m.Stop(id); err != nil && firstErr == nil {
-			firstErr = err
+	for range ids {
+		select {
+		case err := <-errCh:
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+		case <-deadline:
+			// 不再等剩余进程：它们的 Stop 自带 5 秒超时，稍后会自行结束。
+			return firstErr
 		}
 	}
 	return firstErr

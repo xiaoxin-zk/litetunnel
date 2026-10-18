@@ -119,17 +119,23 @@ func (a *App) nextSyncSeq() uint64 {
 // 的过期快照一律不应用，改为重新拉一轮——这时的目标就是「把本机对齐到
 // 最新状态」，重拉一次最直接，也省得区分哪些差异是过期造成的。
 func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err error) {
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	return a.syncWithDataLocked(data, seq)
-}
-
-func (a *App) syncWithDataLocked(data *clientInfoData, seq uint64) (changed bool, err error) {
-	if seq <= a.appliedSyncSeq {
-		return a.applySync()
-	}
 	ctx, cancel := a.newSyncContext()
 	defer cancel()
+
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	return a.syncWithDataLocked(ctx, data, seq)
+}
+
+// syncWithDataLocked 用调用方给的预算完成对账。
+//
+// ctx 必须是**整笔**操作的预算：接入流程拿它同时覆盖「校验 API Key」
+// 与「随后对账」。各起一轮的话，最坏情况就是两轮 45 秒串在一起——
+// 而用户只是点了一下「连接」。
+func (a *App) syncWithDataLocked(ctx context.Context, data *clientInfoData, seq uint64) (changed bool, err error) {
+	if seq <= a.appliedSyncSeq {
+		return a.applySyncCtx(ctx)
+	}
 	return a.applySyncData(ctx, data, seq)
 }
 

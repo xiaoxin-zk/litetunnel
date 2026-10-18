@@ -32,6 +32,12 @@ func (a *App) ListLocalServices() ([]localsvc.Service, error) {
 // 这个概念，用户只需要知道「本机服务跑在哪个端口」。
 // 端口池的挑选、系统占用排除、保留端口过滤全在服务端完成。
 func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePort int, subdomain string) (State, error) {
+	// 整笔预算在抢 syncMu **之前**开始计时：等待后台同步让出锁的时间，
+	// 也是用户实打实等掉的时间。放在锁后的话，自动同步占锁 45 秒时，
+	// 用户先干等 45 秒、再拿到一份完整预算，一次点击的总耗时会接近两倍。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+
 	// 「读凭据 → 发创建请求 → 对账」必须是一个整体，不能被退出登录或重新接入打断。
 	//
 	// 不互斥的话：本方法读到凭据后、发出 POST 前，用户点了退出登录——凭据已被清空、
@@ -59,9 +65,7 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	if err != nil {
 		return a.GetState(), err
 	}
-	// 整笔预算：创建请求 + 随后的同步共用，避免「请求成功后再干等一整轮同步」。
-	ctx, cancel := a.newMutateContext()
-	defer cancel()
+	// 创建请求与随后同步共用开头那份预算，避免「请求成功后再干等一整轮同步」。
 	if _, err := a.do(ctx, http.MethodPost, base+"/api/user/tunnels", apiKey, payload); err != nil {
 		return a.GetState(), err
 	}
@@ -99,8 +103,13 @@ type BatchResult struct {
 // 而不是「一条失败就全都没了」。失败原因逐条带回，用户才知道
 // 该去改哪一个。
 func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports []int) (BatchResult, State, error) {
-	// 与 CreateTunnel 同理：读凭据 → 发创建请求 → 对账必须与退出登录、
-	// 重新接入互斥，否则会用失效凭据把隧道建到旧账号，或在退出后重新拉起进程。
+	// 与 CreateTunnel 同理：预算从抢锁之前开始算，等待同步让出锁的时间
+	// 也是用户等在界面上的时间。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+
+	// 读凭据 → 发创建请求 → 对账必须与退出登录、重新接入互斥，
+	// 否则会用失效凭据把隧道建到旧账号，或在退出后重新拉起进程。
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 
@@ -119,9 +128,7 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 		return BatchResult{}, a.GetState(), err
 	}
 
-	// 整笔预算：批量创建请求 + 随后同步共用。
-	ctx, cancel := a.newMutateContext()
-	defer cancel()
+	// 批量创建请求与随后同步共用上面那份预算。
 	raw, err := a.do(ctx, http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
 	if err != nil {
 		return BatchResult{}, a.GetState(), err
@@ -146,6 +153,10 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 //   - 本地配置必须删：frpc.toml 里含客户端接入密钥与 frps 全局 token，
 //     隧道都删了、凭据还留在磁盘上，任何能读到这个目录的进程都能拿去接入。
 func (a *App) DeleteTunnel(id uint) (State, error) {
+	// 预算同样从抢锁之前开始算：等锁不是「没在操作」。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+
 	// 与后台同步互斥：否则同步可能刚按旧清单把这条隧道的进程拉起来，
 	// 而我们紧接着删掉了它的配置文件——进程还在，配置没了。
 	a.syncMu.Lock()
@@ -156,9 +167,7 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 		return a.GetState(), err
 	}
 	endpoint := fmt.Sprintf("%s/api/user/tunnels/%d", base, id)
-	// 整笔预算：删除请求 + 随后同步共用。
-	ctx, cancel := a.newMutateContext()
-	defer cancel()
+	// 删除请求与随后同步共用上面那份预算。
 	if _, err := a.do(ctx, http.MethodDelete, endpoint, apiKey, nil); err != nil {
 		return a.GetState(), err
 	}
@@ -198,6 +207,11 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 // 反过来（先起进程）拿到的是「隧道还是停用状态」的配置，frps 那边
 // 直接拒绝建代理，用户看到的就是「开关打开了却一直连不上」。
 func (a *App) StartTunnel(id uint) (State, error) {
+	// 预算从抢锁之前开始算：后台同步正占着锁时，用户先在界面等一段时间，
+	// 拿到锁后如果再从零开始计时，一次点击的总耗时会变成「等锁 + 完整预算」。
+	ctx, cancel := a.newManualContext()
+	defer cancel()
+
 	// 整段操作与后台同步互斥。
 	//
 	// 不互斥的话有一个很难复现的竞态：后台同步先读到「这条隧道已停用」
@@ -214,11 +228,8 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	if !ok {
 		return a.GetState(), errors.New("找不到这条隧道，请等待同步完成后重试")
 	}
-	// 整笔操作共用一个截止：下面两步各自带 15 秒超时，网络不好时串起来
-	// 就是近 30 秒的干等，而且用户不知道卡在哪一步（见 manualOpTimeout）。
-	ctx, cancel := a.newManualContext()
-	defer cancel()
-
+	// 下面两步共用开头那份截止：它们各自带 15 秒超时，串起来就是近 30 秒
+	// 的干等，而且用户不知道卡在哪一步（见 manualOpTimeout）。
 	if t.Status != tunnelStatusActive {
 		a.emitTunnelLog(t.Name, "正在启用（提交服务端状态）…")
 		if err := a.setTunnelStatus(ctx, base, apiKey, id, tunnelStatusActive); err != nil {
@@ -274,7 +285,11 @@ func (a *App) StartTunnel(id uint) (State, error) {
 // 是自愈的。代价是有一瞬间服务端已停用而进程还没停——frpc 可能刷一两行
 // 重连错误，比「操作被静默反转」好得多。
 func (a *App) StopTunnel(id uint) (State, error) {
-	// 与 StartTunnel 同理：必须和后台同步互斥，否则会被旧清单重新拉起来。
+	// 与 StartTunnel 同理：预算从抢锁之前开始算。
+	ctx, cancel := a.newManualContext()
+	defer cancel()
+
+	// 必须和后台同步互斥，否则会被旧清单重新拉起来。
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 
@@ -286,10 +301,7 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	if !ok {
 		return a.GetState(), errors.New("找不到这条隧道，请等待同步完成后重试")
 	}
-	// 与 StartTunnel 一样：整笔操作共用一个预算，两步串行等待有上界。
-	ctx, cancel := a.newManualContext()
-	defer cancel()
-
+	// 与 StartTunnel 一样：两步共用开头那份预算，串行等待有上界。
 	if t.Status != tunnelStatusDisabled {
 		a.emitTunnelLog(t.Name, "正在停用（提交服务端状态）…")
 		if err := a.setTunnelStatus(ctx, base, apiKey, id, tunnelStatusDisabled); err != nil {
@@ -420,8 +432,12 @@ func (a *App) findTunnel(id uint) (TunnelVO, bool) {
 // 由调用方直接提示用户——不同兑换码类型的文案差别很大，
 // 在客户端里猜类型容易说错。
 func (a *App) Redeem(code string) (string, State, error) {
-	// 与 CreateTunnel 同理：读凭据 → 发兑换请求 → 对账必须与退出登录、
-	// 重新接入互斥，否则会用失效凭据兑换，或把配额/分组写到错误的账号视角。
+	// 预算从抢锁之前开始算：等锁的时间同样计入用户等待。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+
+	// 读凭据 → 发兑换请求 → 对账必须与退出登录、重新接入互斥，
+	// 否则会用失效凭据兑换，或把配额/分组写到错误的账号视角。
 	a.syncMu.Lock()
 	defer a.syncMu.Unlock()
 
@@ -438,9 +454,7 @@ func (a *App) Redeem(code string) (string, State, error) {
 	if err != nil {
 		return "", a.GetState(), err
 	}
-	// 整笔预算：兑换请求 + 随后同步共用。
-	ctx, cancel := a.newMutateContext()
-	defer cancel()
+	// 兑换请求与随后同步共用上面那份预算。
 	raw, err := a.do(ctx, http.MethodPost, base+"/api/user/redeem", apiKey, payload)
 	if err != nil {
 		return "", a.GetState(), err

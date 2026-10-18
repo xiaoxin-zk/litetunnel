@@ -77,17 +77,15 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) bool {
 	}
 	prev, exists := s.fwPending[port]
 	// 已有记录时**覆盖**为最新意图（而不是保留旧的）：见 pendingFW 的注释。
-	// 覆盖时保留已累计的重试次数，避免「意图反复变化」把上限重置掉。
 	//
-	// 例外：旧意图已经重试耗尽、而这回是**另一个**意图时，从零开始计——
-	// 意图已经变了，说明端口的世界变了（新隧道启用、旧的已删），
-	// 新意图该有自己完整的一轮预算；沿用旧计数会让它第一次失败就再次
-	// 被判为终态。同一意图的再次尝试不在此列，那正是上限要拦的。
+	// 重试次数只在「动作与协议都没变」时继承：意图一变（放行↔收回、tcp↔udp），
+	// 说明端口的世界变了（新隧道启用、旧的已删），新意图该有自己完整的一轮
+	// 预算；沿用旧计数会让它第一次失败就再次被判为终态。同一意图的再次尝试
+	// 不在此列，那正是上限要拦的。
 	attempts := 0
 	if exists {
-		attempts = prev.attempts
-		if prev.exhausted && (prev.open != open || prev.proto != proto) {
-			attempts = 0
+		if prev.open == open && prev.proto == proto {
+			attempts = prev.attempts
 		}
 	} else if len(s.fwPending) >= pendingFWLimit {
 		s.fwMu.Unlock()

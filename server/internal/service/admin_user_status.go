@@ -285,8 +285,12 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 读回本次写入的版本：后面那段断流要放掉用户锁去做（可能十几秒），
 		// 这期间若账号被重新启用（任何实例上），版本变化就是「本次断流
 		// 已过期」的信号。
-		return tx.Model(&model.User{}).Where("id = ?", id).
-			Pluck("state_version", &gen).Error
+		var u model.User
+		if err := tx.Select("state_version").First(&u, id).Error; err != nil {
+			return err
+		}
+		gen = u.StateVersion
+		return nil
 	})
 	if err != nil {
 		lock.Unlock()

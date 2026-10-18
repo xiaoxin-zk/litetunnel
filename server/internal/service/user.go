@@ -837,25 +837,21 @@ func IsValidEmail(s string) bool {
 // 改密后自增 TokenVersion，使此前签发的所有令牌立即失效——
 // JWT 无状态，这是让「改密即全端下线」成立的唯一办法。
 func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
-	var u model.User
-	if err := s.DB.First(&u, userID).Error; err != nil {
-		return ErrNotFound
-	}
-	if !auth.VerifyPassword(u.Password, oldPwd) {
-		return fmt.Errorf("%w: 原密码不正确", ErrInvalidParam)
-	}
 	if len(newPwd) < 8 {
 		return fmt.Errorf("%w: 新密码长度不得少于 8 位", ErrInvalidParam)
 	}
-	if newPwd == oldPwd {
-		return fmt.Errorf("%w: 新密码不能与原密码相同", ErrInvalidParam)
-	}
+	// bcrypt 刻意做得慢（防离线爆破），放在事务外计算，避免长时间持锁。
 	hashed, err := auth.HashPassword(newPwd)
 	if err != nil {
 		return err
 	}
 	if err := s.DB.Transaction(func(tx *gorm.DB) error {
 		// 锁用户行：改密与「重置邮件送达后激活」都以这一行为序。
+		//
+		// 密码校验放在锁内重做，而不是锁外先验一遍：并发改密时，锁外的
+		// 校验基于旧快照，等本事务拿到行锁时密码可能已被别的请求改掉，
+		// 「原密码正确」的那份结论已经作废。锁内重读并校验，保证改密
+		// 一定基于当前密码。
 		var locked model.User
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			First(&locked, userID).Error; err != nil {
@@ -863,6 +859,12 @@ func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 				return ErrNotFound
 			}
 			return err
+		}
+		if !auth.VerifyPassword(locked.Password, oldPwd) {
+			return fmt.Errorf("%w: 原密码不正确", ErrInvalidParam)
+		}
+		if auth.VerifyPassword(locked.Password, newPwd) {
+			return fmt.Errorf("%w: 新密码不能与当前密码相同", ErrInvalidParam)
 		}
 		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
 			"password":      hashed,
@@ -925,14 +927,6 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 // 需要提供登录密码二次确认：注销不可恢复，必须防止令牌被盗后被恶意注销。
 // 关联数据一并清理，避免留下悬空记录。
 func (s *Services) DeleteAccount(userID uint, password string) error {
-	var u model.User
-	if err := s.DB.First(&u, userID).Error; err != nil {
-		return ErrNotFound
-	}
-	if !auth.VerifyPassword(u.Password, password) {
-		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
-	}
-
 	// 与「给自己建隧道」互斥（见 userLock）：只把端口读取放进事务还不够，
 	// READ COMMITTED 下在端口查询之后提交的新隧道仍可能被删掉而漏出回收清单。
 	lock := s.userLock(userID)
@@ -952,6 +946,11 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 				return ErrNotFound
 			}
 			return err
+		}
+		// 密码校验放在锁内：事务外先验一遍的话，并发改密会让「密码正确」的
+		// 结论作废——注销必须基于当前密码，而不是请求开始时的旧快照。
+		if !auth.VerifyPassword(locked.Password, password) {
+			return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 		}
 		var tunnels []model.Tunnel
 		if err := tx.Where("user_id = ? AND remote_port > 0", userID).Find(&tunnels).Error; err != nil {
@@ -978,7 +977,7 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 		}
 		// 凭据类数据（重置令牌、邮箱验证码、待发凭据邮件）与管理员
 		// 删除路径共用同一套清理，避免两条路径各行其是、漏掉其中一类。
-		if err := purgeAccountCredentialsTx(tx, userID, u.Email); err != nil {
+		if err := purgeAccountCredentialsTx(tx, userID, locked.Email); err != nil {
 			return err
 		}
 		// 兑换流水与登录日志保留：它们属于审计数据，删除会让风控出现盲区。

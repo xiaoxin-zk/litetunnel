@@ -307,6 +307,14 @@ func (s *Services) AdminSetUserQuota(id uint, quota int64) error {
 	if quota < 0 {
 		return fmt.Errorf("%w: 配额不能为负数", ErrInvalidParam)
 	}
+	// 与禁用/启用、分组调整等「数据库更新 + 运行时标记刷新」成对的操作共用
+	// 同一把用户锁：并发的配额调整或状态切换交错执行时，各自的写库与内存
+	// 写入可能以不同顺序完成，导致运行时标记与数据库短暂不一致。持有用户锁
+	// 之后两者只可能是先后关系（版本校验见 refreshQuotaFor）。
+	lock := s.userLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Update("traffic_quota", quota)
 	if res.Error != nil {
 		return res.Error

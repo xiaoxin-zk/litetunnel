@@ -165,6 +165,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { User, Lock, Key, Refresh } from '@element-plus/icons-vue'
 import { authApi, publicApi, sessionApi, TOKEN_KEY } from '../api'
+import { useCountdown } from '../composables/useCountdown'
 
 // 管理端是独立 SPA，与用户端同源，因此 localStorage 共享：
 // 管理员登录成功后把令牌写到管理端的键上，直接跳转即可，无需跨页传参。
@@ -202,7 +203,8 @@ const requireEmail = computed(
   () => !!site.value.mail_enabled && !!site.value.register_require_email
 )
 // 验证码重发倒计时
-const countdown = ref(0)
+// 倒计时在组件卸载时自动清理（见 useCountdown）。
+const { countdown, start: startCountdown } = useCountdown()
 
 async function sendEmailCode() {
   const email = reg.email.trim()
@@ -213,11 +215,7 @@ async function sendEmailCode() {
   try {
     await authApi.sendEmailCode({ email, scene: 'register' })
     ElMessage.success('验证码已发送，请查收')
-    countdown.value = 60
-    const timer = setInterval(() => {
-      countdown.value -= 1
-      if (countdown.value <= 0) clearInterval(timer)
-    }, 1000)
+    startCountdown()
   } catch {
     // 失败提示由响应拦截器统一处理
   }

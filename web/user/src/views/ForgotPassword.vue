@@ -91,12 +91,14 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { User, Lock } from '@element-plus/icons-vue'
 import { authApi } from '../api'
+import { useCountdown } from '../composables/useCountdown'
 
 const router = useRouter()
 const formRef = ref()
 const loading = ref(false)
 const error = ref('')
-const countdown = ref(0)
+// 倒计时在组件卸载时自动清理（见 useCountdown）。
+const { countdown, start: startCountdown } = useCountdown()
 // null 表示尚未探测出来，避免首屏闪烁
 const mailEnabled = ref(null)
 const statusLoading = ref(false)
@@ -144,11 +146,7 @@ async function sendCode() {
     // scene=reset：无论邮箱是否注册过都返回成功，避免这个接口变成账号枚举工具
     await authApi.sendEmailCode({ email: account, scene: 'reset' })
     ElMessage.success('找回请求已受理；若长时间未收到验证码，请稍后重新申请')
-    countdown.value = 60
-    const timer = setInterval(() => {
-      countdown.value -= 1
-      if (countdown.value <= 0) clearInterval(timer)
-    }, 1000)
+    startCountdown()
   } catch {
     // 失败提示由响应拦截器统一处理
   }

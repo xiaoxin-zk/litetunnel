@@ -140,6 +140,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { profileApi, publicApi, TOKEN_KEY } from '../api'
 import { formatTime } from '../utils/format'
+import { useCountdown } from '../composables/useCountdown'
 
 const props = defineProps({ profile: Object })
 const router = useRouter()
@@ -173,7 +174,8 @@ const deleting = ref(false)
 // 更换邮箱（两步：发码到新地址 → 带码换绑）。
 const emailVisible = ref(false)
 const emailForm = reactive({ email: '', password: '', code: '' })
-const emailCountdown = ref(0)
+// 倒计时在组件卸载时自动清理（见 useCountdown）。
+const { countdown: emailCountdown, start: startEmailCountdown, stop: stopEmailCountdown } = useCountdown()
 const sendingEmail = ref(false)
 const confirmingEmail = ref(false)
 
@@ -181,6 +183,7 @@ function openEmailChange() {
   emailForm.email = ''
   emailForm.password = ''
   emailForm.code = ''
+  stopEmailCountdown()
   emailCountdown.value = 0
   emailVisible.value = true
 }
@@ -193,11 +196,7 @@ async function sendEmailCode() {
   try {
     await profileApi.requestEmailChange({ email, password: emailForm.password })
     ElMessage.success('验证码已发送到新邮箱，请查收')
-    emailCountdown.value = 60
-    const timer = setInterval(() => {
-      emailCountdown.value -= 1
-      if (emailCountdown.value <= 0) clearInterval(timer)
-    }, 1000)
+    startEmailCountdown()
   } catch (e) {
     ElMessage.error(e?.message || '发送失败，请稍后重试')
   } finally {

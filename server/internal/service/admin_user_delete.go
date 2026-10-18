@@ -84,6 +84,8 @@ func (s *Services) AdminDeleteUser(id uint) error {
 	s.Runtime.SetQuotaExceeded(id, false)
 	s.Runtime.SetUserBlocked(id, false)
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
+	// 状态代次也一起清：账号已经不在了，留着只会让那张表随历史用户数增长。
+	s.forgetUserStatusGen(id)
 	// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
 	// 查的是内存会话表，残留的话已登录的 frpc 仍会被放行新连接——
 	// 账号都删了还在跑，这是最不该出现的一种。

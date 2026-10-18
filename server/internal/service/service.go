@@ -184,7 +184,10 @@ type Services struct {
 	// 启用账号并建立新代理——旧流程手里的那份「要关哪些代理」的判断
 	// 已经作废，继续关就是打自己刚放行的人。
 	statusGenMu sync.Mutex
-	statusGens  map[uint]uint64
+	// 带时间戳是为了回收：账号可以被反复创建又删除，只存代次的话这张表
+	// 只增不减，长期运行会随历史用户数一直长上去。删除账号时立即 forget
+	// （见各删除路径），另有按时间与容量的兜底回收（见 sweepStatusGensLocked）。
+	statusGens map[uint]userStatusEntry
 
 	// adminMu 串行化「涉及超级管理员数量」的变更（改角色/状态、删除）。
 	//
@@ -313,7 +316,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		recoveryCounters: &recoveryCounters{},
 		fwPending:        map[int]pendingFW{},
 		fwKick:           make(chan struct{}, 1),
-		statusGens:       map[uint]uint64{},
+		statusGens:       map[uint]userStatusEntry{},
 	}
 }
 

@@ -213,7 +213,46 @@ func newRateLimiter(maxSize int, source RateSource, rate, capacity float64) *Rat
 		source:   source,
 		lastGC:   time.Now(),
 	}
+	registerRateLimiter(rl)
 	return rl
+}
+
+// limiterRegistry 记录进程内创建的限流器，供维护任务统一清扫空闲桶。
+//
+// 限流器由路由层创建，而路由层没有关闭入口（router.New 返回 *gin.Engine），
+// 所以「还有哪些实例活着」只能在这里登记。条目只在进程生命周期内存在：
+// 路由重建一般只发生在测试里，进程结束一并消失。
+var limiterRegistry struct {
+	mu    sync.Mutex
+	items map[*RateLimiter]struct{}
+}
+
+func registerRateLimiter(rl *RateLimiter) {
+	limiterRegistry.mu.Lock()
+	if limiterRegistry.items == nil {
+		limiterRegistry.items = make(map[*RateLimiter]struct{})
+	}
+	limiterRegistry.items[rl] = struct{}{}
+	limiterRegistry.mu.Unlock()
+}
+
+// SweepIdleLimiters 立即清理所有限流器的空闲桶。
+//
+// 请求路径上的惰性清理只在有流量时触发。流量退潮之后再没有请求的实例
+// （例如只服务某个默认端口的限流器）会把峰值数量的桶一直留着；周期维护
+// 任务调这里兜底，不必为每个实例起一个 gc 协程。
+func SweepIdleLimiters() {
+	limiterRegistry.mu.Lock()
+	limiters := make([]*RateLimiter, 0, len(limiterRegistry.items))
+	for rl := range limiterRegistry.items {
+		limiters = append(limiters, rl)
+	}
+	limiterRegistry.mu.Unlock()
+
+	cutoff := time.Now().Add(-rateLimiterIdleTTL)
+	for _, rl := range limiters {
+		rl.dropIdle(cutoff)
+	}
 }
 
 const (

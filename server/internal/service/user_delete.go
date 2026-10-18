@@ -85,6 +85,8 @@ func (s *Services) DeleteAccount(userID uint, password string) error {
 	s.Runtime.SetQuotaExceeded(userID, false)
 	s.Runtime.SetUserBlocked(userID, false)
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
+	// 状态代次随之清掉（原因见 AdminDeleteUser 同一处）。
+	s.forgetUserStatusGen(userID)
 	// 会话同样要清：数据库里的会话行已经随事务删除，但插件热路径
 	// （onNewUserConn）查的是内存会话表。账号都注销了还能继续建新连接，
 	// 是最不该出现的一种。

@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -187,18 +186,27 @@ func (g *LoginGuard) gc() {
 // 重置所有锁定的开关：用海量随机账号/IP 把表灌满，正在被锁定的真实账号
 // 会跟着一起解封——而这恰好发生在攻击进行中，是最不该放宽的时刻。
 //
-// 按代价从低到高逐级淘汰：
+// 按代价从低到高逐级淘汰，每一级都是**单遍扫描、不排序**：
 //
 //  1. 已解锁且超过观察窗口的：本来就该消失，最没有代价；
 //  2. 只失败过一次且已解锁的：丢掉最多让某个来源重新开始计数；
-//  3. 仍然满：按最后失败时间淘汰仍未锁定的（最旧的先走）；
-//  4. 极端情况（表里全是锁定中的）：只能按最后失败时间淘汰，
-//     锁定状态提前失效——这是容量上限下无法避免的代价，但至少
-//     只影响最旧的那批，而不是全体。
+//  3. 仍未满额：按遍历顺序淘汰未锁定的（map 遍历本身是伪随机，
+//     攻击者无法定向保护某一条）；
+//  4. 极端情况（表里全是锁定中的）：只能按遍历顺序淘汰。
+//
+// 为什么排序是错的：这条路径在互斥锁内，表有 10 万条，构建候选集再排序
+// 会把攻击期间的**每一次**登录判定都拖出长尾（每触顶一次排 10 万条）。
+// 淘汰只需要「挑够数量」，不需要严格的最旧优先。
 func (g *LoginGuard) evictLocked(now time.Time) int {
 	removed := 0
+	// 一次腾出 1/8：避免每来一个新键就全表扫一遍。
+	target := maxLoginRecords - maxLoginRecords/8
 	cutoff := now.Add(-2 * time.Hour)
+
 	for k, rec := range g.records {
+		if len(g.records) <= target {
+			return removed
+		}
 		if rec.lastFail.Before(cutoff) && now.After(rec.lockedTill) {
 			delete(g.records, k)
 			removed++
@@ -208,8 +216,6 @@ func (g *LoginGuard) evictLocked(now time.Time) int {
 		return removed
 	}
 
-	// 一次腾出 1/8：避免每来一个新键就全表扫一遍。
-	target := maxLoginRecords - maxLoginRecords/8
 	for k, rec := range g.records {
 		if len(g.records) <= target {
 			break
@@ -223,31 +229,23 @@ func (g *LoginGuard) evictLocked(now time.Time) int {
 		return removed
 	}
 
-	// 排序一次后按顺序删除：逐个找最旧是 O(n²)，而这里恰恰是满表状态。
-	type candidate struct {
-		key    string
-		last   time.Time
-		locked bool
-	}
-	cands := make([]candidate, 0, len(g.records))
 	for k, rec := range g.records {
-		cands = append(cands, candidate{
-			key:    k,
-			last:   rec.lastFail,
-			locked: !now.After(rec.lockedTill),
-		})
-	}
-	sort.Slice(cands, func(i, j int) bool {
-		if cands[i].locked != cands[j].locked {
-			return !cands[i].locked // 未锁定的排在前面，优先淘汰
-		}
-		return cands[i].last.Before(cands[j].last)
-	})
-	for _, c := range cands {
 		if len(g.records) <= target {
 			break
 		}
-		delete(g.records, c.key)
+		if now.After(rec.lockedTill) {
+			delete(g.records, k)
+			removed++
+		}
+	}
+
+	// 表里可能全是锁定中的：只能牺牲一部分，优先让新流量继续可判定，
+	// 而不是让所有判定都卡在满表上。
+	for k := range g.records {
+		if len(g.records) <= target {
+			break
+		}
+		delete(g.records, k)
 		removed++
 	}
 	return removed

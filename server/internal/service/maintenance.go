@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -78,6 +79,10 @@ func (s *Services) RunMaintenance() {
 	s.pruneTable(deadline, "失败邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailFailed, now.Add(-mailFailedRetention))
 	s.pruneMailOutbox(deadline)
+
+	// 限流器的空闲桶：请求路径上只在有流量时才顺手清理，流量退潮后
+	// 就轮不到它了。这里兜底，顺带让「没有 gc 协程」的方案成立。
+	middleware.SweepIdleLimiters()
 }
 
 // pruneTable 按条件分批删除，返回本轮删掉的条数。

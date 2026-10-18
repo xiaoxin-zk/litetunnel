@@ -166,8 +166,15 @@ func (s *Services) RevokeClientSessions(userID uint) error {
 // gen 是「这次禁用」对应的状态代次（见 bumpUserStatusGen）。断流要访问 frps
 // 管理接口，最长可拖十几秒，而这段时间里用户可以已经被重新启用：客户端会
 // 重连、建立新代理，甚至新代理就出现在下面这份列表里。此时继续关就不是
-// 「断掉禁用前的流量」，而是把刚放行的人又踢下线。所以每关一个之前复查
-// 代次，一变就停手——剩下的代理交给新状态自己决定。
+// 「断掉禁用前的流量」，而是把刚放行的人又踢下线。
+//
+// 复查与关闭都放在**该用户的锁**内，且粒度是一条代理：状态变更路径
+// （启用/禁用/改配额）同样持这把锁，因此「确认代次未变」与「发出关闭请求」
+// 之间不可能插进一次重新启用。只复查不放锁的话，两者之间仍有窗口——
+// 检查通过、请求发出前用户被启用，那条新代理照样会被关掉。
+//
+// 锁的粒度是单条而不是整段：整段持锁会在 frps 变慢时把启用操作挡十几秒，
+// 而用户点「启用」时最不该看到的就是长时间无响应。
 //
 // 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
 func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64) {
@@ -185,12 +192,18 @@ func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64
 		if !strings.HasPrefix(p.Name, prefix) {
 			continue
 		}
-		// 每次关闭前复查：列表是几秒前拉的，期间状态可能已经翻转。
+		// 复查代次与关闭动作在同一把用户锁内完成：列表是几秒前拉的，
+		// 期间状态可能已经翻转，而这个窗口必须以锁关闭，不能只靠一次读。
+		lock := s.userLock(userID)
+		lock.Lock()
 		if s.userStatusGen(userID) != gen {
+			lock.Unlock()
 			log.Printf("[user] 用户 %d 的状态在断流过程中已变更，停止关闭剩余代理（避免误伤重新启用后的新代理）", userID)
 			return
 		}
-		if err := s.Frps.CloseProxy(ctx, p.Name); err != nil {
+		err := s.Frps.CloseProxy(ctx, p.Name)
+		lock.Unlock()
+		if err != nil {
 			log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", userID, p.Name, err)
 			continue
 		}

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
@@ -482,5 +483,41 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	defer mu.Unlock()
 	if len(closed) != 1 {
 		t.Fatalf("状态变更后不应继续关闭剩余代理，实际关闭了 %v", closed)
+	}
+}
+
+// TestCloseUserProxiesHoldsUserLockWhileClosing 覆盖「复查之后、请求之前」的窄窗口。
+//
+// 只复查代次是不够的：检查通过到请求真正发出之间，管理端仍可能完成一次
+// 重新启用，那条刚建立的代理照样会被关掉。所以复查与关闭必须在同一把
+// 用户锁内——关的时候别人改不了状态。
+func TestCloseUserProxiesHoldsUserLockWhileClosing(t *testing.T) {
+	svc := newTestServices(t, nil)
+	t.Cleanup(svc.Close)
+
+	const userID = 9
+	var lockHeld int32 = 1
+	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(frpsOK(`{"total":1,"page":1,"pageSize":200,"items":[` +
+				`{"name":"lt_u9.mc","status":{"phase":"online"}}]}`)))
+		case r.Method == http.MethodDelete:
+			lock := svc.userLock(userID)
+			if lock.TryLock() {
+				lock.Unlock()
+				atomic.StoreInt32(&lockHeld, 0)
+			}
+			_, _ = w.Write([]byte(frpsOK("null")))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	gen := svc.bumpUserStatusGen(userID)
+	svc.CloseUserProxies(context.Background(), userID, gen)
+
+	if atomic.LoadInt32(&lockHeld) == 0 {
+		t.Fatal("关闭代理时没有持有用户锁：复查与关闭之间仍可能插入一次重新启用")
 	}
 }

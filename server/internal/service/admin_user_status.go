@@ -152,6 +152,20 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 	return err
 }
 
+// userStatusEntry 是一个用户的状态代次记录。
+type userStatusEntry struct {
+	gen uint64
+	at  time.Time
+}
+
+const (
+	// statusGenMaxEntries 是代次表的容量上限。正常站点远达不到
+	// （每个改过状态的用户一项），触顶说明账号在被大量创建/删除。
+	statusGenMaxEntries = 100000
+	// statusGenTTL 是代次记录的保留期：超过这么久没改过状态的条目可以回收。
+	statusGenTTL = 7 * 24 * time.Hour
+)
+
 // bumpUserStatusGen 递增并返回该用户的状态代次。
 //
 // 调用时机必须在「状态已写入数据库」之后、释放用户锁之前：它标记的是
@@ -159,15 +173,56 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 func (s *Services) bumpUserStatusGen(userID uint) uint64 {
 	s.statusGenMu.Lock()
 	defer s.statusGenMu.Unlock()
-	s.statusGens[userID]++
-	return s.statusGens[userID]
+	e := s.statusGens[userID]
+	e.gen++
+	e.at = time.Now()
+	s.statusGens[userID] = e
+	if len(s.statusGens) > statusGenMaxEntries {
+		s.sweepStatusGensLocked(e.at)
+	}
+	return e.gen
 }
 
 // userStatusGen 返回该用户当前的状态代次；从未改过状态时为 0。
 func (s *Services) userStatusGen(userID uint) uint64 {
 	s.statusGenMu.Lock()
 	defer s.statusGenMu.Unlock()
-	return s.statusGens[userID]
+	return s.statusGens[userID].gen
+}
+
+// forgetUserStatusGen 在账号删除后清掉代次记录。
+//
+// 删除之后不会再有任何断流任务拿这个 ID 当判据（主键不复用），留着只是
+// 让表随历史用户数增长。
+func (s *Services) forgetUserStatusGen(userID uint) {
+	s.statusGenMu.Lock()
+	delete(s.statusGens, userID)
+	s.statusGenMu.Unlock()
+}
+
+// sweepStatusGensLocked 回收代次表。调用方必须持有 statusGenMu。
+//
+// 先按保留期清，仍超上限就按遍历顺序删到一半：这里不排序（10 万条排序
+// 在锁内会把所有登录/管理操作拖出长尾），遍历顺序本身是伪随机的。
+// 极端情况下丢掉一条仍在进行中的断流的判据，代价是它可能多关几条刚建的
+// 代理；相比内存随历史用户数无限增长，这是更小的故障。
+func (s *Services) sweepStatusGensLocked(now time.Time) {
+	cutoff := now.Add(-statusGenTTL)
+	for id, e := range s.statusGens {
+		if e.at.Before(cutoff) {
+			delete(s.statusGens, id)
+		}
+	}
+	if len(s.statusGens) <= statusGenMaxEntries {
+		return
+	}
+	target := statusGenMaxEntries / 2
+	for id := range s.statusGens {
+		if len(s.statusGens) <= target {
+			break
+		}
+		delete(s.statusGens, id)
+	}
 }
 
 // AdminSetUserStatus 禁用/启用/封禁用户。

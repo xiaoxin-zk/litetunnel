@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -303,19 +304,28 @@ func (s *stagedFile) commit() error {
 		s.backup = backup
 	}
 	if err := os.Rename(s.tmp, s.path); err != nil {
-		// 替换失败：把旧文件放回原位。
-		s.restore()
+		// 替换失败：把旧文件放回原位。恢复也失败时，磁盘上连旧文件都没了，
+		// 必须把这个更糟的情况一并报出去，而不是只报「替换失败」。
+		if rerr := s.restore(); rerr != nil {
+			return fmt.Errorf("替换失败（%v），且恢复旧文件也失败: %w", err, rerr)
+		}
 		return err
 	}
 	return nil
 }
 
-// restore 回滚：把备份的旧文件放回原位。
-func (s *stagedFile) restore() {
-	if s.backup != "" {
-		_ = os.Rename(s.backup, s.path)
-		s.backup = ""
+// restore 回滚：把备份的旧文件放回原位。返回错误表示恢复失败——这时磁盘上
+// 可能既没有新文件也没有旧文件（或仍留着新文件），调用方必须如实上报，
+// 而不是把它当成「已经回滚好了」。
+func (s *stagedFile) restore() error {
+	if s.backup == "" {
+		return nil
 	}
+	if err := os.Rename(s.backup, s.path); err != nil {
+		return err
+	}
+	s.backup = ""
+	return nil
 }
 
 // cleanupBackup 删除备份文件。全部替换成功后在 writeBatch.commit 里调用。
@@ -364,6 +374,54 @@ func writeFileAtomic(path, content string, mode os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+// cleanupLeftovers 启动时清理上次异常退出留下的临时/备份文件。
+//
+// 两类文件处理方式不同：
+//
+//   - .lt-config-tmp-* 是尚未提交的候选内容，谁都没引用，直接删；
+//   - *.lt-config-bak 是提交时给旧文件做的备份：目标文件还在（说明新文件已
+//     落位、备份是旧的）就删掉；目标文件缺失（崩溃发生在「旧文件改名成备份、
+//     新文件还没落位」之间）就把备份恢复回原位——否则活动配置就凭空消失了。
+//
+// 必须在 validateConfig 之前调用：崩溃可能把 .env 也留成「缺失 + 备份」的
+// 状态，不先恢复的话启动校验会直接报「缺少 .env」。
+func cleanupLeftovers(p paths) {
+	seen := map[string]bool{}
+	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {
+		dir := filepath.Dir(f)
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			switch {
+			case strings.HasPrefix(name, ".lt-config-tmp-"):
+				if rerr := os.Remove(filepath.Join(dir, name)); rerr != nil {
+					log.Printf("[lt-config] 清理遗留临时文件失败（%s）: %v", name, rerr)
+				}
+			case strings.HasSuffix(name, ".lt-config-bak"):
+				bak := filepath.Join(dir, name)
+				target := strings.TrimSuffix(bak, ".lt-config-bak")
+				if _, serr := os.Stat(target); os.IsNotExist(serr) {
+					if rerr := os.Rename(bak, target); rerr != nil {
+						log.Printf("[lt-config] 恢复遗留备份失败（%s）: %v", name, rerr)
+					} else {
+						log.Printf("[lt-config] 已恢复遗留备份：%s → %s", name, target)
+					}
+				} else {
+					_ = os.Remove(bak)
+				}
+			}
+		}
+	}
 }
 
 // sortedKeys 返回有序键名，便于输出稳定的日志与结果。

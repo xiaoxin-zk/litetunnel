@@ -93,6 +93,9 @@ func main() {
 	flag.Parse()
 
 	p := newPaths(*deployDir, *envFile, *composeFile, *caddyTpl, *caddyOut, *frpsTpl, *frpsOut, *caddyData)
+	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
+	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。
+	cleanupLeftovers(p)
 	if err := validateConfig(*addr, *token, p); err != nil {
 		log.Fatalf("[lt-config] %v", err)
 	}

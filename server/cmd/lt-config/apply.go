@@ -304,10 +304,14 @@ func (b *writeBatch) commit() error {
 	for i := range b.staged {
 		st := b.staged[i]
 		if err := st.commit(); err != nil {
-			// 当前文件替换失败（它已自行恢复），回滚前面已成功替换的文件，
-			// 丢弃尚未替换的临时文件。
-			b.rollbackCommitted()
+			// 当前文件替换失败（它已尽量自行恢复），回滚前面已成功替换的文件，
+			// 丢弃尚未替换的临时文件。回滚本身也失败时，磁盘可能处于新旧混合
+			// 状态，必须如实上报，而不是只报「替换失败」。
+			rbErr := b.rollbackCommitted()
 			b.discardFrom(i)
+			if rbErr != nil {
+				return fmt.Errorf("替换 %s 失败，且回滚未完成（磁盘可能处于新旧混合状态）: %v；回滚错误: %w", st.name, err, rbErr)
+			}
 			return fmt.Errorf("替换 %s 失败，已回滚（磁盘仍为旧配置）: %w", st.name, err)
 		}
 		b.done++
@@ -319,11 +323,19 @@ func (b *writeBatch) commit() error {
 	return nil
 }
 
-// rollbackCommitted 把已成功替换的文件恢复到备份的旧内容。
-func (b *writeBatch) rollbackCommitted() {
+// rollbackCommitted 把已成功替换的文件恢复到备份的旧内容，返回恢复过程中
+// 收集到的所有错误（nil 表示全部恢复成功）。
+func (b *writeBatch) rollbackCommitted() error {
+	var failures []string
 	for i := 0; i < b.done; i++ {
-		b.staged[i].restore()
+		if err := b.staged[i].restore(); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", b.staged[i].name, err))
+		}
 	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // discard 放弃整批候选内容。

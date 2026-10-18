@@ -164,21 +164,29 @@ done
 check_vhost_port() {
   local name="$1" port="$2" other="$3"
   [[ -z "${port}" ]] && return 0
-  if ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
-    echo "${name}=${port} 不是 1-65535 之间的端口号。" >&2
+  if ! [[ "${port}" =~ ^[0-9]+$ ]]; then
+    echo "${name}=${port} 不是十进制端口号。" >&2
     exit 1
   fi
-  # 所有实际会监听的本机端口：与其中任何一个相同都会在启动时抢占失败。
+  local port_num=$((10#${port}))
+  if (( port_num < 1 || port_num > 65535 )); then
+    echo "${name}=${port} 不在 1-65535 范围内。" >&2
+    exit 1
+  fi
+  # 所有实际会监听的本机端口：统一转为十进制整数比较。
   local reserved=(80 443 "${VARS[LT_GATEWAY_PORT]}" "${VARS[LT_KCP_PORT]}"
     "${VARS[LT_USER_PORT]}" "${VARS[LT_FRPS_API_PORT]}" "${other}")
-  local p
+  local p p_num
   for p in "${reserved[@]}"; do
-    if [[ -n "${p}" && "${p}" == "${port}" ]]; then
-      echo "${name}=${port} 与另一个监听端口冲突，请换一个端口。" >&2
-      exit 1
+    if [[ -n "${p}" && "${p}" =~ ^[0-9]+$ ]]; then
+      p_num=$((10#${p}))
+      if (( p_num == port_num )); then
+        echo "${name}=${port} 与另一个监听端口冲突，请换一个端口。" >&2
+        exit 1
+      fi
     fi
   done
-  if (( port >= ${VARS[LT_PORT_RANGE_START]:-0} && port <= ${VARS[LT_PORT_RANGE_END]:-0} )); then
+  if (( port_num >= ${VARS[LT_PORT_RANGE_START]:-0} && port_num <= ${VARS[LT_PORT_RANGE_END]:-0} )); then
     echo "${name}=${port} 落在隧道端口池 ${VARS[LT_PORT_RANGE_START]}-${VARS[LT_PORT_RANGE_END]} 内，请换一个池外端口。" >&2
     exit 1
   fi

@@ -38,7 +38,7 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 
 	env, vars, err := readEnvFile(s.paths.envFile)
 	if err != nil {
-		return res, fmt.Errorf("读取 %s 失败: %w", s.paths.envFile, err)
+		return res, internalError(fmt.Errorf("读取 %s 失败: %w", s.paths.envFile, err))
 	}
 
 	// 1) 合并面板覆盖值。白名单之外的键一律拒绝，而不是静默忽略：
@@ -90,11 +90,11 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	// 4) 渲染
 	caddyTpl, err := os.ReadFile(s.paths.caddyTpl)
 	if err != nil {
-		return res, fmt.Errorf("读取 Caddyfile 模板失败: %w", err)
+		return res, internalError(fmt.Errorf("读取 Caddyfile 模板失败: %w", err))
 	}
 	frpsTpl, err := os.ReadFile(s.paths.frpsTpl)
 	if err != nil {
-		return res, fmt.Errorf("读取 frps.toml 模板失败: %w", err)
+		return res, internalError(fmt.Errorf("读取 frps.toml 模板失败: %w", err))
 	}
 	caddyText, err := tlscfg.Render(string(caddyTpl), vars)
 	if err != nil {
@@ -159,11 +159,11 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	// 9) 两阶段提交：候选内容全部就绪后才逐个替换。
 	batch, err := prepareWrites(writes)
 	if err != nil {
-		return res, err
+		return res, internalError(err)
 	}
 	res.Warnings = append(res.Warnings, batch.warn...)
 	if err := batch.commit(); err != nil {
-		return res, err
+		return res, internalError(err)
 	}
 	res.Changed = sortedChanged(batch.changed)
 

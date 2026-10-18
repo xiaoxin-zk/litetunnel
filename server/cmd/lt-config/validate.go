@@ -165,6 +165,9 @@ func (s *service) validateCaddy(ctx context.Context, text, image string, vars ma
 
 	out, err := runDocker(ctx, args...)
 	if err != nil {
+		if isHostDockerError(err) {
+			return out, hostError(fmt.Errorf("校验 Caddy 配置时 Docker 不可用：%s", strings.TrimSpace(out)))
+		}
 		return out, fmt.Errorf("Caddy 配置校验未通过：%s", strings.TrimSpace(out))
 	}
 	return "Caddy：" + strings.TrimSpace(out), nil
@@ -217,6 +220,9 @@ func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, 
 	}
 	out, err := runDocker(ctx, args...)
 	if err != nil {
+		if isHostDockerError(err) {
+			return out, hostError(fmt.Errorf("校验 frps 配置时 Docker 不可用：%s", strings.TrimSpace(out)))
+		}
 		return out, fmt.Errorf("frps 配置校验未通过：%s（若所用镜像不带 verify 子命令，可用 LT_CFG_VALIDATE_FRPS=false 关闭该校验）",
 			strings.TrimSpace(out))
 	}

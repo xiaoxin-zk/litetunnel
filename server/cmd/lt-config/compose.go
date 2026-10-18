@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -46,9 +47,9 @@ func (s *service) composeUp(ctx context.Context) (string, error) {
 	text := strings.TrimSpace(string(out))
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return text, fmt.Errorf("重建容器超时（%s）：%s", dockerTimeout, text)
+			return text, hostError(fmt.Errorf("重建容器超时（%s）：%s", dockerTimeout, text))
 		}
-		return text, fmt.Errorf("重建容器失败: %v\n%s", err, text)
+		return text, hostError(fmt.Errorf("重建容器失败: %v\n%s", err, text))
 	}
 	return text, nil
 }
@@ -58,10 +59,27 @@ func runDocker(ctx context.Context, args ...string) (string, error) {
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return text, fmt.Errorf("docker 调用超时")
+		if ctx.Err() != nil {
+			// 保留 context 错误，让调用方能用 errors.Is 判断超时/取消——
+			// 这两者都意味着「宿主机动不了」，该按 502 处理。
+			return text, fmt.Errorf("docker 调用中断: %w", ctx.Err())
 		}
 		return text, err
 	}
 	return text, nil
+}
+
+// isHostDockerError 判断一次 docker 调用失败是「宿主机动不了」（docker 命令
+// 不存在/不可执行、调用超时或被取消），还是「命令执行了但没通过」（例如
+// caddy 拒绝了这份配置）。前者按 502 处理，后者是配置问题按 422 处理。
+func isHostDockerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ee *exec.Error
+	if errors.As(err, &ee) {
+		// 命令都没能启动：docker 二进制不存在或不可执行。
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }

@@ -82,10 +82,17 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.renderAndApply(r.Context(), req)
 	if err != nil {
-		// 校验失败属于「配置本身不对」，用 422 与「helper 挂了」（502）区分开，
-		// 界面据此决定是提示管理员改配置还是去查服务。
-		// 返回前先脱敏：校验输出里可能带回服务商插件打印的凭据片段。
-		failJSON(w, http.StatusUnprocessableEntity, errors.New(redactSecret(req.Vars[tlscfg.VarDNSCredential], err.Error())))
+		// 按错误类别区分状态码：配置错 422（原地改配置）、宿主机错 502（去查
+		// docker）、读盘/写盘错 500（看本服务日志）。返回前先脱敏：校验输出里
+		// 可能带回服务商插件打印的凭据片段。
+		code := http.StatusUnprocessableEntity
+		switch classifyError(err) {
+		case kindHost:
+			code = http.StatusBadGateway
+		case kindInternal:
+			code = http.StatusInternalServerError
+		}
+		failJSON(w, code, errors.New(redactSecret(req.Vars[tlscfg.VarDNSCredential], err.Error())))
 		return
 	}
 	res.Validate = redactSecret(req.Vars[tlscfg.VarDNSCredential], res.Validate)

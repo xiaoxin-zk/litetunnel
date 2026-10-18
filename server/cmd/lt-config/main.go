@@ -294,7 +294,14 @@ type service struct {
 	// 会把它们覆盖掉，所以整个进程拒绝写操作——宁可让管理员手动处理一次，
 	// 也不能让一次自动应用把还能修的现场变成无迹可寻。
 	blockedDirs []string
-	blockedMu    sync.RWMutex
+	blockedMu   sync.RWMutex
+
+	// dockerProbe 缓存 /health 的 docker 可用性探测结果（见 dockerStatus）。
+	// 放在 service 上而不是包级变量：测试要能各自独立地拿到一份空缓存。
+	dockerProbe dockerProbeCache
+	// dockerProbeFn 是探测的替身钩子，正式运行时为 nil（走真实的 docker info）。
+	// 测试环境里没有 docker，而「命令在 ≠ 宿主可用」这条判定必须能被覆盖。
+	dockerProbeFn func() dockerProbeResult
 }
 
 // blockedDirsSnapshot 返回阻断目录的副本，供 health 响应使用。

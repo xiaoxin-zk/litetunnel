@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -140,7 +141,7 @@ func CORSDevOnly(isProd bool) gin.HandlerFunc {
 type bucket struct {
 	tokens   float64
 	lastSeen time.Time
-	// elem 是桶在 LRU 链表中的位置，用于容量满时定位最久未用的桶。
+	// elem 是桶在所属分片 LRU 链表中的位置，用于容量满时定位最久未用的桶。
 	elem *list.Element
 }
 
@@ -160,8 +161,28 @@ const maxBuckets = 50000
 // 由上层注入，使限流阈值可以在管理端热调整而无需重启。
 type RateSource func() (rate, capacity float64)
 
-// RateLimiter 基于令牌桶的内存限流器，按 IP + 分组键隔离。
-type RateLimiter struct {
+// limiterShardCount 是单个限流器的分片数，必须是 2 的幂。
+//
+// # 为什么要分片
+//
+// 单个互斥锁保护的桶表在并发下会把「限流」变成「排队」：同一时刻只有
+// 一个请求能摸到桶表，其余全部阻塞。而限流器是**每个请求都要过**的
+// 中间件，它的临界区长度直接乘在整站吞吐上。分片后每个键固定落在一个
+// 分片上，不同分片之间不再互斥，锁竞争降到 1/N。
+//
+// 取 16 是因为它已经能把竞争压到很低，同时分片本身的固定开销（每片一个
+// map 与一条链表）仍然可以忽略；再往上加收益递减，而「每片容量」会变得
+// 太小，导致正常来源被过早淘汰。
+const limiterShardCount = 16
+
+// rateShard 是限流器的一个分片：自带锁、桶表与 LRU 链表。
+//
+// 分片之后淘汰变成「片内 LRU」而不是全局 LRU。这是分片必然的取舍：
+// 要全局 LRU 就得维护一张全局链表，那把锁又回来了。实际影响很小——
+// 容量上限依然按全局生效（各片容量之和等于 maxSize），只是被淘汰的
+// 是「本片最久未用」的桶，而不是全表最久未用的桶。对限流来说，谁是
+// 最久未用并不重要，重要的是「活跃来源不被挤掉、总量不失控」。
+type rateShard struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	// lru 按「最近使用」排序，Front 是最久未用的桶。
@@ -172,13 +193,38 @@ type RateLimiter struct {
 	lru     *list.List
 	maxSize int
 
-	evicted  uint64    // 累计淘汰数，用于告警
-	lastWarn time.Time // 上次告警时间，避免日志被洪水放大
-
 	// lastGC 是上一次清理空闲桶的时刻。清理写在请求路径上（见 allow），
 	// 不再单独起 gc 协程：那个协程没有关闭入口，每个限流器实例都会留下
 	// 一个永不退出的 goroutine（路由每重建一次就多一个，测试里尤其明显）。
 	lastGC time.Time
+}
+
+func newRateShard(maxSize int) *rateShard {
+	return &rateShard{
+		buckets: make(map[string]*bucket),
+		lru:     list.New(),
+		maxSize: maxSize,
+		lastGC:  time.Now(),
+	}
+}
+
+// RateLimiter 基于令牌桶的内存限流器，按 IP + 分组键隔离。
+//
+// 桶表按 hash(key) 拆成 limiterShardCount 个分片，各分片独立加锁：
+// 热点键只会争它自己那一片，不会把整站请求串行化。
+type RateLimiter struct {
+	shards []*rateShard
+	// mask 是分片下标掩码（shards 数量为 2 的幂），用位与代替取模。
+	mask    uint64
+	maxSize int
+
+	// evicted 是累计淘汰数，用于告警。分片各自淘汰，计数汇总在父对象上，
+	// 用原子变量避免为了一个统计数字再把各分片的锁串起来。
+	evicted atomic.Uint64
+	// warnMu/lastWarn 是告警限频。只有发生淘汰（即容量打满）时才会走到，
+	// 不在请求热路径上。
+	warnMu   sync.Mutex
+	lastWarn time.Time
 
 	rate     float64 // 每秒补充令牌数
 	capacity float64
@@ -188,7 +234,7 @@ type RateLimiter struct {
 
 // NewRateLimiter 创建限流器：每秒补充 rate 个令牌，桶容量 capacity。
 func NewRateLimiter(rate, capacity float64) *RateLimiter {
-	return newRateLimiter(maxBuckets, nil, rate, capacity)
+	return newShardedRateLimiter(limiterShardCount, maxBuckets, nil, rate, capacity)
 }
 
 // NewDynamicRateLimiter 创建阈值可热调整的限流器。
@@ -197,24 +243,63 @@ func NewRateLimiter(rate, capacity float64) *RateLimiter {
 // 攻击者只要设法让管理员改一次配置，就能顺带重置自己的配额。
 // 这里保持桶本身不变，仅在补充令牌时采用最新速率。
 func NewDynamicRateLimiter(source RateSource) *RateLimiter {
-	return newRateLimiter(maxBuckets, source, 0, 0)
+	return newShardedRateLimiter(limiterShardCount, maxBuckets, source, 0, 0)
 }
 
-func newRateLimiter(maxSize int, source RateSource, rate, capacity float64) *RateLimiter {
+// newShardedRateLimiter 按指定分片数创建限流器。
+//
+// 分片数只影响锁的分散程度与淘汰粒度，不改变总容量：各分片的 maxSize
+// 之和**恰好**等于 maxSize（余数分给前几个分片），因此内存上界与分片前
+// 完全一致。maxSize 小于分片数时自动减少分片数，避免出现容量为 0 的
+// 分片——那种分片里新桶刚插入就被淘汰，等于该片上的键完全不受限流。
+func newShardedRateLimiter(shards, maxSize int, source RateSource, rate, capacity float64) *RateLimiter {
 	if maxSize <= 0 {
 		maxSize = maxBuckets
 	}
+	if shards < 1 {
+		shards = 1
+	}
+	// 向下取到 2 的幂，保证可以用位与求下标。
+	for shards&(shards-1) != 0 {
+		shards &= shards - 1
+	}
+	// 每片至少要有一个桶的容量，否则该片上的限流会失效（见上面的说明）。
+	for shards > 1 && maxSize/shards == 0 {
+		shards >>= 1
+	}
+
+	base, rem := maxSize/shards, maxSize%shards
 	rl := &RateLimiter{
-		buckets:  make(map[string]*bucket),
-		lru:      list.New(),
+		shards:   make([]*rateShard, shards),
+		mask:     uint64(shards - 1),
 		maxSize:  maxSize,
 		rate:     rate,
 		capacity: capacity,
 		source:   source,
-		lastGC:   time.Now(),
+	}
+	for i := range rl.shards {
+		size := base
+		if i < rem {
+			size++
+		}
+		rl.shards[i] = newRateShard(size)
 	}
 	registerRateLimiter(rl)
 	return rl
+}
+
+// shardFor 返回键所属的分片。
+//
+// 用内联的 FNV-1a 而不是 maphash：maphash 每个限流器实例都要持有种子、
+// 每次调用要构造 Hash 对象，在「每个请求都要算一次」的热路径上不划算；
+// FNV-1a 无分配，对短键（scope|ip）分布也足够均匀。
+func (rl *RateLimiter) shardFor(key string) *rateShard {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return rl.shards[h&rl.mask]
 }
 
 // limiterRegistry 记录进程内创建的限流器，供维护任务统一清扫空闲桶。
@@ -277,24 +362,29 @@ func (rl *RateLimiter) limits() (rate, capacity float64) {
 	return rate, capacity
 }
 
-// dropIdle 清理超过 cutoff 未活动的桶。
+// dropIdle 清理所有分片中超过 cutoff 未活动的桶。
+//
+// 逐片加锁而不是同时持有全部锁：扫描过程中新桶仍可写入其它分片，
+// 清理只是「顺手回收」，不需要把整个限流器停住。
 func (rl *RateLimiter) dropIdle(cutoff time.Time) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	rl.dropIdleLocked(cutoff)
+	for _, sh := range rl.shards {
+		sh.mu.Lock()
+		sh.dropIdleLocked(cutoff)
+		sh.mu.Unlock()
+	}
 }
 
-// dropIdleLocked 是 dropIdle 的主体。调用方必须持有 rl.mu。
+// dropIdleLocked 是 dropIdle 的主体。调用方必须持有 sh.mu。
 //
 // 摘链与删表必须成对：只删 map 不摘链，链表会残留已不存在的键，
 // 容量满时淘汰到的是一个空壳——表现为「桶数没到上限却一直在淘汰」。
-func (rl *RateLimiter) dropIdleLocked(cutoff time.Time) {
-	for k, b := range rl.buckets {
+func (sh *rateShard) dropIdleLocked(cutoff time.Time) {
+	for k, b := range sh.buckets {
 		if b.lastSeen.Before(cutoff) {
 			if b.elem != nil {
-				rl.lru.Remove(b.elem)
+				sh.lru.Remove(b.elem)
 			}
-			delete(rl.buckets, k)
+			delete(sh.buckets, k)
 		}
 	}
 }
@@ -314,23 +404,32 @@ func (rl *RateLimiter) Allow(key string) bool {
 func (rl *RateLimiter) allow(key string) (allowed bool, warn string) {
 	rate, capacity := rl.limits()
 
-	now := time.Now()
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	sh := rl.shardFor(key)
+	allowed, evicted := sh.allow(key, time.Now(), rate, capacity)
+	if evicted == 0 {
+		return allowed, ""
+	}
+	return allowed, rl.warnMessage(rl.evicted.Add(evicted))
+}
+
+// allow 在分片内做一次令牌判定，返回「是否放行」与本轮淘汰的桶数。
+func (sh *rateShard) allow(key string, now time.Time, rate, capacity float64) (allowed bool, evicted uint64) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	// 空闲桶清理写在请求路径上：限流器只服务于流量，没有请求时也不会
 	// 产生新桶，本来就没有需要回收的东西。间隔判定保证它不会每个请求都扫。
-	if now.Sub(rl.lastGC) >= rateLimiterGCInterval {
-		rl.lastGC = now
-		rl.dropIdleLocked(now.Add(-rateLimiterIdleTTL))
+	if now.Sub(sh.lastGC) >= rateLimiterGCInterval {
+		sh.lastGC = now
+		sh.dropIdleLocked(now.Add(-rateLimiterIdleTTL))
 	}
 
-	b, ok := rl.buckets[key]
+	b, ok := sh.buckets[key]
 	if !ok {
 		b = &bucket{tokens: capacity - 1, lastSeen: now}
-		b.elem = rl.lru.PushBack(key)
-		rl.buckets[key] = b
-		return true, rl.evictLocked()
+		b.elem = sh.lru.PushBack(key)
+		sh.buckets[key] = b
+		return true, sh.evictLocked()
 	}
 	elapsed := now.Sub(b.lastSeen).Seconds()
 	b.tokens = min(capacity, b.tokens+elapsed*rate)
@@ -339,16 +438,16 @@ func (rl *RateLimiter) allow(key string) (allowed bool, warn string) {
 	// （目前没有这种路径）。真出现时也只是一次位置更新被跳过，
 	// 而不是在这里 panic —— 限流器 panic 等于每个请求都 500。
 	if b.elem != nil {
-		rl.lru.MoveToBack(b.elem)
+		sh.lru.MoveToBack(b.elem)
 	}
 	if b.tokens < 1 {
-		return false, ""
+		return false, 0
 	}
 	b.tokens--
-	return true, ""
+	return true, 0
 }
 
-// evictLocked 在超出容量上限时淘汰最久未用的桶，返回需要打印的告警（无则空串）。
+// evictLocked 在超出本分片容量上限时淘汰最久未用的桶，返回淘汰个数。
 //
 // # 为什么淘汰最久未用的，而不是像 LoginGuard 那样整表清空
 //
@@ -356,26 +455,35 @@ func (rl *RateLimiter) allow(key string) (allowed bool, warn string) {
 // 而触发清空的恰恰是攻击流量——也就是在攻击者最需要额度的时候把闸门打开。
 // 只淘汰最久未用的，活跃来源的配额不受影响；被淘汰的那部分来源会重新开始
 // 计数，这是容量受限下必然要付出的代价，但不会变成一次集体放行。
-func (rl *RateLimiter) evictLocked() string {
-	for len(rl.buckets) > rl.maxSize {
-		oldest := rl.lru.Front()
+func (sh *rateShard) evictLocked() uint64 {
+	var evicted uint64
+	for len(sh.buckets) > sh.maxSize {
+		oldest := sh.lru.Front()
 		if oldest == nil {
 			break
 		}
 		key, _ := oldest.Value.(string)
-		rl.lru.Remove(oldest)
-		delete(rl.buckets, key)
-		rl.evicted++
+		sh.lru.Remove(oldest)
+		delete(sh.buckets, key)
+		evicted++
 	}
-	// 限频告警：淘汰一开始就意味着「有大量分散来源」，
-	// 但洪水期间每次插入都会触发，不加限频日志本身会成为放大器。
-	if rl.evicted == 0 || time.Since(rl.lastWarn) < time.Minute {
+	return evicted
+}
+
+// warnMessage 生成淘汰告警并做限频，返回空串表示本次不告警。
+//
+// 限频的意义：淘汰一开始就意味着「有大量分散来源」，但洪水期间每次插入
+// 都会触发，不加限频日志本身会成为放大器。
+func (rl *RateLimiter) warnMessage(evicted uint64) string {
+	rl.warnMu.Lock()
+	defer rl.warnMu.Unlock()
+	if evicted == 0 || time.Since(rl.lastWarn) < time.Minute {
 		return ""
 	}
 	rl.lastWarn = time.Now()
 	return fmt.Sprintf(
-		"[limit] 令牌桶已达上限 %d，累计淘汰 %d 个最久未用的桶：可能存在大量分散来源的请求，建议在入口反代再加一层限流",
-		rl.maxSize, rl.evicted)
+		"[limit] 令牌桶已达上限 %d（分片 %d 个），累计淘汰 %d 个最久未用的桶：可能存在大量分散来源的请求，建议在入口反代再加一层限流",
+		rl.maxSize, len(rl.shards), evicted)
 }
 
 // Limit 返回限流中间件。

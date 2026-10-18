@@ -212,6 +212,22 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	// （写文件、起停、记失败）仍然只发生在主协程的这段循环里，
 	// 并发只存在于网络请求。
 	applyCfg := func(t TunnelVO, cfgText, servedRev string, cfgErr error) {
+		// 截止时间已经过了：这一条完全不碰。
+		//
+		// 必须放在最前面，包括「取到配置之后」这条路径：配置正文是在截止
+		// 之前就取到的，处理它时可能已经超时。若照旧落盘并拉起进程，用户
+		// 会同时看到「本轮同步超时」和一条实际已经连上的隧道——两端说法
+		// 互相矛盾；更糟的是下一轮同步会把这条已在跑的进程当成「已运行」
+		// 跳过，错误提示会一直挂着，却再没有人去纠正它。
+		//
+		// 之所以不杀本轮早期已经起来的进程：那是截止之前完成的有效工作，
+		// 为了一个时间点去杀它只会让已经连上的连接抖一下。
+		//
+		// 这一条**不记失败**：它没做错任何事，只是没轮到。游标与续传位置
+		// 由下面的 dispatched / fetchPos 决定，下一轮会优先重试它。
+		if ctx.Err() != nil {
+			return
+		}
 		if cfgErr != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
@@ -255,7 +271,13 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 
 		switch {
 		case !a.mgr.Running(t.ID):
-			if err := a.writeAndStart(t, cfgText); err != nil {
+			if err := a.writeAndStart(ctx, t, cfgText); err != nil {
+				// 截止时间是 writeAndStart 里最后一道闸：它可能是刚过期的
+				// （上面那次检查之后又走了一段）。这里同样不能记成启动失败
+				// ——隧道什么都没做错，下一轮会优先重试。
+				if errors.Is(err, errSyncDeadline) {
+					return
+				}
 				failStart(t, "启动失败："+err.Error())
 				return
 			}
@@ -263,6 +285,11 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 			// 进程秒退时退出回调可能已经登记了新退避，这一下会把它抹掉。
 			changed = true
 		case cfgChanged:
+			// 停旧进程之前再确认一次预算：停了却因超时不再拉起，
+			// 等于把一条本来能用的连接停在那里——比什么都不做更糟。
+			if ctx.Err() != nil {
+				return
+			}
 			// 只重启这一条：其他隧道的连接不受影响。
 			a.emitTunnelLog(t.Name, "配置有变化（"+diffHint(prev, cfgText)+"），正在重连")
 			if err := a.mgr.Stop(t.ID); err != nil {
@@ -271,7 +298,10 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 				failStart(t, "重连失败：停止旧进程失败："+err.Error())
 				return
 			}
-			if err := a.writeAndStart(t, cfgText); err != nil {
+			if err := a.writeAndStart(ctx, t, cfgText); err != nil {
+				if errors.Is(err, errSyncDeadline) {
+					return
+				}
 				failStart(t, "重连失败："+err.Error())
 				return
 			}

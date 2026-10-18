@@ -224,6 +224,17 @@ func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 	return batch, a.logEpoch
 }
 
+// currentLogEpoch 返回当前日志代次。
+//
+// 单独抽出来是为了把「怎么加锁」收在一处：GetState 已经持着 a.mu，
+// 不能在那里直接读 a.logEpoch（那是 logMu 的职责，混着读会形成
+// mu → logMu 的锁序）。这个方法的调用方必须**不持** a.mu。
+func (a *App) currentLogEpoch() uint64 {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	return a.logEpoch
+}
+
 // logBatchEvent 是推送给前端的日志批次。
 //
 // epoch 用来丢弃「清空之前发出、清空之后才到」的旧批次；

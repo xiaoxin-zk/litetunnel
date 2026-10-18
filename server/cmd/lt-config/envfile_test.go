@@ -19,18 +19,18 @@ import (
 func TestEnvValueEscapingRoundTrip(t *testing.T) {
 	values := []string{
 		"plain-token",
-		"tok$en",                 // 裸 $：会被 Compose 当变量引用
-		"a${LT_CADDY_IMAGE}b",    // 带花括号的完整引用
-		"$NAME",                  // 整段都是引用
-		"pass word",              // 空白：未加引号会被两端去空白
-		"a#b",                    // #：可能被解析成行内注释
-		"a # b",                  // 带空白的 #：注释起点
-		`he said "hi"`,           // 双引号：破坏引号结构
-		`back\slash`,             // 反斜杠：双引号内是转义符
-		"it's",                   // 单引号：破坏引号结构
-		"中文$值",                  // 多字节字符与 $ 混排
-		"line$$dollar",           // 输入里就有 $$
-		"a\tb",                   // 制表符：同样破坏一行一个值
+		"tok$en",              // 裸 $：会被 Compose 当变量引用
+		"a${LT_CADDY_IMAGE}b", // 带花括号的完整引用
+		"$NAME",               // 整段都是引用
+		"pass word",           // 空白：未加引号会被两端去空白
+		"a#b",                 // #：可能被解析成行内注释
+		"a # b",               // 带空白的 #：注释起点
+		`he said "hi"`,        // 双引号：破坏引号结构
+		`back\slash`,          // 反斜杠：双引号内是转义符
+		"it's",                // 单引号：破坏引号结构
+		"中文$值",                // 多字节字符与 $ 混排
+		"line$$dollar",        // 输入里就有 $$
+		"a\tb",                // 制表符：同样破坏一行一个值
 	}
 	for _, v := range values {
 		encoded := encodeEnvValue(v)

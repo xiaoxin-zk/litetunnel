@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -258,6 +261,103 @@ func TestStreamTunnelConfigsStopsOnCanceledContext(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("取消后不应流出任何结果，实际 %d 条", count)
+	}
+}
+
+// TestWriteAndStartSkipsWorkAfterDeadline 覆盖「超时之后仍写配置并拉起进程」。
+//
+// 本轮同步已经报超时，而某条隧道的配置正文是在超时之前取到的、之后才轮到
+// 处理。照旧落盘并启动的话，界面上写着「本轮同步超时」，实际进程已经起来了
+// ——两端说法互相矛盾；更糟的是下一轮同步会把这条已在跑的进程当作「已运行」
+// 跳过，那条错误提示就一直挂着，再没有人去纠正它。
+//
+// 断言三件事：不落盘、不启动、返回的是哨兵错误（调用方据此区分「没轮到」
+// 与「启动失败」——后者会推进退避，前者不会）。
+func TestWriteAndStartSkipsWorkAfterDeadline(t *testing.T) {
+	dir := withTempConfigDir(t)
+
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// 先让它处于退避中：超时路径连退避都不该动（既不推进、也不清掉）。
+	for i := 0; i < 3; i++ {
+		a.noteStartFailure(1, "mc", "启动失败")
+	}
+
+	tun := TunnelVO{
+		ID: 1, Name: "mc", Type: "tcp", Status: tunnelStatusActive,
+		LocalIP: "127.0.0.1", LocalPort: 25565,
+	}
+	err := a.writeAndStart(ctx, tun, "serverAddr = \"127.0.0.1\"\n")
+
+	if !errors.Is(err, errSyncDeadline) {
+		t.Fatalf("超时后应返回 errSyncDeadline（调用方据此不记失败），实际 %v", err)
+	}
+	if a.mgr.Running(1) {
+		t.Fatal("超时后不得拉起进程：界面会同时显示「同步超时」和一条已连上的隧道")
+	}
+	// 连目录都不该建：frpcConfigPath 有「顺手建目录」的副作用，
+	// 所以第一道闸必须在它前面，否则超时之后仍会在磁盘上留下空目录。
+	if _, statErr := os.Stat(filepath.Join(dir, "tunnels", "1", "frpc.toml")); statErr == nil {
+		t.Fatal("超时后不得落盘配置：那一份配置既没被应用也没被记账")
+	}
+	// 退避原封不动：说明根本没走到「启动前清退避」那一步。
+	if got := a.retries[1].attempts; got != 3 {
+		t.Fatalf("退避计数 = %d，期望仍是 3：超时路径不该改动退避状态", got)
+	}
+}
+
+// TestApplySyncDeadlineDoesNotCountTunnelAsFailed 覆盖「超时被当成隧道失败」。
+//
+// 配置接口全部挂住时，本轮应只报「超时」这一条。若把截止时间跳过的隧道也
+// 记进 failures，日志里会多出一串「启动失败」「拉取配置失败」——那些隧道
+// 什么都没做错，只是没轮到。用户会以为隧道本身有问题，去改配置、重装，
+// 而下一轮它明明自己就好了。
+func TestApplySyncDeadlineDoesNotCountTunnelAsFailed(t *testing.T) {
+	oldTimeout := syncRoundTimeout
+	syncRoundTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { syncRoundTimeout = oldTimeout })
+
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/client/config") {
+			<-release
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var sb strings.Builder
+		sb.WriteString(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[`)
+		for i := 0; i < 8; i++ {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString(`{"id":` + itoa(i+1) + `,"name":"t` + itoa(i+1) + `","type":"tcp","status":"active"}`)
+		}
+		sb.WriteString(`]}}`)
+		_, _ = w.Write([]byte(sb.String()))
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+
+	a := newSyncTestApp(t, srv)
+	_, err := a.syncLocked()
+	if err == nil {
+		t.Fatal("配置接口全部挂住时应收尾报错")
+	}
+	// 错误里只能有「超时」这一条汇总，不能带「N 条隧道同步失败」。
+	if strings.Contains(err.Error(), "隧道同步失败") {
+		t.Fatalf("超时跳过的隧道不是失败，不该计入失败条数：%v", err)
+	}
+	if strings.Contains(err.Error(), "另有") {
+		t.Fatalf("超时路径不应追加失败明细：%v", err)
+	}
+	// 一条都不该进退避：它们没启动过，也就谈不上启动失败。
+	for id, st := range a.retries {
+		if st != nil {
+			t.Fatalf("隧道 %d 因超时被记了退避 %+v：下一轮会被白白推迟", id, st)
+		}
 	}
 }
 

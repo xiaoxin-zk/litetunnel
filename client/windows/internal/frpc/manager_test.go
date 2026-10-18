@@ -533,3 +533,98 @@ func TestStartRejectsMissingConfig(t *testing.T) {
 		t.Fatal("启动失败后不应留下运行记录")
 	}
 }
+
+// TestWaitCallbacksCoversStopAllReturn 覆盖「StopAll 返回后回调必须仍可被等到」。
+//
+// 退出登录要用 WaitCallbacks 把在途的退出回调挡在「清凭据」之前。它能成立
+// 的前提是：callbackWG 的计数在 close(exitCh) **之前**就已登记——否则
+// StopAll（看到 exitCh 关闭就返回）返回的那一刻计数还是零，Wait 立刻返回，
+// 等待点形同虚设，迟到的回调仍会落到已清理的新账号状态上。
+//
+// 断言方式：让回调故意慢一点；StopAll 返回后立刻 WaitCallbacks，必须为真，
+// 且此时回调用到的计数器已经归零（说明确实等到它执行完，而不是空等）。
+func TestWaitCallbacksCoversStopAllReturn(t *testing.T) {
+	m := testManager(t)
+	cfg := testConfig(t)
+	t.Cleanup(func() { _ = m.Close() })
+
+	var (
+		mu     sync.Mutex
+		inExit int
+		landed int
+	)
+	m.SetCallbacks(nil, func(uint, string, error, bool) {
+		mu.Lock()
+		inExit++
+		mu.Unlock()
+		// 故意慢一点：模拟「回调要发 Wails 事件、而界面线程正忙」。
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		inExit--
+		landed++
+		mu.Unlock()
+	})
+
+	if err := m.Start(1, "mc1", cfg); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	if err := m.StopAll(); err != nil {
+		t.Fatalf("停止全部失败: %v", err)
+	}
+
+	// StopAll 只保证进程退出，回调此刻通常还在跑。这里不等它自己结束，
+	// 直接走生产路径：WaitCallbacks 必须把这段尾巴等干净。
+	if !m.WaitCallbacks(5 * time.Second) {
+		t.Fatal("StopAll 返回后必须能等到在途的退出回调，否则登出会先清凭据再被回调改状态")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if landed != 1 {
+		t.Fatalf("退出回调应当恰好执行一次，实际 %d 次", landed)
+	}
+	if inExit != 0 {
+		t.Fatalf("WaitCallbacks 返回时不应还有回调在执行，实际 %d 个", inExit)
+	}
+}
+
+// TestWaitCallbacksReturnsFalseOnTimeout 覆盖「回调卡死也不能把登出卡住」。
+//
+// 等待点必须有上限：回调要发 Wails 事件，界面线程卡住时它可能长时间不返回。
+// 到期必须返回 false 并让调用方继续清理，而不是把「退出登录」挂死。
+func TestWaitCallbacksReturnsFalseOnTimeout(t *testing.T) {
+	m := testManager(t)
+	cfg := testConfig(t)
+	t.Cleanup(func() { _ = m.Close() })
+
+	block := make(chan struct{})
+	exited := make(chan struct{}, 1)
+	m.SetCallbacks(nil, func(uint, string, error, bool) {
+		<-block
+		exited <- struct{}{}
+	})
+
+	if err := m.Start(1, "mc1", cfg); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	if err := m.StopAll(); err != nil {
+		t.Fatalf("停止全部失败: %v", err)
+	}
+
+	start := time.Now()
+	ok := m.WaitCallbacks(100 * time.Millisecond)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatal("回调仍卡着时不该报告「已全部落地」")
+	}
+	// 允许一点调度余量，但不该显著超出上限。
+	if elapsed > 2*time.Second {
+		t.Fatalf("等待必须有上限，实际等了 %s", elapsed.Round(time.Millisecond))
+	}
+	// 放行卡住的回调，让 Close（t.Cleanup 里）能正常收尾。
+	close(block)
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("回调未被放行")
+	}
+}

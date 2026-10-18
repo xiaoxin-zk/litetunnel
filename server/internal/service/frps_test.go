@@ -446,11 +446,20 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 // 禁用流程在放掉用户锁之后才断流（断流可能十几秒）。这段时间里管理员可以把
 // 账号重新启用，客户端随即重连并建立新代理——继续按几秒前那份列表往下关，
 // 关的就是刚放行的人。代次一变，本次断流必须停手。
+//
+// fixture 必须给每条代理一个可判定的实例身份（clientID 或 lastStartAt）：
+// 两者都缺失时实现会按「身份不可判定」跳过关闭（见问题 9），这样构造的用例
+// 连一条代理都不会关，测的就不再是代次守卫了。真实 frps 的管理接口总会带上
+// lastStartAt，所以这里用 lastStartAt 是更贴近现实的构造。
 func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	svc := newTestServices(t, nil)
 	t.Cleanup(svc.Close)
 
 	const userID = 7
+	// 代理的启动时间必须在两次列表调用之间保持不变：实现会用它对齐「同一个
+	// 代理实例」，若每次列表都重新取 time.Now()，跨过一个整秒边界就会对不上，
+	// 用例随机失败。
+	startedAt := time.Now().Add(-time.Minute).Unix()
 	var (
 		mu     sync.Mutex
 		closed []string
@@ -459,9 +468,11 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
-			_, _ = w.Write([]byte(frpsOK(`{"total":2,"page":1,"pageSize":200,"items":[` +
-				`{"name":"lt_u7.mc","status":{"phase":"online"}},` +
-				`{"name":"lt_u7.nas","status":{"phase":"online"}}]}`)))
+			_, _ = w.Write([]byte(frpsOK(fmt.Sprintf(
+				`{"total":2,"page":1,"pageSize":200,"items":[`+
+					`{"name":"lt_u7.mc","status":{"phase":"online","lastStartAt":%d}},`+
+					`{"name":"lt_u7.nas","status":{"phase":"online","lastStartAt":%d}}]}`,
+				startedAt, startedAt))))
 		case r.Method == http.MethodDelete:
 			mu.Lock()
 			closed = append(closed, r.URL.Query().Get("name"))
@@ -492,17 +503,24 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 // 只复查代次是不够的：检查通过到请求真正发出之间，管理端仍可能完成一次
 // 重新启用，那条刚建立的代理照样会被关掉。所以复查与关闭必须在同一把
 // 用户锁内——关的时候别人改不了状态。
+//
+// fixture 带 lastStartAt：双空身份会被判成「身份不可判定」而跳过关闭，
+// 那样 DELETE 根本不会发生，这条用例就测不到锁了。
 func TestCloseUserProxiesHoldsUserLockWhileClosing(t *testing.T) {
 	svc := newTestServices(t, nil)
 	t.Cleanup(svc.Close)
 
 	const userID = 9
+	// 同上：启动时间在整个用例内固定，否则列表快照与复查快照对不上。
+	startedAt := time.Now().Add(-time.Minute).Unix()
 	var lockHeld int32 = 1
 	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
-			_, _ = w.Write([]byte(frpsOK(`{"total":1,"page":1,"pageSize":200,"items":[` +
-				`{"name":"lt_u9.mc","status":{"phase":"online"}}]}`)))
+			_, _ = w.Write([]byte(frpsOK(fmt.Sprintf(
+				`{"total":1,"page":1,"pageSize":200,"items":[`+
+					`{"name":"lt_u9.mc","status":{"phase":"online","lastStartAt":%d}}]}`,
+				startedAt))))
 		case r.Method == http.MethodDelete:
 			lock := svc.userLock(userID)
 			if lock.TryLock() {
@@ -534,6 +552,11 @@ func TestCloseUserProxiesSkipsProxiesStartedAfterDisable(t *testing.T) {
 	t.Cleanup(svc.Close)
 
 	const userID = 11
+	// 两条代理的启动时间在整个用例内固定（而不是每次列表都重取 time.Now()）：
+	// 实现会用 lastStartAt 对齐「还是不是同一个代理实例」，跨过一个整秒边界
+	// 就会对不上而跳过关闭，用例随机失败。取值本身仍保持原语义——
+	// old 早于禁用时刻，new 晚于禁用时刻。
+	now := time.Now().Unix()
 	var (
 		mu     sync.Mutex
 		closed []string
@@ -541,7 +564,6 @@ func TestCloseUserProxiesSkipsProxiesStartedAfterDisable(t *testing.T) {
 	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			now := time.Now().Unix()
 			_, _ = w.Write([]byte(frpsOK(fmt.Sprintf(
 				`{"total":2,"page":1,"pageSize":200,"items":[`+
 					`{"name":"lt_u11.old","status":{"phase":"online","lastStartAt":%d}},`+

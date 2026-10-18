@@ -27,7 +27,10 @@ const state = ref({
   server_url: '',
   server_fixed: false,
   needs_server_url: false,
-  running: false
+  running: false,
+  // 日志代次也要有初值：退出登录时会拿服务端的值来对齐本端，
+  // 缺字段的话第一次比较拿到的是 undefined，判断会落到「无变化」分支上。
+  log_epoch: 0
 })
 const logs = ref([])
 // 主进程推送的轻提示（例如「检测到配置变更，已自动同步并重新连接」）。
@@ -41,11 +44,61 @@ const notice = ref(null)
 // 上一个账号、或日志混入上一账号的行。只在「没有更新的写入发生」时才提交。
 let stateSeq = 0
 
+// wasLoggedIn 记住上一次看到的登录态，用来识别「已登录 → 未登录」这一次跳变。
+//
+// 只看当前的 logged_in 是不够的：退出登录之后前端会立刻收到一份未登录的
+// 状态，而页面上那批日志属于**刚退出的那个账号**；等新账号接入时它就会
+// 出现在新账号的日志区里。登录态由真变假这个瞬间是唯一能可靠判断
+// 「该把日志一起丢掉」的时机。
+let wasLoggedIn = false
+
+// applyState 提交一份新状态，并在登录态由真变假时丢弃本端日志。
+//
+// 所有写入 state 的路径都必须走它（快照、事件、组件回传），否则总有
+// 一条路径能把旧账号的日志带进新账号：例如 MainView 里的 logout 是走
+// @update 回传状态的，那条路径并不经过 'state' 事件。
+function applyState(next) {
+  if (!next) return
+  const wasIn = wasLoggedIn
+  wasLoggedIn = !!next.logged_in
+  state.value = next
+  if (wasIn && !wasLoggedIn) {
+    discardLogsForLogout(next.log_epoch)
+  }
+}
+
+// discardLogsForLogout 清空前端这一层的日志，并把代次对齐到服务端。
+//
+// 主进程在退出登录时已经清空了缓冲、递增了代次，但前端这份 logs 数组
+// 与待合并队列都还在。代次必须**取服务端的值**而不是本地自增：清空是
+// 主进程做的，本地自增可能与真实代次差开一位，此后每一批日志都会被
+// 判成「旧代次」而整批丢弃——日志区就再也不动了。
+//
+// 序号基线一并归零：新代次的第一行序号未必接着上一代。
+function discardLogsForLogout(epoch) {
+  // 使在途的 loadLogs 失效：旧快照不该在登出之后重新冒回来。
+  logSeq++
+  if (typeof epoch === 'number') {
+    logEpoch.value = epoch
+  } else {
+    // 万一主进程没带这个字段（旧版），至少保证本端代次前进：
+    // 否则迟到的旧批次代次相等，会被当成有效内容放进来。
+    logEpoch.value += 1
+  }
+  pendingLogs.length = 0
+  logs.value = []
+  lastSeq.value = 0
+  if (logTimer) {
+    clearTimeout(logTimer)
+    logTimer = null
+  }
+}
+
 async function loadState() {
   const seq = ++stateSeq
   const s = await api.getState()
   if (seq !== stateSeq) return
-  state.value = s
+  applyState(s)
 }
 
 // 日志代次：清空时主进程会递增它，并随每个批次下发。
@@ -161,13 +214,13 @@ function pushLog(payload) {
 
 function onConnected(next) {
   stateSeq++ // 使在途的 loadState 失效
-  state.value = next
+  applyState(next)
   loadLogs()
 }
 
 function onUpdate(next) {
   stateSeq++
-  if (next) state.value = next
+  if (next) applyState(next)
   else loadState()
 }
 
@@ -221,7 +274,7 @@ onMounted(async () => {
   // 和日志会被丢掉——它们不属于任何快照，只能靠事件到达。
   subscribe('state', (payload) => {
     stateSeq++ // 事件状态比任何在途快照都新，让它们失效
-    state.value = payload
+    applyState(payload)
   })
   subscribe('logs', pushLog)
   subscribe('log', pushLog)

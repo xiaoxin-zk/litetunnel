@@ -365,9 +365,32 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			current = true
 		}
 		m.mu.Unlock()
+
+		// 回调登记必须在 close(exitCh) **之前**完成。
+		//
+		// Stop/StopAll 是「看到 exitCh 关闭就返回」的，而上层在 StopAll 之后
+		// 会调用 WaitCallbacks 等这批回调落地，再清凭据。Add 若晚于 close，
+		// 那一刻计数还是零，Wait 会立刻返回——等待点形同虚设，迟到的回调
+		// 照样能落到已经清完凭据的新账号状态上。
+		exitLock := m.exitLock(tunnelID)
+		exitLock.Lock()
+
+		m.mu.Lock()
+		stale := m.gens[tunnelID] != gen
+		closing := m.closed
+		// 必须在 mu 内登记：Close 先置 closed 再 Wait，两条路径只可能是先后
+		// 关系——这里读到 false 并 Add 之后才会有人置 true，而那时 Add 已经
+		// 完成，Wait 一定能等到。
+		dispatch := current && !stale && !closing && onExit != nil
+		if dispatch {
+			m.callbackWG.Add(1)
+		}
+		m.mu.Unlock()
+
 		// 先通知等待者再写日志：让 Stop 尽早返回，
 		// 避免日志写入（可能触发前端事件）拖慢重启。
 		close(exitCh)
+		exitLock.Unlock()
 
 		if !current {
 			// 这个进程已经被同一隧道的新进程取代了（Stop 之后紧接 Start
@@ -389,26 +412,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.appendLog(tunnelID, tunnelName, "frpc 已正常退出")
 		}
 
-		// 这里只做「代次校验 + 回调登记」，**不在锁内执行回调**。
+		// 这里只做「代次校验 + 回调派发」，**不在锁内执行回调**。
 		//
 		// 早先的实现把 onExit 放在这把锁里：onExit 会发 Wails 事件、刷界面
 		// 状态，UI 一旦阻塞，同一条隧道的启停就跟着排队。锁按隧道分片只
 		// 解决了「别的隧道被拖住」这一点，同一条隧道仍然会被拖。
-		exitLock := m.exitLock(tunnelID)
-		exitLock.Lock()
-
-		m.mu.Lock()
-		stale := m.gens[tunnelID] != gen
-		closing := m.closed
-		if !stale && !closing && onExit != nil {
-			// 必须在 mu 内登记：Close 先置 closed 再 Wait，两条路径只可能
-			// 是先后关系——这里读到 false 并 Add 之后才会有人置 true，
-			// 而那时 Add 已经完成，Wait 一定能等到。
-			m.callbackWG.Add(1)
-		}
-		m.mu.Unlock()
-		exitLock.Unlock()
-
 		if stale {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
 			return
@@ -420,7 +428,8 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（客户端正在关闭，跳过退出回调）")
 			return
 		}
-		if onExit == nil {
+		if !dispatch {
+			// onExit 为 nil：没有回调可派发（Add 也没做过，不需要 Done）。
 			return
 		}
 
@@ -526,7 +535,9 @@ func (m *Manager) Close() error {
 	// StopAll 只等到 exitCh 关闭（进程确实退出），而退出回调是在那之后
 	// 才执行的。这里再等回调收尾：它们会写日志、发状态事件，而下面就要
 	// 停掉日志投递，上层随后还会销毁 Wails 运行时。
-	m.waitCallbacks(2 * time.Second)
+	if !m.WaitCallbacks(2 * time.Second) {
+		log.Printf("[frpc] 仍有退出回调未结束，继续关闭")
+	}
 
 	// 停完进程再停投递：进程退出的收尾日志已经进了队列，
 	// 立刻掐掉投递协程会把它们吞掉。
@@ -545,11 +556,27 @@ func (m *Manager) Close() error {
 	return err
 }
 
-// waitCallbacks 等正在执行的退出回调结束，超过上限则记录并继续。
+// WaitCallbacks 等所有在途的退出回调执行完毕，最多等 d。
 //
-// 上限是必要的：回调会发 Wails 事件，运行时已经不可用时可能长时间不返回。
-// 日志可以丢，进程必须退——关闭流程不能被一个回调卡死。
-func (m *Manager) waitCallbacks(d time.Duration) {
+// 返回 true 表示全部回调都已落地；false 表示等到上限还没等到（已记一行日志）。
+//
+// 给上层用的原因：StopAll 只等到「进程真的退出」（exitCh 关闭），而 onExit
+// 是在那之后才执行的。退出登录要清凭据、清隧道配置，而一个迟到的退出回调
+// 会在清理之后才跑：它会拿旧进程的结局去改**新账号**的运行态——把刚连上的
+// 隧道标成未连接、或替新账号推进一次退避，而它描述的那个进程早就跟当前
+// 账号无关了。
+//
+// 所以登出流程必须在「停止进程」与「清凭据」之间插一个等待点：先让这批
+// 回调落地（它们此刻带的还是旧代次），再翻转代次与凭据。顺序反过来的话，
+// 迟到的回调会被自己的代次校验放过，污染的就是新账号的状态。
+//
+// 能等到是因为 callbackWG 的 Add 挪到了 close(exitCh) **之前**：
+// Stop/StopAll 一看到 exitCh 关闭就返回，Add 若晚于它，这里的 Wait 会在
+// 计数为零时立刻返回，等待就形同虚设（见 Start 里的退出协程）。
+//
+// 上限是必要的：回调会发 Wails 事件，界面线程卡住时可能长时间不返回。
+// 日志可以丢，进程必须退——退出登录不能因为一个回调卡死。
+func (m *Manager) WaitCallbacks(d time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
 		m.callbackWG.Wait()
@@ -557,8 +584,10 @@ func (m *Manager) waitCallbacks(d time.Duration) {
 	}()
 	select {
 	case <-done:
+		return true
 	case <-time.After(d):
-		log.Printf("[frpc] 退出回调未在 %s 内结束，继续关闭", d)
+		log.Printf("[frpc] 退出回调未在 %s 内结束，可能有迟到的回调落在清理之后", d)
+		return false
 	}
 }
 

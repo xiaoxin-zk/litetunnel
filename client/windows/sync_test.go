@@ -454,7 +454,7 @@ func TestWriteAndStartClearsBackoffBeforeStarting(t *testing.T) {
 		ID: 1, Name: "mc", Type: "tcp", Status: tunnelStatusActive,
 		LocalIP: "127.0.0.1", LocalPort: 25565,
 	}
-	if err := a.writeAndStart(tun, "serverAddr = \"127.0.0.1\"\n"); err == nil {
+	if err := a.writeAndStart(context.Background(), tun, "serverAddr = \"127.0.0.1\"\n"); err == nil {
 		t.Fatal("前置条件：frpc 不存在，启动应失败")
 	}
 

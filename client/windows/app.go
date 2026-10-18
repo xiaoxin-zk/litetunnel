@@ -120,6 +120,17 @@ type State struct {
 	// 客户端出问题时第一个要确认的永远是「你跑的是哪个版本」——
 	// 没有它就只能靠对比 exe 体积去猜，既不可靠也让排查绕远路。
 	Version string `json:"version"`
+
+	// LogEpoch 是日志命名空间的代次（每次清空日志时递增）。
+	//
+	// 前端拿它做「跨账号丢弃」：退出登录会清空日志并递增代次，而清空之前
+	// 已经发出、清空之后才到达前端的那一批日志事件，前端无法自行分辨
+	// ——它们带着旧代次，据此直接丢弃，界面就不会在换账号后先冒出一段
+	// 上一个账号的日志。
+	//
+	// 挂在 State 里而不是只在日志事件里带：登录态变化时前端收到的第一个
+	// 权威值就是这份状态，不用等到下一批日志才知道代次变了。
+	LogEpoch uint64 `json:"log_epoch"`
 }
 
 // App 是暴露给前端的应用对象。
@@ -312,6 +323,19 @@ type App struct {
 	// 同样的错误，而问题一点没变，用户还以为客户端在「努力重连」。
 	retries map[uint]*retryState
 
+	// startGen 记录每条隧道的进程是在哪个**账号代次**下启动的
+	// （值取自 a.authGeneration，与它一同由 a.mu 保护）。
+	//
+	// 退出登录的顺序是「停进程 → 等回调落地 → 翻代次 → 清凭据」，而进程的
+	// 退出回调是另一个协程里异步执行的：StopAll 只保证进程真的退出，不保证
+	// 回调用完。没有这份记录，一个在登出清理之后才跑到的回调会照着旧进程的
+	// 结局去改**新账号**的运行态——把刚连上的隧道标成未连接、或替新账号推进
+	// 一次退避，而它描述的那个进程早就跟当前账号无关了。
+	//
+	// 记的是「启动那一刻的代次」，不是「当前代次」：判据必须是
+	// 「启动它的那个账号还是现在这个账号吗」。
+	startGen map[uint]uint64
+
 	// cfgErr 记录本地配置读取失败的原因，通过 State 呈现给用户。
 	cfgErr string
 }
@@ -358,6 +382,7 @@ func NewApp() *App {
 		registeredAt: map[uint]time.Time{},
 		connectAt:    map[uint]time.Time{},
 		errEmitAt:    map[uint]time.Time{},
+		startGen:     map[uint]uint64{},
 		logKick:      make(chan struct{}, 1),
 		logStop:      make(chan struct{}),
 		startedAt:    time.Now(),
@@ -410,28 +435,58 @@ func (a *App) startup(ctx context.Context) {
 				a.emitStateThrottled(id)
 			}
 		}
-	}, func(id uint, name string, err error, requested bool) {
-		// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
-		// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
-		a.setTunnelRegistered(id, false)
-		switch {
-		case requested:
-			// 我们自己停的（用户关开关、退出登录、配置变更重连）：
-			// 不是失败，不该进入退避——否则用户关掉一条隧道，
-			// 界面反而开始报「启动失败，30 秒后重试」。
-			a.clearRetry(id)
-		default:
-			// 非请求退出都算失败并进入退避，包括 err == nil 的情况：
-			// frpc 自己干净退出同样意味着这条隧道没在跑，不加退避就会
-			// 每 20 秒被重新拉起一次。
-			reason := "frpc 已退出"
-			if err != nil {
-				reason = "frpc 异常退出：" + err.Error()
-			}
-			a.noteStartFailure(id, name, reason)
+	}, a.onTunnelExit)
+}
+
+// onTunnelExit 处理「某条隧道的 frpc 进程退出」。
+//
+// 单独抽成方法（而不是留在 startup 的闭包里）是为了让它能被单测直接调用：
+// 这段逻辑守的是「退出登录与迟到回调」的竞态，靠真起进程去复现既慢又不稳，
+// 而它要判断的东西全在 a 的状态里。
+func (a *App) onTunnelExit(id uint, name string, err error, requested bool) {
+	// 先核对这条隧道是不是**当前账号**启动的。
+	//
+	// 退出登录的顺序是「停进程 → 等回调 → 翻代次 → 清凭据」，但等待是有
+	// 上限的：超时后流程照常往下走，那个回调可能仍会在新账号下才执行。
+	// 它描述的是一个属于上一个账号的进程，而下面每一行写的都是**当前**
+	// 账号的运行态：清掉 registered 会把新账号刚连上的隧道标成未连接，
+	// noteStartFailure 会给新账号记一笔它没犯过的失败并推进退避，
+	// emitState 会把这份污染推给界面。
+	//
+	// 所以代次不符时只做无副作用的收尾：什么都不写、什么也不发。
+	// startGeneration 自带 a.mu，这里不持锁调用任何 mgr 方法，
+	// 也就不会与 exitMu → mu 的既有顺序冲突。
+	//
+	// 不在这里删自己那条记账：它的值就是账号代次，同一账号下的下一次
+	// 启动会写出同一个值，删错就把下一次的记录抹掉了（详见
+	// startGeneration 的说明）。条目由 pruneTunnelState 与
+	// resetPerAccountState 负责回收。
+	if _, current := a.startGeneration(id); !current {
+		// 记录已被清掉（退出登录或隧道被删）时同样落到这里：那也
+		// 说明「无法证明它属于当前账号」，按不处理即可——
+		// 下一轮同步会据实对账，甚至已经把这条隧道停掉了。
+		return
+	}
+	// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
+	// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
+	a.setTunnelRegistered(id, false)
+	switch {
+	case requested:
+		// 我们自己停的（用户关开关、退出登录、配置变更重连）：
+		// 不是失败，不该进入退避——否则用户关掉一条隧道，
+		// 界面反而开始报「启动失败，30 秒后重试」。
+		a.clearRetry(id)
+	default:
+		// 非请求退出都算失败并进入退避，包括 err == nil 的情况：
+		// frpc 自己干净退出同样意味着这条隧道没在跑，不加退避就会
+		// 每 20 秒被重新拉起一次。
+		reason := "frpc 已退出"
+		if err != nil {
+			reason = "frpc 异常退出：" + err.Error()
 		}
-		a.emitState()
-	})
+		a.noteStartFailure(id, name, reason)
+	}
+	a.emitState()
 }
 
 // domReady 在 WebView 加载完成、前端脚本就绪后调用，负责「打开即连」。
@@ -615,6 +670,15 @@ func (a *App) shutdown(ctx context.Context) {
 
 // GetState 返回当前完整状态。
 func (a *App) GetState() State {
+	// 日志代次必须在拿 a.mu 之前读：它由 logMu 保护，而 ClearLogs 是
+	// 「先拿 logMu、再……不拿 a.mu」的顺序，这里若反过来（持 mu 读
+	// logMu）就构成了 mu → logMu 的锁序，与日志路径形成环。
+	//
+	// 单独提前读一次的代价是它可能与下面那份快照差一拍（正赶上一次清空）。
+	// 这可以接受：代次只用于「丢弃跨代次的旧批次」，而清空本身会立刻
+	// 再推一次状态，界面下一次拿到的就是新值。
+	logEpoch := a.currentLogEpoch()
+
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
@@ -683,6 +747,7 @@ func (a *App) GetState() State {
 		LastSyncAt:     lastSync,
 		ConfigError:    a.cfgErr,
 		Version:        Version(),
+		LogEpoch:       logEpoch,
 		// Running 是「有没有任意一条隧道在连」，界面的状态点用它。
 		Running:   a.mgr.AnyRunning(),
 		FrpcFound: a.mgr.Available(),

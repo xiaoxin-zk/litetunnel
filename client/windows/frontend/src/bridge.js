@@ -34,7 +34,10 @@ const emptyState = {
   config_error: '',
   group: null,
   payment_enabled: false,
-  balance_cents: 0
+  balance_cents: 0,
+  // log_epoch：日志命名空间代次。退出登录清空日志时主进程会递增它，
+  // 前端据此丢弃「清空前发出、清空后到达」的旧批次。
+  log_epoch: 0
 }
 
 /** 浏览器内预览时使用的假实现，方便纯前端调试样式。 */

@@ -114,12 +114,27 @@ func fileSum(path string) (string, error) {
 func (b *writeBatch) writeManifest() (batchManifest, error) {
 	m := batchManifest{Version: 1}
 	for _, st := range b.staged {
-		_, err := os.Stat(st.path)
+		// 只有「确认不存在」才记 Existed=false。
+		//
+		// 权限不足、路径被别的进程占住、磁盘 I/O 出错时 Stat 同样返回 err，
+		// 把它一并当成「文件本来就不存在」会让恢复逻辑改走「删掉新文件」那条
+		// 分支：那个文件其实一直在，只是替换前没被备份成 .lt-config-bak。
+		// 一旦提交后崩溃，旧内容已经无从恢复——记录还明确写着「它原本不存在」，
+		// 等于把唯一能修的方向也指反了。
+		//
+		// 所以非 ENOENT 必须中止。此刻一个目标文件都还没动，中止是安全的。
+		existed := true
+		if _, err := os.Stat(st.path); err != nil {
+			if !os.IsNotExist(err) {
+				return batchManifest{}, fmt.Errorf("检查 %s 是否存在失败（无法判断提交前是否需要备份）: %w", st.path, err)
+			}
+			existed = false
+		}
 		m.Files = append(m.Files, manifestEntry{
 			Name:    st.name,
 			Path:    st.path,
 			Tmp:     st.tmp,
-			Existed: err == nil,
+			Existed: existed,
 			// BakSum 此刻还是空的（备份尚未创建），由 refreshBackupSums
 			// 在整批替换完成后补写一次。
 			NewSum: st.newSum,

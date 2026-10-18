@@ -311,7 +311,15 @@ func stageFile(name, path, content string, mode os.FileMode) (*stagedFile, error
 // 状态要到下次容器重建才以配置错误的形式爆炸。有备份就能在失败时整体回滚。
 func (s *stagedFile) commit() error {
 	// 备份旧文件（若存在）。用 rename：原子且不跨文件系统（备份与目标同目录）。
-	if _, err := os.Stat(s.path); err == nil {
+	//
+	// 「存在」只能由 os.IsNotExist 来否定。权限不足、路径被占用、I/O 错误
+	// 这些非 ENOENT 的失败如果被当成「本来就没有旧文件」，existed 会被记成
+	// false、备份也不会创建：替换之后崩溃，restore 走的是「删掉新文件」，
+	// 而那个位置原本有一份正常配置——一次写盘就把活动配置写没了。
+	// 所以非 ENOENT 直接中止：候选内容还在临时文件里，目标文件一个字节没动。
+	if _, err := os.Stat(s.path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("检查目标文件是否存在失败（无法确定是否需要备份 %s）: %w", s.path, err)
+	} else if err == nil {
 		s.existed = true
 		backup := s.path + backupSuffix
 		if err := os.Rename(s.path, backup); err != nil {

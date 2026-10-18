@@ -17,6 +17,37 @@ import (
 // 两层的分工很重要：变量层面的检查能给出指向具体字段的错误（哪个域名不对、
 // 哪个端口没填），而模板渲染与指令是否被镜像支持，只有真跑一次校验才知道。
 
+// 传输层协议的显示名。端口冲突按「协议 + 端口号」判定：TCP 与 UDP 是彼此
+// 独立的端口空间，一个 UDP 端口不会挡住同号的 TCP 监听。
+const (
+	protoTCP = "TCP"
+	protoUDP = "UDP"
+)
+
+// portKey 把协议与端口号组成冲突判定的键。
+func portKey(proto string, port int) string {
+	return proto + ":" + strconv.Itoa(port)
+}
+
+// portOwner 记录某个「协议 + 端口」已被哪个变量占用，用于报出冲突双方。
+type portOwner struct {
+	proto string
+	name  string
+}
+
+// portProtocol 声明每个端口变量监听在哪个传输层协议上。
+//
+// TCP 与 UDP 是两个独立的端口空间：同一个数字可以同时被两边监听。LT_KCP_PORT
+// 是 KCP（UDP），其余入口与管理端口都是 TCP；80/443 固定入口也走 TCP。
+var portProtocol = map[string]string{
+	"LT_GATEWAY_PORT":     protoTCP,
+	"LT_KCP_PORT":         protoUDP,
+	"LT_VHOST_HTTP_PORT":  protoTCP,
+	"LT_VHOST_HTTPS_PORT": protoTCP,
+	"LT_FRPS_API_PORT":    protoTCP,
+	"LT_USER_PORT":        protoTCP,
+}
+
 // validateVars 校验合并后的变量集合。
 //
 // res 里的 Warnings 是「能跑但不该这样配」的情况；返回 error 则是
@@ -107,9 +138,14 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 		"LT_GATEWAY_PORT", "LT_KCP_PORT", "LT_VHOST_HTTP_PORT",
 		"LT_VHOST_HTTPS_PORT", "LT_FRPS_API_PORT", "LT_USER_PORT",
 	}
-	seenPort := map[int]string{
-		80:  "固定 HTTP 入口",
-		443: "固定 HTTPS 入口",
+	// 每个端口的传输层协议见 portProtocol：冲突判定必须带上协议，只按端口
+	// 数字去重的话，LT_GATEWAY_PORT=7001 与 LT_KCP_PORT=7001 这一组完全合法
+	// （也是 .env.example 明确写出的组合）会被判成冲突，管理员只能去改一个
+	// 本来没问题的端口号。面板侧的端口池同样按 "tcp|"/"udp|" 两种键记录占用，
+	// 说明协议本来就是判定的一部分。
+	seenPort := map[string]portOwner{
+		portKey(protoTCP, 80):  {proto: protoTCP, name: "固定 HTTP 入口"},
+		portKey(protoTCP, 443): {proto: protoTCP, name: "固定 HTTPS 入口"},
 	}
 	usedPorts := make([]int, 0, len(portKeys))
 	for _, k := range portKeys {
@@ -117,16 +153,19 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 		if err != nil || p < 1 || p > 65535 {
 			return fmt.Errorf("%s 不是合法端口（当前 %q）", k, vars[k])
 		}
-		if prev, ok := seenPort[p]; ok {
+		proto := portProtocol[k]
+		if prev, ok := seenPort[portKey(proto, p)]; ok {
 			// 80/443 是 Caddy 的固定入口，分别允许由对应的 vhost
 			// 变量显式使用；其它变量仍不得占用，也不能互相占用。
-			allowedFixed := (p == 80 && k == "LT_VHOST_HTTP_PORT" && prev == "固定 HTTP 入口") ||
-				(p == 443 && k == "LT_VHOST_HTTPS_PORT" && prev == "固定 HTTPS 入口")
+			// 固定入口走 TCP，所以这里只会与 TCP 变量相撞。
+			allowedFixed := (p == 80 && k == "LT_VHOST_HTTP_PORT" && prev.name == "固定 HTTP 入口") ||
+				(p == 443 && k == "LT_VHOST_HTTPS_PORT" && prev.name == "固定 HTTPS 入口")
 			if !allowedFixed {
-				return fmt.Errorf("%s 与 %s 使用了同一个端口 %d：同一台宿主机上它们必须互不相同", k, prev, p)
+				return fmt.Errorf("%s(%s) 与 %s(%s) 使用了同一个端口 %d：同一台宿主机上它们必须互不相同（同一端口号只有分属 TCP 与 UDP 时可以共存）",
+					k, proto, prev.name, prev.proto, p)
 			}
 		} else {
-			seenPort[p] = k
+			seenPort[portKey(proto, p)] = portOwner{proto: proto, name: k}
 		}
 		usedPorts = append(usedPorts, p)
 	}
@@ -146,8 +185,11 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 			maxPerUser, capacity)
 	}
 	for i, k := range portKeys {
+		// 池范围检查对所有端口变量一视同仁，不按协议区分：端口池里的端口
+		// 会被同时当作 TCP 与 UDP 来用（面板侧按 "tcp|"/"udp|" 两种键记录
+		// 占用），所以一个 UDP 端口落在池内同样会被运行期分配走。
 		if usedPorts[i] >= poolStart && usedPorts[i] <= poolEnd {
-			return fmt.Errorf("%s（%d）落在端口池 %d-%d 内：隧道分配会把它当成可用端口并尝试占用",
+			return fmt.Errorf("%s（%d）落在端口池 %d-%d 内：隧道分配会把它当成可用端口并尝试占用（TCP 与 UDP 都会被分配）",
 				k, usedPorts[i], poolStart, poolEnd)
 		}
 	}

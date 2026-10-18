@@ -8,18 +8,54 @@ import (
 	"time"
 )
 
+// errSyncDeadline 表示这一轮同步的截止时间已经过了：该隧道既没有落盘配置，
+// 也没有启动进程。
+//
+// 单独做成哨兵而不是直接返回 ctx.Err()：调用方必须把它和「拉取失败」
+// 「启动失败」区分开——后两者要记进隧道行并推进退避，而它只是「这一轮
+// 没轮到」，下一轮会照常重试。混在一起的话，用户会在「同步超时」的同时
+// 看到一条并不存在的隧道失败原因，而隧道其实什么都没做错。
+var errSyncDeadline = errors.New("本轮同步已超时，该隧道未写入配置也未启动")
+
 // writeAndStart 落盘配置并启动该隧道的 frpc 进程。
+//
+// ctx 是本轮的整笔预算（整轮同步的截止时间，或一次手动开关操作的预算）。
+// 已经过了截止时间就**什么都不做**：配置正文可能是超时之前取到、超时之后
+// 才轮到处理的，照旧落盘并拉起进程，就会出现「界面报同步超时，进程却已经
+// 起来了」——用户看到的错误与客户端的实际状态对不上，而下一轮同步又会
+// 把这条已经起来的进程当成「已运行」跳过，两面都不一致。
+//
+// 已经在上一轮/本轮早期起来的进程不受影响，也不会为了超时去杀它：
+// 那是有效工作，杀掉只会让已经连上的连接抖一下。
 //
 // 启动成功与否由回调里的日志体现（frpc 会打印自己的连接过程），
 // 这里不做额外等待：frpc 从启动到真正建好代理要一两秒，
 // 阻塞在界面上等它只会让「连接」这个动作显得很慢。
-func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
+func (a *App) writeAndStart(ctx context.Context, t TunnelVO, cfgText string) error {
+	// 这一步必须放在最前面：frpcConfigPath 会顺手建出隧道目录，
+	// 超时之后连这个副作用都不该留下。
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return errSyncDeadline
+		}
+	}
 	path, err := frpcConfigPath(t.ID)
 	if err != nil {
 		return err
 	}
 	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
 		return err
+	}
+	// 落盘之后、动任何运行态之前再核对一次：写文件本身也要花时间，
+	// 这中间的取消同样不该演变成「超时报错 + 进程起来了」。
+	//
+	// 此时配置已经写到磁盘上，但 applied/cfgRev 都还没记（和启动失败路径
+	// 一样），所以下一轮仍会重新拉取、重新落盘——不会把一份没启动的配置
+	// 当成「已应用」而跳过。
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return errSyncDeadline
+		}
 	}
 	// 清退避要放在**启动之前**，不能等启动成功之后再清。
 	//
@@ -41,6 +77,9 @@ func (a *App) writeAndStart(t TunnelVO, cfgText string) error {
 	// 等于把一次已经结束的等待又贴回来，之后掉线重连显示的时长里
 	// 会混进那段早就连上的时间。
 	a.markConnectStart(t.ID)
+	// 记账必须在 Start **之前**：见 markStartGeneration 的说明——记的是
+	// 「启动那一刻的账号」，中间插一次退出登录也不会记错。
+	a.markStartGeneration(t.ID)
 	if err := a.mgr.Start(t.ID, t.Name, path); err != nil {
 		// 没起来就不算「连接中」：留着起点会让界面显示一段并不存在的等待。
 		a.clearConnectStart(t.ID)
@@ -104,7 +143,14 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 		return errors.New("服务端未返回该隧道的配置")
 	}
 	t.ConfigRev = servedRev
-	return a.writeAndStart(t, cfgText)
+	err = a.writeAndStart(ctx, t, cfgText)
+	if errors.Is(err, errSyncDeadline) {
+		// 手动点连接时「没预算了」就是这次操作超时，不是这条隧道的启动问题：
+		// 换成 ctx 的错误，交给 describeManualErr 翻成「操作超时，请重试」。
+		// 直接把哨兵的说明抛出去，用户会看到一句与本机状态无关的同步术语。
+		return ctx.Err()
+	}
+	return err
 }
 
 // stopTunnelProcess 停掉某条隧道的进程。

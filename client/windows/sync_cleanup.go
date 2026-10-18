@@ -151,4 +151,12 @@ func (a *App) pruneTunnelState(alive map[uint]bool) {
 			delete(a.connectAt, id)
 		}
 	}
+	// 启动代次：隧道已被服务端删除，它的进程也已经在 applySyncData 里停掉。
+	// 留着的后果不是内存，而是**误判**——将来同 id 的退出回调（这台机器上
+	// 不会有，但记录不清就是一次无法自证的历史残留）会被当成当前账号的。
+	for id := range a.startGen {
+		if !alive[id] {
+			delete(a.startGen, id)
+		}
+	}
 }

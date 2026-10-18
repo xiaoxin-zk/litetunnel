@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -246,6 +247,15 @@ func (a *App) Logout() (State, error) {
 // 让用户重试，比无限期挂住强。
 const logoutSyncWait = 10 * time.Second
 
+// logoutCallbackWait 是退出登录等待「进程退出回调」落地的上限。
+//
+// 这段等待卡在「停完进程」与「清凭据」之间，所以必须有上限：回调要发
+// Wails 事件，界面线程卡住（用户拖动窗口、系统繁忙）时它可能迟迟不返回，
+// 而这个等待发生在用户点「退出登录」之后、界面还能响应之前。等不到就
+// 记一行日志继续——迟到的回调另有代次校验兜底（见 SetCallbacks 的退出
+// 分支），不会污染新账号。
+const logoutCallbackWait = 3 * time.Second
+
 func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 	waitCtx, waitCancel := context.WithTimeout(a.rootContext(), logoutSyncWait)
 	defer waitCancel()
@@ -256,6 +266,23 @@ func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 
 	if err := a.mgr.StopAll(); err != nil {
 		return a.GetState(), fmt.Errorf("停止隧道失败，未退出登录: %w", err)
+	}
+
+	// 停完进程、**在清凭据之前**等这批退出回调落地。
+	//
+	// 顺序反过来（先翻代次再等）就白等了：回调在清理之后才跑的话，它看到的
+	// 已经是新账号，自己的代次校验反而会放过它，于是它拿旧进程的结局去改
+	// 新账号的运行态——把刚连上的隧道标成未连接、或替新账号记一笔失败。
+	// 等待点放在这里，回调看到的是「旧代次 + 旧凭据」，脏数据只会落在即将
+	// 被整体丢弃的本账号状态上。
+	//
+	// 也不能省掉这段等待、只靠代次校验：校验能挡住状态污染，但挡不住
+	// 「回调在凭据清空之后才写日志」——那一行会落在新账号的日志里；
+	// 而磁盘清理（clearMain / clearTunnels）也要求进程真的收尾完毕。
+	if !a.mgr.WaitCallbacks(logoutCallbackWait) {
+		// 继续流程而不是报错：用户要的是「退出」，卡在这里比漏一次清理更糟。
+		// 代次校验已把污染面压到最小，这行日志留给排查。
+		log.Printf("[client] 退出登录：仍有隧道退出回调未落地，继续清理凭据")
 	}
 
 	// 与接入流程的「写盘 + 发布」互斥（见 Connect）：否则清空凭据与
@@ -271,7 +298,19 @@ func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 
 	// 日志缓冲属于「旧账号的历史」，也必须清掉：否则换账号后界面上会先冒出一段
 	// 上一个账号的日志。单独在 a.mu 之外清——ClearLogs 自己拿 logMu。
-	a.ClearLogs()
+	//
+	// 返回值不能丢：它带的是递增之后的日志代次，而前端正是靠这个值丢弃
+	// 「清空前发出、清空后才到」的旧批次（见 State.LogEpoch）。
+	cleared := a.ClearLogs()
+
+	// 代次递增之后才推状态。
+	//
+	// 顺序反了（先推、后清）前端会收到一份「登录态已变、代次没变」的状态，
+	// 它按这个代次去比对在途的日志批次，旧账号那批就会被当成有效内容放进来
+	// ——正是这一步要防的现象。cleared.Epoch 就是本次递增后的值，与随后的
+	// GetState 读到的是同一个。
+	log.Printf("[client] 退出登录：日志缓冲已清空（代次 %d）", cleared.Epoch)
+	a.emitState()
 
 	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。
 	//
@@ -337,6 +376,11 @@ func (a *App) resetPerAccountState() {
 	a.connectAt = map[uint]time.Time{}
 	a.errEmitAt = map[uint]time.Time{}
 	a.cleanupWarned = map[uint]bool{}
+	// 启动代次同样清掉：这是「迟到的退出回调」的第二道保险。
+	// logout 会先等回调落地再走到这里，但等待有上限——等不到时流程照常
+	// 往下走。清空之后，那个迟到回调查不到自己的记账，就会按「无法证明
+	// 属于当前账号」处理，从而不会去改新账号的运行态。
+	a.startGen = map[uint]uint64{}
 }
 
 // currentCredential 返回当前接入用的长期凭据。

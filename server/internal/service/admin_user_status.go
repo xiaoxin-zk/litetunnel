@@ -282,6 +282,27 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		if res.RowsAffected == 0 {
 			return ErrNotFound
 		}
+		if status != model.UserStatusActive {
+			// 把数据库里的会话置为离线，**必须和状态写在同一个事务里**。
+			//
+			// 为什么不能等事务提交之后再撤销：提交点就是其他实例看到「账号已
+			// 禁用」的唯一时刻。提交后到撤销语句之间的那一小段里，别的实例上
+			// 的插件回调（onNewUserConn → EnsureSessionOnline →
+			// FindTrustedClientSession）读到的仍是 online=true、没过期的会话，
+			// 于是继续放行新连接——账号明明已被禁用，却还在新建数据连接。
+			// 更糟的是撤销语句若失败，这个窗口会一直存在到那台实例上的会话
+			// 过期为止（sessionTrustWindow 10 分钟），而本实例的日志只有一行。
+			//
+			// 放进事务还有一个副作用是想要的：撤销失败会让整笔状态变更回滚，
+			// 管理员收到错误而不是「已禁用」——不会出现「库里禁用、库里会话
+			// 仍在线」这种自相矛盾的状态。
+			//
+			// 已有的「事务外 CloseUserProxies 带 15s 超时」保持不变：那个要访问
+			// frps，不能拖进事务；这里只做一次 UPDATE。
+			if err := revokeClientSessionsTx(tx, id); err != nil {
+				return err
+			}
+		}
 		// 读回本次写入的版本：后面那段断流要放掉用户锁去做（可能十几秒），
 		// 这期间若账号被重新启用（任何实例上），版本变化就是「本次断流
 		// 已过期」的信号。
@@ -322,7 +343,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 主动关闭该用户在 frps 侧已建立的代理：只清会话拦得住新连接，
 		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
 		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
-		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		closeCtx, cancel := context.WithTimeout(context.Background(), closeProxiesTimeout)
 		s.CloseUserProxies(closeCtx, id, gen, disabledAt)
 		cancel()
 		return nil

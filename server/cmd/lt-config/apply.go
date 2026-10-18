@@ -178,7 +178,7 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	}
 	res.Warnings = append(res.Warnings, batch.warn...)
 	if err := batch.commit(); err != nil {
-		return res, internalError(err)
+		return res, s.commitFailure(err)
 	}
 	res.Changed = sortedChanged(batch.changed)
 
@@ -191,9 +191,12 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 			return res, fmt.Errorf("请求在写盘后中断，且回滚磁盘失败（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", err, rbErr)
 		}
 		if rbErr != nil {
-			// 文件已回到旧配置，只是记录没删掉：不影响下次启动，但它是一次
-			// 残留，应当让管理员知道（下次启动会自动清理）。
-			res.Warnings = append(res.Warnings, rbErr.Error())
+			// 磁盘已经回到旧配置，但记录没能删掉。它不能只当一条 warning：
+			// 下次启动会按这条「未提交」记录再处理一遍整批文件，与管理员
+			// 此后的手工修改打架。登记阻断，避免本进程继续写盘覆盖现场。
+			s.registerDirtyScene()
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("配置已回滚为旧配置，但批次记录未清理：重启时恢复逻辑会再按它处理一遍整批文件，需人工确认后清理\n%v", rbErr))
 		}
 		return res, err
 	}
@@ -202,6 +205,14 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	//
 	// 文件都没有变化时仍然重建：.env 里的 DNS 凭据可能变了，
 	// 而 compose 只有在重建容器时才会把新的环境变量带进容器。
+	//
+	// 这里不再复用 /health 的 docker 探测结论：那是一次 12 秒 TTL 的缓存，
+	// 最多只会过时十几秒，却会在这个「已经开始写盘」的关键点上把「宿主机
+	// 到底能不能用」的判定建立在一个可能过期的观察上——探测说可用而 daemon
+	// 刚挂掉，等于白写一遍盘。真正的权威是 composeUp：它按 hostError 给出
+	// 「docker 宿主机不可用」的中文原因，并驱动下面的回滚。探测的用途是让
+	// 管理员在**点应用之前**看到宿主机状态（见 handlers.go 的 handleHealth），
+	// 两者分工就是「提前告知」与「实际执行」。
 	out, upErr := s.composeUp(ctx)
 	if upErr != nil {
 		return res, s.recoverFromFailedApply(ctx, batch, upErr, out)
@@ -223,6 +234,7 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 			return res, &partialApplyError{
 				msg:      fmt.Sprintf("配置与容器均已生效，但批次现场无法落定：重启可能把磁盘回滚到旧配置，需人工处理\n%v", err),
 				services: states,
+				cause:    err,
 			}
 		}
 		res.Warnings = append(res.Warnings, err.Error())
@@ -240,9 +252,20 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 type partialApplyError struct {
 	msg      string
 	services []tlscfg.ServiceState
+	// cause 保留原始错误链。
+	//
+	// 这个类型是给 HTTP 层用的「结构化结果」，不是普通的包装错误：它自己
+	// 只带一句给人看的话。若把底层错误丢掉，调用方就再也没法用
+	// errors.Is 认出 errBatchCleanupPending / errBatchRecoveryAtRisk 这类
+	// 哨兵——「现场未清理」与「现场无法落定」的处理方式完全不同，靠匹配
+	// 错误文本去区分是最不可靠的做法。
+	cause error
 }
 
 func (e *partialApplyError) Error() string { return e.msg }
+
+// Unwrap 暴露原始错误，让 errors.Is / errors.As 能穿过结构化结果继续下探。
+func (e *partialApplyError) Unwrap() error { return e.cause }
 
 // recoverFromFailedApply 处理「文件已换好、容器重建失败」。
 //
@@ -282,11 +305,18 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
 				"\n重建错误: %v\n回滚错误: %v%s", upErr, rbErr, detail),
 			services: states,
+			cause:    rbErr,
 		}
 	}
 	note := ""
 	if cleanupPending {
-		note = "；批次记录未删除，重启后会自动清理"
+		// 记录留在磁盘上，而且状态仍是「未提交」：下一次启动不会只是顺手
+		// 清理，而是按这条记录把整批文件再回滚一次。管理员在这之后手工改好
+		// 的配置会被它当成要撤掉的现场，所以必须登记运行时阻断——本进程也
+		// 不能再写盘，否则同样会与那份现场互相覆盖。措辞上不能说成「重启后
+		// 会自动清理」，那会让管理员以为可以放着不管。
+		s.registerDirtyScene()
+		note = "；但批次记录未清理，重启后恢复逻辑会按它再回滚一遍整批文件（可能覆盖此后的手工修改），需人工确认后清理"
 	}
 
 	// 文件已回到旧配置。再重建一次，尽量让容器也回到旧版本。
@@ -299,6 +329,7 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 			msg: fmt.Sprintf("新配置重建失败，磁盘已回滚为旧配置，但按旧配置重建也失败：容器当前版本未知"+
 				"\n新配置重建错误: %v\n回滚重建错误: %v%s", upErr, reErr, detail),
 			services: states,
+			cause:    reErr,
 		}
 	}
 }
@@ -450,8 +481,7 @@ func (b *writeBatch) commit() error {
 				// 把「磁盘可能混合」这件事藏起来。
 				return fmt.Errorf("替换 %s 失败，且回滚未完成（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", st.name, err, rbErr)
 			}
-			b.removeManifest(m)
-			return fmt.Errorf("替换 %s 失败，已回滚（磁盘仍为旧配置）: %w", st.name, err)
+			return b.rollbackFailedCommit(m, st.name, err)
 		}
 		b.done++
 	}
@@ -465,6 +495,55 @@ func (b *writeBatch) commit() error {
 	// finalize 调用）。在这里清掉备份，容器重建失败时就再也回不去旧配置；
 	// 而在这里清掉记录，「文件已换好、容器没起来」的中间态就少了一份说明。
 	return nil
+}
+
+// commitFailure 把 writeBatch.commit 的失败翻译成调用方该做的事。
+//
+// 单独抽出来的理由：`errBatchCleanupPending` 不是「写盘失败」而是「磁盘已经
+// 回到旧配置、现场却还留着」，两者的处理方式完全不同——前者管理员改配置
+// 重试即可，后者必须人工清理，而且在那之前本进程不能再写盘，否则会与那份
+// 未清理的记录互相覆盖（下次启动它会按记录把整批再回滚一遍，管理员这期间
+// 手工改好的内容会被当成要撤掉的现场）。
+//
+// 因此这里与 finalize 分支的 errBatchRecoveryAtRisk 保持一致：登记运行时
+// 阻断 + 报 partial（附各容器状态），而不是草草地包成 internalError。
+func (s *service) commitFailure(err error) error {
+	if !errors.Is(err, errBatchCleanupPending) {
+		return internalError(err)
+	}
+	s.registerDirtyScene()
+	statesCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return &partialApplyError{
+		msg: fmt.Sprintf("本次写盘已回滚（磁盘仍为旧配置），但批次现场未能清理："+
+			"重启后恢复逻辑会按残留记录把整批再回滚一次、覆盖此后的任何修改；"+
+			"在人工清理之前，所有写操作都会被拒绝\n%v", err),
+		services: s.serviceStates(statesCtx),
+		cause:    err,
+	}
+}
+
+// rollbackFailedCommit 收尾「替换失败、但已回滚成功」这条路径。
+//
+// 回滚成功不等于现场干净：批次记录还在磁盘上时，它会成为下一次启动的
+// 权威依据——那份记录写的是「这一批没提交完」，恢复逻辑会按它把整批再
+// 回滚一遍。管理员随后手工改好的内容会被当成要撤掉的现场，而备份已在本次
+// 回滚中消耗掉，那次回滚只能按记录硬删文件。所以记录删不掉时**必须**返回
+// 能被 errors.Is(err, errBatchCleanupPending) 识别的错误，交给调用方登记
+// 运行时阻断；静默忽略（丢弃 removeManifest 的返回值）是最糟的做法。
+//
+// 单独抽成方法是为了让这条路径可以被单元测试直接覆盖：制造一次
+// 「替换失败 + 记录删不掉」需要先占住 .lt-config-batch.json，测试里能构造，
+// 但写在 commit 内部就只能靠整个 renderAndApply 流程间接观察。
+func (b *writeBatch) rollbackFailedCommit(m batchManifest, name string, cause error) error {
+	if b.removeManifest(m) {
+		return fmt.Errorf("替换 %s 失败，已回滚（磁盘仍为旧配置）: %w", name, cause)
+	}
+	// 两个 %w 是有意的：调用方既要能 errors.Is 认出 errBatchCleanupPending
+	// （据此登记运行时阻断），又要能追溯最初的替换失败原因。
+	return fmt.Errorf("%w: 替换 %s 失败，已回滚（磁盘仍为旧配置），但批次记录未能删除，"+
+		"重启后恢复逻辑会按它把整批再回滚一次、覆盖此后的修改；请人工确认后删除部署目录下的 %s 与 *%s 备份；原始错误: %w",
+		errBatchCleanupPending, name, batchManifestName, backupSuffix, cause)
 }
 
 // finalize 在配置确认生效（容器已按新配置重建）后落定这一批。

@@ -147,6 +147,43 @@ func (a *App) markReconnectStart(id uint) {
 	a.connectAt[id] = time.Now()
 }
 
+// markStartGeneration 记下「这条隧道的进程此刻是在哪个账号代次下拉起的」。
+//
+// 必须与 authGeneration 在同一把锁内取，且要在 mgr.Start **之前**调用：
+// 记下的必须是「启动那一刻的账号」，而不是「回调到来时的账号」。放在
+// Start 之后的话，中间恰好完成一次退出登录，记录的就是新账号——那个
+// 迟到的回调会被当成新账号的，正好放它去污染新账号的状态。
+func (a *App) markStartGeneration(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.startGen == nil {
+		a.startGen = map[uint]uint64{}
+	}
+	a.startGen[id] = a.authGeneration
+}
+
+// startGeneration 返回这条隧道记录的启动代次，以及它是否属于当前账号。
+//
+// 没有记录时返回 (0, false)：说明这条隧道的启动记账已被清掉（退出登录或
+// 隧道被删），此刻**无法证明**进程属于当前账号。宁可漏掉一次状态清理
+// ——下一轮同步会据实对账——也不要让它去改新账号的运行态。
+//
+// 这里刻意不提供「删掉自己那条记录」的写法：记账的值就是账号代次，
+// 同一账号下重复启动得到的是同一个值，回调无法分辨手上的记录是本次启动
+// 留下的还是下一次启动刚写的。删错一次就等于把下一次启动的记录抹掉，
+// 它的回调从此变成「查无记录」、永远被跳过。而留着这个条目的代价只有
+// 每个隧道 id 一个 uint64：隧道被服务端删除时由 pruneTunnelState 清、
+// 退出登录时由 resetPerAccountState 清，不存在随进程寿命增长的泄漏。
+func (a *App) startGeneration(id uint) (uint64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	gen, ok := a.startGen[id]
+	if !ok {
+		return 0, false
+	}
+	return gen, gen == a.authGeneration
+}
+
 // registeredGrace 是本机「已注册」标记不被服务端结论推翻的宽限期。
 //
 // 服务端 online 的延迟上限约 50 秒（采集 30 秒 + 同步 20 秒），

@@ -143,7 +143,20 @@ type Health struct {
 	// 避免「面板改的那份」和「实际在跑的那份」不是同一个目录这种诡异问题。
 	DeployDir string `json:"deploy_dir"`
 	// Docker 表示能否调用 docker（校验与重建容器都依赖它）。
+	//
+	// 它只回答「docker 命令在不在」——命令在而 daemon 没起来时它仍为 true。
+	// 要判断「宿主机现在能不能真的起容器」，看 DockerReady。
 	Docker bool `json:"docker"`
+	// DockerReady 表示 docker 命令存在**且**宿主机侧可用（daemon 可达、
+	// 当前身份有权限、compose 插件在位）。
+	//
+	// 单独一个字段的理由：Docker 为真只能证明命令在 PATH 里。装在宿主机上
+	// 但 daemon 没启动、或本服务没有 socket 权限时，它照样为真，于是面板
+	// 一路放行到「保存」才在重建容器那步失败——而那时文件已经写盘了。
+	DockerReady bool `json:"docker_ready"`
+	// DockerErr 是 DockerReady 为假时的可读中文原因（例如命令存在但 daemon
+	// 不可达），供界面直接展示；DockerReady 为真时为空。
+	DockerErr string `json:"docker_err,omitempty"`
 	// Reason 在不可用时说明原因，供界面直接展示。
 	Reason string `json:"reason"`
 	// Ports 是部署目录 .env 里那几个**与入口路由直接相关**的端口。

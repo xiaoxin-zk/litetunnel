@@ -38,10 +38,10 @@ func TestLogQueueDropsOldestAndCounts(t *testing.T) {
 			dropped, total, remain)
 	}
 	// 最新一行必须保留，最早那行必须已经没了。
-	if last != fmt.Sprintf("line-%d", total-1) {
-		t.Fatalf("最新一行必须保留，实际 %q", last)
+	if last.text != fmt.Sprintf("line-%d", total-1) {
+		t.Fatalf("最新一行必须保留，实际 %q", last.text)
 	}
-	if first == "line-0" {
+	if first.text == "line-0" {
 		t.Fatal("应当丢弃最旧的日志，而不是把全部内容都留着")
 	}
 }
@@ -114,7 +114,7 @@ func TestLogQueueRespectsByteBudget(t *testing.T) {
 	bytes, lines := a.logBufBytes, len(a.logBuf)
 	sum := 0
 	for _, l := range a.logBuf {
-		sum += len(l)
+		sum += len(l.text)
 	}
 	a.logMu.Unlock()
 

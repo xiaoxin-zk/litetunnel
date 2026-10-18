@@ -28,10 +28,23 @@ const (
 
 // batchManifest 是一次多文件提交的现场。
 type batchManifest struct {
-	Version int             `json:"version"`
-	Dir     string          `json:"dir"`
-	Files   []manifestEntry `json:"files"`
+	Version int `json:"version"`
+	// Status 记录这一批是否已经「确认生效」。
+	//
+	// 没有这个字段时，只能靠「记录还在」推断「没提交完」——于是
+	// 「文件都换好了、容器也重建成功了，只是记录没删掉」会被下一次启动
+	// 当成未完成批次整批回滚，把一份正在运行的配置撤回。
+	// 提交成功（容器已按新配置重建）后先把它改成 committed，再删记录：
+	// 任何一步失败，下次启动都能分清方向。
+	Status string          `json:"status,omitempty"`
+	Dir    string          `json:"dir"`
+	Files  []manifestEntry `json:"files"`
 }
+
+const (
+	// batchStatusCommitted 表示这一批已经生效，启动时只清理、不回滚。
+	batchStatusCommitted = "committed"
+)
 
 // manifestEntry 记录一个文件在提交前的状态。
 type manifestEntry struct {
@@ -64,25 +77,35 @@ func (b *writeBatch) writeManifest() (batchManifest, error) {
 	}
 	m.Dir = filepath.Dir(m.Files[0].Path)
 
-	raw, err := json.Marshal(m)
-	if err != nil {
-		return m, err
-	}
-	// 记录里是部署目录的绝对路径，可能包含宿主机拓扑信息，按凭据文件对待。
-	if err := writeFileAtomic(filepath.Join(m.Dir, batchManifestName), string(raw)+"\n", modeSecret); err != nil {
+	if err := writeManifestFile(m); err != nil {
 		return m, err
 	}
 	return m, nil
 }
 
+// writeManifestFile 把现场（含状态）覆盖写入批次记录。
+func writeManifestFile(m batchManifest) error {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	// 记录里是部署目录的绝对路径，可能包含宿主机拓扑信息，按凭据文件对待。
+	return writeFileAtomic(filepath.Join(m.Dir, batchManifestName), string(raw)+"\n", modeSecret)
+}
+
 // removeManifest 在整批文件已经确定落定（新配置生效或已完整回滚）后撤掉记录。
-func (b *writeBatch) removeManifest(m batchManifest) {
+//
+// 返回 false 表示记录没删掉。调用方据此决定要不要保留备份：
+// 记录还在、备份却没了，下次启动就只能对着半份现场猜。
+func (b *writeBatch) removeManifest(m batchManifest) bool {
 	if m.Dir == "" {
-		return
+		return true
 	}
 	if err := os.Remove(filepath.Join(m.Dir, batchManifestName)); err != nil && !os.IsNotExist(err) {
 		log.Printf("[lt-config] 删除批次记录失败: %v", err)
+		return false
 	}
+	return true
 }
 
 // recoverBatch 按批次记录把整批文件恢复到提交前状态，返回是否已经「确定落定」。
@@ -118,6 +141,33 @@ func recoverBatch(dir string) bool {
 		log.Printf("[lt-config] 批次记录无法解析（%s），改按单文件规则清理: %v", path, err)
 		_ = os.Remove(path)
 		return true
+	}
+
+	if m.Status == batchStatusCommitted {
+		// 这一批已经生效（文件与容器都按新配置完成），只是记录没删掉。
+		// 这里**必须**只清理、不回滚：回滚会把一份正在运行的配置撤回，
+		// 而它在磁盘上、容器里都已经是对的。
+		log.Printf("[lt-config] 发现已提交的批次记录（%d 个文件），清理残留备份", len(m.Files))
+		ok := true
+		for _, f := range m.Files {
+			if err := os.Remove(f.Path + backupSuffix); err != nil && !os.IsNotExist(err) {
+				log.Printf("[lt-config] 清理批次备份失败（%s）: %v", f.Path, err)
+				ok = false
+			}
+			if f.Tmp != "" {
+				_ = os.Remove(f.Tmp)
+			}
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("[lt-config] 删除批次记录失败（%s）: %v", path, err)
+			ok = false
+		}
+		if err := os.Remove(path + backupSuffix); err != nil && !os.IsNotExist(err) {
+			ok = false
+		}
+		// 清理没做干净时保留记录，下次启动继续收拾；但备份已经没用了，
+		// 留着也只是占空间。
+		return ok
 	}
 
 	log.Printf("[lt-config] 发现未完成的批次提交（%d 个文件），按批次整体回滚", len(m.Files))

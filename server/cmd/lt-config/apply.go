@@ -175,6 +175,11 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 
 	// 写盘完成、重建容器前再确认一次：避免「磁盘新、容器旧」的中间态。
 	if err := ctx.Err(); err != nil {
+		// 客户端已经走了：磁盘不能留在新配置上，否则下一次重建容器时
+		// 会突然按一份「谁也没确认过」的配置起来。
+		if rbErr := batch.revert(); rbErr != nil {
+			return res, fmt.Errorf("请求在写盘后中断，且回滚磁盘失败（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", err, rbErr)
+		}
 		return res, err
 	}
 
@@ -182,14 +187,65 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	//
 	// 文件都没有变化时仍然重建：.env 里的 DNS 凭据可能变了，
 	// 而 compose 只有在重建容器时才会把新的环境变量带进容器。
-	out, err := s.composeUp(ctx)
-	if err != nil {
-		return res, err
+	out, upErr := s.composeUp(ctx)
+	if upErr != nil {
+		return res, s.recoverFromFailedApply(ctx, batch, upErr, out)
+	}
+
+	// 容器已按新配置起来，这时才算「生效」——可以撤记录、清备份了。
+	// 收尾失败不影响运行中的配置，记成 warning 而不是让整个请求失败。
+	if err := batch.finalize(); err != nil {
+		res.Warnings = append(res.Warnings, err.Error())
 	}
 	res.Applied = true
 	res.Validate = strings.TrimSpace(res.Validate + "\n" + out)
 	res.Message = "配置已应用，caddy 与 frps 已重建"
 	return res, nil
+}
+
+// partialApplyError 表示配置没有停在「全部生效」或「全部回滚」上。
+//
+// 单独一个类型是为了让 HTTP 层能给出结构化结果（partial + 各容器状态），
+// 而不是把「现在到底是哪一版在跑」埋进一段错误文本里。
+type partialApplyError struct {
+	msg      string
+	services []tlscfg.ServiceState
+}
+
+func (e *partialApplyError) Error() string { return e.msg }
+
+// recoverFromFailedApply 处理「文件已换好、容器重建失败」。
+//
+// 目标是把磁盘与容器拉回同一个版本：先回滚文件，再按旧配置重建一次。
+// 两步都成功才算真的回滚。任何一步失败都必须明确说「现在不是已知状态」，
+// 并给出每个容器的实际状态——只说「重建失败」，管理员既不知道该重试
+// 还是该手工修，也看不出磁盘与新配置哪个已经生效。
+func (s *service) recoverFromFailedApply(ctx context.Context, batch *writeBatch, upErr error, upOut string) error {
+	detail := strings.TrimSpace(upOut)
+	if detail != "" {
+		detail = "\n" + detail
+	}
+
+	if rbErr := batch.revert(); rbErr != nil {
+		states := s.serviceStates(ctx)
+		return &partialApplyError{
+			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
+				"\n重建错误: %v\n回滚错误: %v%s", upErr, rbErr, detail),
+			services: states,
+		}
+	}
+
+	// 文件已回到旧配置。再重建一次，尽量让容器也回到旧版本。
+	if reOut, reErr := s.composeUp(ctx); reErr == nil {
+		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置，可修改后重试）%s", upErr, detail)
+	} else {
+		states := s.serviceStates(ctx)
+		return &partialApplyError{
+			msg: fmt.Sprintf("新配置重建失败，磁盘已回滚为旧配置，但按旧配置重建也失败：容器当前版本未知"+
+				"\n新配置重建错误: %v\n回滚重建错误: %v%s", upErr, reErr, detail),
+			services: states,
+		}
+	}
 }
 
 // pendingChanges 列出「如果应用，会变化哪些文件」，全程不碰磁盘。
@@ -271,6 +327,9 @@ type writeBatch struct {
 	warn    []string
 	// done 是已成功替换的文件数，失败时用于说清边界。
 	done int
+	// manifest 是这一批的现场记录。commit 成功后仍保留在磁盘上，
+	// 直到 finalize（确认生效）或 revert（撤回）把它撤掉。
+	manifest batchManifest
 }
 
 // prepareWrites 比较内容、准备候选项。
@@ -321,6 +380,7 @@ func (b *writeBatch) commit() error {
 		b.discard()
 		return batchManifestError(err)
 	}
+	b.manifest = m
 
 	for i := range b.staged {
 		st := b.staged[i]
@@ -340,12 +400,56 @@ func (b *writeBatch) commit() error {
 		}
 		b.done++
 	}
-	// 全部成功：先撤批次记录，再清备份。
+	// 全部成功，但**不在这里**撤记录、清备份。
 	//
-	// 顺序不能反：先删备份的话，中途崩溃只会留下一份仍然存在的批次记录，
-	// 而它指向的备份已经被删——那时既恢复不了旧配置，也说不清哪一份是
-	// 完整的。
-	b.removeManifest(m)
+	// 配置是否真的生效要等容器重建完——那一步由调用方做（见 apply 的
+	// finalize 调用）。在这里清掉备份，容器重建失败时就再也回不去旧配置；
+	// 而在这里清掉记录，「文件已换好、容器没起来」的中间态就少了一份说明。
+	return nil
+}
+
+// finalize 在配置确认生效（容器已按新配置重建）后落定这一批。
+//
+// 顺序：先标记 committed，再删记录，最后清备份。
+//   - 标记失败 → 保留记录与备份。下次启动看到的是「未提交」，会回滚——
+//     这会把一份已经生效的配置撤回，但比「磁盘与容器都在新版本、记录却
+//     指向不存在的备份」更容易收拾；
+//   - 记录删失败 → 记录仍是 committed，下次启动只清理、不回滚
+//     （见 recoverBatch），备份留到那时再清；
+//   - 备份清理失败 → 只是残留文件，不影响任何判定。
+func (b *writeBatch) finalize() error {
+	if len(b.staged) == 0 {
+		return nil
+	}
+	m := b.manifest
+	m.Status = batchStatusCommitted
+	if err := writeManifestFile(m); err != nil {
+		return fmt.Errorf("标记批次为已提交失败（保留记录与备份，重启后会按未提交处理并回滚）: %w", err)
+	}
+	if !b.removeManifest(m) {
+		// 记录已经标成 committed，留着无害；备份也留着，等下次启动清理。
+		return errors.New("配置已生效，但批次记录未能删除（下次启动会自动清理，不影响运行中的配置）")
+	}
+	for _, st := range b.staged {
+		st.cleanupBackup()
+	}
+	return nil
+}
+
+// revert 把整批文件恢复成提交前的旧内容，并撤掉记录与备份。
+//
+// 用于「文件已经换好，但容器重建失败」：此时磁盘是新配置、容器还是旧的，
+// 不做这一步就留下一个跨版本的半成品。
+func (b *writeBatch) revert() error {
+	if len(b.staged) == 0 {
+		return nil
+	}
+	if err := b.rollbackCommitted(); err != nil {
+		// 恢复失败：记录与备份必须留着，它们是下次启动唯一能依的现场。
+		return err
+	}
+	b.removeManifest(b.manifest)
+	b.discard()
 	for _, st := range b.staged {
 		st.cleanupBackup()
 	}

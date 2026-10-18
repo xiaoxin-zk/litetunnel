@@ -87,6 +87,17 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.renderAndApply(r.Context(), req)
 	if err != nil {
+		// 部分应用必须单独返回：既不是成功，也不是「什么都没发生」。
+		// 只回一句「重建失败」的话，管理员无从判断磁盘与新配置哪个生效了。
+		var partial *partialApplyError
+		if errors.As(err, &partial) {
+			res.Partial = true
+			res.Services = partial.services
+			res.Applied = false
+			res.Message = redactSecret(req.Vars[tlscfg.VarDNSCredential], partial.msg)
+			writeJSON(w, http.StatusOK, res)
+			return
+		}
 		// 按错误类别区分状态码：配置错 422（原地改配置）、宿主机错 502（去查
 		// docker）、读盘/写盘错 500（看本服务日志）。返回前先脱敏：校验输出里
 		// 可能带回服务商插件打印的凭据片段。

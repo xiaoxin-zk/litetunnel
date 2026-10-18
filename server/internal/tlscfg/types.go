@@ -199,6 +199,22 @@ type RenderResult struct {
 	RequiredPorts []int `json:"required_ports"`
 	// Message 是给界面的一句话结论。
 	Message string `json:"message"`
+	// Partial 表示「磁盘与容器没能停在同一版本」。
+	//
+	// 典型场景：文件已换新、容器重建失败，回滚文件后又按旧配置重建也失败。
+	// 这时既不能说成功，也不能说「什么都没发生」——必须让管理员知道
+	// 当前是一个需要人看的状态，并配合 Services 判断先修哪一边。
+	Partial bool `json:"partial,omitempty"`
+	// Services 是重建失败时各 compose 容器的实际状态。
+	//
+	// 只有 Partial 为真时才有意义：它是「现在到底跑的是哪一版」的唯一线索。
+	Services []ServiceState `json:"services,omitempty"`
+}
+
+// ServiceState 是一个 compose 服务的实际状态。
+type ServiceState struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 // DNSCheckRequest 是一次 DNS 检查请求。

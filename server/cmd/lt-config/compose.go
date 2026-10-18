@@ -110,6 +110,41 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 	}
 }
 
+// serviceStates 读取各 compose 容器的实际状态，用于「部分应用」时如实上报。
+//
+// 用 --format 取「服务名 + 状态」一行一条。老版本 compose 不认这个参数，
+// 那就返回空列表——宁可少给信息，也不要在这里再报一个错误掩盖真正的问题
+// （容器重建已经失败了，管理员需要的是原始错误）。
+func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	out, err := runDockerIn(probeCtx, s.paths.deployDir,
+		"compose",
+		"--env-file", s.paths.envFile,
+		"-f", s.paths.composeFile,
+		"ps", "-a", "--format", "{{.Service}}\t{{.State}}")
+	if err != nil {
+		return nil
+	}
+	var states []tlscfg.ServiceState
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, state, ok := strings.Cut(line, "\t")
+		if !ok {
+			name, state = line, ""
+		}
+		states = append(states, tlscfg.ServiceState{
+			Name:  strings.TrimSpace(name),
+			State: strings.TrimSpace(state),
+		})
+	}
+	return states
+}
+
 // notRunningServices 返回当前不在运行状态的 composeServices。
 func (s *service) notRunningServices(ctx context.Context) ([]string, error) {
 	// compose ps 默认只列运行中的容器（--all 才包含已退出的），

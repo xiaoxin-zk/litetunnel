@@ -3,6 +3,8 @@ package service
 import (
 	"log"
 
+	"gorm.io/gorm"
+
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -29,7 +31,16 @@ import (
 // 登记粒度是「步进码」而不是「口令值」：步进码能精确区分窗口内的不同时刻
 // （上一分钟的口令不该挡住这一分钟的），也不会把口令明文存下来。
 func (s *Services) ClaimTOTPStep(adminID uint, step int64) bool {
-	res := s.DB.Model(&model.Admin{}).
+	return s.ClaimTOTPStepTx(s.DB, adminID, step)
+}
+
+// ClaimTOTPStepTx 是 ClaimTOTPStep 的事务版本。
+//
+// 调用方已经在事务内时用它：SQLite 默认只开一条连接，事务里再用主连接会
+// 自锁。防重放判定必须落在**同一个事务**里，否则并发绑定/关闭的临界区里
+// 会漏掉这一次登记。
+func (s *Services) ClaimTOTPStepTx(tx *gorm.DB, adminID uint, step int64) bool {
+	res := tx.Model(&model.Admin{}).
 		Where("id = ? AND totp_last_step < ?", adminID, step).
 		Update("totp_last_step", step)
 	if res.Error != nil {

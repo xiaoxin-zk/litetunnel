@@ -97,37 +97,42 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 // 「只有密码保护」——而用户以为自己正在换绑，多半不会察觉第二因素已经没了。
 // 暂存之后，未完成的换绑等于什么都没发生。
 func (s *Services) AdminTOTPSetup(id uint, code string) (secret, otpauthURL string, err error) {
-	a, err := s.LoadAdmin(id)
+	var username, generated string
+	err = s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+		username = a.Username
+		if a.TOTPEnabled {
+			if strings.TrimSpace(code) == "" {
+				return false, fmt.Errorf(
+					"%w: 双因素认证已启用，换绑需要输入当前动态口令（设备已丢失请联系超级管理员重置）",
+					ErrInvalidParam)
+			}
+			step, ok := auth.VerifyTOTPStep(a.TOTPSecret, code, time.Now())
+			if !ok {
+				return false, ErrTOTPInvalid
+			}
+			// 与登录、绑定一致，这一步的口令也要登记：否则同一个口令可以被拿去
+			// 连续做两次操作（换绑 + 登录），防重放就出现了一个缺口。
+			if !s.ClaimTOTPStepTx(tx, a.ID, step) {
+				return false, ErrTOTPReplay
+			}
+		}
+
+		var gerr error
+		generated, gerr = auth.GenerateTOTPSecret()
+		if gerr != nil {
+			return false, gerr
+		}
+		if err := tx.Model(&model.Admin{}).Where("id = ?", id).
+			Update("totp_pending_secret", generated).Error; err != nil {
+			return false, err
+		}
+		// 只暂存待确认密钥，不动生效的那把：不撤销会话。
+		return false, nil
+	})
 	if err != nil {
 		return "", "", err
 	}
-
-	if a.TOTPEnabled {
-		if strings.TrimSpace(code) == "" {
-			return "", "", fmt.Errorf(
-				"%w: 双因素认证已启用，换绑需要输入当前动态口令（设备已丢失请联系超级管理员重置）",
-				ErrInvalidParam)
-		}
-		step, ok := auth.VerifyTOTPStep(a.TOTPSecret, code, time.Now())
-		if !ok {
-			return "", "", ErrTOTPInvalid
-		}
-		// 与登录、绑定一致，这一步的口令也要登记：否则同一个口令可以被拿去
-		// 连续做两次操作（换绑 + 登录），防重放就出现了一个缺口。
-		if !s.ClaimTOTPStep(a.ID, step) {
-			return "", "", ErrTOTPReplay
-		}
-	}
-
-	secret, err = auth.GenerateTOTPSecret()
-	if err != nil {
-		return "", "", err
-	}
-	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).
-		Update("totp_pending_secret", secret).Error; err != nil {
-		return "", "", err
-	}
-	return secret, auth.OtpauthURL("LiteTunnel", a.Username, secret), nil
+	return generated, auth.OtpauthURL("LiteTunnel", username, generated), nil
 }
 
 // AdminTOTPEnable 用一次正确的动态口令确认绑定（或完成换绑）。
@@ -138,92 +143,115 @@ func (s *Services) AdminTOTPSetup(id uint, code string) (secret, otpauthURL stri
 //
 // 没有待确认密钥时走**首次绑定**：验证的是刚生成的那把密钥本身。
 func (s *Services) AdminTOTPEnable(id uint, code string) error {
-	a, err := s.LoadAdmin(id)
-	if err != nil {
-		return err
-	}
-
-	// 换绑期间优先验证待确认的那把；否则验证当前生效的（首次绑定）。
-	pending := a.TOTPPendingSecret
-	target := pending
-	if target == "" {
-		target = a.TOTPSecret
-	}
-	if target == "" {
-		return fmt.Errorf("%w: 请先生成密钥", ErrInvalidParam)
-	}
-
-	step, ok := auth.VerifyTOTPStep(target, code, time.Now())
-	if !ok {
-		return ErrTOTPInvalid
-	}
-	now := time.Now()
-
-	if pending != "" {
-		// 原子切换：把待确认密钥提升为生效密钥，并清掉暂存。
-		//
-		// 条件里带上「待确认密钥仍是刚验证的那把」，于是：
-		//   - 并发两次确认只有一个成功（另一个 RowsAffected=0）；
-		//   - 期间又调了一次 Setup 换了新密钥的话，这次确认作废——否则会用
-		//     一个已经被替换掉的密钥把 2FA 打开。
-		//
-		// 水位线一并置为本次验证的步进：旧密钥的水位线对新密钥没有意义，
-		// 而且这样这个刚用过的口令也不会被重放。
-		//
-		// token_version 也在同一个 UPDATE 里递增（换绑即撤销既有会话，
-		// 见 updateAdminSecurity）：换绑的前提往往是设备丢失或疑似泄露，
-		// 此刻最该停止信任的就是既有会话。
-		res := s.DB.Model(&model.Admin{}).
-			Where("id = ? AND totp_pending_secret = ?", id, pending).
-			Updates(map[string]any{
-				"totp_secret":         pending,
-				"totp_pending_secret": "",
-				"totp_enabled":        true,
-				"totp_last_step":      step,
-				"totp_verified_at":    now,
-				"token_version":       gorm.Expr("token_version + 1"),
-			})
-		if res.Error != nil {
-			return res.Error
+	return s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+		// 换绑期间优先验证待确认的那把；否则验证当前生效的（首次绑定）。
+		pending := a.TOTPPendingSecret
+		target := pending
+		if target == "" {
+			target = a.TOTPSecret
 		}
-		if res.RowsAffected == 0 {
-			return ErrTOTPReplay
+		if target == "" {
+			return false, fmt.Errorf("%w: 请先生成密钥", ErrInvalidParam)
 		}
-		s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
-		return nil
-	}
 
-	// 首次绑定：登记这一步，避免「刚绑定完立刻拿同一个口令去登录」。
-	if !s.ClaimTOTPStep(a.ID, step) {
-		return ErrTOTPReplay
-	}
-	return s.updateAdminSecurity(id, map[string]any{
-		"totp_enabled":     true,
-		"totp_verified_at": now,
+		step, ok := auth.VerifyTOTPStep(target, code, time.Now())
+		if !ok {
+			return false, ErrTOTPInvalid
+		}
+		now := time.Now()
+
+		if pending != "" {
+			// 原子切换：把待确认密钥提升为生效密钥，并清掉暂存。
+			//
+			// 条件里带上「待确认密钥仍是刚验证的那把」，于是：
+			//   - 并发两次确认只有一个成功（另一个 RowsAffected=0）；
+			//   - 期间又调了一次 Setup 换了新密钥的话，这次确认作废——否则会用
+			//     一个已经被替换掉的密钥把 2FA 打开。
+			//
+			// 水位线一并置为本次验证的步进：旧密钥的水位线对新密钥没有意义，
+			// 而且这样这个刚用过的口令也不会被重放。
+			//
+			// token_version 也在同一个 UPDATE 里递增（换绑即撤销既有会话）：
+			// 换绑的前提往往是设备丢失或疑似泄露，此刻最该停止信任的就是既有会话。
+			res := tx.Model(&model.Admin{}).
+				Where("id = ? AND totp_pending_secret = ?", id, pending).
+				Updates(map[string]any{
+					"totp_secret":         pending,
+					"totp_pending_secret": "",
+					"totp_enabled":        true,
+					"totp_last_step":      step,
+					"totp_verified_at":    now,
+					"token_version":       gorm.Expr("token_version + 1"),
+				})
+			if res.Error != nil {
+				return false, res.Error
+			}
+			if res.RowsAffected == 0 {
+				return false, ErrTOTPReplay
+			}
+			return true, nil
+		}
+
+		// 首次绑定：登记这一步，避免「刚绑定完立刻拿同一个口令去登录」。
+		if !s.ClaimTOTPStepTx(tx, a.ID, step) {
+			return false, ErrTOTPReplay
+		}
+		return true, s.updateAdminSecurityTx(tx, id, map[string]any{
+			"totp_enabled":     true,
+			"totp_verified_at": now,
+		})
 	})
 }
 
-// updateAdminSecurity 写入一次安全相关的管理员状态变更，并撤销其既有会话。
+// withAdminSecurity 在管理员锁内串行执行一次安全状态变更，并在事务内
+// FOR UPDATE 重读目标行。
 //
-// # 会话策略
+// 绑定/换绑/关闭/救援重置这些操作并发时，若各自「先读再写」，会互相覆盖
+// 密钥状态（例如关闭把刚换绑的新密钥清掉），或让令牌撤销与双因素状态
+// 不一致。统一走这一个入口，让「读取-校验-写入」在同一把锁、同一个事务里
+// 原子完成。
 //
-// **任何改变动态口令绑定的操作**——启用、换绑、关闭、超管救援重置——都会让该
-// 管理员已签发的令牌立即失效：递增 token_version（校验时会比对），并清掉身份
-// 缓存（令牌只验签、不查库，缓存不清的话已登录会话在缓存过期前仍会被放行）。
+// fn 返回 changed 表示状态真的变了（据此决定是否撤销既有会话）；返回 error
+// 则整个事务回滚、不撤销会话。会话策略见下方注释：**任何改变动态口令绑定
+// 的操作**都要让该管理员已签发的令牌立即失效——递增 token_version 并清掉
+// 身份缓存，因为这类操作的前提往往是「设备丢失或疑似泄露」，此刻最该停止
+// 信任的恰恰是既有会话。
 //
-// 为什么这类操作要踢人下线：它们的前提往往是「设备丢失或疑似泄露」，而此刻最该
-// 停止信任的恰恰是既有会话——一个被盗的令牌可能正是这次操作要处理的东西。
-// 这与改密码、改角色/状态采用同一套语义。
-//
-// 注意**只在状态真的改变时**才调用：把已经关闭的双因素再关一次也把人踢下线，
-// 只会让管理员在无意义的操作里莫名被登出（改角色那处也是这么处理的）。
-func (s *Services) updateAdminSecurity(id uint, updates map[string]any) error {
-	updates["token_version"] = gorm.Expr("token_version + 1")
-	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+// 注意**只在状态真的改变时**才返回 changed：把已经关闭的双因素再关一次也
+// 把人踢下线，只会让管理员在无意义的操作里莫名被登出。
+func (s *Services) withAdminSecurity(id uint, fn func(tx *gorm.DB, a *model.Admin) (bool, error)) error {
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+
+	var changed bool
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var a model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&a, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		c, ferr := fn(tx, &a)
+		changed = c
+		return ferr
+	})
+	if err != nil {
 		return err
 	}
-	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	if changed {
+		s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	}
 	return nil
+}
+
+// updateAdminSecurityTx 在事务内写入一次安全状态变更：递增 token_version + 写字段。
+//
+// 是否撤销会话由 withAdminSecurity 根据 changed 统一处理，这里只负责那半次
+// 数据库写入，避免各调用方重复调用 InvalidateIdentity。
+func (s *Services) updateAdminSecurityTx(tx *gorm.DB, id uint, updates map[string]any) error {
+	updates["token_version"] = gorm.Expr("token_version + 1")
+	return tx.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error
 }
 
 // AdminTOTPDisable 关闭双因素认证。
@@ -234,23 +262,21 @@ func (s *Services) updateAdminSecurity(id uint, updates map[string]any) error {
 // 关闭同样撤销既有会话（见 updateAdminSecurity）：这是一次「第二因素没了」的
 // 状态变化，此刻继续沿用旧会话等于让降级前的信任无限延续下去。
 func (s *Services) AdminTOTPDisable(id uint, password string) error {
-	a, err := s.LoadAdmin(id)
-	if err != nil {
-		return err
-	}
-	if !auth.VerifyPassword(a.Password, password) {
-		return fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
-	}
-	if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
-		// 本来就没绑定：什么都没变，不该因为一次空操作把人踢下线。
-		return nil
-	}
-	return s.updateAdminSecurity(id, map[string]any{
-		"totp_enabled": false,
-		"totp_secret":  "",
-		// 待确认的密钥一并清掉：关闭之后它没有意义，留着只会在下次绑定时
-		// 被当成「正在换绑」。
-		"totp_pending_secret": "",
+	return s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+		if !auth.VerifyPassword(a.Password, password) {
+			return false, fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
+		}
+		if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
+			// 本来就没绑定：什么都没变，不该因为一次空操作把人踢下线。
+			return false, nil
+		}
+		return true, s.updateAdminSecurityTx(tx, id, map[string]any{
+			"totp_enabled": false,
+			"totp_secret":  "",
+			// 待确认的密钥一并清掉：关闭之后它没有意义，留着只会在下次绑定时
+			// 被当成「正在换绑」。
+			"totp_pending_secret": "",
+		})
 	})
 }
 
@@ -304,18 +330,16 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 // （设备丢失、疑似泄露），而执行救援的超级管理员无法判断目标账号当前
 // 还有哪些会话在活动——全部作废，让持有人重新登录并绑定新设备。
 func (s *Services) AdminClearTOTP(id uint) error {
-	a, err := s.LoadAdmin(id)
-	if err != nil {
-		return err
-	}
-	if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
-		// 没有可清除的绑定：不改变任何状态，也不该把人踢下线。
-		return nil
-	}
-	return s.updateAdminSecurity(id, map[string]any{
-		"totp_enabled":        false,
-		"totp_secret":         "",
-		"totp_pending_secret": "",
-		"totp_verified_at":    nil,
+	return s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+		if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
+			// 没有可清除的绑定：不改变任何状态，也不该把人踢下线。
+			return false, nil
+		}
+		return true, s.updateAdminSecurityTx(tx, id, map[string]any{
+			"totp_enabled":        false,
+			"totp_secret":         "",
+			"totp_pending_secret": "",
+			"totp_verified_at":    nil,
+		})
 	})
 }

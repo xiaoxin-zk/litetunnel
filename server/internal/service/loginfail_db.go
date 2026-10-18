@@ -135,6 +135,9 @@ func (c *dbLoginFailureCounter) bump(account string, now time.Time) error {
 	row := model.LoginFailCounter{Account: account, Count: 1, Since: now.Unix()}
 	return c.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "account"}},
+		// 两个 CASE 都读**旧行**的 since（SQLite 与 Postgres 的 DO UPDATE 都是
+		// 这个语义），所以它们之间没有先后依赖，用 map 形式的 Assignments 即可
+		// （它会按列名排序，正好与仓库里其它条件 upsert 的写法一致）。
 		DoUpdates: clause.Assignments(map[string]any{
 			// 窗口已过期（since <= cutoff）就重新从 1 开始并把窗口起点推到 now，
 			// 否则在原计数上加一。两个 CASE 必须用同一个 cutoff，否则可能出现

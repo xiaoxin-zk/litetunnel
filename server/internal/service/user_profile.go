@@ -33,7 +33,6 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 	updates := map[string]any{}
 	renamed := false
 	emailChanged := false
-	var newEmail string
 
 	if in.Username != nil {
 		name := strings.TrimSpace(*in.Username)
@@ -66,66 +65,35 @@ func (s *Services) UpdateProfile(userID uint, in ProfileUpdateInput) (*model.Use
 		if email != "" && !IsValidEmail(email) {
 			return nil, fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
 		}
-		if email != strings.ToLower(strings.TrimSpace(u.Email)) {
-			// 换邮箱必须走验证流程（见 RequestEmailChange）：要有当前密码，
-			// 还要新地址收得到验证码。否则拿到一个被盗会话的人可以先改成
-			// 自己的邮箱，再用「找回密码」把它变成长期接管。
-			if s.MailEnabled() {
-				return nil, fmt.Errorf("%w: 修改邮箱需要验证新地址，请使用「更换邮箱」流程", ErrInvalidParam)
-			}
-			// 站点没开邮件：邮箱只是联系方式，找不回密码，直接保存没有提权风险。
-			// 但必须清掉「已验证」——那个标记针对的是旧地址。
-			//
-			// 唯一性在这里显式判一次：数据库上有 lower(email) 的唯一索引，
-			// 撞上时 update 会失败，而下面那条错误映射是「用户名已被占用」，
-			// 会把一个邮箱问题报成用户名问题。用 lower() 比较是为了兜住
-			// 早期存入的大小写混写地址（索引缺失时这条就是唯一防线）。
-			taken, err := s.emailTaken(email, userID)
-			if err != nil {
-				return nil, err
-			}
-			if taken {
-				return nil, ErrEmailTaken
-			}
-			updates["email"] = email
-			updates["email_verified"] = false
-			emailChanged = true
-			newEmail = email
-			// email_domain 刻意**不**跟着改：它记的是注册来源域名，
-			// 用于「单域名每日注册额度」的统计。跟着改等于用户换一次邮箱
-			// 就把原域名的当日额度退回去，批量注册可以靠换域名无限续杯。
+		// 换邮箱必须走验证流程（见 RequestEmailChange）：要有当前密码，还要
+		// 新地址收得到验证码，否则拿到一个被盗会话的人可以先改成自己的邮箱、
+		// 再用「找回密码」长期接管。站点没开邮件时邮箱只是联系方式，找不回
+		// 密码，直接保存没有提权风险，但仍要清掉旧地址的「已验证」与恢复凭据。
+		//
+		// 「是否真的换了」与「是否需要验证」都在 changeEmailLocked 里用行锁后的
+		// 当前值判断，不能用开头读到的 u.Email 这个过期快照——并发换绑会漏清
+		// 或覆盖。email_domain 不跟着改：它记的是注册来源域名，用于单域名每日
+		// 注册额度统计，跟着改等于换一次邮箱就退回原域名的当日额度。
+		changed, err := s.changeEmailLocked(userID, email, true, false)
+		if err != nil {
+			return nil, err
 		}
+		emailChanged = changed
 	}
 
-	if len(updates) == 0 {
+	if len(updates) == 0 && !emailChanged {
 		return u, nil
 	}
-	if emailChanged {
-		// 改邮箱与作废旧地址的凭据必须同一个事务：只改不清理，
-		// 旧邮箱持有人手里的重置链接仍然有效（令牌按用户 ID 生效，
-		// 不核对邮箱），而邮件开关随时可能被重新打开。
-		err := s.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
-				return err
-			}
-			return purgeEmailCredentialsTx(tx, userID, u.Email)
-		})
-		if err != nil {
-			// 唯一索引冲突（并发改邮箱）按占用处理；前面的显式检查
-			// 已经把绝大多数情况挡在事务之外，这里只是兜住竞态。
-			if taken, _ := s.emailTaken(newEmail, userID); taken {
-				return nil, ErrEmailTaken
+	if len(updates) > 0 {
+		if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
+			// 只有唯一索引冲突（并发改名）按占用处理。昵称等普通字段写失败也
+			// 报「用户名已被占用」会把排查方向直接带偏——用户会去改名，而真实
+			// 原因是一次写库失败。
+			if isUniqueConflict(err) {
+				return nil, ErrUsernameTaken
 			}
 			return nil, err
 		}
-	} else if err := s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
-		// 只有唯一索引冲突（并发改名）按占用处理。昵称等普通字段写失败也
-		// 报「用户名已被占用」会把排查方向直接带偏——用户会去改名，而真实
-		// 原因是一次写库失败。
-		if isUniqueConflict(err) {
-			return nil, ErrUsernameTaken
-		}
-		return nil, err
 	}
 	if renamed {
 		// 会话表里的用户名仅用于后台展示，改名后同步，避免显示旧值。

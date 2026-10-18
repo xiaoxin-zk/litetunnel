@@ -120,34 +120,20 @@ type AdminUpdateUserInput struct {
 // AdminUpdateUser 更新用户基础信息。
 func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 	updates := map[string]any{}
+	emailChanged := false
 	if in.Email != nil {
-		// 与自助改邮箱（UpdateProfile）同一套口径：小写归一、格式校验、
-		// 唯一性检查，并且换地址后清掉「已验证」——管理员直接填的地址没有
-		// 经过验证码，标成已验证会在「邮箱即身份凭证」的场景下造成误判。
-		var cur model.User
-		if err := s.DB.Select("email").First(&cur, id).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrNotFound
-			}
-			return err
-		}
 		email := strings.ToLower(strings.TrimSpace(*in.Email))
 		if email != "" && !IsValidEmail(email) {
 			return fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
 		}
-		updates["email"] = email
-		if email != strings.ToLower(strings.TrimSpace(cur.Email)) {
-			// 唯一性显式判一次：数据库上的 lower(email) 唯一索引是「尽力而为」
-			// （历史重复时建不起来），撞上时这里兜住并给出准确报错。
-			taken, err := s.emailTaken(email, id)
-			if err != nil {
-				return err
-			}
-			if taken {
-				return ErrEmailTaken
-			}
-			updates["email_verified"] = false
+		// 管理员改邮箱与作废旧地址的恢复凭据必须在用户行锁内同一个事务完成，
+		// 并递增 token_version 让既有网页会话失效（邮箱是找回密码的入口）。
+		// 管理员直接填的地址没走过验证码，因此 email_verified 置 false。
+		changed, err := s.changeEmailLocked(id, email, false, true)
+		if err != nil {
+			return err
 		}
+		emailChanged = changed
 	}
 	if in.Nickname != nil {
 		updates["nickname"] = truncate(*in.Nickname, 64)
@@ -155,21 +141,23 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 	if in.Remark != nil {
 		updates["remark"] = truncate(*in.Remark, 200)
 	}
-	if len(updates) == 0 {
+	if len(updates) == 0 && !emailChanged {
 		return ErrInvalidParam
 	}
-	res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(updates)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		// 可能只是值未变化，仍需确认用户存在。
-		var n int64
-		if err := s.DB.Model(&model.User{}).Where("id = ?", id).Count(&n).Error; err != nil {
-			return err
+	if len(updates) > 0 {
+		res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(updates)
+		if res.Error != nil {
+			return res.Error
 		}
-		if n == 0 {
-			return ErrNotFound
+		if res.RowsAffected == 0 {
+			// 可能只是值未变化，仍需确认用户存在。
+			var n int64
+			if err := s.DB.Model(&model.User{}).Where("id = ?", id).Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrNotFound
+			}
 		}
 	}
 	return nil

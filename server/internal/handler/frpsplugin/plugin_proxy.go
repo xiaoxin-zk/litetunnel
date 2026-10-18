@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
 type newProxyContent struct {

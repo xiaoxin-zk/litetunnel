@@ -161,9 +161,6 @@ type Services struct {
 	// 放行失败更是没有任何地方会再尝试。
 	fwMu      sync.Mutex
 	fwPending map[int]pendingFW
-	// fwGen 是端口意图的单调版本号，每次登记新意图时递增。
-	// 与 fwPending 同一把锁保护。
-	fwGen int64
 
 	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
 	userLocks [userLockShards]sync.Mutex

@@ -25,7 +25,8 @@ type pendingFW struct {
 	attempts  int
 	lastErr   string
 	exhausted bool
-	// gen 是这条意图的版本号，来自 Services.fwGen；落库用它做条件写。
+	// gen 是这条意图的版本号，来自落库的单调序列（nextFirewallGen）；
+	// 落库用 generation 做条件写。
 	gen int64
 }
 
@@ -42,6 +43,27 @@ const (
 	// pendingFWLimit 是待重试队列的长度上限，防止异常情况下无限增长。
 	pendingFWLimit = 512
 )
+
+// nextFirewallGen 从数据库序列取下一个防火墙待办代次。
+//
+// 用落库的单行序列而不是进程内计数器：多实例部署时每个进程从相同值起步，
+// 会生成相同代次，>= 条件无法区分先后。序列在库里，天然全局单调。
+//
+// 调用方必须已持有 fwMu：在锁内取号，才能保证「拿到锁的顺序」等于「代次
+// 的顺序」，否则两个并发登记会以与取锁相反的顺序落到内存里。
+func (s *Services) nextFirewallGen() (int64, error) {
+	var next int64
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var seq model.FirewallSeq
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&seq, 1).Error; err != nil {
+			return err
+		}
+		next = seq.Next
+		return tx.Model(&model.FirewallSeq{}).Where("id = ?", 1).
+			Update("next", seq.Next+1).Error
+	})
+	return next, err
+}
 
 // markFirewallPending 记下一条待重试的端口操作（内存 + 落库）。
 //
@@ -73,8 +95,13 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) bool {
 			pendingFWLimit, port)
 		return false
 	}
-	s.fwGen++
-	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: s.fwGen}
+	gen, err := s.nextFirewallGen()
+	if err != nil {
+		s.fwMu.Unlock()
+		log.Printf("[firewall] 获取待办代次失败（端口 %d），本次意图无法登记: %v", port, err)
+		return false
+	}
+	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: gen}
 	s.fwPending[port] = item
 	s.fwMu.Unlock()
 
@@ -95,16 +122,21 @@ func (s *Services) persistPending(port int, item pendingFW) {
 		Generation: item.gen,
 		LastErr:    truncate(item.lastErr, 255),
 	}
-	// 条件 upsert：只允许「版本号 ≥ 库里那代」的写回覆盖旧记录。
-	// 落库在锁外，旧意图的写回可能晚于新意图——无条件覆盖会让旧「收回」
-	// 顶掉新「放行」。等号允许「同一代的重试次数/终态更新」正常落库。
+	// 条件 upsert：只有「代次更高」（新意图覆盖旧意图）或「同代次且重试次数
+	// 不倒退」（重试循环的状态写回）才覆盖。落库在锁外，旧意图的写回可能
+	// 晚于新意图——无条件覆盖会让旧「收回」顶掉新「放行」；同代次写回不
+	// 带 attempts 条件的话，多实例下旧的重试状态会覆盖新的。
 	if err := s.DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "port"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"proto", "open", "attempts", "exhausted", "generation", "last_err",
 		}),
 		Where: clause.Where{Exprs: []clause.Expression{
-			gorm.Expr("excluded.generation >= lt_firewall_pending.generation"),
+			// 条件写分两层：
+			//   - 代次更高：新意图覆盖旧意图（markFirewallPending 每次取新号）；
+			//   - 同代次且重试次数不倒退：重试循环用同一代次写回 attempts/
+			//     last_err，多实例下旧的重试状态不能覆盖新的。
+			gorm.Expr("excluded.generation > lt_firewall_pending.generation OR (excluded.generation = lt_firewall_pending.generation AND excluded.attempts >= lt_firewall_pending.attempts)"),
 		}},
 	}).Create(&rec).Error; err != nil {
 		log.Printf("[firewall] 待办落库失败（端口 %d，重启后会丢失这条意图）: %v", port, err)
@@ -150,10 +182,6 @@ func (s *Services) loadPendingFirewall() {
 		s.fwPending[r.Port] = pendingFW{
 			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
 			exhausted: r.Exhausted, gen: r.Generation,
-		}
-		if r.Generation > s.fwGen {
-			// 新登记的意图必须比库里所有旧代都大，否则条件写永远不生效。
-			s.fwGen = r.Generation
 		}
 	}
 	n := len(s.fwPending)

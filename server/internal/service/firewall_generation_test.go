@@ -47,10 +47,8 @@ func TestFirewallPendingLoadSeedsGeneration(t *testing.T) {
 	svc.markFirewallPending(20002, "tcp", true) // gen 1
 	svc.persistPending(20002, pendingFW{open: true, proto: "tcp", gen: 1})
 
-	// 模拟重启：读回时 fwGen 必须至少等于库里的最大值，
-	// 否则下一次登记会从 1 开始，条件写永远不生效。
+	// 模拟重启：代次来自落库序列，重启后取号仍然单调递增（不会撞回旧值）。
 	svc.fwPending = nil
-	svc.fwGen = 0
 	svc.loadPendingFirewall()
 
 	svc.markFirewallPending(20002, "tcp", false)

@@ -615,6 +615,19 @@ type FirewallPending struct {
 // TableName 固定表名。
 func (FirewallPending) TableName() string { return "lt_firewall_pending" }
 
+// FirewallSeq 是防火墙待办代次的跨实例单调序列（单行表，ID 固定为 1）。
+//
+// 之前用进程内计数器（Services.fwGen）做代次：多实例部署时每个进程从相同值
+// 起步，会生成相同代次，落库的 >= 条件无法区分两个实例的先后。改成落库的
+// 单行序列后，代次在所有实例间全局单调。
+type FirewallSeq struct {
+	ID   uint  `gorm:"primarykey" json:"id"`
+	Next int64 `gorm:"not null;default:1" json:"next"`
+}
+
+// TableName 固定表名。
+func (FirewallSeq) TableName() string { return "lt_firewall_seq" }
+
 // Setting 运行期可调的键值配置。
 type Setting struct {
 	Key       string    `gorm:"primarykey;size:64" json:"key"`

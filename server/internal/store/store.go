@@ -12,6 +12,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
@@ -97,6 +98,9 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		// 待重试的防火墙端口操作：必须落库，否则进程重启后丢失，
 		// 那条本该收回的规则会一直留在宿主机上。
 		&model.FirewallPending{},
+		// 防火墙待办代次的跨实例单调序列：多实例下用落库序列而不是进程内
+		// 计数器，保证代次全局单调。
+		&model.FirewallSeq{},
 		// 流量采样基线：必须落库，否则控制面重启后会把当天已有流量
 		// 重复计入一遍（frps 没重启时它的当日累计值还在）。
 		&model.TrafficBaseline{},
@@ -111,6 +115,21 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.RuntimeLease{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
+	}
+
+	// 种子：防火墙代次序列。单行（ID=1），Next 从现有待办代次之上起步，
+	// 避免与升级前用进程内计数器写下的旧代次撞车（撞了会让条件写失效）。
+	// OnConflict DoNothing 保证幂等：并发启动 / 重启时只有第一次真正写入。
+	row := db.Model(&model.FirewallPending{}).Select("COALESCE(MAX(generation), 0)").Row()
+	var maxGen int64
+	if err := row.Scan(&maxGen); err != nil {
+		return nil, fmt.Errorf("读取防火墙待办最大代次失败: %w", err)
+	}
+	if err := db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(&model.FirewallSeq{ID: 1, Next: maxGen + 1}).Error; err != nil {
+		return nil, fmt.Errorf("初始化防火墙序列失败: %w", err)
 	}
 
 	// 端口唯一性由数据库兜底：并发分配同一端口时会被这里直接拒绝。

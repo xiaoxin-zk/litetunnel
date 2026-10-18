@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -258,13 +259,6 @@ func (s *Services) AdminTOTPDisable(id uint, password string) error {
 // 管理员口令是平台的最高权限入口，因此策略比普通用户更严格：
 // 长度不少于 12 位，且不允许与原密码相同。
 func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string) error {
-	a, err := s.LoadAdmin(id)
-	if err != nil {
-		return err
-	}
-	if !auth.VerifyPassword(a.Password, oldPassword) {
-		return fmt.Errorf("%w: 原密码不正确", ErrInvalidParam)
-	}
 	if len(newPassword) < 12 {
 		return fmt.Errorf("%w: 管理员密码长度不得少于 12 位", ErrInvalidParam)
 	}
@@ -275,15 +269,30 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 	if err != nil {
 		return err
 	}
-	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
-		"password":      hashed,
-		"token_version": gorm.Expr("token_version + 1"),
+
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		// 在锁内重读目标行：并发改密时，事务外读到的旧密码已经过时，用它
+		// 验证会把「已被他人改掉」的旧密码当成有效凭据。FOR UPDATE 锁住这
+		// 一行，让「验旧密码」与「写新密码」原子完成。
+		var a model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&a, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !auth.VerifyPassword(a.Password, oldPassword) {
+			return fmt.Errorf("%w: 原密码不正确", ErrInvalidParam)
+		}
+		return tx.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+			"password":      hashed,
+			"token_version": gorm.Expr("token_version + 1"),
+		}).Error
 	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
+	if err != nil {
+		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
 	return nil

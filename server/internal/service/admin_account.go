@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -223,7 +224,7 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 	}
 	// 真正的守卫在 applyAdminUpdate 里：上面那次数量检查只负责给出准确的报错，
 	// 并发下它可能已经过时。
-	if err := s.applyAdminUpdate(id, target, updates); err != nil {
+	if err := s.applyAdminUpdate(id, updates); err != nil {
 		return err
 	}
 	// 角色或状态变更后，让该账号的旧令牌立即失效。
@@ -243,12 +244,22 @@ func (s *Services) UpdateAdmin(id, operatorID uint, in AdminUpdateInput) error {
 //  2. 检查与 UPDATE 放进同一个事务，对其它写路径原子；
 //  3. 检查用 tx 而不是主连接——SQLite 默认只开一条连接，在事务里用主连接
 //     重新查询会永久等它释放（AdminSetUserGroup 就踩过这个自锁）。
-func (s *Services) applyAdminUpdate(id uint, target *model.Admin, updates map[string]any) error {
+func (s *Services) applyAdminUpdate(id uint, updates map[string]any) error {
 	s.adminMu.Lock()
 	defer s.adminMu.Unlock()
 
 	return s.DB.Transaction(func(tx *gorm.DB) error {
-		if err := assertSuperAdminRemainsAfterUpdate(tx, target, updates); err != nil {
+		// 在事务内重读目标行：调用方传入的是事务外读的旧快照，并发
+		// 降权/禁用/删除可能已经改掉它的 role/status。锁住这行再复核，
+		// 否则「最后超管」的判断会基于过期状态，可能被并发操作绕过。
+		var fresh model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fresh, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if err := assertSuperAdminRemainsAfterUpdate(tx, &fresh, updates); err != nil {
 			return err
 		}
 		return tx.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error
@@ -298,12 +309,22 @@ func (s *Services) DeleteAdmin(id, operatorID uint) error {
 	s.adminMu.Lock()
 	defer s.adminMu.Unlock()
 	if err := s.DB.Transaction(func(tx *gorm.DB) error {
-		if target.Role == "super" {
-			if err := assertNotLastSuperAdminIn(tx, target.ID, "删除"); err != nil {
+		// 在事务内重读目标行：target 是事务外读的旧快照，其 role 可能在
+		// 这之间被并发改动（升/降级）。用旧角色决定要不要做超管保护，
+		// 会漏拦「并发升成超管后被删」这种本应受保护的情况。
+		var fresh model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fresh, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if fresh.Role == "super" {
+			if err := assertNotLastSuperAdminIn(tx, fresh.ID, "删除"); err != nil {
 				return err
 			}
 		}
-		return tx.Delete(&model.Admin{}, target.ID).Error
+		return tx.Delete(&model.Admin{}, fresh.ID).Error
 	}); err != nil {
 		return err
 	}
@@ -320,15 +341,26 @@ func (s *Services) AdminSetPassword(id uint, newPassword string) error {
 	if err != nil {
 		return err
 	}
-	res := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
-		"password":      hashed,
-		"token_version": gorm.Expr("token_version + 1"),
+
+	// 与改密/删号/改角色同用管理员锁，并在事务内重读确认目标仍存在：
+	// 并发删除时若先删后改，这里会明确报错而非静默成功。
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		var a model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&a, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		return tx.Model(&model.Admin{}).Where("id = ?", id).Updates(map[string]any{
+			"password":      hashed,
+			"token_version": gorm.Expr("token_version + 1"),
+		}).Error
 	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
+	if err != nil {
+		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
 	return nil

@@ -100,11 +100,14 @@ func (s *Services) FirewallOpenPort(port int, proto string) error {
 //
 // 关闭比放行危险得多：配错会让管理员再也连不上服务器。
 // 因此这里必须过 CheckRemove，而它内置了「保护端口」与「端口池范围」双重校验。
+//
+// 与放行对称：总开关 + 自动收回开关都开才会动手；自动收回关闭时返回 nil
+// （跳过、不重试），删/停隧道仍成功，规则留给管理员手工清理。
 func (s *Services) FirewallClosePort(port int, proto string) error {
 	if port <= 0 {
 		return nil
 	}
-	if !s.Settings.Bool(KeyFirewallEnabled) {
+	if !s.Settings.Bool(KeyFirewallEnabled) || !s.Settings.Bool(KeyFirewallAutoClose) {
 		return nil
 	}
 	if err := s.FirewallGuard().CheckRemove(port); err != nil {

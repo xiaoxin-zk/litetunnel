@@ -6,9 +6,10 @@ import (
 
 // FirewallStatus 是管理页需要的防火墙运行态。
 type FirewallStatus struct {
-	Enabled  bool   `json:"enabled"`
-	AutoOpen bool   `json:"auto_open"`
-	Backend  string `json:"backend"`
+	Enabled   bool   `json:"enabled"`
+	AutoOpen  bool   `json:"auto_open"`
+	AutoClose bool   `json:"auto_close"`
+	Backend   string `json:"backend"`
 	Reason   string `json:"reason,omitempty"`
 	// Active 是后端报告的「防火墙是否处于启用状态」。
 	Active bool `json:"active"`
@@ -56,6 +57,7 @@ func (s *Services) FirewallStatusOf() *FirewallStatus {
 	st := &FirewallStatus{
 		Enabled:    s.Settings.Bool(KeyFirewallEnabled),
 		AutoOpen:   s.Settings.Bool(KeyFirewallAutoOpen),
+		AutoClose:  s.Settings.Bool(KeyFirewallAutoClose),
 		Protected:  s.FirewallGuard().Protected(),
 		PoolStart:  s.Cfg.PortRangeStart,
 		PoolEnd:    s.Cfg.PortRangeEnd,

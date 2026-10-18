@@ -88,6 +88,7 @@ const (
 	KeyPortReserved      SettingKey = "port.reserved"
 	KeyFirewallEnabled   SettingKey = "firewall.enabled"
 	KeyFirewallAutoOpen  SettingKey = "firewall.auto_open"
+	KeyFirewallAutoClose SettingKey = "firewall.auto_close"
 	KeyFirewallProtected SettingKey = "firewall.protected_ports"
 	// 宿主机 helper 的回环地址与访问令牌
 	KeyFirewallHelperAddr  SettingKey = "firewall.helper_addr"
@@ -264,6 +265,7 @@ var settingSpecs = []settingSpec{
 	}},
 	{Key: KeyFirewallEnabled, Default: func(*config.Config) string { return "false" }},
 	{Key: KeyFirewallAutoOpen, Default: func(*config.Config) string { return "true" }},
+	{Key: KeyFirewallAutoClose, Default: func(*config.Config) string { return "true" }},
 	{Key: KeyFirewallHelperAddr, Default: func(*config.Config) string { return "http://127.0.0.1:7849" }},
 	{Key: KeyFirewallHelperToken, Secret: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyFirewallProtected, Default: func(c *config.Config) string {

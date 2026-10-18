@@ -870,12 +870,20 @@ func (s *Services) UpdatePassword(userID uint, oldPwd, newPwd string) error {
 		}).Error; err != nil {
 			return err
 		}
+		// 已建立的客户端会话同步置为离线：只递增 token_version 只能让
+		// 网页 JWT 失效，frpc 用的是 client_secret，不受它影响。
+		if err := revokeClientSessionsTx(tx, userID); err != nil {
+			return err
+		}
 		// 旧的重置链接与排队中的重置邮件一并作废：改密之后它们不该还能用。
 		return revokePasswordResetTx(tx, userID, locked.Email)
 	}); err != nil {
 		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
+	// 内存会话必须一起清：插件热路径先查内存，命中后只校验配额就放行，
+	// 根本不会读数据库。不清的话，改完密码的 frpc 仍能继续接受新连接。
+	s.Runtime.DropUserSessions(userID)
 	return nil
 }
 

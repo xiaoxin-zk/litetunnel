@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -485,8 +486,17 @@ func TestEnablingFirewallAtRuntimeAlignsRules(t *testing.T) {
 		t.Fatalf("建隧道失败: %v", err)
 	}
 
-	svc.StartFirewallReconciler()
-	// 协调器先睡 3 秒等 frps 与数据库就绪（见实现）。
+	ctx, cancel := context.WithCancel(context.Background())
+	done := svc.StartFirewallReconciler(ctx)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("协调器未在退出信号后停止")
+		}
+	})
+	// 协调器先等 3 秒让 frps 与数据库就绪（见实现）。
 	time.Sleep(3*time.Second + 300*time.Millisecond)
 
 	// 运行中打开防火墙，并立刻唤醒协调器（设置页会这么做）。

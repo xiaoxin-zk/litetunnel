@@ -471,12 +471,20 @@ func (s *Services) AdminResetUserPassword(id uint, newPassword string) error {
 		if res.RowsAffected == 0 {
 			return ErrNotFound
 		}
+		// 已建立的客户端会话同步置为离线：token_version 只影响网页 JWT，
+		// frpc 用的是 client_secret，不会因此失效。
+		if err := revokeClientSessionsTx(tx, id); err != nil {
+			return err
+		}
 		// 旧的重置链接与排队中的重置邮件一并作废：改密之后它们不该还能用。
 		return revokePasswordResetTx(tx, id, locked.Email)
 	}); err != nil {
 		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
+	// 内存会话必须一起清：插件热路径只查内存，命中后只校验配额就放行。
+	// 管理员重置密码的典型场景是「账号可能已被他人控制」，留着会话等于没重置。
+	s.Runtime.DropUserSessions(id)
 	return nil
 }
 

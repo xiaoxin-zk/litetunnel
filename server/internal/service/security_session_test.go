@@ -50,6 +50,79 @@ func TestResetClientSecretRevokesSessions(t *testing.T) {
 	}
 }
 
+// TestPasswordChangeDropsClientSessions 覆盖「改密后 frpc 仍能继续连」。
+//
+// token_version 只让网页 JWT 失效；frpc 用的是 client_secret，不受它影响。
+// 插件热路径又只查内存会话，所以数据库与内存两边都必须处理。
+func TestPasswordChangeDropsClientSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	hashed, err := auth.HashPassword("OldPassw0rd!")
+	if err != nil {
+		t.Fatalf("生成口令失败: %v", err)
+	}
+	u := &model.User{Username: "pwchange", Password: hashed, Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-pw-1"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID, Online: true,
+	}).Error; err != nil {
+		t.Fatalf("建会话失败: %v", err)
+	}
+
+	if err := svc.UpdatePassword(u.ID, "OldPassw0rd!", "NewPassw0rd!"); err != nil {
+		t.Fatalf("改密失败: %v", err)
+	}
+
+	if _, ok := svc.Runtime.LookupSession(runID); ok {
+		t.Error("改密后内存会话必须被清掉：插件热路径只查它，留着就还会放行新连接")
+	}
+	var sess model.ClientSession
+	if err := svc.DB.Where("run_id = ?", runID).First(&sess).Error; err != nil {
+		t.Fatalf("读会话失败: %v", err)
+	}
+	if sess.Online {
+		t.Error("改密后数据库会话应标记为离线")
+	}
+}
+
+// TestAdminResetPasswordDropsClientSessions 覆盖管理员重置密码的同一问题。
+func TestAdminResetPasswordDropsClientSessions(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	u := &model.User{Username: "adminreset", Password: "not-used", Status: model.UserStatusActive}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	const runID = "run-ar-1"
+	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
+	if err := svc.DB.Create(&model.ClientSession{
+		UserID: u.ID, Username: u.Username, RunID: runID, Online: true,
+	}).Error; err != nil {
+		t.Fatalf("建会话失败: %v", err)
+	}
+
+	if err := svc.AdminResetUserPassword(u.ID, "ResetPassw0rd!"); err != nil {
+		t.Fatalf("重置密码失败: %v", err)
+	}
+
+	if _, ok := svc.Runtime.LookupSession(runID); ok {
+		t.Error("管理员重置密码后内存会话必须被清掉")
+	}
+	var sess model.ClientSession
+	if err := svc.DB.Where("run_id = ?", runID).First(&sess).Error; err != nil {
+		t.Fatalf("读会话失败: %v", err)
+	}
+	if sess.Online {
+		t.Error("管理员重置密码后数据库会话应标记为离线")
+	}
+}
+
 // TestDropUserSessionsOnlyDropsThatUser 确认清理不会误伤其他账号。
 func TestDropUserSessionsOnlyDropsThatUser(t *testing.T) {
 	svc := newTestServices(t, nil)

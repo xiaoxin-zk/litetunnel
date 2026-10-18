@@ -137,10 +137,27 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 	// 端口锁，不碰用户锁，不会阻塞该用户的任何其他操作。
 	if len(res.Created) > 0 {
 		created := res.Created
+		// 先把这些端口登记为「待放行」再返回：异步补做的这段时间里，
+		// 管理页的待办列表能看出规则还没生效，而不是显示一切正常、
+		// 用户却连不上。补做成功后立即移除。
+		for i := range created {
+			if created[i].RemotePort > 0 {
+				s.markFirewallPending(created[i].RemotePort, ProtoOfTunnel(created[i].Type), true)
+			}
+		}
 		go func() {
 			for i := range created {
-				if created[i].RemotePort > 0 {
-					s.applyPortIntent(created[i].RemotePort, ProtoOfTunnel(created[i].Type), true)
+				port := created[i].RemotePort
+				if port <= 0 {
+					continue
+				}
+				acted, err := s.applyPortIntent(port, ProtoOfTunnel(created[i].Type), true)
+				// 失败时 applyPortIntent 已经重新登记为待办；这里只处理
+				// 「成功」与「意图已过时」两种情况。
+				if err == nil {
+					s.dropPending(port)
+				} else if !acted {
+					s.dropPending(port)
 				}
 			}
 		}()

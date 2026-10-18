@@ -73,7 +73,7 @@ func main() {
 	// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
 	// 没有它，公网服务跑久了这几张表会一直膨胀。
 	svc.StartMaintenanceWorker(ctx)
-	svc.StartFirewallReconciler()
+	fwDone := svc.StartFirewallReconciler(ctx)
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
 	go svc.Monitor.Start(ctx)
 
@@ -101,6 +101,14 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+
+	// 等协调器退出再返回：它可能正在访问数据库或调用 helper，
+	// 进程先走会让那次写操作停在半路。
+	select {
+	case <-fwDone:
+	case <-time.After(5 * time.Second):
+		log.Println("防火墙协调器未在 5 秒内退出，继续关闭")
+	}
 	log.Println("已退出")
 }
 

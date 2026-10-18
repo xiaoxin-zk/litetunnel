@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -742,16 +743,33 @@ func (s *Services) ReconcileFirewall() bool {
 //
 // 除了定时轮询，设置页打开防火墙时会通过 KickFirewall 立刻唤醒一次，
 // 不必等下一个周期。
-func (s *Services) StartFirewallReconciler() {
+// 返回值在协程退出时关闭，供关闭阶段等待（见 main）。
+func (s *Services) StartFirewallReconciler(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
+
 		// 延迟几秒执行：等待 frps 与数据库就绪，避免启动瞬间的误判。
-		time.Sleep(3 * time.Second)
+		// 用可取消的 timer 而不是 Sleep：收到退出信号时不必等这几秒。
+		start := time.NewTimer(3 * time.Second)
+		select {
+		case <-start.C:
+		case <-ctx.Done():
+			start.Stop()
+			return
+		}
 
 		// 恢复上次进程遗留的待办：它们在内存里丢了，但意图还在库里。
 		s.loadPendingFirewall()
 
 		aligned := false
 		for {
+			// 每轮先看退出信号：协调器会访问数据库与 helper，
+			// 关闭之后继续跑只会在已关停的连接上刷错误日志。
+			if ctx.Err() != nil {
+				return
+			}
+
 			enabled := s.Settings.Bool(KeyFirewallEnabled)
 			if !enabled {
 				// 关着的时候不碰规则；同时把「已对齐」标记清掉，
@@ -768,12 +786,18 @@ func (s *Services) StartFirewallReconciler() {
 				}
 			}
 
+			timer := time.NewTimer(firewallRetryInterval)
 			select {
-			case <-time.After(firewallRetryInterval):
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
 			case <-s.fwKick:
 				// 被设置变更唤醒：立刻重新判断（对齐标记为 false 时会做整表对齐）。
+				timer.Stop()
 				aligned = false
 			}
 		}
 	}()
+	return done
 }

@@ -190,13 +190,14 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 之后，两者只可能是先后关系，内存标记随之与数据库一致。
 	lock := s.userLock(id)
 	lock.Lock()
-	defer lock.Unlock()
 
 	res := s.DB.Model(&model.User{}).Where("id = ?", id).Update("status", status)
 	if res.Error != nil {
+		lock.Unlock()
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
+		lock.Unlock()
 		return ErrNotFound
 	}
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
@@ -212,6 +213,11 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 同时撤销其运行时会话：插件热路径命中会话后只看这两个标记，
 		// 但会话本身留着也没有意义——账号都禁用了。
 		s.Runtime.DropUserSessions(id)
+		// 「改库 + 置阻断标记」到此完成，释放用户锁再做断流：断流要访问
+		// frps 管理接口、最长 15 秒，持锁会让同一账号的其它管理操作
+		// （改配额、改分组、删除）全部排队 15 秒。
+		lock.Unlock()
+
 		// 主动关闭该用户在 frps 侧已建立的代理：只清会话拦得住新连接，
 		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
 		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
@@ -237,8 +243,10 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 直到下一轮采集成功才纠正——期间流量照跑、配额照超。保持原标记
 	// 并把失败明确报给管理员（重试本操作幂等，或等采集纠正）。
 	if err := s.refreshQuotaFor(id); err != nil {
+		lock.Unlock()
 		return fmt.Errorf("账号已启用，但配额标记刷新失败（沿用原有超额状态，重试本操作或等下一轮采集可纠正）: %w", err)
 	}
+	lock.Unlock()
 	return nil
 }
 

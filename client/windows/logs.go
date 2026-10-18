@@ -256,13 +256,19 @@ func (a *App) flushLogs() {
 // logKick 为 nil 时这里仍要能工作：nil 通道在 select 里永远不就绪，
 // 于是退化成纯定时推送——不能因为少初始化一个 channel 就让日志彻底不显示。
 func (a *App) startLogFlusher() {
+	a.logWg.Add(1)
 	go func() {
+		defer a.logWg.Done()
 		ticker := time.NewTicker(logFlushInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 			case <-a.logKick:
+			case <-a.logStop:
+				// 退出前把队列剩下的推出去，别让最后几行收尾日志丢在缓冲区里。
+				a.flushLogs()
+				return
 			}
 			a.flushLogs()
 		}

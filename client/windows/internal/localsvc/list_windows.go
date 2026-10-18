@@ -3,9 +3,18 @@
 package localsvc
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
+	"time"
 )
+
+// listCommandTimeout 是 netstat / tasklist 的单次命令超时。
+//
+// 这两个系统命令正常情况下瞬间返回，卡住多半是系统进入了异常状态
+// （WMI 或进程枚举服务无响应）。没有超时的话，建隧道页面会一直转圈，
+// 用户既不知道发生了什么，也无法取消。
+const listCommandTimeout = 10 * time.Second
 
 // List 枚举本机正在监听的服务。
 //
@@ -50,7 +59,9 @@ func List() ([]Service, error) {
 // 不隐藏的话每次扫描都会在用户屏幕上闪一个黑框——
 // 用户会以为程序出了问题。
 func runHidden(name string, args ...string) ([]byte, error) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), listCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW

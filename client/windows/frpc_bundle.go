@@ -39,13 +39,29 @@ func ensureFrpc() (string, error) {
 		return target, nil
 	}
 
+	// 先写临时文件、成功后再原子替换，绝不直接覆盖目标。
+	//
+	// 直接 WriteFile 覆盖的话，写到一半被强杀或被杀软拦截，目标路径上会
+	// 留下一个半写的 frpc.exe；而下面判断「存在」只靠内容比对，残缺文件
+	// 既不能执行、又可能因为长度不同而反复触发重写。写临时文件再 Rename，
+	// 目标在任何时刻要么是上一份完整可用的、要么是这一份完整可用的。
+	tmp := target + ".tmp"
+	if err := os.WriteFile(tmp, embeddedFrpc, 0o600); err != nil {
+		// 写不进去不致命：调用方会回退到「同目录查找」，
+		// 至少还有一条路能走通。
+		return "", fmt.Errorf("释放内置 frpc 失败: %w", err)
+	}
+	// 落盘后再核一次长度：WriteFile 返回成功并不绝对等于磁盘上就是完整的那份。
+	if info, err := os.Stat(tmp); err != nil || info.Size() != int64(len(embeddedFrpc)) {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("释放内置 frpc 失败：临时文件长度不一致")
+	}
 	// 0600：只给当前用户读写。
 	//
 	// 这里防的不是提权（用户本来就拥有这台机器），
 	// 而是避免同一台机器上的其他账户把它替换成别的程序。
-	if err := os.WriteFile(target, embeddedFrpc, 0o600); err != nil {
-		// 写不进去不致命：调用方会回退到「同目录查找」，
-		// 至少还有一条路能走通。
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
 		return "", fmt.Errorf("释放内置 frpc 失败: %w", err)
 	}
 	return target, nil

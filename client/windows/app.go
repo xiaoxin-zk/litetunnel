@@ -290,6 +290,12 @@ type App struct {
 	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
 	// 不排队也不阻塞——推送协程醒来时取走一批（maxLogBatch 行）。
 	logKick chan struct{}
+	// logStop 在退出时通知日志推送协程停止，避免窗口销毁后它还继续
+	// 调用 EventsEmit；logStopOnce 保证只关闭一次，logWg 让关闭流程
+	// 等到它真正退出再返回（见 startLogFlusher / shutdown）。
+	logStop     chan struct{}
+	logStopOnce sync.Once
+	logWg       sync.WaitGroup
 
 	// retries 记录每条隧道连续失败次数与下次允许拉起的时间。
 	//
@@ -345,6 +351,7 @@ func NewApp() *App {
 		connectAt:    map[uint]time.Time{},
 		errEmitAt:    map[uint]time.Time{},
 		logKick:      make(chan struct{}, 1),
+		logStop:      make(chan struct{}),
 		startedAt:    time.Now(),
 		http: &http.Client{
 			Timeout: 15 * time.Second,
@@ -534,6 +541,16 @@ func (a *App) shutdown(ctx context.Context) {
 		}
 	})
 
+	// 停止日志推送协程：先关信号、等它退出，最后再推一次兜底。
+	//
+	// mgr.Close（上面）会产出「隧道已断开」「frpc 已退出」等收尾日志，这些行
+	// 已经进入队列，flusher 收到停止信号后会先把它们推出去再退出。这里最后
+	// 再 flush 一次，覆盖 flusher 尚未启动（如测试直接构造的 App）等边缘情况。
+	// 关信号必须在等退出之前：不关的话 logWg.Wait 会永远等不到。
+	if a.logStop != nil {
+		a.logStopOnce.Do(func() { close(a.logStop) })
+		a.logWg.Wait()
+	}
 	// 把队列里剩下的日志推出去：停止进程会产出「隧道已断开」「frpc 已退出」
 	// 这类收尾日志，攒在队列里不发，用户下次打开客户端时日志就断在退出前。
 	a.flushLogs()

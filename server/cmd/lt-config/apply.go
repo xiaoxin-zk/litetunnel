@@ -156,6 +156,12 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 		return res, errors.New("本服务以只渲染模式启动（LT_CFG_APPLY=false），配置未写入、也未重建容器")
 	}
 
+	// 校验（可能跑了 docker）结束后、写盘前再确认一次请求仍在：校验耗时可能
+	// 让浏览器/代理超时断开，此时继续写盘会留下「磁盘新、容器旧」的半套状态。
+	if err := ctx.Err(); err != nil {
+		return res, err
+	}
+
 	// 9) 两阶段提交：候选内容全部就绪后才逐个替换。
 	batch, err := prepareWrites(writes)
 	if err != nil {
@@ -166,6 +172,11 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 		return res, internalError(err)
 	}
 	res.Changed = sortedChanged(batch.changed)
+
+	// 写盘完成、重建容器前再确认一次：避免「磁盘新、容器旧」的中间态。
+	if err := ctx.Err(); err != nil {
+		return res, err
+	}
 
 	// 10) 重建容器。
 	//

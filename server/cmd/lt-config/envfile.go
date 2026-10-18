@@ -256,6 +256,10 @@ type stagedFile struct {
 	tmp  string
 	// backup 是替换前旧文件的备份路径；替换成功后删除，失败时用于回滚。
 	backup string
+	// existed 记录目标路径在替换前是否已存在。原本不存在的文件，回滚时
+	// 不是「把备份放回去」，而是「把刚创建的新文件删掉」——否则会留下
+	// 半套配置（新文件在、旧文件从来没有）。
+	existed bool
 }
 
 // stageFile 把内容写进同目录的临时文件并设好权限，内容尚未生效。
@@ -297,6 +301,7 @@ func stageFile(name, path, content string, mode os.FileMode) (*stagedFile, error
 func (s *stagedFile) commit() error {
 	// 备份旧文件（若存在）。用 rename：原子且不跨文件系统（备份与目标同目录）。
 	if _, err := os.Stat(s.path); err == nil {
+		s.existed = true
 		backup := s.path + ".lt-config-bak"
 		if err := os.Rename(s.path, backup); err != nil {
 			return fmt.Errorf("备份旧文件失败: %w", err)
@@ -318,13 +323,21 @@ func (s *stagedFile) commit() error {
 // 可能既没有新文件也没有旧文件（或仍留着新文件），调用方必须如实上报，
 // 而不是把它当成「已经回滚好了」。
 func (s *stagedFile) restore() error {
-	if s.backup == "" {
+	if s.backup != "" {
+		if err := os.Rename(s.backup, s.path); err != nil {
+			return err
+		}
+		s.backup = ""
 		return nil
 	}
-	if err := os.Rename(s.backup, s.path); err != nil {
-		return err
+	if !s.existed {
+		// 目标文件原本不存在：回滚 = 删掉刚创建的新文件，回到「不存在」，
+		// 否则磁盘上会留下一个新文件，而其余文件回滚回了旧版本——同样是
+		// 新旧混合。文件已不在（并发删除）不视为失败。
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
-	s.backup = ""
 	return nil
 }
 

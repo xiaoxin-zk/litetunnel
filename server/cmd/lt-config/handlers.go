@@ -79,6 +79,11 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 		failJSON(w, http.StatusBadRequest, errors.New("请求体格式不正确"))
 		return
 	}
+	// vars 缺省（请求体省略或显式传 null）统一归一成空 map：渲染流程后续会对
+	// 变量做读取与派生写入，归一成非 nil 可避免任何一处误写到 nil map 引发 panic。
+	if req.Vars == nil {
+		req.Vars = map[string]string{}
+	}
 
 	res, err := s.renderAndApply(r.Context(), req)
 	if err != nil {

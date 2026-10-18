@@ -235,8 +235,35 @@ func (a *App) Logout() (State, error) {
 	return a.logout(clearConfig, removeAllFrpcConfigs)
 }
 
+// logoutSyncWait 是退出登录等待同步让出锁的上限。
+//
+// 不设上限的话，后台同步正卡在几十秒的网络请求里时，用户点「退出登录」
+// 之后界面毫无反应，也无法取消——看起来就是卡死了。等不到就明确报错，
+// 让用户重试，比无限期挂住强。
+const logoutSyncWait = 10 * time.Second
+
+// lockSyncWithin 在期限内拿到 syncMu，拿不到返回 false。
+//
+// 用 TryLock 轮询而不是 Lock：sync.Mutex 的等待不可取消，只有这一条路径
+// 需要「可放弃的等待」。第一次尝试几乎总能成功（真正并发的时刻很少），
+// 轮询只在同步正在跑的时候发生，10ms 的间隔对这里完全够用。
+func (a *App) lockSyncWithin(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if a.syncMu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
-	a.syncMu.Lock()
+	if !a.lockSyncWithin(logoutSyncWait) {
+		return a.GetState(), errors.New("正在同步隧道，请稍后再退出登录")
+	}
 	defer a.syncMu.Unlock()
 
 	if err := a.mgr.StopAll(); err != nil {

@@ -175,6 +175,11 @@ type RateLimiter struct {
 	evicted  uint64    // 累计淘汰数，用于告警
 	lastWarn time.Time // 上次告警时间，避免日志被洪水放大
 
+	// lastGC 是上一次清理空闲桶的时刻。清理写在请求路径上（见 allow），
+	// 不再单独起 gc 协程：那个协程没有关闭入口，每个限流器实例都会留下
+	// 一个永不退出的 goroutine（路由每重建一次就多一个，测试里尤其明显）。
+	lastGC time.Time
+
 	rate     float64 // 每秒补充令牌数
 	capacity float64
 	// source 非空时改用实时读取的阈值，用于支持管理端热调整。
@@ -206,10 +211,17 @@ func newRateLimiter(maxSize int, source RateSource, rate, capacity float64) *Rat
 		rate:     rate,
 		capacity: capacity,
 		source:   source,
+		lastGC:   time.Now(),
 	}
-	go rl.gc()
 	return rl
 }
+
+const (
+	// rateLimiterGCInterval 是两次空闲桶清理之间的最小间隔。
+	rateLimiterGCInterval = 10 * time.Minute
+	// rateLimiterIdleTTL 是桶无活动多久后可回收。
+	rateLimiterIdleTTL = 30 * time.Minute
+)
 
 // limits 返回本次使用的速率与容量，并做兜底，避免配置异常导致完全放开。
 func (rl *RateLimiter) limits() (rate, capacity float64) {
@@ -226,21 +238,18 @@ func (rl *RateLimiter) limits() (rate, capacity float64) {
 	return rate, capacity
 }
 
-func (rl *RateLimiter) gc() {
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		rl.dropIdle(time.Now().Add(-30 * time.Minute))
-	}
-}
-
 // dropIdle 清理超过 cutoff 未活动的桶。
-//
-// 摘链与删表必须成对：只删 map 不摘链，链表会残留已不存在的键，
-// 容量满时淘汰到的是一个空壳——表现为「桶数没到上限却一直在淘汰」。
 func (rl *RateLimiter) dropIdle(cutoff time.Time) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+	rl.dropIdleLocked(cutoff)
+}
+
+// dropIdleLocked 是 dropIdle 的主体。调用方必须持有 rl.mu。
+//
+// 摘链与删表必须成对：只删 map 不摘链，链表会残留已不存在的键，
+// 容量满时淘汰到的是一个空壳——表现为「桶数没到上限却一直在淘汰」。
+func (rl *RateLimiter) dropIdleLocked(cutoff time.Time) {
 	for k, b := range rl.buckets {
 		if b.lastSeen.Before(cutoff) {
 			if b.elem != nil {
@@ -269,6 +278,13 @@ func (rl *RateLimiter) allow(key string) (allowed bool, warn string) {
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	// 空闲桶清理写在请求路径上：限流器只服务于流量，没有请求时也不会
+	// 产生新桶，本来就没有需要回收的东西。间隔判定保证它不会每个请求都扫。
+	if now.Sub(rl.lastGC) >= rateLimiterGCInterval {
+		rl.lastGC = now
+		rl.dropIdleLocked(now.Add(-rateLimiterIdleTTL))
+	}
 
 	b, ok := rl.buckets[key]
 	if !ok {

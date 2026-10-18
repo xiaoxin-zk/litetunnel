@@ -161,6 +161,18 @@ async function submit() {
     error.value = '请输入有效的注册邮箱，验证码流程不支持用户名'
     return
   }
+  if (!form.account.trim()) {
+    error.value = '请输入用户名或邮箱'
+    return
+  }
+  if (form.password.length < 8) {
+    error.value = '密码至少 8 位'
+    return
+  }
+  if (form.confirm !== form.password) {
+    error.value = '两次输入的密码不一致'
+    return
+  }
   if (!await formRef.value.validate().catch(() => false)) return
 
   if (mailEnabled.value && !form.email_code.trim()) {

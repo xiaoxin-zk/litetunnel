@@ -108,7 +108,8 @@ func TestEmailCodeQuotaEnforcedBeforeWrite(t *testing.T) {
 		t.Fatalf("冷却窗口内应拒绝，实际 %v", err)
 	}
 
-	// 场景二：当日总量达到上限（时间推到冷却窗口之外）。
+	// 场景二独立验证每日额度，避免午夜时当天记录无法越过冷却窗口。
+	quota.cooldown = 0
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	old := dayStart.Add(time.Minute)
 	if err := svc.DB.Model(&model.MailOutbox{}).

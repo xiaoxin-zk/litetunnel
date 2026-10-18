@@ -270,6 +270,10 @@ func (s *Services) refreshGuardDue() {
 		// 先落库再算标记：把到期用户迁到默认分组之后，他们不会再被每轮扫出来。
 		if err := s.migrateExpiredGroups(groupDue); err != nil {
 			log.Printf("[quota] 迁移到期分组用户失败（本轮仍按默认分组算标记）: %v", err)
+		} else {
+			// 分组已变化：推进准入版本，让在途的旧分组快照写不进内存标记，
+			// 否则用户在下一轮校准前仍沿用旧分组配额。
+			s.Runtime.BumpGuardVer()
 		}
 	}
 

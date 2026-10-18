@@ -62,6 +62,11 @@ func (s *Services) FirewallManualOpen(port int, proto string) error {
 	if err := s.FirewallGuard().CheckAdd(port); err != nil {
 		return err
 	}
+	// 与自动收回（applyPortIntent）使用同一把端口锁：否则「手工放行」可能与
+	// 并发的一条「删除隧道 → 自动收回」交错，最终规则状态取决于时序。
+	pl := s.portLock(port)
+	pl.Lock()
+	defer pl.Unlock()
 	return be.AddPort(port, proto)
 }
 

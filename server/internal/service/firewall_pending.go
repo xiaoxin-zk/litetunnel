@@ -49,8 +49,8 @@ const (
 // 用落库的单行序列而不是进程内计数器：多实例部署时每个进程从相同值起步，
 // 会生成相同代次，>= 条件无法区分先后。序列在库里，天然全局单调。
 //
-// 调用方必须已持有 fwMu：在锁内取号，才能保证「拿到锁的顺序」等于「代次
-// 的顺序」，否则两个并发登记会以与取锁相反的顺序落到内存里。
+// 取号不要求持 fwMu（见 markFirewallPending：先取号再拿锁，避免在锁内做
+// 数据库 IO）；代次单调，写回内存时用代次比较保证新意图覆盖旧意图。
 func (s *Services) nextFirewallGen() (int64, error) {
 	var next int64
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
@@ -73,11 +73,26 @@ func (s *Services) nextFirewallGen() (int64, error) {
 //   - ErrFirewallQueueFull：队列已满且这是一个新端口，需要人工清理队列；
 //   - ErrFirewallQueueUnavailable：取不到落库代次（数据库故障），需要查库。
 func (s *Services) markFirewallPending(port int, proto string, open bool) error {
+	// 先取号（一次数据库事务），再拿 fwMu：取号是 IO，放在锁内会让数据库
+	// 变慢时阻塞所有防火墙意图操作。代次单调，写回内存时用代次比较保证
+	// 「新意图覆盖旧意图」不依赖取锁顺序。
+	gen, err := s.nextFirewallGen()
+	if err != nil {
+		log.Printf("[firewall] 获取待办代次失败（端口 %d），本次意图无法登记: %v", port, err)
+		return fmt.Errorf("%w: %v", ErrFirewallQueueUnavailable, err)
+	}
+
 	s.fwMu.Lock()
 	if s.fwPending == nil {
 		s.fwPending = map[int]pendingFW{}
 	}
 	prev, exists := s.fwPending[port]
+	if exists && gen <= prev.gen {
+		// 期间已有更新的意图写入（并发登记取号更晚、先拿到锁）：这条已过期，
+		// 不能覆盖新意图。
+		s.fwMu.Unlock()
+		return nil
+	}
 	// 已有记录时**覆盖**为最新意图（而不是保留旧的）：见 pendingFW 的注释。
 	//
 	// 重试次数只在「动作与协议都没变」时继承：意图一变（放行↔收回、tcp↔udp），
@@ -94,12 +109,6 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) error 
 		log.Printf("[firewall] 待处理端口操作已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
 			pendingFWLimit, port)
 		return ErrFirewallQueueFull
-	}
-	gen, err := s.nextFirewallGen()
-	if err != nil {
-		s.fwMu.Unlock()
-		log.Printf("[firewall] 获取待办代次失败（端口 %d），本次意图无法登记: %v", port, err)
-		return fmt.Errorf("%w: %v", ErrFirewallQueueUnavailable, err)
 	}
 	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: gen}
 	s.fwPending[port] = item

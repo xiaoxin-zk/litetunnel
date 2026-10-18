@@ -36,6 +36,9 @@ type process struct {
 	name string
 	cmd  *exec.Cmd
 
+	// gen 是这条隧道第几次启动。旧进程退出时靠它判断「自己还是不是最新的」。
+	gen uint64
+
 	// exitCh 在进程**真正**退出（Wait 返回）时关闭。
 	//
 	// 存在的意义：Kill 只是「发出终止信号」，进程可能还要几毫秒才消失。
@@ -65,6 +68,23 @@ type Manager struct {
 
 	// closed 表示已进入关闭流程：此后 Start 直接失败，见 Close。
 	closed bool
+
+	// exitMu 串行化「派发某条隧道的退出回调」与「为同一条隧道登记新进程」。
+	//
+	// 只靠 procs 里是否还有本进程来判断是不够的：Wait 协程删掉记录、关闭
+	// exitCh 之后，Stop 立刻返回，新进程可能在此刻完成登记，而旧回调还没
+	// 开始执行——它会把刚连上的隧道标成「未连接」。
+	// 两边都持这把锁之后，二者只可能是先后关系：要么旧回调先跑完再登记，
+	// 要么登记先完成、旧回调发现自己已过期而放弃。
+	//
+	// 锁序固定为 exitMu → mu，与下面 Start 和 Wait 协程的取法一致。
+	exitMu sync.Mutex
+
+	// gens 记录每条隧道最近一次启动的代次，进程退出后仍然保留：
+	// 它是「旧回调是否已过期」的唯一判据，删掉就等于失去判断依据。
+	// 条目数与历史隧道数同阶（每条隧道一项），不随重启次数增长。
+	gens   map[uint]uint64
+	genSeq uint64
 
 	// 重复行合并状态：frpc 在「本地服务没起来」时会为每一次连接失败
 	// 打一行完全相同的错误，被扫描或压测时一秒能刷几百行。
@@ -120,6 +140,7 @@ func New(exePath string) *Manager {
 	m := &Manager{
 		exePath:  exePath,
 		procs:    map[uint]*process{},
+		gens:     map[uint]uint64{},
 		emitWake: make(chan struct{}, 1),
 		emitQuit: make(chan struct{}),
 	}
@@ -200,6 +221,13 @@ func (m *Manager) AnyRunning() bool {
 // tunnelName 只用于日志前缀：进程本身只认配置文件，
 // 不依赖隧道名字，因此改名不影响正在运行的连接。
 func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
+	// 持 exitMu 直到本函数返回：这段时间里该隧道的旧退出回调不会执行，
+	// 因此不可能出现「回调先跑、把刚登记的新进程当成已退出」的覆盖。
+	// 反过来若回调先拿到锁，它会先于本次登记执行完——那时新进程还不存在，
+	// 上层清掉的状态随后会被新进程的 start proxy success 重新置位。
+	m.exitMu.Lock()
+	defer m.exitMu.Unlock()
+
 	m.mu.Lock()
 	// 关闭之后不再放行任何新进程：关闭流程是「关闸 → 停全部」，
 	// 反过来的话与它并发的调用方能在 StopAll 之后拉起一个漏网进程。
@@ -242,7 +270,10 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	}
 
 	exitCh := make(chan struct{})
-	m.procs[tunnelID] = &process{name: tunnelName, cmd: cmd, exitCh: exitCh}
+	m.genSeq++
+	gen := m.genSeq
+	m.gens[tunnelID] = gen
+	m.procs[tunnelID] = &process{name: tunnelName, cmd: cmd, exitCh: exitCh, gen: gen}
 	onExit := m.onExit
 	m.mu.Unlock()
 
@@ -329,9 +360,25 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		} else {
 			m.appendLog(tunnelID, tunnelName, "frpc 已正常退出")
 		}
+
+		// 上面那一步只保证了「本进程不再是表里的那一个」，并不保证
+		// 「还没有新进程登记」：停表与回调之间有窗口，Stop 已返回，
+		// 新进程可能刚好在这段时间里登记完成。持 exitMu 复查代次，
+		// 与 Start 的登记互斥——复查通过即意味着直到回调结束都不会有
+		// 新进程把状态顶掉，回调也就不会覆盖它。
+		m.exitMu.Lock()
+		m.mu.Lock()
+		stale := m.gens[tunnelID] != gen
+		m.mu.Unlock()
+		if stale {
+			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
+			m.exitMu.Unlock()
+			return
+		}
 		if onExit != nil {
 			onExit(tunnelID, tunnelName, err, requested)
 		}
+		m.exitMu.Unlock()
 	}()
 
 	return nil

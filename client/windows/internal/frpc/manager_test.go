@@ -463,6 +463,62 @@ func TestCloseRejectsNewProcess(t *testing.T) {
 	}
 }
 
+// TestStaleExitCallbackDoesNotOverrideNewProcess 覆盖「停止后立刻重新启动」。
+//
+// 旧实现在 Wait 协程里删掉进程记录、关闭 exitCh 之后才回调上层。
+// close(exitCh) 会让 Stop 立即返回，紧接着的 Start 可能已经登记了新进程，
+// 而旧回调此时才执行——上层据此把「已注册」清成 false，用户看到刚连上的
+// 隧道又变回未连接，要等下一轮同步才纠正。
+//
+// 断言方式：回调执行时如果该隧道已经有进程在跑，就是踩中了这个窗口。
+func TestStaleExitCallbackDoesNotOverrideNewProcess(t *testing.T) {
+	m := testManager(t)
+	cfg := testConfig(t)
+	t.Cleanup(func() { _ = m.Close() })
+
+	var (
+		mu    sync.Mutex
+		stale bool
+	)
+	m.SetCallbacks(nil, func(id uint, _ string, _ error, _ bool) {
+		if m.Running(id) {
+			mu.Lock()
+			stale = true
+			mu.Unlock()
+		}
+	})
+
+	if err := m.Start(1, "mc1", cfg); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	// 反复制造竞态：每次 Stop 返回后立刻 Start，旧回调正好落在窗口里。
+	for i := 0; i < 10; i++ {
+		if err := m.Stop(1); err != nil {
+			t.Fatalf("第 %d 次停止失败: %v", i, err)
+		}
+		if err := m.Start(1, "mc1", cfg); err != nil {
+			t.Fatalf("第 %d 次重启失败: %v", i, err)
+		}
+	}
+
+	// 退出回调是异步的：留一段时间让它暴露。
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		bad := stale
+		mu.Unlock()
+		if bad {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if stale {
+		t.Fatal("旧进程的退出回调在新进程运行后仍被执行，会把刚连上的隧道标成未连接")
+	}
+}
+
 // TestStartRejectsMissingConfig 覆盖「配置没写好就起进程」这条错误路径：
 // 不拦的话 frpc 会带着一个不存在的配置启动并立刻失败，
 // 用户只看到「隧道起来了又断」，原因却在日志最前面几行。

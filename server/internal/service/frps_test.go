@@ -459,9 +459,14 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 // 构造：两页都必须是**满页**（frpsPageSize 条），否则实现会在「短页且 total
 // 未满足」处提前报「列表不完整」，根本走不到复检——那就测不到缺陷 10 了。
 //
-// 第 1 轮：第 1 页 = a0..a199，第 2 页 = b0..b199（total=400）。
-// 第 2 轮（收尾复检第 1 页）：第 1 页换成 a1..a200 —— 条数完全相同、total
-// 完全相同，只有集合变了（正是「删一条 + 加一条」的形态）。
+// 每轮的请求序列是 [第 1 页, 第 2 页, 复检第 1 页]（见 recheckFirstPage）：
+//
+//	第 1 轮：a0..a199 / b0..b199 / 复检时 a1..a200  ← 集合变了
+//	第 2 轮：同上（重取一次仍然不稳定，才应该最终报错）
+//
+// 用 (n-1)%3 == 2 认「复检」而不是写死 n>=3：ListProxies 会在不稳定时整轮
+// 重取一次（frpsListAttempts=2），只让第 1 轮失败的话第 2 轮会成功返回，
+// 测试就变成「复检生效但重取兜住了」，断言 err != nil 直接挂掉。
 func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -478,10 +483,10 @@ func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 		items := make([]string, 0, frpsPageSize)
 		switch page {
 		case "1":
-			// 第 1、2 次请求是第 1 轮（第 1 页、第 2 页）；第 3 次是复检。
-			// 复检时整体后移一位：a0 消失、a200 出现，条数与 total 都不变。
+			// 每轮的第 3 次请求是复检：整体后移一位（a0 消失、a200 出现），
+			// 条数与 total 都不变，只有集合变了。
 			base := 0
-			if n >= 3 {
+			if (n-1)%3 == 2 {
 				base = 1
 			}
 			for i := 0; i < frpsPageSize; i++ {

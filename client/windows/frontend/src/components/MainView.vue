@@ -929,9 +929,10 @@ async function run(fn, successText) {
 // 后端接口保留（api.refresh 仍可用），需要时能随时加回入口。
 const logout = () => run(() => api.logout())
 
-async function clearLogs() {
-  await api.clearLogs()
-  emit('update')
+function clearLogs() {
+  // 交给 App 处理：它同时持有主进程缓冲、页面数组与待合并队列三份状态，
+  // 只在这里调 api.clearLogs() 的话，页面上的旧行会留在原地。
+  emit('clearlogs')
   flash('日志已清空')
 }
 

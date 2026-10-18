@@ -229,6 +229,16 @@ func (a *App) GetLogs() []string {
 }
 
 // ClearLogs 清空日志缓冲。
+//
+// 必须同时清掉**待推送队列**：只清 mgr 里的历史记录的话，清空前已经攒在
+// 队列里、还没推给前端的那批行会在下一次 flush 时照常出现，
+// 用户看到的就是「点了清空，日志又自己冒回来」。
 func (a *App) ClearLogs() {
 	a.mgr.ClearLogs()
+
+	a.logMu.Lock()
+	a.logBuf = nil
+	a.logBufBytes = 0
+	a.logDropped = 0
+	a.logMu.Unlock()
 }

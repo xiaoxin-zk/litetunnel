@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/xiaoxin-zk/litetunnel/client/internal/frpc"
 )
 
 // TestLogQueueDropsOldestAndCounts 覆盖「待推送队列无界增长」。
@@ -214,5 +216,24 @@ func TestTakeLogBatchReportsDropped(t *testing.T) {
 	defer a.logMu.Unlock()
 	if a.logDropped != 0 {
 		t.Fatalf("提示发出后计数应当归零，实际 %d", a.logDropped)
+	}
+}
+
+// TestClearLogsDropsPendingQueue 覆盖「点了清空，日志又自己冒回来」。
+//
+// 清空只清历史记录是不够的：清空前已经攒在待推送队列里、还没发出去的行，
+// 会在下一次 flush 时照常出现在界面上。
+func TestClearLogsDropsPendingQueue(t *testing.T) {
+	a := &App{mgr: frpc.New("")}
+	a.pushLog("before clear")
+	a.ClearLogs()
+	if batch := a.takeLogBatch(); len(batch) != 0 {
+		t.Fatalf("清空后不该再推出旧行，实际 %v", batch)
+	}
+
+	a.pushLog("after clear")
+	batch := a.takeLogBatch()
+	if len(batch) != 1 || batch[0] != "after clear" {
+		t.Fatalf("清空后的新行应保留，实际 %v", batch)
 	}
 }

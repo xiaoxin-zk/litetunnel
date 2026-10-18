@@ -2,7 +2,14 @@
   <div class="app">
     <transition name="fade" mode="out-in">
       <LoginView v-if="!state.logged_in" :state="state" @connected="onConnected" />
-      <MainView v-else :state="state" :logs="logs" :notice="notice" @update="onUpdate" />
+      <MainView
+        v-else
+        :state="state"
+        :logs="logs"
+        :notice="notice"
+        @update="onUpdate"
+        @clearlogs="onClearLogs"
+      />
     </transition>
   </div>
 </template>
@@ -81,6 +88,15 @@ function onConnected(next) {
 function onUpdate(next) {
   if (next) state.value = next
   else loadState()
+}
+
+// 清空日志必须同时清掉**前端这一层**：主进程清完缓冲后，页面上的
+// logs 数组如果不动，旧行会一直留在界面上，看起来就像「清空没生效」。
+// 待合并队列也要一起丢，否则 200ms 后它会把清空前的行重新补回来。
+async function onClearLogs() {
+  await api.clearLogs()
+  pendingLogs.length = 0
+  logs.value = []
 }
 
 onMounted(async () => {

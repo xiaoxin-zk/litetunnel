@@ -12,6 +12,7 @@ package frpsplugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -134,6 +135,9 @@ type newUserConnContent struct {
 type Handler struct {
 	svc        *service.Services
 	allowCIDRs []*net.IPNet
+	// conns 按隧道限制新建连接速率，并在持续超限时短暂熔断。
+	// 纯内存状态：限制针对「此刻正在发生的滥用」，不需要跨实例或跨重启。
+	conns *connLimiter
 }
 
 // New 构造处理器。allowCIDRs 为允许调用本回调的来源网段。
@@ -142,7 +146,7 @@ type Handler struct {
 // Guard 拒绝**所有**回调——表现是「隧道全部起不来」，而单条日志只有一个
 // 403。启动校验（config 包）会在更早的地方拦住非法项，这里是兜底与线索。
 func New(svc *service.Services, cidrs []string) *Handler {
-	h := &Handler{svc: svc}
+	h := &Handler{svc: svc, conns: newConnLimiter()}
 	var invalid []string
 	for _, c := range cidrs {
 		if _, n, err := net.ParseCIDR(c); err == nil {
@@ -642,7 +646,7 @@ func (h *Handler) onNewUserConn(req *request) response {
 				if exceeded {
 					return deny("流量额度已用尽")
 				}
-				return allow()
+				return h.allowUserConn(&content)
 			}
 			if h.svc.Runtime.IsUserBlocked(s.UserID) {
 				return deny("账号已被禁用")
@@ -650,7 +654,7 @@ func (h *Handler) onNewUserConn(req *request) response {
 			if h.svc.Runtime.IsQuotaExceeded(s.UserID) {
 				return deny("流量额度已用尽")
 			}
-			return allow()
+			return h.allowUserConn(&content)
 		}
 	}
 	u, ok := h.resolveUser(content.User.User, content.User.RunID, content.User.Metas)
@@ -665,6 +669,24 @@ func (h *Handler) onNewUserConn(req *request) response {
 	}
 	if h.svc.Runtime.IsQuotaExceeded(u.ID) {
 		return deny("流量额度已用尽")
+	}
+	return h.allowUserConn(&content)
+}
+
+// allowUserConn 在身份与配额都通过后，再做一次连接速率限制。
+//
+// 放在最后而不是最前：账号被禁用、额度用尽这类原因更具体，
+// 先报它们用户才知道该找谁；速率限制只是「看起来像滥用」时的兜底。
+func (h *Handler) allowUserConn(c *newUserConnContent) response {
+	// 网站类隧道由 vhost 承接，连接数与页面请求数同阶，正常浏览就可能
+	// 触发按「新建连接」的限流，因此不在这里限制。
+	switch strings.ToLower(strings.TrimSpace(c.ProxyType)) {
+	case "http", "https", "tcpmux":
+		return allow()
+	}
+	key := c.User.RunID + "|" + c.ProxyName
+	if ok, wait := h.conns.allow(key); !ok {
+		return deny(fmt.Sprintf("连接过于频繁，已临时限制（约 %s 后恢复）", wait.Round(time.Second)))
 	}
 	return allow()
 }

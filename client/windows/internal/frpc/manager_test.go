@@ -236,8 +236,10 @@ func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 // 问题的时候。现在按总字节再裁一次，并把单行压到 maxLogLineBytes。
 func TestLogBufferRespectsByteBudget(t *testing.T) {
 	m := testManager(t)
+	// 每行加不同前缀：完全相同的连续行会被合并（见重复行合并），
+	// 那样测不到字节预算这条路径。
 	for i := 0; i < 200; i++ {
-		m.appendLog(1, "mc1", strings.Repeat("x", maxLogLineBytes))
+		m.appendLog(1, "mc1", fmt.Sprintf("%d-%s", i, strings.Repeat("x", maxLogLineBytes)))
 	}
 
 	m.mu.Lock()
@@ -270,6 +272,45 @@ func TestLogBufferRespectsByteBudget(t *testing.T) {
 	}
 	if !strings.Contains(logs[0], "已截断") {
 		t.Fatal("截断后应标明，否则用户以为日志完整")
+	}
+}
+
+// TestLogMergesRepeatedLines 覆盖「同一条错误刷屏把日志挤满」。
+//
+// 本地服务没起来时，frpc 会为每一次连接失败打一行完全相同的错误；
+// 被扫描或 tcping 时一秒能刷几百行，500 行的缓冲几秒就被同一条占满，
+// 之前真正有用的日志全被挤掉。
+func TestLogMergesRepeatedLines(t *testing.T) {
+	m := testManager(t)
+
+	for i := 0; i < 50; i++ {
+		m.appendLog(1, "mc", "connect to local service error")
+	}
+	if got := m.Logs(); len(got) != 1 {
+		t.Fatalf("连续重复行应合并为一条，实际 %d 条", len(got))
+	}
+
+	m.appendLog(1, "mc", "start proxy success")
+	got := m.Logs()
+	if len(got) != 3 {
+		t.Fatalf("换行后应先补一条计数、再记新行，实际 %d 条: %v", len(got), got)
+	}
+	if !strings.Contains(got[1], "重复 49 次") {
+		t.Fatalf("应交代被合并的次数，实际 %q", got[1])
+	}
+	if !strings.Contains(got[2], "start proxy success") {
+		t.Fatalf("新行必须保留，实际 %q", got[2])
+	}
+}
+
+// TestClearLogsResetsRepeatState 覆盖「清空后第一条日志被当成重复吞掉」。
+func TestClearLogsResetsRepeatState(t *testing.T) {
+	m := testManager(t)
+	m.appendLog(1, "mc", "same line")
+	m.ClearLogs()
+	m.appendLog(1, "mc", "same line")
+	if got := m.Logs(); len(got) != 1 {
+		t.Fatalf("清空后的第一条日志不能被合并掉，实际 %d 条: %v", len(got), got)
 	}
 }
 

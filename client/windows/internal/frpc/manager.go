@@ -83,6 +83,17 @@ type Manager struct {
 	// closed 表示已进入关闭流程：此后 Start 直接失败，见 Close。
 	closed bool
 
+	// 重复行合并状态：frpc 在「本地服务没起来」时会为每一次连接失败
+	// 打一行完全相同的错误，被扫描或压测时一秒能刷几百行。
+	//
+	// 只保留第一行、其余计数，等下一行不同内容时补一条「重复 N 次」：
+	// 用户仍然知道发生过什么，而日志缓冲不会被同一条错误挤满。
+	repeatKey        string
+	repeatAt         time.Time
+	repeatCount      int
+	repeatTunnelID   uint
+	repeatTunnelName string
+
 	// onLog 收到的行已经带好「Tunnel/<名字>」前缀。
 	onLog func(tunnelID uint, tunnelName, line string)
 	// onExit 在某个隧道的进程退出时调用。
@@ -391,6 +402,11 @@ func (m *Manager) ClearLogs() {
 	defer m.mu.Unlock()
 	m.logs = nil
 	m.logBytes = 0
+	// 重复行合并状态也要清：留着的话，清空后的第一条日志如果恰好与
+	// 清空前那条相同，会被当成「重复」直接吞掉，用户以为清空把新日志也弄没了。
+	m.repeatKey = ""
+	m.repeatCount = 0
+	m.repeatAt = time.Time{}
 }
 
 // pumpLineLimit 是单行日志保留的字节上限，超出的部分截断丢弃。
@@ -464,15 +480,66 @@ func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 	}
 }
 
+// logRepeatWindow 是同一行连续出现时的合并窗口。
+//
+// 窗口内只计数不落行；窗口外仍在重复时补一条「重复 N 次」再继续，
+// 否则持续压测下日志看起来像停住了。
+const logRepeatWindow = 5 * time.Second
+
+// logEntry 是一条已经带好前缀、等待同时写进缓冲并推给前端的日志。
+type logEntry struct {
+	id   uint
+	name string
+	text string
+}
+
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	line = strings.TrimRight(line, "\r\n")
 	line = clipLogLine(line, maxLogLineBytes)
 	if line == "" {
 		return
 	}
-	stamped := fmt.Sprintf("%s  %s  %s", time.Now().Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
+
+	now := time.Now()
+	key := fmt.Sprintf("%d\x00%s", tunnelID, line)
 
 	m.mu.Lock()
+	var out []logEntry
+	// 重复窗口结束、或换了一条不同的日志：先把累计的重复次数交代掉。
+	if m.repeatCount > 0 && (key != m.repeatKey || now.Sub(m.repeatAt) >= logRepeatWindow) {
+		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName,
+			fmt.Sprintf("（上一条重复 %d 次，已合并）", m.repeatCount), now))
+		m.repeatCount = 0
+	}
+	if key == m.repeatKey && now.Sub(m.repeatAt) < logRepeatWindow {
+		m.repeatCount++
+		m.repeatAt = now
+		cb := m.onLog
+		m.mu.Unlock()
+		emitLogs(cb, out)
+		return
+	}
+	m.repeatKey, m.repeatAt = key, now
+	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
+	out = append(out, m.recordLocked(tunnelID, tunnelName, line, now))
+	cb := m.onLog
+	m.mu.Unlock()
+
+	emitLogs(cb, out)
+}
+
+func emitLogs(cb func(uint, string, string), entries []logEntry) {
+	if cb == nil {
+		return
+	}
+	for _, e := range entries {
+		cb(e.id, e.name, e.text)
+	}
+}
+
+// recordLocked 在已持有锁的前提下写入一行日志，返回可推送的副本。
+func (m *Manager) recordLocked(tunnelID uint, tunnelName, line string, now time.Time) logEntry {
+	stamped := fmt.Sprintf("%s  %s  %s", now.Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
 	m.logs = append(m.logs, stamped)
 	m.logBytes += len(stamped)
 
@@ -488,12 +555,7 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 		m.logBytes -= len(m.logs[0])
 		m.logs = m.logs[1:]
 	}
-	cb := m.onLog
-	m.mu.Unlock()
-
-	if cb != nil {
-		cb(tunnelID, tunnelName, stamped)
-	}
+	return logEntry{id: tunnelID, name: tunnelName, text: stamped}
 }
 
 // clipLogLine 把超长的单行截断，且不切断多字节字符。

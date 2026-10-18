@@ -67,18 +67,35 @@ foreach ($line in Get-Content -LiteralPath $envFile -Encoding UTF8) {
     $vars[$trimmed.Substring(0, $idx).Trim()] = ConvertFrom-DotEnvValue ($trimmed.Substring($idx + 1).Trim())
 }
 
-function Strip-Scheme([string]$v) {
-    if ([string]::IsNullOrWhiteSpace($v)) { return '' }
-    return ($v -replace '^https?://', '').TrimEnd('/')
+function Split-PublicUrl([string]$raw) {
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @{ Scheme = 'https'; Domain = '' } }
+    $scheme = 'https'
+    if ($raw.StartsWith('http://', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $scheme = 'http'
+    } elseif ($raw.StartsWith('https://', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $scheme = 'https'
+    } elseif ($raw -match '://') {
+        throw 'LT_USER_PUBLIC_URL only supports http or https.'
+    }
+    $domain = ($raw -replace '^https?://', '').TrimEnd('/')
+    return @{ Scheme = $scheme; Domain = $domain }
 }
 
-$userDomain = Strip-Scheme $vars['LT_USER_PUBLIC_URL']
+$publicUrl = Split-PublicUrl $vars['LT_USER_PUBLIC_URL']
+$userDomain = $publicUrl.Domain
+$vars['LT_USER_SCHEME'] = $publicUrl.Scheme
 
 if ([string]::IsNullOrWhiteSpace($userDomain)) {
-    throw 'LT_USER_PUBLIC_URL is empty: Caddy needs a domain to issue a certificate.'
+    throw 'LT_USER_PUBLIC_URL is empty: the panel needs a public address.'
 }
 
 $vars['LT_USER_DOMAIN'] = $userDomain
+if ($vars['LT_USER_SCHEME'] -eq 'https') {
+    $vars['LT_HSTS_ON'] = '1'
+} else {
+    $vars['LT_HSTS_ON'] = ''
+    Write-Warning 'LT_USER_PUBLIC_URL uses HTTP: Caddy will not request a certificate and credentials travel in plaintext.'
+}
 # Admin console shares the user domain; only the optional IP allowlist placeholder remains.
 $vars['LT_ADMIN_ALLOW_CIDR'] = if ($vars['LT_ADMIN_ALLOW_CIDR']) { $vars['LT_ADMIN_ALLOW_CIDR'] } else { '127.0.0.1/32' }
 $vars['LT_ACME_EMAIL']       = if ($vars['LT_ACME_EMAIL']) { $vars['LT_ACME_EMAIL'] } else { "admin@$userDomain" }
@@ -200,15 +217,20 @@ Render $caddyTpl $caddyOut $vars
 
 Write-Host ''
 Write-Host 'Done. Next steps:'
-Write-Host '  1) Open ports 80, 443, the tunnel port pool (default 20000-30000),'
-Write-Host '     7001/TCP and 7002/UDP in your firewall / security group only.'
+Write-Host '  1) Open port 80 (plus 443 when using HTTPS), the tunnel port pool'
+Write-Host '     (default 20000-30000), 7001/TCP and 7002/UDP in your firewall.'
 Write-Host '  2) From the repository root run:'
 Write-Host '     docker compose --env-file .env -f deploy/docker-compose.yml pull'
 Write-Host '     docker compose --env-file .env -f deploy/docker-compose.yml up -d'
 Write-Host '     (--env-file is required: .env lives in the repository root while the'
 Write-Host '      default lookup only looks next to the compose file)'
+if ($vars['LT_USER_SCHEME'] -eq 'https') {
+    Write-Host "  3) Console: https://$($vars['LT_USER_DOMAIN'])/"
+} else {
+    Write-Host "  3) Console: http://$($vars['LT_USER_DOMAIN'])/ (plaintext, no certificate)"
+}
 if ($vars['LT_HTTPS_E2E_PORT']) {
-    Write-Host '  3) End-to-end HTTPS is enabled (LT_HTTPS_TUNNEL_MODE=e2e):'
+    Write-Host '  4) End-to-end HTTPS is enabled (LT_HTTPS_TUNNEL_MODE=e2e):'
     Write-Host "     - open $($vars['LT_HTTPS_E2E_PORT'])/TCP, the certificate lives on the local site"
     Write-Host "     - reach HTTPS tunnels at <sub>.$($vars['LT_TUNNEL_DOMAIN']):$($vars['LT_HTTPS_E2E_PORT'])"
     Write-Host '       (443 is served by Caddy and returns the platform certificate)'

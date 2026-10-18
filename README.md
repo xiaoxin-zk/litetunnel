@@ -211,7 +211,7 @@ echo "LT_BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 15 | tr -d '/+=')"
 | 变量 | 说明 |
 |---|---|
 | `LT_ENV` | **必须是 `production`**，否则启动时会放宽安全校验并告警 |
-| `LT_USER_PUBLIC_URL` | 控制台域名，如 `https://panel.example.com`（Caddy 靠它签证书）。**生产环境未配置会拒绝启动**：找回密码的重置链接只能由它生成，若退化为从请求的 `Host` 头推断，可被 Host 头投毒 |
+| `LT_USER_PUBLIC_URL` | 控制台对外地址，`https://panel.example.com`（Caddy 自动签证书）或 `http://1.2.3.4`（无域名/无备案时的明文模式）。**生产环境未配置会拒绝启动**：找回密码的重置链接只能由它生成，若退化为从请求的 `Host` 头推断，可被 Host 头投毒 |
 | `LT_GATEWAY_HOST` | 客户端接入地址，填域名或公网 IP |
 | `LT_ACME_EMAIL` | Let's Encrypt 通知邮箱 |
 | 上面生成的 6 个密钥 | 直接粘贴 |
@@ -376,8 +376,13 @@ DNS：把控制台域名 A 记录指向服务器，泛域名（如 `*.tunnel.exa
 
 | 入口 | 地址 |
 |---|---|
-| 用户控制台 | `https://你的域名/` |
-| 管理后台 | `https://你的域名/lt-console/`（路径由 `LT_ADMIN_PATH` 决定） |
+| 用户控制台 | `协议://你的域名/`（协议取自 `LT_USER_PUBLIC_URL`） |
+| 管理后台 | `协议://你的域名/lt-console/`（路径由 `LT_ADMIN_PATH` 决定） |
+
+> **没有域名或无法备案时**：把 `LT_USER_PUBLIC_URL` 写成 `http://服务器公网IP` 即可，
+> 渲染出的 Caddyfile 会以 `http://` 起站点、不申请证书、也不发送 HSTS。
+> 这种模式下登录令牌与客户端 API Key 都是明文传输，只建议在可信网络或临时环境使用；
+> 条件具备后改回 `https://` 重新渲染即可，无需改代码。
 
 **必须使用管理员账号登录管理后台**：管理员与普通用户是两套完全独立的账号体系
 （不同的表、不同的令牌域、不同的签名密钥）。用户控制台注册的账号**无法**登录管理后台，反之亦然。
@@ -512,7 +517,7 @@ git push origin v1.0.0
 
 | 项 | 实现 |
 |---|---|
-| 传输加密 | frp 强制 TLS；用户侧统一 HTTPS |
+| 传输加密 | frp 强制 TLS；用户侧默认 HTTPS，`LT_USER_PUBLIC_URL` 配成 `http://` 时为明文（无证书部署） |
 | 客户端鉴权 | 每用户独立 `client_secret`，写入 frpc 的 `metadatas`，登录时校验 |
 | **插件身份判定** | 以 `run_id` 为唯一依据，且该 `run_id` 必须来自「已通过凭据校验」的会话记录；客户端自报的 user 字段仅用于交叉核对 |
 | 口令存储 | bcrypt（cost 10） |

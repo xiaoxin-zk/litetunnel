@@ -40,7 +40,7 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 
 	panel := vars[tlscfg.VarPanelDomain]
 	if panel == "" {
-		return errors.New("面板域名为空：Caddy 需要一个域名来签发证书")
+		return errors.New("面板域名为空：Caddy 需要一个站点地址（域名或 IP）")
 	}
 	if err := validDomain(panel); err != nil {
 		return fmt.Errorf("面板域名不合法: %w", err)

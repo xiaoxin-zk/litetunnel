@@ -151,7 +151,7 @@ type DomainStatus struct {
 func (s *Services) DomainConfigVars() (map[string]string, error) {
 	panel := s.DesiredPanelDomain()
 	if panel == "" {
-		return nil, fmt.Errorf("%w: 请先填写面板域名，Caddy 需要一个域名来签发证书", ErrInvalidParam)
+		return nil, fmt.Errorf("%w: 请先填写面板域名（HTTP 模式可填域名或公网 IP）", ErrInvalidParam)
 	}
 	if err := checkDomain(panel); err != nil {
 		return nil, fmt.Errorf("%w: 面板域名 %s", ErrInvalidParam, err.Error())
@@ -172,7 +172,7 @@ func (s *Services) domainVars(fromEnv bool) map[string]string {
 	//
 	// 这一份是**要下发**的配置，因此取期望值而不是已生效值。
 	vars := map[string]string{
-		tlscfg.VarUserPublicURL: "https://" + s.DesiredPanelDomain(),
+		tlscfg.VarUserPublicURL: s.publicPanelURLWithScheme(s.DesiredPanelDomain(), s.desiredPanelScheme()),
 		tlscfg.VarTunnelDomain:  s.DesiredTunnelDomain(),
 		tlscfg.VarACMEEmail:     strings.TrimSpace(s.Settings.Get(KeyDomainACMEEmail)),
 		tlscfg.VarDNSProvider:   strings.TrimSpace(s.Settings.Get(KeyDomainDNSProvider)),
@@ -183,7 +183,7 @@ func (s *Services) domainVars(fromEnv bool) map[string]string {
 	if !fromEnv {
 		return vars
 	}
-	vars[tlscfg.VarUserPublicURL] = "https://" + normalizeDomainValue(s.Cfg.UserPublicURL)
+	vars[tlscfg.VarUserPublicURL] = s.publicPanelURLWithScheme(normalizeDomainValue(s.Cfg.UserPublicURL), publicURLScheme(s.Cfg.UserPublicURL))
 	vars[tlscfg.VarTunnelDomain] = normalizeDomainValue(s.Cfg.TunnelDomain)
 	vars[tlscfg.VarHTTPSMode] = s.envHTTPSMode()
 	// 渲染类字段没有 .env 来源（helper 从它自己的 .env 读），面板侧的默认值就是
@@ -286,10 +286,39 @@ func (s *Services) TunnelDomain() string {
 
 // UserPublicURL 返回面板对外地址（带 scheme），同样以**已下发**的为准。
 func (s *Services) UserPublicURL() string {
-	if v := normalizeDomainValue(s.Settings.Get(KeyDomainAppliedPanel)); v != "" {
-		return "https://" + v
+	if v := strings.TrimSpace(s.Settings.Get(KeyDomainAppliedPanel)); v != "" {
+		return s.publicPanelURLWithScheme(v, s.desiredPanelScheme())
 	}
-	return strings.TrimRight(strings.TrimSpace(s.Cfg.UserPublicURL), "/")
+	return normalizePublicURL(s.Cfg.UserPublicURL)
+}
+
+func (s *Services) desiredPanelScheme() string {
+	return publicURLScheme(s.Cfg.UserPublicURL)
+}
+
+func publicURLScheme(raw string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "http://") {
+		return "http"
+	}
+	return "https"
+}
+
+func (s *Services) publicPanelURLWithScheme(domain, scheme string) string {
+	if scheme != "http" {
+		scheme = "https"
+	}
+	return scheme + "://" + normalizeDomainValue(domain)
+}
+
+func normalizePublicURL(raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if strings.HasPrefix(strings.ToLower(raw), "http://") || strings.HasPrefix(strings.ToLower(raw), "https://") {
+		return raw
+	}
+	if raw == "" {
+		return ""
+	}
+	return "https://" + raw
 }
 
 // markDomainApplied 记录「刚下发的这一份已经在宿主机上生效」。

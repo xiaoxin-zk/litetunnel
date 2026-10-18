@@ -10,12 +10,16 @@
 }
 
 # ---------- 用户控制台 ----------
-${LT_USER_DOMAIN} {
+${LT_USER_SCHEME}://${LT_USER_DOMAIN} {
 	encode zstd gzip
 
 	# 基础安全响应头（应用层已设置，这里做兜底）
 	header {
+		# HSTS 只在 HTTPS 站点启用：HTTP 模式下发送它会让浏览器把后续请求
+		# 自动升级到 https，而该站点根本没有证书。
+# @if LT_HSTS_ON
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+# @endif
 		X-Content-Type-Options "nosniff"
 		-Server
 	}

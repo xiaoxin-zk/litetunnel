@@ -80,21 +80,39 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   VARS["${key}"]="$(decode_env_value "${val}")"
 done < "${ENV_FILE}"
 
-strip_scheme() {
-  local v="${1:-}"
-  v="${v#http://}"
-  v="${v#https://}"
-  echo "${v%/}"
+split_public_url() {
+  local raw="${1:-}"
+  local scheme="https"
+  if [[ "${raw}" == http://* ]]; then
+    scheme="http"
+  elif [[ "${raw}" == https://* ]]; then
+    scheme="https"
+  elif [[ "${raw}" == *://* ]]; then
+    echo "LT_USER_PUBLIC_URL 只支持 http 或 https。" >&2
+    exit 1
+  fi
+  raw="${raw#http://}"
+  raw="${raw#https://}"
+  raw="${raw%/}"
+  VARS[LT_USER_SCHEME]="${scheme}"
+  VARS[LT_USER_DOMAIN]="${raw}"
 }
 
-USER_DOMAIN="$(strip_scheme "${VARS[LT_USER_PUBLIC_URL]:-}")"
+split_public_url "${VARS[LT_USER_PUBLIC_URL]:-}"
+USER_DOMAIN="${VARS[LT_USER_DOMAIN]}"
 
 if [[ -z "${USER_DOMAIN}" ]]; then
-  echo "LT_USER_PUBLIC_URL 未填写：Caddy 需要一个域名来签发证书。" >&2
+  echo "LT_USER_PUBLIC_URL 未填写：面板需要一个对外地址。" >&2
   exit 1
 fi
 
 VARS[LT_USER_DOMAIN]="${USER_DOMAIN}"
+if [[ "${VARS[LT_USER_SCHEME]}" == "https" ]]; then
+  VARS[LT_HSTS_ON]="1"
+else
+  VARS[LT_HSTS_ON]=""
+  echo "提示：LT_USER_PUBLIC_URL 使用 HTTP，Caddy 不申请证书，登录令牌与 API Key 将明文传输。" >&2
+fi
 # 管理后台与用户控制台共用域名，仅保留一个占位符用于可选的 IP 限制示例
 VARS[LT_ADMIN_ALLOW_CIDR]="${VARS[LT_ADMIN_ALLOW_CIDR]:-127.0.0.1/32}"
 VARS[LT_ACME_EMAIL]="${VARS[LT_ACME_EMAIL]:-admin@${USER_DOMAIN}}"
@@ -223,14 +241,20 @@ render "${CADDY_TPL}" "${CADDY_OUT}"
 cat <<'EOF'
 
 渲染完成。接下来：
-  1) 确保防火墙/安全组只放行 80、443 与隧道端口池（默认 20000-30000），以及网关端口 7001/TCP 与 7002/UDP
+  1) 确保防火墙/安全组放行 80 与隧道端口池（默认 20000-30000），以及网关端口 7001/TCP 与 7002/UDP
   2) 在仓库根目录执行：
        docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
      （--env-file 是必须的：.env 在仓库根目录，而默认只读 compose 文件所在目录的那份）
 EOF
 
+if [[ "${VARS[LT_USER_SCHEME]}" == "https" ]]; then
+  echo "  3) 控制台地址：https://${VARS[LT_USER_DOMAIN]}/"
+else
+  echo "  3) 控制台地址：http://${VARS[LT_USER_DOMAIN]}/（明文模式，未申请证书）"
+fi
+
 if [[ -n "${VARS[LT_HTTPS_E2E_PORT]}" ]]; then
-  echo "  3) 端到端 HTTPS 已启用（LT_HTTPS_TUNNEL_MODE=e2e）："
+  echo "  4) 端到端 HTTPS 已启用（LT_HTTPS_TUNNEL_MODE=e2e）："
   echo "     · 放行 ${VARS[LT_HTTPS_E2E_PORT]}/TCP，证书由本地网站自己持有"
   echo "     · HTTPS 隧道请用 <子域>.${VARS[LT_TUNNEL_DOMAIN]}:${VARS[LT_HTTPS_E2E_PORT]} 访问"
   echo "       （443 由 Caddy 接管，返回的是平台证书，浏览器会提示不匹配）"

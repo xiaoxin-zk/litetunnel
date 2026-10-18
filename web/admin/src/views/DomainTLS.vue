@@ -147,7 +147,11 @@
         <el-form-item label="面板域名">
           <el-input v-model="form.panel" placeholder="panel.example.com" />
         </el-form-item>
-        <div class="hint">控制台地址。必须解析到本机，Caddy 靠它申请证书；找回密码邮件也用它拼链接。</div>
+        <div class="hint">
+          控制台地址（域名或公网 IP），必须解析到本机；找回密码邮件也用它拼链接。
+          协议取自 <span class="mono">LT_USER_PUBLIC_URL</span>：填 <span class="mono">http://</span> 时
+          Caddy 不申请证书、也不发送 HSTS，适合无域名/无法备案的部署，但凭据会明文传输。
+        </div>
 
         <el-form-item label="隧道根域名">
           <el-input v-model="form.tunnel" placeholder="tunnel.example.com（留空表示不启用 HTTP/HTTPS 隧道）" />

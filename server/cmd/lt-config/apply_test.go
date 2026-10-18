@@ -310,6 +310,24 @@ func TestDeriveVars(t *testing.T) {
 	if vars[tlscfg.VarHTTPSE2EPort] != "8444" {
 		t.Errorf("端到端模式应产出公网入口端口，得到 %q", vars[tlscfg.VarHTTPSE2EPort])
 	}
+	if vars[tlscfg.VarPanelScheme] != "https" || vars[tlscfg.VarHSTSOn] == "" {
+		t.Errorf("HTTPS 地址应派生 https 站点并开启 HSTS，得到 scheme=%q hsts=%q",
+			vars[tlscfg.VarPanelScheme], vars[tlscfg.VarHSTSOn])
+	}
+
+	// 无证书部署：协议与 HSTS 都必须跟着对外地址走，否则浏览器会被
+	// HSTS 强制升级到一个根本没有证书的 https 站点。
+	vars[tlscfg.VarUserPublicURL] = "http://203.0.113.10"
+	deriveVars(vars)
+	if vars[tlscfg.VarPanelScheme] != "http" {
+		t.Errorf("HTTP 地址应派生 http 站点，得到 %q", vars[tlscfg.VarPanelScheme])
+	}
+	if vars[tlscfg.VarHSTSOn] != "" {
+		t.Errorf("HTTP 站点不能开启 HSTS，得到 %q", vars[tlscfg.VarHSTSOn])
+	}
+	if vars[tlscfg.VarPanelDomain] != "203.0.113.10" {
+		t.Errorf("站点地址应保留 IP，得到 %q", vars[tlscfg.VarPanelDomain])
+	}
 
 	// 切回边缘模式后，那个派生端口必须消失，否则模板会继续渲染
 	// 「请放行 8444」的提示，而实际上该端口并不需要对外。

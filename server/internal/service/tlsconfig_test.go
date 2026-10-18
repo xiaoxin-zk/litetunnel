@@ -190,6 +190,50 @@ func TestDomainPendingFalseWhenOnlyEnvConfigured(t *testing.T) {
 	}
 }
 
+// TestPanelPublicURLKeepsConfiguredScheme 覆盖「没有域名证书也能用 HTTP」。
+//
+// 协议只由部署配置（LT_USER_PUBLIC_URL）决定，界面里保存的仍是不带 scheme 的
+// 域名：这样 Caddy 渲染、找回密码链接与客户端地址三处始终一致，不会出现
+// 「Caddy 按 HTTP 起、邮件链接却写 https」的错配。
+func TestPanelPublicURLKeepsConfiguredScheme(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want string
+	}{
+		{"http://panel.example.com", "http://panel.example.com"},
+		{"https://panel.example.com", "https://panel.example.com"},
+		{"http://panel.example.com/", "http://panel.example.com"},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			svc := newTestServices(t, &config.Config{UserPublicURL: tc.env})
+			if got := svc.UserPublicURL(); got != tc.want {
+				t.Fatalf("UserPublicURL 应为 %q，实际 %q", tc.want, got)
+			}
+			vars, err := svc.DomainConfigVars()
+			if err != nil {
+				t.Fatalf("组装下发变量失败: %v", err)
+			}
+			if got := vars[tlscfg.VarUserPublicURL]; got != tc.want {
+				t.Fatalf("下发给 helper 的地址应为 %q，实际 %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestAppliedPanelKeepsConfiguredScheme 覆盖「已下发」路径：
+// 记录里存的是裸域名，协议必须从部署配置继承，而不是一律补 https。
+func TestAppliedPanelKeepsConfiguredScheme(t *testing.T) {
+	svc := newTestServices(t, &config.Config{UserPublicURL: "http://panel.example.com"})
+	if err := svc.Settings.SetInternal(map[SettingKey]string{
+		KeyDomainAppliedPanel: "panel.example.com",
+	}); err != nil {
+		t.Fatalf("写入已生效记录失败: %v", err)
+	}
+	if got := svc.UserPublicURL(); got != "http://panel.example.com" {
+		t.Fatalf("已下发记录也必须保留 HTTP，实际 %q", got)
+	}
+}
+
 // TestUpgradeDoesNotAssumeDesiredApplied 覆盖升级路径**不猜**的取舍。
 //
 // 老版本里运行期按库中的期望值算，所以存在一种诱惑：升级后把期望值直接记为

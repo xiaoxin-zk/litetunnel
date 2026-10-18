@@ -109,26 +109,28 @@ func TestRenderRealTemplates(t *testing.T) {
 				"LT_VHOST_HTTPS_PORT":       "8444",
 				"LT_HTTPS_E2E_PORT":         "8444",
 				"LT_ADMIN_ALLOW_CIDR":       "127.0.0.1/32",
+				"LT_USER_SCHEME":            "https",
+				"LT_HSTS_ON":                "1",
 				"LT_ACME_EMAIL_PLACEHOLDER": "",
 			},
 		},
 		{
 			file: "frps/frps.toml.template",
 			vars: map[string]string{
-				"LT_GATEWAY_PORT":        "7001",
-				"LT_KCP_PORT":            "7002",
-				"LT_VHOST_HTTP_PORT":     "8081",
-				"LT_VHOST_HTTPS_PORT":    "8444",
-				"LT_FRPS_TOKEN":          "x",
-				"LT_PORT_RANGE_START":    "15000",
-				"LT_PORT_RANGE_END":      "32767",
-				"LT_MAX_PORTS_PER_USER":  "20",
-				"LT_TUNNEL_DOMAIN":       "tunnel.example.com",
-				"LT_FRPS_API_PORT":       "7500",
-				"LT_FRPS_API_USER":       "admin",
-				"LT_FRPS_API_PASSWORD":   "x",
-				"LT_USER_PORT":           "7848",
-				"LT_HTTPS_E2E_PORT":      "8444",
+				"LT_GATEWAY_PORT":       "7001",
+				"LT_KCP_PORT":           "7002",
+				"LT_VHOST_HTTP_PORT":    "8081",
+				"LT_VHOST_HTTPS_PORT":   "8444",
+				"LT_FRPS_TOKEN":         "x",
+				"LT_PORT_RANGE_START":   "15000",
+				"LT_PORT_RANGE_END":     "32767",
+				"LT_MAX_PORTS_PER_USER": "20",
+				"LT_TUNNEL_DOMAIN":      "tunnel.example.com",
+				"LT_FRPS_API_PORT":      "7500",
+				"LT_FRPS_API_USER":      "admin",
+				"LT_FRPS_API_PASSWORD":  "x",
+				"LT_USER_PORT":          "7848",
+				"LT_HTTPS_E2E_PORT":     "8444",
 			},
 		},
 	}
@@ -141,5 +143,32 @@ func TestRenderRealTemplates(t *testing.T) {
 		if _, err := Render(string(raw), c.vars); err != nil {
 			t.Errorf("%s 渲染失败: %v", c.file, err)
 		}
+	}
+}
+
+// TestRenderCaddyHTTPMode 覆盖「没有域名证书的部署」。
+//
+// HTTP 站点不能发送 HSTS：那会让浏览器把后续请求强制升级到 https，
+// 而该站点根本没有证书——表现就是「配置改对了却打不开」。
+func TestRenderCaddyHTTPMode(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "caddy", "Caddyfile.template"))
+	if err != nil {
+		t.Skipf("跳过：%v", err)
+	}
+	vars := map[string]string{
+		"LT_USER_DOMAIN": "203.0.113.10",
+		"LT_USER_SCHEME": "http",
+		"LT_HSTS_ON":     "",
+		"LT_USER_PORT":   "7848",
+	}
+	out, err := Render(string(raw), vars)
+	if err != nil {
+		t.Fatalf("HTTP 模板渲染失败: %v", err)
+	}
+	if !strings.Contains(out, "http://203.0.113.10 {") {
+		t.Fatalf("站点地址应为 http://，实际:\n%s", out)
+	}
+	if strings.Contains(out, "Strict-Transport-Security") {
+		t.Fatal("HTTP 模式不得发送 HSTS")
 	}
 }

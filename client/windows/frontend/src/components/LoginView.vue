@@ -18,13 +18,13 @@
         <input
           v-else
           v-model="form.server"
-          placeholder="例如 https://panel.example.com"
+          placeholder="例如 https://panel.example.com 或 http://1.2.3.4"
           spellcheck="false"
           autocomplete="off"
           @keyup.enter="submit"
         />
         <em class="muted">
-          {{ state.server_fixed ? '由客户端内置，无需填写' : '当前为调试构建，请填写控制台地址' }}
+          {{ state.server_fixed ? '由客户端内置，无需填写' : '当前为调试构建，请填写控制台地址（http 会明文传输 API Key）' }}
         </em>
       </label>
 

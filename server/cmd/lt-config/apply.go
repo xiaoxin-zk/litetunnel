@@ -202,7 +202,21 @@ func pendingChanges(writes []pendingWrite) []string {
 // 一串值（站点地址、ACME 邮箱、dns 参数、端到端入口端口）。手工跑脚本与从
 // 后台下发走的是同一套规则，才不会出现「脚本生成的对、后台生成的错」。
 func deriveVars(vars map[string]string) {
-	// 站点地址：Caddy 需要一个不带 scheme 的裸域名。
+	// 站点地址：Caddy 需要一个不带 scheme 的裸域名；协议单独派生。
+	//
+	// 没有域名证书的部署用 http:// 起站点，因此协议不能硬编码成 https。
+	// HSTS 只在 HTTPS 下开启：HTTP 站点发送它会让浏览器强制升级到 https。
+	publicURL := strings.ToLower(strings.TrimSpace(vars[tlscfg.VarUserPublicURL]))
+	scheme := "https"
+	if strings.HasPrefix(publicURL, "http://") {
+		scheme = "http"
+	}
+	vars[tlscfg.VarPanelScheme] = scheme
+	if scheme == "https" {
+		vars[tlscfg.VarHSTSOn] = "1"
+	} else {
+		vars[tlscfg.VarHSTSOn] = ""
+	}
 	if v := stripScheme(vars[tlscfg.VarUserPublicURL]); v != "" {
 		vars[tlscfg.VarPanelDomain] = v
 	}

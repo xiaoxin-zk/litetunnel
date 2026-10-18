@@ -22,6 +22,16 @@ const (
 	VarUserPublicURL = "LT_USER_PUBLIC_URL"
 	// VarPanelDomain 是 Caddy 站点地址（裸域名，不带 scheme）。
 	VarPanelDomain = "LT_USER_DOMAIN"
+	// VarPanelScheme 是 Caddy 站点协议（http / https），由 VarUserPublicURL 派生。
+	//
+	// 它不放进 OverridableVars：面板只声明「对外地址」，协议是其中的一部分，
+	// 单独可覆盖会造出「地址写 https、站点按 http 起」这种自相矛盾的配置。
+	VarPanelScheme = "LT_USER_SCHEME"
+	// VarHSTSOn 只在 HTTPS 模式下非空，模板据此决定是否发送 HSTS 头。
+	//
+	// HTTP 站点发送 HSTS 会让浏览器把后续请求强制升级到 https，
+	// 而该站点没有证书——表现为「配好了却打不开」。
+	VarHSTSOn = "LT_HSTS_ON"
 	// VarTunnelDomain 是隧道根域名（裸域名，不带 *.）。
 	VarTunnelDomain = "LT_TUNNEL_DOMAIN"
 	// VarACMEEmail 是 ACME 通知邮箱。

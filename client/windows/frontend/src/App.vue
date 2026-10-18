@@ -107,6 +107,7 @@ const maxPendingLogs = 2000
 let logTimer = null
 
 function pushLog(payload) {
+  if (disposed) return
   // 主进程成批推送 {epoch, seqs, lines}；也接受数组与单行字符串，这样前端
   // 热重载、或与旧版主进程混跑时都不会丢日志。
   let batch = payload
@@ -148,6 +149,9 @@ function pushLog(payload) {
   if (logTimer) return
   logTimer = setTimeout(() => {
     logTimer = null
+    // clearTimeout 只拦得住「还没进队列」的回调；已经进入队列的会在卸载
+    // 之后照常执行，这里再挡一次。
+    if (disposed) return
     const batch = pendingLogs.splice(0, pendingLogs.length)
     if (!batch.length) return
     logs.value = [...logs.value, ...batch.map((item) => item.text)].slice(-500)
@@ -188,11 +192,24 @@ async function onClearLogs() {
 // 组件实例，表现为「改了却不生效」这类无法复现的现象。
 const unsubscribes = []
 
+// disposed 在卸载后置位。
+//
+// 注销与 clearTimeout 都是「尽力而为」：Wails 按事件名注销，已在派发中的
+// 回调仍会执行；timer 也可能已经进入了回调队列。置位之后所有入口先看一眼，
+// 迟到的写操作直接丢弃——否则热重载时旧组件实例仍会被写入。
+let disposed = false
+
 function subscribe(name, handler) {
-  unsubscribes.push(onEvent(name, handler))
+  unsubscribes.push(
+    onEvent(name, (payload) => {
+      if (disposed) return
+      handler(payload)
+    })
+  )
 }
 
 onMounted(async () => {
+  disposed = false // 同一模块被重复挂载（热重载）时重新开放
   // 先注册事件、再读快照：反过来的话，两次 await 之间主进程推送的状态
   // 和日志会被丢掉——它们不属于任何快照，只能靠事件到达。
   subscribe('state', (payload) => {
@@ -210,6 +227,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  disposed = true
+
   while (unsubscribes.length) {
     const off = unsubscribes.pop()
     try {

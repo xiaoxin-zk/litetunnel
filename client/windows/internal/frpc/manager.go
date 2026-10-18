@@ -36,6 +36,15 @@ var ErrClosed = errors.New("客户端正在退出，不再启动 frpc")
 // 而这类操作本来就很稀疏。
 const exitLockShards = 32
 
+// stillCurrent 报告该隧道是否仍是这一代进程、且客户端未进入关闭。
+//
+// 用于回调派发前的最后一道核对：此时已经不持锁，只能靠代次确认。
+func (m *Manager) stillCurrent(tunnelID uint, gen uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gens[tunnelID] == gen && !m.closed
+}
+
 // exitLock 返回某条隧道的退出回调锁。
 func (m *Manager) exitLock(tunnelID uint) *sync.Mutex {
 	return &m.exitMu[tunnelID%exitLockShards]
@@ -380,11 +389,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.appendLog(tunnelID, tunnelName, "frpc 已正常退出")
 		}
 
-		// 上面那一步只保证了「本进程不再是表里的那一个」，并不保证
-		// 「还没有新进程登记」：停表与回调之间有窗口，Stop 已返回，
-		// 新进程可能刚好在这段时间里登记完成。持该隧道的 exitMu 复查代次，
-		// 与 Start 的登记互斥——复查通过即意味着直到回调结束都不会有
-		// 新进程把状态顶掉，回调也就不会覆盖它。
+		// 这里只做「代次校验 + 回调登记」，**不在锁内执行回调**。
+		//
+		// 早先的实现把 onExit 放在这把锁里：onExit 会发 Wails 事件、刷界面
+		// 状态，UI 一旦阻塞，同一条隧道的启停就跟着排队。锁按隧道分片只
+		// 解决了「别的隧道被拖住」这一点，同一条隧道仍然会被拖。
 		exitLock := m.exitLock(tunnelID)
 		exitLock.Lock()
 
@@ -398,10 +407,10 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.callbackWG.Add(1)
 		}
 		m.mu.Unlock()
+		exitLock.Unlock()
 
 		if stale {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
-			exitLock.Unlock()
 			return
 		}
 		if closing {
@@ -409,14 +418,26 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			// 回调里的状态写入与事件发送没有接收方，还可能落在一个
 			// 已经销毁的目标上。
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（客户端正在关闭，跳过退出回调）")
-			exitLock.Unlock()
 			return
 		}
-		if onExit != nil {
-			onExit(tunnelID, tunnelName, err, requested)
-			m.callbackWG.Done()
+		if onExit == nil {
+			return
 		}
-		exitLock.Unlock()
+
+		// 锁外派发。代价是「校验 → 回调写入」之间重新出现窗口：新进程可能
+		// 在这期间登记，回调会把它的状态清掉。派发前再核对一次代次（Start
+		// 登记时会先递增 gens，这里看得见），把窗口压到两次内存读之间。
+		//
+		// 这个残余窗口无法靠锁消除：要彻底关掉，得让上层记录的「已注册」
+		// 也带上代次，那是改回调签名的事，影响面大于收益。实际后果也有限
+		// ——新进程接下来会因 "start proxy success" 重新置位。
+		if !m.stillCurrent(tunnelID, gen) {
+			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
+			m.callbackWG.Done()
+			return
+		}
+		onExit(tunnelID, tunnelName, err, requested)
+		m.callbackWG.Done()
 	}()
 
 	return nil

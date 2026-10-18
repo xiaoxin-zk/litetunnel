@@ -302,7 +302,7 @@ func (s *stagedFile) commit() error {
 	// 备份旧文件（若存在）。用 rename：原子且不跨文件系统（备份与目标同目录）。
 	if _, err := os.Stat(s.path); err == nil {
 		s.existed = true
-		backup := s.path + ".lt-config-bak"
+		backup := s.path + backupSuffix
 		if err := os.Rename(s.path, backup); err != nil {
 			return fmt.Errorf("备份旧文件失败: %w", err)
 		}
@@ -386,17 +386,25 @@ func writeFileAtomic(path, content string, mode os.FileMode) error {
 		st.discard()
 		return err
 	}
+	// commit 会给旧文件留一份备份用于失败回滚；单文件写入已经成功，
+	// 备份必须当场清掉，否则每写一次就在部署目录多留一个文件
+	// （里面是旧凭据），直到下次启动清理才消失。
+	st.cleanupBackup()
 	return nil
 }
 
-// cleanupLeftovers 启动时清理上次异常退出留下的临时/备份文件。
+// cleanupLeftovers 启动时清理上次异常退出留下的现场。
 //
-// 两类文件处理方式不同：
+// 三类残留处理方式不同：
 //
+//   - .lt-config-batch.json 是未完成的批次记录：先按它把整批文件回滚，
+//     再走下面的单文件规则（见 recoverBatch）；
 //   - .lt-config-tmp-* 是尚未提交的候选内容，谁都没引用，直接删；
 //   - *.lt-config-bak 是提交时给旧文件做的备份：目标文件还在（说明新文件已
 //     落位、备份是旧的）就删掉；目标文件缺失（崩溃发生在「旧文件改名成备份、
 //     新文件还没落位」之间）就把备份恢复回原位——否则活动配置就凭空消失了。
+//   - .lt-config-caddy-* / .lt-config-frps-* 是校验用的临时目录，里面放着
+//     挂进容器的凭据 env 文件，必须整目录删掉。
 //
 // 必须在 validateConfig 之前调用：崩溃可能把 .env 也留成「缺失 + 备份」的
 // 状态，不先恢复的话启动校验会直接报「缺少 .env」。
@@ -409,6 +417,11 @@ func cleanupLeftovers(p paths) {
 		}
 		seen[dir] = true
 
+		// 有未完成的批次记录时先按批次整体回滚。单文件备份只能说明「这个
+		// 文件被替换过」，说明不了整批是否提交完整——那正是强杀/断电之后
+		// 最危险的中间态。
+		recoverBatch(dir)
+
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -420,9 +433,16 @@ func cleanupLeftovers(p paths) {
 				if rerr := os.Remove(filepath.Join(dir, name)); rerr != nil {
 					log.Printf("[lt-config] 清理遗留临时文件失败（%s）: %v", name, rerr)
 				}
-			case strings.HasSuffix(name, ".lt-config-bak"):
+			case e.IsDir() && isValidateTempDir(name):
+				// 校验用的临时目录里有挂进容器的 env 文件（DNS 凭据）。
+				// 只清普通临时文件的话，异常退出后这些凭据会一直留在部署
+				// 目录里——而那是个能被备份、被同步、被随手打包带走的地方。
+				if rerr := os.RemoveAll(filepath.Join(dir, name)); rerr != nil {
+					log.Printf("[lt-config] 清理遗留校验目录失败（%s）: %v", name, rerr)
+				}
+			case strings.HasSuffix(name, backupSuffix):
 				bak := filepath.Join(dir, name)
-				target := strings.TrimSuffix(bak, ".lt-config-bak")
+				target := strings.TrimSuffix(bak, backupSuffix)
 				if _, serr := os.Stat(target); os.IsNotExist(serr) {
 					if rerr := os.Rename(bak, target); rerr != nil {
 						log.Printf("[lt-config] 恢复遗留备份失败（%s）: %v", name, rerr)

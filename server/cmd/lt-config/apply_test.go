@@ -288,6 +288,60 @@ func TestWriteBatchCommitRollsBackOnPartialFailure(t *testing.T) {
 	}
 }
 
+// TestRecoverBatchRollsBackWholeBatch 覆盖「提交到一半被强杀」。
+//
+// 进程内回滚盖不住这种情况：磁盘上第一个文件已经换新、第二个还是旧的，
+// 而批次记录还留着。启动清理必须按记录把整批恢复——只按单文件备份判断，
+// 会得出「第一个文件备份在、第二个备份不在」这种看起来像是正常的状态，
+// 于是把半套配置留在原地。
+func TestRecoverBatchRollsBackWholeBatch(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "Caddyfile")
+	second := filepath.Join(dir, "frps.toml")
+
+	// 崩溃现场：Caddyfile 已换成新内容（旧内容在备份里），frps.toml 未被触碰。
+	if err := os.WriteFile(first, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(first+backupSuffix, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("old-second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"version":1,"dir":"` + strings.ReplaceAll(dir, `\`, `\\`) + `","files":[` +
+		`{"name":"Caddyfile","path":"` + strings.ReplaceAll(first, `\`, `\\`) + `","tmp":"` +
+		strings.ReplaceAll(filepath.Join(dir, ".lt-config-tmp-a"), `\`, `\\`) + `","existed":true},` +
+		`{"name":"frps.toml","path":"` + strings.ReplaceAll(second, `\`, `\\`) + `","tmp":"` +
+		strings.ReplaceAll(filepath.Join(dir, ".lt-config-tmp-b"), `\`, `\\`) + `","existed":true}]}`
+	if err := os.WriteFile(filepath.Join(dir, batchManifestName), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupLeftovers(paths{
+		deployDir: dir,
+		caddyOut:  first,
+		frpsOut:   second,
+		envFile:   filepath.Join(dir, ".env"),
+	})
+
+	if raw, err := os.ReadFile(first); err != nil || string(raw) != "old\n" {
+		t.Errorf("已替换的文件应回滚回旧内容，实际 %q / %v", raw, err)
+	}
+	if raw, err := os.ReadFile(second); err != nil || string(raw) != "old-second\n" {
+		t.Errorf("未触碰的文件应保持原样，实际 %q / %v", raw, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, batchManifestName)); !os.IsNotExist(err) {
+		t.Error("恢复完成后批次记录应被删除")
+	}
+	if _, err := os.Stat(first + backupSuffix); !os.IsNotExist(err) {
+		t.Error("备份应已归位，不能留在部署目录里")
+	}
+	if leftovers := tempLeftovers(t, dir); len(leftovers) > 0 {
+		t.Errorf("批次恢复后残留临时文件: %v", leftovers)
+	}
+}
+
 // tempLeftovers 列出目录里残留的临时文件。
 func tempLeftovers(t *testing.T, dir string) []string {
 	t.Helper()

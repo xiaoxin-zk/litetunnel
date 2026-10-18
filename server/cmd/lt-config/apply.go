@@ -312,6 +312,16 @@ func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 // 才以错误形式爆炸。所以每个文件替换前先备份旧内容（见 stagedFile.commit），
 // 失败时把已替换的文件恢复，最终磁盘回到「全部旧配置」。
 func (b *writeBatch) commit() error {
+	// 先把整批文件的身份落盘，再动第一个目标文件。进程内回滚只覆盖「本进程
+	// 还活着」的失败；强杀或断电时，磁盘可能停在第一个文件已换新、第二个
+	// 还没换的中间态，而启动清理单看某个文件的备份无法判断整批是否提交完整。
+	// 有这份记录，重启后就能确定「这一批没提交完」，整批回滚到旧配置。
+	m, err := b.writeManifest()
+	if err != nil {
+		b.discard()
+		return batchManifestError(err)
+	}
+
 	for i := range b.staged {
 		st := b.staged[i]
 		if err := st.commit(); err != nil {
@@ -321,13 +331,21 @@ func (b *writeBatch) commit() error {
 			rbErr := b.rollbackCommitted()
 			b.discardFrom(i)
 			if rbErr != nil {
-				return fmt.Errorf("替换 %s 失败，且回滚未完成（磁盘可能处于新旧混合状态）: %v；回滚错误: %w", st.name, err, rbErr)
+				// 保留批次记录：下次启动时由它把整批恢复回去。删掉记录等于
+				// 把「磁盘可能混合」这件事藏起来。
+				return fmt.Errorf("替换 %s 失败，且回滚未完成（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", st.name, err, rbErr)
 			}
+			b.removeManifest(m)
 			return fmt.Errorf("替换 %s 失败，已回滚（磁盘仍为旧配置）: %w", st.name, err)
 		}
 		b.done++
 	}
-	// 全部成功：清掉备份。
+	// 全部成功：先撤批次记录，再清备份。
+	//
+	// 顺序不能反：先删备份的话，中途崩溃只会留下一份仍然存在的批次记录，
+	// 而它指向的备份已经被删——那时既恢复不了旧配置，也说不清哪一份是
+	// 完整的。
+	b.removeManifest(m)
 	for _, st := range b.staged {
 		st.cleanupBackup()
 	}

@@ -126,7 +126,7 @@ func isOfficialCaddyImage(image string) bool {
 // 校验器与运行时镜像必须一致：两者的指令集不同（DNS 插件是编译期决定的），
 // 换一个镜像校验就只剩下自我安慰的作用。
 func (s *service) validateCaddy(ctx context.Context, text, image string, vars map[string]string) (string, error) {
-	dir, err := s.tempDir("lt-config-caddy-")
+	dir, err := s.tempDir(tempPrefixCaddy)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +197,7 @@ func (s *service) validateContainers(ctx context.Context, caddyText, caddyImage,
 
 // validateFrpsConfig 用 frps 自带的 verify 子命令校验。
 func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, error) {
-	dir, err := s.tempDir("lt-config-frps-")
+	dir, err := s.tempDir(tempPrefixFrps)
 	if err != nil {
 		return "", err
 	}
@@ -237,6 +237,28 @@ func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, 
 // ——报错会是 "no such file or directory"，与真正的原因毫无关系。
 func (s *service) tempDir(prefix string) (string, error) {
 	return os.MkdirTemp(s.paths.deployDir, "."+prefix)
+}
+
+// 校验临时目录的名字前缀（MkdirTemp 会在前面再加一个点）。
+//
+// 集中定义是为了让启动清理能认出来：这些目录里有挂进容器的凭据 env 文件，
+// 异常退出后不删就等于把 DNS API 凭据长期留在部署目录里。
+const (
+	tempPrefixCaddy = "lt-config-caddy-"
+	tempPrefixFrps  = "lt-config-frps-"
+)
+
+// validateTempDirPrefixes 是全部校验临时目录前缀。
+var validateTempDirPrefixes = []string{tempPrefixCaddy, tempPrefixFrps}
+
+// isValidateTempDir 判断目录名是否为本服务的校验临时目录。
+func isValidateTempDir(name string) bool {
+	for _, p := range validateTempDirPrefixes {
+		if strings.HasPrefix(name, "."+p) {
+			return true
+		}
+	}
+	return false
 }
 
 // validDomain 校验裸域名。

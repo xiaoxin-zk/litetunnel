@@ -123,7 +123,7 @@
 </template>
 
 <script setup>
-import { reactive, ref, watch } from 'vue'
+import { onUnmounted, reactive, ref, watch } from 'vue'
 import { api } from '../bridge'
 
 const props = defineProps({
@@ -167,6 +167,18 @@ const mailEnabled = ref(false)
 const notice = ref('')
 const reset = reactive({ account: '', emailCode: '', oldPassword: '', password: '', confirm: '' })
 
+// 倒计时定时器必须能在「重新发送」与「组件卸载」时被清掉：
+// 反复进入找回密码页会各起一个 setInterval，旧定时器在组件卸载后仍在修改
+// 已销毁组件的状态。统一收口到 stopCountdown，卸载时一并停掉。
+let countdownTimer = null
+function stopCountdown() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
+  }
+}
+onUnmounted(stopCountdown)
+
 /** 打开重置面板，并向服务端确认该走验证码还是旧密码。 */
 async function openReset() {
   error.value = ''
@@ -192,9 +204,11 @@ async function sendCode() {
   try {
     await api.sendEmailCode(form.server.trim(), account, 'reset')
     countdown.value = 60
-    const timer = setInterval(() => {
+    // 重新发送前先停掉旧计时器，避免叠起多个 interval。
+    stopCountdown()
+    countdownTimer = setInterval(() => {
       countdown.value -= 1
-      if (countdown.value <= 0) clearInterval(timer)
+      if (countdown.value <= 0) stopCountdown()
     }, 1000)
   } catch (e) {
     error.value = typeof e === 'string' ? e : e?.message || '验证码发送失败'

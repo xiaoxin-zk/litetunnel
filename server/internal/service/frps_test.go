@@ -222,8 +222,14 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(pages) != 2 {
-		t.Fatalf("请求了 %d 页，期望 2 页", len(pages))
+	// 3 次 = 第 1 页 + 第 2 页 + 收尾复检第 1 页（见 recheckFirstPage）。
+	// 复检是缺陷 10 的修复：分页接口没有稳定快照，不复核第一页就发现不了
+	// 「删一条 + 加一条、total 不变」的错位。它只加一次请求、与页数无关。
+	if len(pages) != 3 {
+		t.Fatalf("请求了 %d 页，期望 3 次（2 页 + 1 次复检），实际序列 %v", len(pages), pages)
+	}
+	if pages[0] != "1" || pages[1] != "2" || pages[2] != "1" {
+		t.Fatalf("请求顺序 = %v，期望 [1 2 1]（最后一页之后复检第 1 页）", pages)
 	}
 	if proxies[200].Name != "lt_u1.last" {
 		t.Fatalf("最后一条 = %q，期望 lt_u1.last", proxies[200].Name)
@@ -450,14 +456,17 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 // 条数校验、total 校验、重复校验**全部发现不了**，只有翻页结束后复检第 1 页
 // 才能看出来（见 recheckFirstPage）。
 //
-// 构造：第 1 轮第 1 页是 A 组、第 2 页是 B 组；第 2 轮（复检）第 1 页换成 A'
-// 组（条数完全相同、只有内容变了），于是复检必须报不稳定。
+// 构造：两页都必须是**满页**（frpsPageSize 条），否则实现会在「短页且 total
+// 未满足」处提前报「列表不完整」，根本走不到复检——那就测不到缺陷 10 了。
+//
+// 第 1 轮：第 1 页 = a0..a199，第 2 页 = b0..b199（total=400）。
+// 第 2 轮（收尾复检第 1 页）：第 1 页换成 a1..a200 —— 条数完全相同、total
+// 完全相同，只有集合变了（正是「删一条 + 加一条」的形态）。
 func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
 
-	// total 固定 2：一页放 1 条，共两页，保证一定翻页（单页不走复检）。
-	const total = 2
+	const total = 2 * frpsPageSize
 
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -466,19 +475,25 @@ func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 		mu.Unlock()
 
 		page := r.URL.Query().Get("page")
-		// 第 1 页在第 3 次请求（= 第 2 轮复检）时换名字：
-		// 条数没变、total 没变，只有集合变了。
-		var name string
-		switch {
-		case page == "1" && n <= 2:
-			name = "lt_u1.a"
-		case page == "1":
-			name = "lt_u1.a-new" // 一删一增之后的名单
+		items := make([]string, 0, frpsPageSize)
+		switch page {
+		case "1":
+			// 第 1、2 次请求是第 1 轮（第 1 页、第 2 页）；第 3 次是复检。
+			// 复检时整体后移一位：a0 消失、a200 出现，条数与 total 都不变。
+			base := 0
+			if n >= 3 {
+				base = 1
+			}
+			for i := 0; i < frpsPageSize; i++ {
+				items = append(items, fmt.Sprintf(`{"name":"lt_u1.a%d","status":{"phase":"online"}}`, base+i))
+			}
 		default:
-			name = "lt_u1.b"
+			for i := 0; i < frpsPageSize; i++ {
+				items = append(items, fmt.Sprintf(`{"name":"lt_u1.b%d","status":{"phase":"online"}}`, i))
+			}
 		}
-		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%s,"pageSize":1,"items":[{"name":%q,"status":{"phase":"online"}}]}}`,
-			total, page, name)
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%s,"pageSize":%d,"items":[%s]}}`,
+			total, page, frpsPageSize, strings.Join(items, ","))
 	})
 
 	proxies, err := c.ListProxies(context.Background())
@@ -488,8 +503,10 @@ func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 	if proxies != nil {
 		t.Fatal("结果不稳定时不应返回代理列表：错位的条目会让人被判离线、让新代理被多计流量")
 	}
-	if !strings.Contains(err.Error(), "分页期间") {
-		t.Fatalf("错误信息应说明分页期间发生变化，实际: %v", err)
+	// 错误信息里要能看出「总量没变但集合变了」——只写「列表不稳定」的话，
+	// 运维无法区分这是分页错位还是 frps 返回了残缺响应，两者要查的东西不同。
+	if !strings.Contains(err.Error(), "集合变了") {
+		t.Fatalf("错误信息应说明集合发生变化，实际: %v", err)
 	}
 }
 

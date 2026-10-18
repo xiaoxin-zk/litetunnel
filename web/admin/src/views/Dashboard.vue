@@ -117,7 +117,9 @@
       <!-- 这类失败不影响登录（认证已通过），所以界面上不出现任何异常；
            正因如此才需要在这里点名，否则「审计字段一直是旧值」可以几个月无人察觉。 -->
       <div class="lt-muted" style="margin-top: 10px">
-        登录、动态口令验证、兑换核销成功时，若审计字段没能写进数据库，认证仍会放行——避免一次数据库抖动把管理员锁在门外。失败次数与最近原因记在这里。计数在进程重启后清零。
+        登录、动态口令验证、兑换核销成功时，若审计字段没能写进数据库，认证仍会放行——避免一次数据库抖动把管理员锁在门外。失败次数与最近原因记在这里。
+        这些计数是<b>实例级</b>的：只来自当前处理本次请求的进程，重启清零；多实例部署时不能把它们相加当作全局值
+        <span v-if="metrics.audit?.instance">（实例 <code>{{ metrics.audit.instance }}</code>）</span>。
       </div>
       <el-alert v-if="metrics.audit?.failures" type="warning" :closable="false"
         :title="`有 ${metrics.audit.failures} 次审计写入失败（最近：${metrics.audit.last_scope || '未知位置'}｜${metrics.audit.last_error || '未记录原因'}），请检查数据库状态：锁表、磁盘空间、目录权限。`"

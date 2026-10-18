@@ -152,6 +152,13 @@ type Health struct {
 	// 只在 .env 里，面板的环境变量里没有，也不该为此再存一份到数据库——
 	// 两份数据一定会分叉，而分叉的表现是「界面显示的端口和实际转发的不一致」。
 	Ports Ports `json:"ports"`
+
+	// BlockedDirs 是存在「未能自动收敛的配置现场」的目录。
+	//
+	// 非空意味着这些目录里留着上次提交的记录与备份，helper 已经拒绝一切
+	// 写盘操作（见 cmd/lt-config）。放在健康检查里而不是只在日志里说：
+	// 面板是管理员唯一会主动打开的地方，否则他要等到「保存不生效」才发现。
+	BlockedDirs []string `json:"blocked_dirs,omitempty"`
 }
 
 // Ports 是入口路由相关的端口。

@@ -454,7 +454,12 @@ func writeFileAtomic(path, content string, mode os.FileMode) error {
 //
 // 必须在 validateConfig 之前调用：崩溃可能把 .env 也留成「缺失 + 备份」的
 // 状态，不先恢复的话启动校验会直接报「缺少 .env」。
-func cleanupLeftovers(p paths) {
+//
+// 返回值是**没能自动收敛**的目录。它们被原样保留（记录、备份、目标都在），
+// 调用方必须据此拒绝后续的写盘操作：再应用一次会覆盖掉唯一可恢复的现场，
+// 把「还能修」变成「只能人工拼」。这类目录只应由人看过之后手工清理。
+func cleanupLeftovers(p paths) []string {
+	var blocked []string
 	seen := map[string]bool{}
 	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {
 		dir := filepath.Dir(f)
@@ -472,6 +477,7 @@ func cleanupLeftovers(p paths) {
 		// 删掉，磁盘从此停在新旧混合状态，再无自动修复的机会。
 		if !recoverBatch(dir) {
 			log.Printf("[lt-config] %s 的批次回滚未完成，跳过本次残留清理", dir)
+			blocked = append(blocked, dir)
 			continue
 		}
 
@@ -508,6 +514,7 @@ func cleanupLeftovers(p paths) {
 			}
 		}
 	}
+	return blocked
 }
 
 // sortedKeys 返回有序键名，便于输出稳定的日志与结果。

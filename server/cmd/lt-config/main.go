@@ -95,7 +95,15 @@ func main() {
 	p := newPaths(*deployDir, *envFile, *composeFile, *caddyTpl, *caddyOut, *frpsTpl, *frpsOut, *caddyData)
 	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
 	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。
-	cleanupLeftovers(p)
+	//
+	// 清理不掉的目录会被记住，之后拒绝一切写盘操作：那里的记录与备份是
+	// 唯一还能修复磁盘的东西，被一次新的应用覆盖就彻底没了。
+	blockedDirs := cleanupLeftovers(p)
+	for _, dir := range blockedDirs {
+		log.Printf("[lt-config] 警告：%s 存在未能自动收敛的配置现场（批次记录/备份与目标内容无法对齐）。"+
+			"本次进程将拒绝所有写盘请求，请先人工确认该目录下的 %s 与 %s 备份，再手工清理",
+			dir, batchManifestName, backupSuffix)
+	}
 	if err := validateConfig(*addr, *token, p); err != nil {
 		log.Fatalf("[lt-config] %v", err)
 	}
@@ -107,6 +115,7 @@ func main() {
 		frpsImage:    *frpsImage,
 		validateFrps: *validateFrps,
 		allowApply:   *allowApply,
+		blockedDirs:  blockedDirs,
 	}
 
 	mux := http.NewServeMux()
@@ -278,6 +287,40 @@ type service struct {
 	// 校验）。测试里起不了 docker，而「校验阶段不许改活动文件」这条性质必须被
 	// 守住——没有这个钩子就只能靠人眼盯着，而那正是它上次被漏掉的原因。
 	validateFn func(caddyText, caddyImage, frpsText string, vars map[string]string) (string, error)
+
+	// blockedDirs 是启动时无法自动收敛的目录（见 cleanupLeftovers）。
+	//
+	// 这些目录里留着批次记录与备份，是修复「新旧混合」的唯一依据。此时再写盘
+	// 会把它们覆盖掉，所以整个进程拒绝写操作——宁可让管理员手动处理一次，
+	// 也不能让一次自动应用把还能修的现场变成无迹可寻。
+	blockedDirs []string
+}
+
+// dirtyDir 返回与本次写盘相关、且处于未收敛状态的目录；为空表示可以继续。
+func (s *service) dirtyDir() string {
+	if len(s.blockedDirs) == 0 {
+		return ""
+	}
+	for _, f := range []string{s.paths.caddyOut, s.paths.frpsOut, s.paths.envFile} {
+		dir := filepath.Dir(f)
+		for _, b := range s.blockedDirs {
+			if b != "" && b == dir {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+// dirtySceneError 说明「为什么这次拒绝执行」，并给出人工处理的办法。
+//
+// 只说「配置现场异常」是不够的：管理员需要知道去看哪个目录、删之前要确认什么。
+func (s *service) dirtySceneError(dir string) error {
+	return fmt.Errorf(
+		"部署目录 %s 存在上次提交未能自动收敛的现场：批次记录里的摘要与磁盘上的备份/目标文件对不上，"+
+			"自动恢复已停止。为避免覆盖唯一可恢复的备份，本次写盘被拒绝。"+
+			"请人工确认 %s 与 *%s 的内容，保留需要的那一份后手工清理，再重新应用",
+		dir, batchManifestName, backupSuffix)
 }
 
 // auth 校验 Bearer token，用常量时间比较避免逐字节试探。

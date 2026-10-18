@@ -30,7 +30,13 @@ type auditCounters struct {
 }
 
 // AuditWriteHealth 是审计写入失败的可观测快照。
+//
+// 这是**实例级**指标：计数只在本进程内存里，重启清零。多实例部署时，
+// 管理端看到的是某一个实例的数字，不是集群合计。字段里带上 Instance
+// 就是为了让读的人一眼看出这一点，而不是把它当成全局值。
 type AuditWriteHealth struct {
+	// Instance 是产生这份计数的进程标识（见 Services.instanceID，重启会变）。
+	Instance string `json:"instance,omitempty"`
 	// Failures 是进程启动以来的累计失败次数。
 	Failures uint64 `json:"failures"`
 	// LastAt 是最近一次失败的时刻；从未失败时为零值。
@@ -80,6 +86,7 @@ func (s *Services) AuditHealth() AuditWriteHealth {
 	}
 	c := s.auditCounters
 	var out AuditWriteHealth
+	out.Instance = s.instanceID
 	out.Failures = c.failures.Load()
 
 	c.mu.Lock()

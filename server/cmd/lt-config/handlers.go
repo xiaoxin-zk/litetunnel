@@ -41,7 +41,7 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h := tlscfg.Health{DeployDir: s.paths.deployDir, Available: true}
+	h := tlscfg.Health{DeployDir: s.paths.deployDir, Available: true, BlockedDirs: s.blockedDirs}
 	if _, vars, err := readEnvFile(s.paths.envFile); err == nil {
 		h.Ports = tlscfg.Ports{
 			Gateway:    atoiOr(vars["LT_GATEWAY_PORT"], 0),
@@ -65,6 +65,13 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	}
+	// 现场未收敛放在最后判断：它是「必须人工介入」的状态，比缺 docker、
+	// 缺文件更该先处理，Reason 也以它为准——否则界面显示「缺少某个文件」，
+	// 管理员去补文件，却发现保存仍然失败。
+	if dir := s.dirtyDir(); dir != "" {
+		h.Available = false
+		h.Reason = fmt.Sprintf("部署目录 %s 存在未能自动收敛的配置现场，写盘已被拒绝，需人工确认后清理", dir)
 	}
 	writeJSON(w, http.StatusOK, h)
 }
@@ -135,6 +142,14 @@ func (s *service) handleApply(w http.ResponseWriter, r *http.Request) {
 	// 起出来的进程读到的就是一份新旧混合的配置。
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	// 现场未收敛时同样拒绝：磁盘可能是新旧混合，按它重建容器等于把混合
+	// 状态跑起来，还会让「哪一版在跑」更难判断。409 而不是 500——这不是
+	// 服务出错，是需要人来做决定。
+	if dir := s.dirtyDir(); dir != "" {
+		failJSON(w, http.StatusConflict, s.dirtySceneError(dir))
+		return
+	}
 
 	out, err := s.composeUp(r.Context())
 	if err != nil {

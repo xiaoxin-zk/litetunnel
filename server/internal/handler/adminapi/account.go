@@ -1,6 +1,8 @@
 package adminapi
 
 import (
+	"errors"
+	"io"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -64,8 +66,16 @@ func (h *Handler) TOTPSetup(c *gin.Context) {
 	var req struct {
 		Code string `json:"code"`
 	}
-	// 空 body 不是错误：首次绑定时前端不会传任何参数。
-	_ = c.ShouldBindJSON(&req)
+	// 空 body 不是错误：首次绑定时前端不会传任何参数，这一点必须保留。
+	//
+	// 但**只有 EOF 算空**。以前这里忽略了一切解析错误，于是「忘了带
+	// Content-Type」「JSON 写错了」「字段名拼错」与「没传参数」在处理流程里
+	// 无法区分：接口照常生成新密钥并返回成功。调用方以为参数生效了，实际
+	// 被静默丢弃——对一个会改变双因素认证状态的接口，这种沉默比报错更危险。
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpx.BadRequest(c, "参数格式不正确")
+		return
+	}
 
 	adminID, _, _ := middleware.CurrentAdminID(c)
 	secret, otpauth, err := h.svc.AdminTOTPSetup(adminID, req.Code)

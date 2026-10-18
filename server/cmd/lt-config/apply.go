@@ -37,6 +37,14 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
+	// 启动时就有目录没能自动收敛：那里的批次记录与备份是唯一还能修复磁盘的
+	// 东西，继续写盘会把它们覆盖掉。拒绝执行，由管理员先确认现场（见
+	// dirtySceneError）。这一步刻意放在最前面且**不**自动清理——自动清理
+	// 正是这里最不该做的事。
+	if dir := s.dirtyDir(); dir != "" {
+		return res, s.dirtySceneError(dir)
+	}
+
 	env, vars, err := readEnvFile(s.paths.envFile)
 	if err != nil {
 		return res, internalError(fmt.Errorf("读取 %s 失败: %w", s.paths.envFile, err))

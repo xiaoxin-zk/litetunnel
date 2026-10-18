@@ -67,23 +67,60 @@ func (s *service) composeUp(ctx context.Context) (string, error) {
 	return text, nil
 }
 
-// verifyServicesRunning 确认 composeServices 都处于运行状态。
+const (
+	// containerStableChecks 是「容器仍在运行」需要连续确认的次数。
+	//
+	// 只查一次是不够的：配置写错时容器会起来、加载失败、立刻退出，而
+	// `compose ps` 恰好落在这一两秒里就会看到「在运行」。连续确认把观察
+	// 窗口拉到 containerStableChecks*containerStableInterval（默认 2 秒），
+	// 「启动即退出」基本都会被抓住。
+	containerStableChecks = 3
+	// containerStableInterval 是两次确认之间的间隔。
+	containerStableInterval = time.Second
+)
+
+// verifyServicesRunning 确认 composeServices 都**持续**处于运行状态。
 //
-// 容器起来后可能立刻就因配置错误退出，而这一步是「Applied 是否可信」的
-// 最后一道检查：没有它，接口会把一次「容器启动即崩溃」当成应用成功。
+// 这是「Applied 是否可信」的最后一道检查：没有它，接口会把一次
+// 「容器启动即崩溃」当成应用成功，管理员看到的界面与实际运行状态分叉。
 func (s *service) verifyServicesRunning(ctx context.Context) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	streak := 0
+	for {
+		missing, err := s.notRunningServices(probeCtx)
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			return hostError(fmt.Errorf(
+				"容器重建后未保持运行: %s（多半是新配置未被接受，请查看 docker compose logs）",
+				strings.Join(missing, ", ")))
+		}
+		streak++
+		if streak >= containerStableChecks {
+			return nil
+		}
+		select {
+		case <-probeCtx.Done():
+			return hostError(fmt.Errorf("重建后等待容器稳定超时: %w", probeCtx.Err()))
+		case <-time.After(containerStableInterval):
+		}
+	}
+}
+
+// notRunningServices 返回当前不在运行状态的 composeServices。
+func (s *service) notRunningServices(ctx context.Context) ([]string, error) {
 	// compose ps 默认只列运行中的容器（--all 才包含已退出的），
 	// 所以不需要额外参数，老版本 compose 也能用。
-	out, err := runDockerIn(probeCtx, s.paths.deployDir,
+	out, err := runDockerIn(ctx, s.paths.deployDir,
 		"compose",
 		"--env-file", s.paths.envFile,
 		"-f", s.paths.composeFile,
 		"ps", "--services")
 	if err != nil {
-		return hostError(fmt.Errorf("重建后无法确认容器状态: %v\n%s", err, out))
+		return nil, hostError(fmt.Errorf("重建后无法确认容器状态: %v\n%s", err, out))
 	}
 	running := make(map[string]bool, len(composeServices))
 	for _, line := range strings.Split(out, "\n") {
@@ -97,12 +134,7 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 			missing = append(missing, name)
 		}
 	}
-	if len(missing) > 0 {
-		return hostError(fmt.Errorf(
-			"容器重建后未处于运行状态: %s（多半是新配置未被接受，请查看 docker compose logs）",
-			strings.Join(missing, ", ")))
-	}
-	return nil
+	return missing, nil
 }
 
 func runDocker(ctx context.Context, args ...string) (string, error) {

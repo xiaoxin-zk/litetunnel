@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // 本文件负责「多文件提交」的现场记录与崩溃恢复。
@@ -84,7 +85,7 @@ func (b *writeBatch) removeManifest(m batchManifest) {
 	}
 }
 
-// recoverBatch 按批次记录把整批文件恢复到提交前状态。
+// recoverBatch 按批次记录把整批文件恢复到提交前状态，返回是否已经「确定落定」。
 //
 // 判据只有一条：备份文件存在，说明那个文件的替换已经进行过。
 // 恢复方式是「先删目标再放回备份」——Windows 上 Rename 到已存在的文件会
@@ -93,14 +94,21 @@ func (b *writeBatch) removeManifest(m batchManifest) {
 // 全部替换成功、只剩记录与备份没清时崩溃，这里同样会把整批回滚到旧配置。
 // 这是刻意的：那种状态下无法确认容器是否已经按新配置重建过，宁可回到
 // 一份确定一致的旧配置，再由管理员重新应用一次。
-func recoverBatch(dir string) {
+//
+// 返回 false 表示**至少有一个文件没能恢复**。此时绝不能删记录与备份：
+// 它们是下一次尝试恢复的唯一依据，而磁盘正处在「新旧混合」状态——
+// 删掉就等于把「还能修」变成「只能人工拼」。
+func recoverBatch(dir string) bool {
 	path := filepath.Join(dir, batchManifestName)
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("[lt-config] 读取批次记录失败（%s）: %v", path, err)
+			// 读不出来（权限、被占用）同样是「还没确定」，不能继续清理。
+			return false
 		}
-		return
+		// 没有记录：上一批已经落定，按单文件规则清理即可。
+		return true
 	}
 
 	var m batchManifest
@@ -109,19 +117,22 @@ func recoverBatch(dir string) {
 		// 至少保证下次启动不会一直卡在这份坏记录上。
 		log.Printf("[lt-config] 批次记录无法解析（%s），改按单文件规则清理: %v", path, err)
 		_ = os.Remove(path)
-		return
+		return true
 	}
 
 	log.Printf("[lt-config] 发现未完成的批次提交（%d 个文件），按批次整体回滚", len(m.Files))
+	var failed []string
 	for _, f := range m.Files {
 		bak := f.Path + backupSuffix
 		if _, err := os.Stat(bak); err == nil {
 			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
 				log.Printf("[lt-config] 批次回滚：删除新文件失败（%s）: %v", f.Path, err)
+				failed = append(failed, f.Name)
 				continue
 			}
 			if err := os.Rename(bak, f.Path); err != nil {
 				log.Printf("[lt-config] 批次回滚：恢复旧文件失败（%s）: %v", f.Path, err)
+				failed = append(failed, f.Name)
 				continue
 			}
 			log.Printf("[lt-config] 已回滚：%s", f.Name)
@@ -132,6 +143,7 @@ func recoverBatch(dir string) {
 		if !f.Existed {
 			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
 				log.Printf("[lt-config] 批次回滚：删除多余文件失败（%s）: %v", f.Path, err)
+				failed = append(failed, f.Name)
 			}
 		}
 	}
@@ -141,13 +153,21 @@ func recoverBatch(dir string) {
 		}
 	}
 
+	if len(failed) > 0 {
+		log.Printf("[lt-config] 批次回滚未完成（失败：%s），保留批次记录与备份，等待下次启动重试或人工处理",
+			strings.Join(failed, ", "))
+		return false
+	}
+
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Printf("[lt-config] 删除批次记录失败（%s）: %v", path, err)
-		return
+		return false
 	}
 	if err := os.Remove(path + backupSuffix); err != nil && !os.IsNotExist(err) {
 		log.Printf("[lt-config] 删除批次记录的备份失败（%s）: %v", path, err)
+		return false
 	}
+	return true
 }
 
 // batchManifestError 把「写不下批次记录」这件事说清楚：

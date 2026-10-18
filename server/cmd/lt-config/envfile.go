@@ -420,7 +420,14 @@ func cleanupLeftovers(p paths) {
 		// 有未完成的批次记录时先按批次整体回滚。单文件备份只能说明「这个
 		// 文件被替换过」，说明不了整批是否提交完整——那正是强杀/断电之后
 		// 最危险的中间态。
-		recoverBatch(dir)
+		//
+		// 回滚没能完成时**跳过**这个目录的单文件清理：那些备份正是下一次
+		// 恢复的依据，按单文件规则处理（目标在就删备份）会把唯一的退路
+		// 删掉，磁盘从此停在新旧混合状态，再无自动修复的机会。
+		if !recoverBatch(dir) {
+			log.Printf("[lt-config] %s 的批次回滚未完成，跳过本次残留清理", dir)
+			continue
+		}
 
 		entries, err := os.ReadDir(dir)
 		if err != nil {

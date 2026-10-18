@@ -18,6 +18,11 @@ const (
 	captchaTTL = 5 * time.Minute
 	// captchaMaxEntries 是同时在线的验证码上限，防止被刷爆内存。
 	captchaMaxEntries = 20000
+	// captchaEvictBatch 是单次淘汰最多处理的条数。
+	//
+	// 淘汰发生在写入验证码的持锁路径上：把「一次处理多少条」钉死，才能保证
+	// 无论表多大，单次请求在锁内的开销都是有界的。
+	captchaEvictBatch = 512
 )
 
 // Captcha 是一次性算术验证码。
@@ -44,6 +49,14 @@ type captchaEntry struct {
 type CaptchaStore struct {
 	mu      sync.Mutex
 	entries map[string]captchaEntry
+
+	// order 是票据的插入顺序（FIFO），head 是尚未消费的位置。
+	//
+	// 有了它，清理与淘汰都不必遍历整张表：TTL 固定，插入顺序就是到期顺序，
+	// 队头就是最早到期的那一批。旧实现每次触顶都要在全局锁内扫 2 万条，
+	// 集中领码时正常请求会跟着排队。
+	order []string
+	head  int
 
 	// stop 用于结束 gc 协程（见 Close）。
 	stop      chan struct{}
@@ -79,46 +92,61 @@ func (s *CaptchaStore) Close() {
 // 随机来源刷满票据表，就能把正常登录一起打掉，而且看起来像「验证码
 // 总是错」，没有任何线索指向容量。
 //
-// 先删过期的；仍然满就按到期时间淘汰最早的 1/8——它们本来也是最先失效的。
+// 先清过期（只需看队头），仍然满再从队头硬删——单次最多 captchaEvictBatch 条。
+// 全程不遍历整表，单次持锁开销与表大小无关。
 func (s *CaptchaStore) evictLocked(now time.Time) {
-	for k, e := range s.entries {
-		if now.After(e.expireAt) {
-			delete(s.entries, k)
-		}
-	}
+	s.dropExpiredLocked(now)
 	if len(s.entries) < captchaMaxEntries {
 		return
 	}
 
-	// 一次腾出 1/8，避免每来一个新票据就全表扫一遍。
-	target := captchaMaxEntries - captchaMaxEntries/8
+	// 一次腾出一批空间（降到 floor 以下或删满 batch），而不是「删一条
+	// 就低于上限」——后者会让下一次写入立刻又触顶，淘汰变成每个请求都做。
+	floor := captchaMaxEntries - captchaEvictBatch
+	removed := 0
+	for s.head < len(s.order) && removed < captchaEvictBatch && len(s.entries) > floor {
+		key := s.order[s.head]
+		s.head++
+		if _, ok := s.entries[key]; !ok {
+			continue // 已经被验证消费掉
+		}
+		delete(s.entries, key)
+		removed++
+	}
+	s.compactOrderLocked()
+}
 
-	// 按「剩余有效期」分桶，桶 0 最早失效、优先淘汰。
-	//
-	// 不排序：这条路径在全局锁内，2 万条排序会让集中领取验证码的请求
-	// 排成一队（攻击者恰好能借此放大影响）。分桶是一次遍历加一次按桶删除，
-	// 与记录数成线性，且淘汰顺序仍是「最早失效的先走」。
-	const bucketCount = 8
-	bucketWidth := captchaTTL / bucketCount
-	byBucket := make([][]string, bucketCount)
-	for k, e := range s.entries {
-		idx := int(e.expireAt.Sub(now) / bucketWidth)
-		if idx < 0 {
-			idx = 0
+// dropExpiredLocked 从队头清理过期票据。调用方必须持有 s.mu。
+//
+// 插入顺序即到期顺序（TTL 固定），所以扫到第一个未过期的就可以停：
+// 它后面的都还没到期。O(过期条数)，而不是 O(表大小)。
+func (s *CaptchaStore) dropExpiredLocked(now time.Time) {
+	for s.head < len(s.order) {
+		key := s.order[s.head]
+		e, ok := s.entries[key]
+		if !ok {
+			s.head++
+			continue
 		}
-		if idx >= bucketCount {
-			idx = bucketCount - 1
+		if now.Before(e.expireAt) {
+			break
 		}
-		byBucket[idx] = append(byBucket[idx], k)
+		delete(s.entries, key)
+		s.head++
 	}
-	for _, keys := range byBucket {
-		for _, k := range keys {
-			if len(s.entries) <= target {
-				return
-			}
-			delete(s.entries, k)
-		}
+	s.compactOrderLocked()
+}
+
+// compactOrderLocked 回收队头已经消费掉的空间。
+//
+// 不回收的话 order 会随「累计发出过的票据数」一直增长——虽然每项只是一个
+// 指针，但那是整段进程生命周期里只增不减的量。
+func (s *CaptchaStore) compactOrderLocked() {
+	if s.head < 1024 || s.head*2 < len(s.order) {
+		return
 	}
+	s.order = append([]string(nil), s.order[s.head:]...)
+	s.head = 0
 }
 
 func (s *CaptchaStore) gc() {
@@ -129,13 +157,8 @@ func (s *CaptchaStore) gc() {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			now := time.Now()
 			s.mu.Lock()
-			for k, e := range s.entries {
-				if now.After(e.expireAt) {
-					delete(s.entries, k)
-				}
-			}
+			s.dropExpiredLocked(time.Now())
 			s.mu.Unlock()
 		}
 	}
@@ -180,6 +203,9 @@ func (s *Services) NewCaptcha(ip string) (*Captcha, error) {
 		ip:       ip,
 		expireAt: time.Now().Add(captchaTTL),
 	}
+	// 插入顺序就是到期顺序（TTL 固定），清理与淘汰都靠这条队列定位队头。
+	// 票据被消费时不从队列里删（那需要额外查找），推进队头时跳过即可。
+	s.Captchas.order = append(s.Captchas.order, ticket)
 	s.Captchas.mu.Unlock()
 
 	return &Captcha{

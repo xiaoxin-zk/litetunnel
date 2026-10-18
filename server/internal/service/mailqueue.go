@@ -311,6 +311,10 @@ const (
 	// mailActivateLease 是「激活中」的租约时长：激活只是一次数据库事务，
 	// 但失败重试、数据库卡顿都要留余量；到期即可被接手。
 	mailActivateLease = 2 * time.Minute
+	// mailSendDrainTimeout 是发送超时/停服后，等待底层发送协程收尾的上限。
+	// 正常实现（Mailer）拿到取消后的 ctx 会立刻返回，几乎立即结束；无视
+	// context 的实现最多等到这里，不会拖住主流程去发下一封。
+	mailSendDrainTimeout = 5 * time.Second
 )
 
 // claimMail 原子领取一行待办，返回本次领取的令牌。
@@ -366,9 +370,14 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox, token 
 	case <-sendCtx.Done():
 		if ctx.Err() != nil {
 			// 服务停止：本轮直接放弃，不发失败记录（下次启动重试）。
+			// 但仍要等底层发送协程收尾：它拿到取消后的 ctx 应当自行退出，
+			// 不等它的话，它会继续占用 SMTP 连接直到自身 deadline。
+			drainSend(done)
 			return
 		}
 		err = fmt.Errorf("发送超时（%s）", MailSendTimeout)
+		// 超时路径同样等它收尾，避免这条连接与下一封邮件的连接叠着用。
+		drainSend(done)
 	}
 
 	if err != nil {
@@ -430,6 +439,18 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox, token 
 		return
 	}
 	s.finishMailAction(row, activateToken)
+}
+
+// drainSend 等待发送协程收尾，最多等到 mailSendDrainTimeout。
+//
+// 发送协程拿到的是带超时的 sendCtx，正常实现会在 cancel 后尽快返回；等它
+// 是为了不让「我们判超时了、协程却还在占用 SMTP 连接」持续到下一封。
+// 无视 context 的实现最多阻塞到这个上限，不会卡住主流程。
+func drainSend(done <-chan error) {
+	select {
+	case <-done:
+	case <-time.After(mailSendDrainTimeout):
+	}
 }
 
 // finishMailAction 执行凭据动作；失败只重试这一步，不重发邮件。

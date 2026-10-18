@@ -12,17 +12,32 @@ kcpBindPort = ${LT_KCP_PORT}
 
 # ---------- HTTP/HTTPS 隧道入口 ----------
 #
-# vhostHTTPPort：只对回环开放。Caddy 用泛域名证书在 443 上终止 TLS，
-# 再以 HTTP 转发进来——本地网站因此可以继续用 HTTP，证书留在 Caddy。
+# vhostHTTPPort 是网站隧道的 HTTP 入口，监听在所有网卡上：
+#   · Caddy 通过 127.0.0.1:${LT_VHOST_HTTP_PORT} 转发进来（泛域名证书在 443 终止）；
+#   · 同时它也是可以直接对外访问的明文入口，需要在安全组里放行。
+#
+# 说明：frp 的 vhost 监听地址**只能**由 proxyBindAddr 决定，而 proxyBindAddr
+# 同时用于绑定隧道端口池（frp v0.71 的 server/ports 用它 net.Listen 每一个远程
+# 端口）。把它设成 127.0.0.1 会让所有 TCP/UDP 隧道都无法从公网访问，因此这里
+# 保持默认的 0.0.0.0。
+#
+# 代价是外部可以用 Host 头直接访问隧道站点（不经过 Caddy，也就没有 TLS）。
+# 这是该入口的设计行为，默认对公网开放。
+#
+# 如果不需要「IP:${LT_VHOST_HTTP_PORT}」直连、只想让 Caddy 使用它，可以只封
+# 非回环来源（必须带 ! -i lo，否则本机转发也会被挡住）：
+#   iptables -I INPUT ! -i lo -p tcp --dport ${LT_VHOST_HTTP_PORT} -j DROP
+#   nft add rule inet filter input iifname != "lo" tcp dport ${LT_VHOST_HTTP_PORT} drop
+#
+# 另外：HTTP 隧道必须有域名（subDomainHost），没有域名时请把本地网站映射成
+# TCP 隧道，用 http://服务器IP:<分配的远程端口> 访问，那条路径不经过这个入口。
 vhostHTTPPort = ${LT_VHOST_HTTP_PORT}
 #
-# vhostHTTPSPort：定位取决于 HTTPS 隧道模式（LT_HTTPS_TUNNEL_MODE）
-#   edge（默认）：HTTPS 隧道同样由 Caddy 终止 TLS 后走上面的 HTTP 入口，
-#                 这个端口不对公网放行，留着是为了流量特征与 frp 版本兼容。
-#   e2e         ：直接对公网提供。frps 在这里按 SNI 把**原始 TLS 连接**转给
-#                 frpc，证书由本地网站自己持有，加密是端到端的。
-vhostHTTPSPort = ${LT_VHOST_HTTPS_PORT}
+# vhostHTTPSPort：只在端到端模式（LT_HTTPS_TUNNEL_MODE=e2e）下需要，此时它
+# 直接对公网提供：frps 按 SNI 把**原始 TLS 连接**转给 frpc，证书由本地网站
+# 自己持有。边缘模式下整段不渲染——端口不会监听，也就没有可绕过的入口。
 # @if LT_HTTPS_E2E_PORT
+vhostHTTPSPort = ${LT_VHOST_HTTPS_PORT}
 # 当前为端到端模式：请务必放行 ${LT_HTTPS_E2E_PORT}/TCP，
 # 并且让 HTTPS 隧道用这个端口访问（443 由 Caddy 接管，会返回平台自己的证书）。
 # @endif

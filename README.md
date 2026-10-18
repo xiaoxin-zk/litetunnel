@@ -172,8 +172,29 @@ docker compose --env-file .env -f deploy/docker-compose.yml logs panel | head -3
 | 7002 | UDP | KCP 加速（游戏联机建议开） |
 | 20000-30000 | TCP+UDP | 隧道端口池 |
 | 8444 | TCP | 端到端 HTTPS 隧道（仅 `e2e` 模式） |
+| 8081 | TCP | 网站隧道的 HTTP 入口（`LT_VHOST_HTTP_PORT`），Caddy 与外部都可直接访问 |
 
 `7848` 与 `7500` 是内部端口，**不要对公网放行**。
+
+> 网站隧道入口同时被 Caddy（走 `127.0.0.1`）和外部请求使用：外部可以用
+> `Host: <子域>.隧道域名` 直接访问，此时不经过 Caddy，也就没有 TLS。
+> 这是该入口的设计行为，默认对公网开放。
+>
+> 若不需要 `IP:8081` 直连、只想让 Caddy 使用，可只封非回环来源：
+>
+> ```bash
+> iptables -I INPUT ! -i lo -p tcp --dport 8081 -j DROP
+> # 或 nft：
+> nft add rule inet filter input iifname != "lo" tcp dport 8081 drop
+> ```
+>
+> 必须带 `! -i lo`，否则 Caddy 的本机转发也会被挡住。
+>
+> 无法在 frp 配置里把它绑到回环：frp 的 `proxyBindAddr` 同时用于绑定隧道端口池，
+> 设成 `127.0.0.1` 会让所有 TCP/UDP 隧道失去公网入口。
+>
+> 没有域名时 HTTP 隧道不可用（vhost 需要 `Host`），请把本地网站映射成 **TCP 隧道**，
+> 用 `http://服务器IP:<分配的远程端口>` 访问；那条路径不经过 8081。
 
 DNS：控制台域名 A 记录指向服务器；启用隧道域名时，`*.隧道域名` 按需解析。
 

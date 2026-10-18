@@ -158,6 +158,27 @@ for k in "${!VARS[@]}"; do
   fi
 done
 
+# vhost 端口由 frps 直接监听在所有网卡上（proxyBindAddr 同时用于隧道端口池，
+# 不能收窄到回环），因此它不能与任何公网入口重合，否则 Caddy 与本机转发会
+# 互相抢占，或把隧道入口暴露到本不该开放的端口上。
+check_vhost_port() {
+  local name="$1" port="$2" other="$3"
+  [[ -z "${port}" ]] && return 0
+  case "${port}" in
+    "${VARS[LT_GATEWAY_PORT]}"|"${VARS[LT_KCP_PORT]}"|80|443|"${other}")
+      echo "${name}=${port} 与公网入口端口冲突，请换一个仅本机使用的端口。" >&2
+      exit 1
+      ;;
+  esac
+  if (( port >= ${VARS[LT_PORT_RANGE_START]:-0} && port <= ${VARS[LT_PORT_RANGE_END]:-0} )); then
+    echo "${name}=${port} 落在隧道端口池 ${VARS[LT_PORT_RANGE_START]}-${VARS[LT_PORT_RANGE_END]} 内，请换一个池外端口。" >&2
+    exit 1
+  fi
+}
+
+check_vhost_port LT_VHOST_HTTP_PORT "${VARS[LT_VHOST_HTTP_PORT]:-}" "${VARS[LT_VHOST_HTTPS_PORT]:-}"
+check_vhost_port LT_VHOST_HTTPS_PORT "${VARS[LT_VHOST_HTTPS_PORT]:-}" "${VARS[LT_VHOST_HTTP_PORT]:-}"
+
 # ---- HTTPS 隧道模式 ----
 #
 # edge：证书留在 Caddy，Caddy 用泛域名证书终止 TLS 后走 vhostHTTPPort；

@@ -138,6 +138,27 @@ foreach ($k in $vars.Keys) {
     }
 }
 
+# frps listens on the vhost ports on every interface (proxyBindAddr also binds the
+# tunnel port pool, so it cannot be narrowed to loopback). They must therefore never
+# collide with a public entry point or with the tunnel pool.
+function Assert-VhostPort([string]$name, [string]$value, [string]$other) {
+    if ([string]::IsNullOrWhiteSpace($value)) { return }
+    $port = 0
+    if (-not [int]::TryParse($value, [ref]$port)) { throw "$name must be a number." }
+    $conflicts = @($vars['LT_GATEWAY_PORT'], $vars['LT_KCP_PORT'], $other, '80', '443')
+    if ($conflicts -contains $value) {
+        throw "$name=$value collides with a public entry port. Choose a loopback-only port."
+    }
+    $start = [int]$vars['LT_PORT_RANGE_START']
+    $end = [int]$vars['LT_PORT_RANGE_END']
+    if ($port -ge $start -and $port -le $end) {
+        throw "$name=$value falls inside the tunnel port pool $start-$end. Choose a port outside it."
+    }
+}
+
+Assert-VhostPort 'LT_VHOST_HTTP_PORT' $vars['LT_VHOST_HTTP_PORT'] $vars['LT_VHOST_HTTPS_PORT']
+Assert-VhostPort 'LT_VHOST_HTTPS_PORT' $vars['LT_VHOST_HTTPS_PORT'] $vars['LT_VHOST_HTTP_PORT']
+
 # ---- HTTPS tunnel mode ----
 # edge: the certificate stays in Caddy, which terminates TLS with the wildcard
 #       certificate and forwards plain HTTP to vhostHTTPPort.

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -481,7 +482,9 @@ func (s *Services) ApplyDomainConfig(apply bool) (tlscfg.RenderResult, error) {
 // 除了面板域名与隧道根域名，还会探测一个**随机子域**：
 // 泛域名证书签发的第一步就是服务商侧必须存在一条泛解析记录，
 // 这条探测能直接把「忘了加 *.tunnel 的记录」变成一个明确结论。
-func (s *Services) DomainDNSCheck() ([]tlscfg.DNSRecord, error) {
+// ctx 是发起检查的请求上下文：DNS 检查串行跑若干条记录，单条 5 秒，
+// 最多 20 条。客户端断开后必须尽快收手，否则重复点击会叠出成堆的后台查询。
+func (s *Services) DomainDNSCheck(ctx context.Context) ([]tlscfg.DNSRecord, error) {
 	client := s.DomainHelper()
 	if !client.Configured() {
 		return nil, fmt.Errorf("%w: %s", ErrDomainApply, client.Reason())
@@ -499,7 +502,7 @@ func (s *Services) DomainDNSCheck() ([]tlscfg.DNSRecord, error) {
 		return nil, fmt.Errorf("%w: 请先填写面板域名与隧道根域名", ErrInvalidParam)
 	}
 
-	return client.DNSCheck(tlscfg.DNSCheckRequest{
+	return client.DNSCheck(ctx, tlscfg.DNSCheckRequest{
 		Names:      names,
 		ExpectedIP: strings.TrimSpace(s.Settings.Get(KeyDomainExpectedIP)),
 	})

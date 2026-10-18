@@ -48,11 +48,17 @@ func (s *service) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
 
 	records := make([]tlscfg.DNSRecord, 0, len(req.Names))
 	for _, name := range req.Names {
+		// 客户端断开就停手：每条记录最多查 5 秒，20 条串起来近两分钟。
+		// 没有这个检查，管理员关掉页面后这些查询仍会一条条跑完，
+		// 反复点「检查」就叠出一堆后台任务。
+		if err := r.Context().Err(); err != nil {
+			break
+		}
 		name = strings.TrimSpace(name)
 		if name == "" || len(name) > 253 {
 			continue
 		}
-		records = append(records, s.lookup(name, strings.TrimSpace(req.ExpectedIP)))
+		records = append(records, s.lookup(r.Context(), name, strings.TrimSpace(req.ExpectedIP)))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"records": records})
 }
@@ -62,9 +68,11 @@ func (s *service) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
 // 提示不是客套话：DNS 是这套部署里**唯一**没法用代码兜底的环节
 // （证书签不下来、网站打不开，根因十有八九在这里），
 // 把「下一步该看什么」直接写进结果，能省掉一轮来回问。
-func (s *service) lookup(name, expected string) tlscfg.DNSRecord {
+func (s *service) lookup(parent context.Context, name, expected string) tlscfg.DNSRecord {
 	rec := tlscfg.DNSRecord{Name: name}
-	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
+	// 单条仍受 dnsTimeout 限制，但父上下文（请求）被取消时立即结束：
+	// 客户端已经走了，没有人在等这份结果。
+	ctx, cancel := context.WithTimeout(parent, dnsTimeout)
 	defer cancel()
 
 	ips, err := s.resolver().LookupHost(ctx, name)

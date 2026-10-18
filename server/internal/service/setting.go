@@ -663,7 +663,22 @@ func (s *SettingStore) hasRow(k SettingKey) bool {
 //
 // 由采集协程每个周期调用一次（默认 30 秒）。收敛延迟与采集周期一致，对
 // 「保留端口」「注册开关」这类配置足够；真正的热路径仍然只读内存缓存。
+//
+// 必须在 domainMu 内重载：域名下发是「读一整组设置 → 渲染 → 校验 → 写盘 →
+// 记录已生效」，全程持这把锁，但耗时可到几分钟。重载若插在它读取的中途，
+// 下发方会拿到「新面板域名 + 旧隧道域名」这种从未在任何一次保存里存在过的
+// 组合，并且那份组合随后被登记成「已生效」——界面显示一致，实际跑的是
+// 一份谁也没要求过的配置。
+//
+// 用 TryLock 而不是 Lock：采集协程不能为一次可能持续几分钟的下发停下，
+// 它还要记账与刷新准入。拿不到就跳过本轮，下一个周期再对齐；
+// 收敛晚 30 秒没有任何影响。
 func (s *Services) ReloadSettingsIfChanged() {
+	if !s.domainMu.TryLock() {
+		return
+	}
+	defer s.domainMu.Unlock()
+
 	changed, err := s.Settings.ReloadIfChanged()
 	if err != nil {
 		// 数据库暂时不可用：保持现有缓存（旧值仍然可用），下一轮再试。

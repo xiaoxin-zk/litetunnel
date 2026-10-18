@@ -61,7 +61,7 @@ func (h *Handler) DomainApply(c *gin.Context) {
 
 // DomainDNSCheck 检查面板域名、隧道根域名与一个随机子域的解析。
 func (h *Handler) DomainDNSCheck(c *gin.Context) {
-	records, err := h.svc.DomainDNSCheck()
+	records, err := h.svc.DomainDNSCheck(c.Request.Context())
 	if err != nil {
 		failWithReason(c, err)
 		return

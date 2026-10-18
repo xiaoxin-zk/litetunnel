@@ -205,8 +205,13 @@ func validateDomainSettings(view, current func(SettingKey) string) error {
 		return fmt.Errorf("%w: DNS 检查的期望地址不是合法 IP", ErrInvalidParam)
 	}
 
-	if addr := strings.TrimSpace(view(KeyDomainHelperAddr)); addr != "" && !strings.HasPrefix(addr, "http") {
-		return fmt.Errorf("%w: 配置服务地址需形如 http://127.0.0.1:7850", ErrInvalidParam)
+	// 严格解析而不是「以 http 开头」：后者拦不住
+	// `http://127.0.0.1:7850@evil.example.com` 这一类写法——请求会被发往
+	// @ 之后的主机，而 Bearer token 与随后的配置凭据都在请求里。
+	if addr := strings.TrimSpace(view(KeyDomainHelperAddr)); addr != "" {
+		if _, err := tlscfg.ParseBaseURL(addr); err != nil {
+			return fmt.Errorf("%w: 配置服务地址不合法（%s），需形如 http://127.0.0.1:7850", ErrInvalidParam, err.Error())
+		}
 	}
 	if token := view(KeyDomainHelperToken); token != "" && len(token) < 16 {
 		return fmt.Errorf("%w: 配置服务访问令牌至少 16 个字符，否则本机任意进程都能让它重写 TLS 配置并重启容器", ErrInvalidParam)

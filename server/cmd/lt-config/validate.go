@@ -96,6 +96,52 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 				"并且把 443 上的 HTTPS 请求指向该端口（443 由 Caddy 终止，用的是平台自己的泛域名证书）")
 	}
 
+	// 端口组：这几条规则面板侧的 config.Validate 一直在拦，helper 以前一条
+	// 都不查——于是「端口池起点 443」「网关端口与 frps 管理端口相同」这类配置
+	// 能一路写进 .env 并重建容器，直到运行期分配端口才以与配置无关的形式
+	// 失败。helper 是最后一道闸，规则必须与面板一致。
+	//
+	// 顺序固定（不用 map 遍历）：错误信息要稳定，否则同一次错误每次重启
+	// 报的是另一个端口，排查时对不上。
+	portKeys := []string{
+		"LT_GATEWAY_PORT", "LT_KCP_PORT", "LT_VHOST_HTTP_PORT",
+		"LT_VHOST_HTTPS_PORT", "LT_FRPS_API_PORT", "LT_USER_PORT",
+	}
+	seenPort := make(map[int]string, len(portKeys))
+	usedPorts := make([]int, 0, len(portKeys))
+	for _, k := range portKeys {
+		p, err := strconv.Atoi(strings.TrimSpace(vars[k]))
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("%s 不是合法端口（当前 %q）", k, vars[k])
+		}
+		if prev, ok := seenPort[p]; ok {
+			return fmt.Errorf("%s 与 %s 使用了同一个端口 %d：同一台宿主机上它们必须互不相同", k, prev, p)
+		}
+		seenPort[p] = k
+		usedPorts = append(usedPorts, p)
+	}
+
+	poolStart, errStart := strconv.Atoi(strings.TrimSpace(vars["LT_PORT_RANGE_START"]))
+	poolEnd, errEnd := strconv.Atoi(strings.TrimSpace(vars["LT_PORT_RANGE_END"]))
+	if errStart != nil || errEnd != nil || poolStart < 1024 || poolEnd <= poolStart || poolEnd > 65535 {
+		return fmt.Errorf("端口池范围非法（%s-%s）：需满足 1024 <= 起始 < 结束 <= 65535",
+			vars["LT_PORT_RANGE_START"], vars["LT_PORT_RANGE_END"])
+	}
+	maxPerUser, errMax := strconv.Atoi(strings.TrimSpace(vars["LT_MAX_PORTS_PER_USER"]))
+	if errMax != nil || maxPerUser <= 0 {
+		return fmt.Errorf("LT_MAX_PORTS_PER_USER 需为正整数（当前 %q）", vars["LT_MAX_PORTS_PER_USER"])
+	}
+	if capacity := poolEnd - poolStart + 1; maxPerUser > capacity {
+		return fmt.Errorf("LT_MAX_PORTS_PER_USER（%d）超过端口池容量（%d）：单个用户就能占满整池",
+			maxPerUser, capacity)
+	}
+	for i, k := range portKeys {
+		if usedPorts[i] >= poolStart && usedPorts[i] <= poolEnd {
+			return fmt.Errorf("%s（%d）落在端口池 %d-%d 内：隧道分配会把它当成可用端口并尝试占用",
+				k, usedPorts[i], poolStart, poolEnd)
+		}
+	}
+
 	res.RequiredPorts = []int{80, 443}
 	if p := strings.TrimSpace(vars[tlscfg.VarHTTPSE2EPort]); p != "" {
 		if port, err := strconv.Atoi(p); err == nil {

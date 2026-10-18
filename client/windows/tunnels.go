@@ -59,7 +59,10 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	if err != nil {
 		return a.GetState(), err
 	}
-	if _, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/tunnels", apiKey, payload); err != nil {
+	// 整笔预算：创建请求 + 随后的同步共用，避免「请求成功后再干等一整轮同步」。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+	if _, err := a.do(ctx, http.MethodPost, base+"/api/user/tunnels", apiKey, payload); err != nil {
 		return a.GetState(), err
 	}
 	// 建完立刻同步：新建的隧道会带上下发的公网地址，
@@ -70,7 +73,7 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	// SyncErr 呈现，下一轮自动同步会把列表补齐——与批量创建同一语义。
 	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu，Refresh 会再去抢
 	// 同一把锁而死锁。
-	state := a.syncAndState()
+	state := a.syncAndStateCtx(ctx)
 	return state, nil
 }
 
@@ -116,7 +119,10 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 		return BatchResult{}, a.GetState(), err
 	}
 
-	raw, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
+	// 整笔预算：批量创建请求 + 随后同步共用。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+	raw, err := a.do(ctx, http.MethodPost, base+"/api/user/tunnels/batch", apiKey, payload)
 	if err != nil {
 		return BatchResult{}, a.GetState(), err
 	}
@@ -129,7 +135,7 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 	// 建完立刻同步：新建的隧道会带上下发的公网地址。
 	// 同步失败时不把整体判为失败——隧道其实已经建好了。
 	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。
-	state := a.syncAndState()
+	state := a.syncAndStateCtx(ctx)
 	return out, state, nil
 }
 
@@ -150,7 +156,10 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 		return a.GetState(), err
 	}
 	endpoint := fmt.Sprintf("%s/api/user/tunnels/%d", base, id)
-	if _, err := a.do(a.rootContext(), http.MethodDelete, endpoint, apiKey, nil); err != nil {
+	// 整笔预算：删除请求 + 随后同步共用。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+	if _, err := a.do(ctx, http.MethodDelete, endpoint, apiKey, nil); err != nil {
 		return a.GetState(), err
 	}
 
@@ -170,7 +179,7 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 	a.clearTunnelErr(id)
 	a.clearRetry(id)
 
-	state := a.syncAndState()
+	state := a.syncAndStateCtx(ctx)
 	if err := removeFrpcConfig(id); err != nil {
 		// 删除失败必须让用户知道：磁盘上还留着一份含凭据的配置。
 		a.emitNotice("隧道已删除，但本地配置文件删除失败（其中含接入密钥）：" + err.Error())
@@ -331,7 +340,13 @@ func (a *App) applyLocalStatus(id uint, status string) {
 // 重新对账」，中间不能让后台同步插进来；而 Refresh 自己会去抢锁，
 // 在锁内调用它就是死锁。
 func (a *App) syncAndState() State {
-	if _, err := a.applySync(); err != nil {
+	return a.syncAndStateCtx(a.rootContext())
+}
+
+// syncAndStateCtx 与 syncAndState 相同，但同步挂到调用方给的预算上
+// （见 applySyncCtx）。
+func (a *App) syncAndStateCtx(parent context.Context) State {
+	if _, err := a.applySyncCtx(parent); err != nil {
 		a.setSyncErr(err)
 	}
 	state := a.GetState()
@@ -363,6 +378,14 @@ const manualOpTimeout = 30 * time.Second
 // 窗口不会因为一次卡住的请求而关不掉。
 func (a *App) newManualContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(a.rootContext(), manualOpTimeout)
+}
+
+// newMutateContext 为「改数据 + 随后同步一次」的操作创建整笔预算。
+//
+// 预算取一轮同步的长度：API 请求用掉一部分后，同步只能花剩下的部分，
+// 于是创建 / 删除 / 兑换的总等待被这一轮封顶，而不是「请求 + 完整一轮」。
+func (a *App) newMutateContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(a.rootContext(), syncRoundTimeout)
 }
 
 // describeManualErr 把手动操作的超时翻译成用户能照做的说法。
@@ -415,7 +438,10 @@ func (a *App) Redeem(code string) (string, State, error) {
 	if err != nil {
 		return "", a.GetState(), err
 	}
-	raw, err := a.do(a.rootContext(), http.MethodPost, base+"/api/user/redeem", apiKey, payload)
+	// 整笔预算：兑换请求 + 随后同步共用。
+	ctx, cancel := a.newMutateContext()
+	defer cancel()
+	raw, err := a.do(ctx, http.MethodPost, base+"/api/user/redeem", apiKey, payload)
 	if err != nil {
 		return "", a.GetState(), err
 	}
@@ -427,6 +453,6 @@ func (a *App) Redeem(code string) (string, State, error) {
 
 	// 兑换可能改变配额或分组，同步一次让界面立刻反映最新状态。
 	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。
-	state := a.syncAndState()
+	state := a.syncAndStateCtx(ctx)
 	return out.Message, state, nil
 }

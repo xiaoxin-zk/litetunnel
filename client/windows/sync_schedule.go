@@ -164,6 +164,15 @@ func (a *App) rootContext() context.Context {
 // 单个进程，任何一条隧道的改动都会让整份文本变化，于是所有隧道一起重启
 // ——用户看到的就是「改一条隧道，其他全断一下」。
 func (a *App) applySync() (changed bool, err error) {
+	return a.applySyncCtx(a.rootContext())
+}
+
+// applySyncCtx 与 applySync 相同，但把整轮同步挂到调用方给的预算上。
+//
+// 建/删/兑换这类操作要「改完立刻同步一次」，若同步各自再起一轮 45 秒的
+// 预算，用户看到的总等待就是「请求 + 45 秒」。传入手动操作的整笔预算后，
+// 同步只花它剩下的那部分时间。
+func (a *App) applySyncCtx(parent context.Context) (changed bool, err error) {
 	base := a.serverBase()
 
 	a.mu.RLock()
@@ -177,8 +186,8 @@ func (a *App) applySync() (changed bool, err error) {
 	// 整轮共用一个截止上下文：接入信息（可能还要分页）与后续的配置拉取
 	// 都在同一笔预算里。只给配置拉取限时的话，前面那几次请求仍可各自
 	// 等满超时，手动操作被挡的总时长并没有真正封顶。
-	// 根上下文随应用退出而取消，见 newSyncContext。
-	ctx, cancel := a.newSyncContext()
+	// 父上下文随应用退出而取消（见 rootContext）。
+	ctx, cancel := context.WithTimeout(parent, syncRoundTimeout)
 	defer cancel()
 
 	data, err := a.fetchClientInfo(ctx, base, apiKey)

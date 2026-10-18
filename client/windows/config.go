@@ -125,20 +125,13 @@ func saveConfig(cfg *Config) error {
 		return err
 	}
 
-	// 先写临时文件再原子替换。
+	// 先写临时文件再原子替换（见 writeFileAtomic）。
 	//
 	// 直接覆盖的话，写到一半断电 / 被强杀会留下半截 JSON，而下次启动读不动
 	// 它时客户端会当成「没有配置」——用户看到的是自己莫名其妙被登出了。
-	// 同目录下改名在同一文件系统内是原子的（Windows 上 os.Rename 走
-	// MoveFileEx + MOVEFILE_REPLACE_EXISTING，可以直接替换已存在的目标）。
 	//
 	// 0600：仅当前用户可读写。API Key 等同于账号凭据。
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("保存配置失败: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := writeFileAtomic(path, raw, 0o600); err != nil {
 		return fmt.Errorf("保存配置失败: %w", err)
 	}
 	return nil

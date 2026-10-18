@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
@@ -181,7 +180,8 @@ func writeFrpcConfig(tunnelID uint, text string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+	// 原子写入：配置被写坏时 frpc 直接起不来，而在此之前它可能一直连得上。
+	if err := writeFileAtomic(path, []byte(text), 0o600); err != nil {
 		return fmt.Errorf("写入客户端配置失败: %w", err)
 	}
 	return nil

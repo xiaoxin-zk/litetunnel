@@ -459,7 +459,16 @@ func (a *App) startOnce(ctx context.Context) {
 		// 再等一小会儿：OnDomReady 只保证页面加载完成，而前端注册事件
 		// 监听是在 Vue 挂载之后，早于它发出的事件会被丢掉（日志第一行
 		// 凭空消失，看起来像客户端没干活）。
-		time.Sleep(300 * time.Millisecond)
+		//
+		// 用可取消的等待而不是 time.Sleep：窗口在此期间被关掉时直接返回，
+		// 不要等延迟结束再发一次同步、再推一轮状态事件。
+		timer := time.NewTimer(300 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-a.rootContext().Done():
+			return
+		case <-timer.C:
+		}
 
 		a.mu.RLock()
 		hasKey := a.cfg.APIKey != ""

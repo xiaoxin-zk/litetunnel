@@ -67,6 +67,61 @@ func TestConnLimiterTripsAndRecovers(t *testing.T) {
 	}
 }
 
+// TestConnLimiterTripsOnSustainedSlightOverload 覆盖「略超限时熔断永远不触发」。
+//
+// 流量长期略高于速率上限时，拒绝与成功会交替出现。若每次成功都把拒绝计数
+// 清零，计数器永远攒不满，熔断形同不存在——限流还在，但长期滥用不会被切断。
+func TestConnLimiterTripsOnSustainedSlightOverload(t *testing.T) {
+	l, now := fixedClock(time.Unix(5000, 0))
+	const key = "run|mc"
+
+	for i := 0; i < connBurst; i++ {
+		l.allow(key)
+	}
+
+	// 之后每秒 310 个请求：约 300 个放行、10 个被拒。
+	tripped := false
+	for sec := 0; sec < 30 && !tripped; sec++ {
+		*now = now.Add(time.Second)
+		for i := 0; i < connRatePerSec+10; i++ {
+			if ok, wait := l.allow(key); !ok && wait >= connCooldown {
+				tripped = true
+			}
+		}
+	}
+	if !tripped {
+		t.Fatal("持续略超限应在达到持续时长后触发熔断")
+	}
+}
+
+// TestConnLimiterResetsAfterOverloadGap 覆盖反面：超限中断后重新计数，
+// 零星的拒绝不能累计成熔断。
+func TestConnLimiterResetsAfterOverloadGap(t *testing.T) {
+	l, now := fixedClock(time.Unix(6000, 0))
+	const key = "run|mc"
+
+	for i := 0; i < connBurst; i++ {
+		l.allow(key)
+	}
+	for i := 0; i < 50; i++ {
+		l.allow(key)
+	}
+
+	// 间隔超过判定阈值后再放行一次：这一轮超限应当被认定结束。
+	*now = now.Add(connOverGap + time.Second)
+	if ok, _ := l.allow(key); !ok {
+		t.Fatal("间隔足够久之后应恢复放行")
+	}
+
+	l.mu.Lock()
+	b := l.buckets[key]
+	reset := b.denied == 0 && b.overSince.IsZero()
+	l.mu.Unlock()
+	if !reset {
+		t.Fatalf("超限中断后计数应归零，实际 denied=%d overSince=%v", b.denied, b.overSince)
+	}
+}
+
 // TestConnLimiterIsolatesTunnels 覆盖按隧道独立计数。
 func TestConnLimiterIsolatesTunnels(t *testing.T) {
 	l, _ := fixedClock(time.Unix(3000, 0))

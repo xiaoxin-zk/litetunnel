@@ -28,11 +28,13 @@ func shortLine(s string) string {
 
 // emitLog 往运行日志里追加一行客户端自身的说明（不带隧道前缀）。
 //
-// 与 emitTunnelLog 分开：带前缀的行是「某条隧道发生了什么」，
-// 不带前缀的行是「客户端整体在做什么」（启动同步、用时统计）。
-// 混在一起会让用户以为启动统计也属于某条隧道。
+// 走 Manager 的统一缓冲而不是只进推送队列：历史快照与实时推送必须是同一份
+// 数据，否则界面重新加载日志时，启动同步、重连这类说明会凭空消失。
 func (a *App) emitLog(msg string) {
-	a.appendLogLine(time.Now().Format("15:04:05") + "  " + msg)
+	if a.mgr == nil {
+		return
+	}
+	a.mgr.AppendRaw(time.Now().Format("15:04:05") + "  " + msg)
 }
 
 // emitTunnelLog 往运行日志里追加一行带隧道前缀的说明。
@@ -42,7 +44,18 @@ func (a *App) emitLog(msg string) {
 // 每条隧道一个进程之后，日志是多个进程交织在一起的，
 // 没有前缀就分不出哪一行属于哪条隧道。
 func (a *App) emitTunnelLog(name, msg string) {
-	a.appendLogLine(fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+	if a.mgr == nil {
+		return
+	}
+	a.mgr.AppendRaw(fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+}
+
+// pendingLog 是一条等待推送的日志。
+//
+// 带序号是为了让「清空」能挡住清空前产生、清空后才入队的在途行。
+type pendingLog struct {
+	seq  uint64
+	text string
 }
 
 // maxLogBatch 是一批日志的上限。
@@ -90,13 +103,13 @@ const logFlushInterval = 120 * time.Millisecond
 //
 // 所有往日志区写字的路径都必须走它（frpc 输出、客户端自己的说明），
 // 否则同一段时间里的日志会出现两种先后顺序。
-func (a *App) appendLogLine(line string) {
+func (a *App) appendLogLine(seq uint64, line string) {
 	if a.ctx == nil {
 		return
 	}
 	// 攒满一批就立刻推，不等下一个时间片：一味等间隔会让日志洪峰时的
 	// 延迟随着挤压行数一起增长（队列越长，轮到它越晚）。
-	if a.pushLog(line) {
+	if a.pushLog(seq, line) {
 		select {
 		case a.logKick <- struct{}{}:
 		default:
@@ -110,9 +123,14 @@ func (a *App) appendLogLine(line string) {
 // 没有 ctx 依赖也不发事件：队列行为本身要能被单测覆盖——「有界」「丢最旧」
 // 「一批不超过 maxLogBatch」这几条一旦坏了，症状只是日志少了几行或内存涨了，
 // 不看队列本身根本发现不了。
-func (a *App) pushLog(line string) bool {
+func (a *App) pushLog(seq uint64, line string) bool {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
+
+	// 清空前产生的行即使晚到也不再入队：它们属于用户已经清掉的那段历史。
+	if seq != 0 && seq <= a.logDroppedSeq {
+		return false
+	}
 
 	// 队列满了丢掉**最旧**的一批：日志是有时效的，留下最近的才能解释
 	// 「刚才发生了什么」；丢最新的会让用户盯着一段早已过去的开头，
@@ -129,13 +147,13 @@ func (a *App) pushLog(line string) bool {
 			drop = 1
 		}
 		for i := 0; i < drop && i < len(a.logBuf); i++ {
-			a.logBufBytes -= len(a.logBuf[i])
+			a.logBufBytes -= len(a.logBuf[i].text)
 		}
 		a.logBuf = append(a.logBuf[:0], a.logBuf[drop:]...)
 		a.logDropped += drop
 	}
 
-	a.logBuf = append(a.logBuf, line)
+	a.logBuf = append(a.logBuf, pendingLog{seq: seq, text: line})
 	a.logBufBytes += len(line)
 	return len(a.logBuf) >= maxLogBatch
 }
@@ -166,7 +184,7 @@ func (a *App) takeLogBatch() []string {
 	bytes := 0
 	limit := 0
 	for limit < n {
-		size := len(a.logBuf[limit])
+		size := len(a.logBuf[limit].text)
 		if limit > 0 && bytes+size > maxLogBatchBytes {
 			break
 		}
@@ -183,14 +201,22 @@ func (a *App) takeLogBatch() []string {
 			time.Now().Format("15:04:05"), a.logDropped))
 		a.logDropped = 0
 	}
-	batch = append(batch, a.logBuf[:n]...)
+	for i := 0; i < n; i++ {
+		batch = append(batch, a.logBuf[i].text)
+		a.logBufBytes -= len(a.logBuf[i].text)
+	}
 
 	// 从头部截断而不是重新分配：剩下的是「更新的那部分」，顺序不变。
-	for i := 0; i < n; i++ {
-		a.logBufBytes -= len(a.logBuf[i])
-	}
 	a.logBuf = a.logBuf[n:]
 	return batch
+}
+
+// logBatchEvent 是推送给前端的日志批次。
+//
+// 带 epoch：前端据此丢弃「清空之前发出、清空之后才到」的旧批次。
+type logBatchEvent struct {
+	Epoch uint64   `json:"epoch"`
+	Lines []string `json:"lines"`
 }
 
 // flushLogs 把队列里攒下的日志行成批推给前端。
@@ -202,7 +228,10 @@ func (a *App) flushLogs() {
 	if len(batch) == 0 {
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "logs", batch)
+	a.logMu.Lock()
+	epoch := a.logEpoch
+	a.logMu.Unlock()
+	wailsruntime.EventsEmit(a.ctx, "logs", logBatchEvent{Epoch: epoch, Lines: batch})
 }
 
 // startLogFlusher 启动批量推送协程，进程生命周期内常驻。
@@ -223,22 +252,50 @@ func (a *App) startLogFlusher() {
 	}()
 }
 
+// LogSnapshot 是日志快照，连同它所属的代次一起返回。
+type LogSnapshot struct {
+	Epoch uint64   `json:"epoch"`
+	Lines []string `json:"lines"`
+}
+
 // GetLogs 返回日志快照。
-func (a *App) GetLogs() []string {
-	return a.mgr.Logs()
+//
+// 快照来自 Manager 的统一缓冲，因此 frpc 输出与客户端自身说明都在里面，
+// 顺序也与实时推送一致（两者由同一把锁串行化）。
+func (a *App) GetLogs() LogSnapshot {
+	a.logMu.Lock()
+	epoch := a.logEpoch
+	a.logMu.Unlock()
+	if a.mgr == nil {
+		return LogSnapshot{Epoch: epoch}
+	}
+	return LogSnapshot{Epoch: epoch, Lines: a.mgr.Logs()}
+}
+
+// LogCleared 是清空操作的结果。
+type LogCleared struct {
+	Epoch uint64 `json:"epoch"`
 }
 
 // ClearLogs 清空日志缓冲。
 //
-// 必须同时清掉**待推送队列**：只清 mgr 里的历史记录的话，清空前已经攒在
-// 队列里、还没推给前端的那批行会在下一次 flush 时照常出现，
+// 三处状态必须一起清：Manager 的历史、待推送队列、以及代次。
+// 只清历史的话，队列里已经攒下的行会在下一次 flush 时照常出现，
 // 用户看到的就是「点了清空，日志又自己冒回来」。
-func (a *App) ClearLogs() {
-	a.mgr.ClearLogs()
+func (a *App) ClearLogs() LogCleared {
+	var dropped uint64
+	if a.mgr != nil {
+		dropped = a.mgr.ClearLogs()
+	}
 
 	a.logMu.Lock()
 	a.logBuf = nil
 	a.logBufBytes = 0
 	a.logDropped = 0
+	a.logDroppedSeq = dropped
+	a.logEpoch++
+	epoch := a.logEpoch
 	a.logMu.Unlock()
+
+	return LogCleared{Epoch: epoch}
 }

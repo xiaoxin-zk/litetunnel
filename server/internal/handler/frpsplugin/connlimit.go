@@ -33,6 +33,15 @@ const (
 	connBurst = 800
 	// connCooldown 是熔断后的冷却时长。
 	connCooldown = time.Minute
+	// connSustainTrip 是「持续超限」触发熔断的时长。
+	//
+	// 只靠连续拒绝计数是不够的：流量长期略高于速率上限时，拒绝与成功会
+	// 交替出现，计数器永远攒不满，熔断也就永远不触发。按持续时长判断，
+	// 才能把「一直贴着上限摩擦」这类长期超限识别出来。
+	connSustainTrip = 20 * time.Second
+	// connOverGap 是判定「超限中断」的间隔：超过这么久没有新的拒绝，
+	// 就认为上一轮超限已经结束，计数与起点重新开始。
+	connOverGap = 10 * time.Second
 	// connIdleTTL 是空闲隧道的计数记录保留时长。
 	connIdleTTL = 10 * time.Minute
 	// connSweepEvery 是每处理多少次回调清理一次空闲记录。
@@ -46,9 +55,14 @@ const (
 
 // connBucket 是一条隧道的连接计数。
 type connBucket struct {
-	tokens       float64
-	last         time.Time
-	denied       int
+	tokens float64
+	last   time.Time
+	// denied 是**本轮持续超限**内的拒绝次数，成功不会清零；
+	// 只有超过 connOverGap 没有新的拒绝时才认为这一轮结束。
+	denied int
+	// overSince 是本轮持续超限的起点，零值表示当前没有超限。
+	overSince    time.Time
+	lastDeny     time.Time
 	blockedUntil time.Time
 	lastLog      time.Time
 	lastSeen     time.Time
@@ -105,22 +119,44 @@ func (l *connLimiter) allow(key string) (bool, time.Duration) {
 
 	if b.tokens >= 1 {
 		b.tokens--
-		b.denied = 0
+		// 成功**不清零** denied：略超限时拒绝与成功交替出现，清零会让
+		// 熔断门槛永远达不到。只有超限真正中断了才重置。
+		b.endOverloadIfGap(now)
 		return true, 0
 	}
 
+	if b.overSince.IsZero() || now.Sub(b.lastDeny) > connOverGap {
+		b.overSince = now
+		b.denied = 0
+	}
+	b.lastDeny = now
 	b.denied++
-	// 连续被拒到突发容量的量级：认定不是正常访问，进入冷却期。
-	if b.denied >= connBurst {
+
+	// 两种触发方式：
+	//   - 短时间内的密集拒绝（瞬时洪峰）；
+	//   - 持续超限达到 connSustainTrip（长期略超限）。
+	if b.denied >= connBurst || now.Sub(b.overSince) >= connSustainTrip {
 		b.blockedUntil = now.Add(connCooldown)
 		b.denied = 0
+		b.overSince = time.Time{}
 		b.tokens = 0
-		log.Printf("[plugin] 隧道 %s 新建连接速率异常（超过 %d/秒），熔断 %s",
+		log.Printf("[plugin] 隧道 %s 新建连接持续超出 %d/秒，熔断 %s",
 			key, connRatePerSec, connCooldown)
 		return false, connCooldown
 	}
 	l.logDenied(b, now, key, "超出速率", time.Second)
 	return false, time.Second
+}
+
+// endOverloadIfGap 在超限已经中断时重置计数。
+func (b *connBucket) endOverloadIfGap(now time.Time) {
+	if b.overSince.IsZero() {
+		return
+	}
+	if now.Sub(b.lastDeny) > connOverGap {
+		b.overSince = time.Time{}
+		b.denied = 0
+	}
 }
 
 // logDenied 按间隔输出拒绝日志，避免日志本身成为攻击面。

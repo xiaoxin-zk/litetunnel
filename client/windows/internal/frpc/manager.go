@@ -94,8 +94,15 @@ type Manager struct {
 	repeatTunnelID   uint
 	repeatTunnelName string
 
-	// onLog 收到的行已经带好「Tunnel/<名字>」前缀。
-	onLog func(tunnelID uint, tunnelName, line string)
+	// logSeq 是日志行的单调序号，清空之后仍然继续递增。
+	//
+	// 用途是过滤「清空前产生、清空后才送达」的在途行：调用方记下清空时的
+	// 序号，之后收到的行只要序号不大于它就直接丢弃。只按内容或时间戳判断
+	// 都不可靠——秒级时间戳分不出先后，内容更可能与新日志相同。
+	logSeq uint64
+
+	// onLog 收到的行已经带好前缀；seq 是该行的单调序号。
+	onLog func(tunnelID uint, tunnelName string, seq uint64, line string)
 	// onExit 在某个隧道的进程退出时调用。
 	//
 	// requested 为 true 表示这次退出是 Stop 主动请求的（用户关掉开关、
@@ -115,7 +122,7 @@ func New(exePath string) *Manager {
 
 // SetCallbacks 注册日志与退出回调。回调会在后台协程中被调用。
 func (m *Manager) SetCallbacks(
-	onLog func(tunnelID uint, tunnelName, line string),
+	onLog func(tunnelID uint, tunnelName string, seq uint64, line string),
 	onExit func(tunnelID uint, tunnelName string, err error, requested bool),
 ) {
 	m.mu.Lock()
@@ -397,7 +404,11 @@ func (m *Manager) Logs() []string {
 }
 
 // ClearLogs 清空日志缓冲。
-func (m *Manager) ClearLogs() {
+// ClearLogs 清空历史缓冲，返回清空时的日志序号。
+//
+// 调用方应记下这个序号：清空前产生、清空后才送达的日志行序号不会大于它，
+// 据此可以把这些「在途旧行」丢掉，而不是让它们重新出现在界面上。
+func (m *Manager) ClearLogs() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.logs = nil
@@ -407,6 +418,7 @@ func (m *Manager) ClearLogs() {
 	m.repeatKey = ""
 	m.repeatCount = 0
 	m.repeatAt = time.Time{}
+	return m.logSeq
 }
 
 // pumpLineLimit 是单行日志保留的字节上限，超出的部分截断丢弃。
@@ -490,7 +502,30 @@ const logRepeatWindow = 5 * time.Second
 type logEntry struct {
 	id   uint
 	name string
+	seq  uint64
 	text string
+}
+
+// AppendRaw 记录一条由客户端自己格式化好的日志（启动同步、重连说明等）。
+//
+// 走同一条缓冲与同一个序号：这些行过去只进待推送队列，不进历史记录，
+// 于是界面重新加载日志时它们会凭空消失，而它们恰恰是解释「客户端在做什么」
+// 的关键信息。
+func (m *Manager) AppendRaw(line string) {
+	line = strings.TrimRight(line, "\r\n")
+	line = clipLogLine(line, maxLogLineBytes)
+	if line == "" {
+		return
+	}
+
+	m.mu.Lock()
+	e := logEntry{seq: m.recordTextLocked(line), text: line}
+	cb := m.onLog
+	m.mu.Unlock()
+
+	if cb != nil {
+		cb(0, "", e.seq, e.text)
+	}
 }
 
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
@@ -528,18 +563,25 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	emitLogs(cb, out)
 }
 
-func emitLogs(cb func(uint, string, string), entries []logEntry) {
+func emitLogs(cb func(uint, string, uint64, string), entries []logEntry) {
 	if cb == nil {
 		return
 	}
 	for _, e := range entries {
-		cb(e.id, e.name, e.text)
+		cb(e.id, e.name, e.seq, e.text)
 	}
 }
 
 // recordLocked 在已持有锁的前提下写入一行日志，返回可推送的副本。
 func (m *Manager) recordLocked(tunnelID uint, tunnelName, line string, now time.Time) logEntry {
 	stamped := fmt.Sprintf("%s  %s  %s", now.Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
+	return logEntry{id: tunnelID, name: tunnelName, seq: m.recordTextLocked(stamped), text: stamped}
+}
+
+// recordTextLocked 写入一行已经格式化好的文本，并返回它分配的序号。
+func (m *Manager) recordTextLocked(text string) uint64 {
+	m.logSeq++
+	stamped := text
 	m.logs = append(m.logs, stamped)
 	m.logBytes += len(stamped)
 
@@ -555,7 +597,7 @@ func (m *Manager) recordLocked(tunnelID uint, tunnelName, line string, now time.
 		m.logBytes -= len(m.logs[0])
 		m.logs = m.logs[1:]
 	}
-	return logEntry{id: tunnelID, name: tunnelName, text: stamped}
+	return m.logSeq
 }
 
 // clipLogLine 把超长的单行截断，且不切断多字节字符。

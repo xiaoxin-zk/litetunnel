@@ -39,8 +39,20 @@ async function loadState() {
   state.value = await api.getState()
 }
 
+// 日志代次：清空时主进程会递增它，并随每个批次下发。
+// 清空前发出、清空后才到达的批次代次更小，直接丢弃——否则用户会看到
+// 「刚清空，旧日志又自己回来了」。
+const logEpoch = ref(0)
+
 async function loadLogs() {
-  logs.value = await api.logs()
+  const snap = await api.logs()
+  if (snap && Array.isArray(snap.lines)) {
+    logEpoch.value = snap.epoch || 0
+    logs.value = snap.lines
+    return
+  }
+  // 兼容旧版主进程：直接返回字符串数组。
+  logs.value = Array.isArray(snap) ? snap : []
 }
 
 // 日志先攒进缓冲，每 200 毫秒合并成一次更新。
@@ -61,12 +73,19 @@ const maxPendingLogs = 2000
 let logTimer = null
 
 function pushLog(payload) {
-  // 主进程成批推送（数组）；也接受单行字符串，这样前端热重载、或与旧版
-  // 主进程混跑时都不会丢日志。
-  if (Array.isArray(payload)) {
-    for (const line of payload) pendingLogs.push(line)
+  // 主进程成批推送 {epoch, lines}；也接受数组与单行字符串，这样前端热重载、
+  // 或与旧版主进程混跑时都不会丢日志。
+  let batch = payload
+  if (payload && !Array.isArray(payload) && typeof payload === 'object') {
+    if (typeof payload.epoch === 'number' && payload.epoch < logEpoch.value) {
+      return // 清空前的在途批次
+    }
+    batch = payload.lines || []
+  }
+  if (Array.isArray(batch)) {
+    for (const line of batch) pendingLogs.push(line)
   } else {
-    pendingLogs.push(payload)
+    pendingLogs.push(batch)
   }
   if (pendingLogs.length > maxPendingLogs) {
     pendingLogs.splice(0, pendingLogs.length - maxPendingLogs)
@@ -94,7 +113,12 @@ function onUpdate(next) {
 // logs 数组如果不动，旧行会一直留在界面上，看起来就像「清空没生效」。
 // 待合并队列也要一起丢，否则 200ms 后它会把清空前的行重新补回来。
 async function onClearLogs() {
-  await api.clearLogs()
+  const res = await api.clearLogs()
+  if (res && typeof res.epoch === 'number') {
+    logEpoch.value = res.epoch
+  } else {
+    logEpoch.value += 1
+  }
   pendingLogs.length = 0
   logs.value = []
 }

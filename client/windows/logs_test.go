@@ -18,7 +18,7 @@ func TestLogQueueDropsOldestAndCounts(t *testing.T) {
 	a := &App{}
 	const total = maxLogQueue + 1000
 	for i := 0; i < total; i++ {
-		a.pushLog(fmt.Sprintf("line-%d", i))
+		a.pushLog(0, fmt.Sprintf("line-%d", i))
 	}
 
 	a.logMu.Lock()
@@ -55,7 +55,7 @@ func TestTakeLogBatchCapsAtMaxLogBatch(t *testing.T) {
 	a := &App{}
 	const total = maxLogBatch + 50
 	for i := 0; i < total; i++ {
-		a.pushLog(fmt.Sprintf("line-%d", i))
+		a.pushLog(0, fmt.Sprintf("line-%d", i))
 	}
 
 	batch := a.takeLogBatch()
@@ -107,7 +107,7 @@ func TestLogQueueRespectsByteBudget(t *testing.T) {
 	a := &App{}
 	line := strings.Repeat("x", 8*1024)
 	for i := 0; i < 400; i++ {
-		a.pushLog(line)
+		a.pushLog(0, line)
 	}
 
 	a.logMu.Lock()
@@ -139,7 +139,7 @@ func TestTakeLogBatchRespectsByteBudget(t *testing.T) {
 	a := &App{}
 	line := strings.Repeat("y", 16*1024)
 	for i := 0; i < 50; i++ {
-		a.pushLog(line)
+		a.pushLog(0, line)
 	}
 
 	batch := a.takeLogBatch()
@@ -156,7 +156,7 @@ func TestTakeLogBatchRespectsByteBudget(t *testing.T) {
 
 	single := &App{}
 	huge := strings.Repeat("z", maxLogBatchBytes+1)
-	single.pushLog(huge)
+	single.pushLog(0, huge)
 	if got := single.takeLogBatch(); len(got) != 1 || got[0] != huge {
 		t.Fatalf("单行超过批次预算时也必须发出去，否则队列永远清不空（实际 %d 行）", len(got))
 	}
@@ -168,7 +168,7 @@ func TestTakeLogBatchRespectsByteBudget(t *testing.T) {
 // 越界取会让整个客户端崩在日志推送协程里，而且崩得毫无征兆。
 func TestTakeLogBatchOnlyDroppedNotice(t *testing.T) {
 	a := &App{}
-	a.pushLog("x")
+	a.pushLog(0, "x")
 	_ = a.takeLogBatch() // 先清空队列
 
 	a.logMu.Lock()
@@ -188,7 +188,7 @@ func TestTakeLogBatchOnlyDroppedNotice(t *testing.T) {
 func TestTakeLogBatchReportsDropped(t *testing.T) {
 	a := &App{}
 	for i := 0; i < maxLogQueue+500; i++ {
-		a.pushLog(fmt.Sprintf("line-%d", i))
+		a.pushLog(0, fmt.Sprintf("line-%d", i))
 	}
 
 	a.logMu.Lock()
@@ -225,15 +225,58 @@ func TestTakeLogBatchReportsDropped(t *testing.T) {
 // 会在下一次 flush 时照常出现在界面上。
 func TestClearLogsDropsPendingQueue(t *testing.T) {
 	a := &App{mgr: frpc.New("")}
-	a.pushLog("before clear")
+	a.pushLog(0, "before clear")
 	a.ClearLogs()
 	if batch := a.takeLogBatch(); len(batch) != 0 {
 		t.Fatalf("清空后不该再推出旧行，实际 %v", batch)
 	}
 
-	a.pushLog("after clear")
+	a.pushLog(0, "after clear")
 	batch := a.takeLogBatch()
 	if len(batch) != 1 || batch[0] != "after clear" {
 		t.Fatalf("清空后的新行应保留，实际 %v", batch)
+	}
+}
+
+// TestClearLogsDropsInFlightLines 覆盖「清空前产生的行清空后才送达」。
+//
+// 回调在 Manager 解锁之后才执行，所以这些行完全可能晚于清空进入队列。
+// 只清缓冲挡不住它们，必须靠序号识别。
+func TestClearLogsDropsInFlightLines(t *testing.T) {
+	a := &App{mgr: frpc.New("")}
+	a.mgr.AppendRaw("old line")
+	cleared := a.ClearLogs()
+
+	a.pushLog(1, "stale line")
+	if batch := a.takeLogBatch(); len(batch) != 0 {
+		t.Fatalf("清空前的在途行不该重新出现，实际 %v", batch)
+	}
+	if cleared.Epoch == 0 {
+		t.Fatal("清空后必须递增代次，供前端丢弃旧批次")
+	}
+	a.pushLog(2, "fresh line")
+	if batch := a.takeLogBatch(); len(batch) != 1 || batch[0] != "fresh line" {
+		t.Fatalf("清空后的新行应保留，实际 %v", batch)
+	}
+}
+
+// TestGetLogsIncludesClientLines 覆盖「客户端自身日志不在历史快照里」。
+//
+// 启动同步、重连说明过去只进待推送队列，不进历史；界面重新加载日志后
+// 这些行就消失了，而它们正是解释「客户端在做什么」的关键。
+func TestGetLogsIncludesClientLines(t *testing.T) {
+	a := &App{mgr: frpc.New("")}
+	a.emitLog("启动同步完成：2 条隧道运行中")
+	a.emitTunnelLog("mc", "隧道已断开")
+
+	snap := a.GetLogs()
+	if len(snap.Lines) != 2 {
+		t.Fatalf("快照应同时包含客户端与隧道说明，实际 %v", snap.Lines)
+	}
+	if !strings.Contains(snap.Lines[0], "启动同步完成") {
+		t.Fatalf("客户端说明缺失: %v", snap.Lines)
+	}
+	if !strings.Contains(snap.Lines[1], "Tunnel/mc") {
+		t.Fatalf("隧道说明缺失: %v", snap.Lines)
 	}
 }

@@ -275,9 +275,18 @@ type App struct {
 	logMu sync.Mutex
 	// logBufBytes 是 logBuf 的总字节数：行数上限挡不住「每行都很长」，
 	// 两份预算一起用（见 maxLogQueueBytes）。
-	logBuf      []string
+	logBuf      []pendingLog
 	logBufBytes int
 	logDropped  int
+
+	// logEpoch 在每次清空时递增，随推送事件一起下发。
+	//
+	// 跨进程事件是异步的：清空之前已经发出、清空之后才到达前端的那一批，
+	// 前端无法自行分辨。带上代次之后，旧代次的事件直接被丢弃。
+	logEpoch uint64
+	// logDroppedSeq 是清空时的日志序号：序号不大于它的在途行属于清空前的
+	// 内容，不再入队。仅靠代次挡不住「行已入队、尚未推送」的情况。
+	logDroppedSeq uint64
 	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
 	// 不排队也不阻塞——推送协程醒来时取走一批（maxLogBatch 行）。
 	logKick chan struct{}
@@ -356,8 +365,8 @@ func (a *App) startup(ctx context.Context) {
 	// 日志出的第一行就进批量队列：只要开始产生日志，推送到前端的节奏就
 	// 由推送协程决定，而不是「一行一次 Wails 调用」。
 	a.startLogFlusher()
-	a.mgr.SetCallbacks(func(id uint, name, line string) {
-		a.appendLogLine(line)
+	a.mgr.SetCallbacks(func(id uint, name string, seq uint64, line string) {
+		a.appendLogLine(seq, line)
 		switch {
 		case strings.Contains(line, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。

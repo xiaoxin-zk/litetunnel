@@ -108,7 +108,7 @@ type collector struct {
 	lines []string
 }
 
-func (c *collector) log(_ uint, _ string, line string) {
+func (c *collector) log(_ uint, _ string, _ uint64, line string) {
 	c.mu.Lock()
 	c.lines = append(c.lines, line)
 	c.mu.Unlock()
@@ -300,6 +300,32 @@ func TestLogMergesRepeatedLines(t *testing.T) {
 	}
 	if !strings.Contains(got[2], "start proxy success") {
 		t.Fatalf("新行必须保留，实际 %q", got[2])
+	}
+}
+
+// TestAppendRawSharesHistoryAndSeq 覆盖「客户端自身日志不进历史」。
+//
+// 两条来源必须落进同一份缓冲、共用同一个序号：否则重新加载日志时
+// 客户端说明会消失，而且实时显示的顺序与快照顺序可能不一致。
+func TestAppendRawSharesHistoryAndSeq(t *testing.T) {
+	m := testManager(t)
+	var seqs []uint64
+	m.SetCallbacks(func(_ uint, _ string, seq uint64, _ string) {
+		seqs = append(seqs, seq)
+	}, nil)
+
+	m.appendLog(1, "mc", "frpc line")
+	m.AppendRaw("15:04:05  启动同步完成")
+
+	logs := m.Logs()
+	if len(logs) != 2 {
+		t.Fatalf("客户端说明应进入同一份历史，实际 %d 条: %v", len(logs), logs)
+	}
+	if !strings.Contains(logs[1], "启动同步完成") {
+		t.Fatalf("客户端说明缺失: %v", logs)
+	}
+	if len(seqs) != 2 || seqs[1] <= seqs[0] {
+		t.Fatalf("序号必须单调递增，实际 %v", seqs)
 	}
 }
 

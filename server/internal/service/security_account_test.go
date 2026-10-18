@@ -721,11 +721,12 @@ func TestRunMaintenancePrunesExpiredCredentials(t *testing.T) {
 	}
 }
 
-// TestRunMaintenanceIsBatched 覆盖「清理任务一次删太多」。
+// TestRunMaintenanceDrainsBacklog 覆盖「积压长期存在」。
 //
-// 一次性大删会长时间占住写锁（SQLite 更是整库阻塞），在业务高峰期尤其危险。
-// 每轮每表必须有上限，剩下的下一轮继续。
-func TestRunMaintenanceIsBatched(t *testing.T) {
+// 单条 DELETE 仍按批进行（见 TestPruneBatchIsBatched），但一轮维护会在
+// 时间预算内连续分批，直到清空——否则过期记录产生速度高于清理速度时，
+// 积压只会越滚越大。
+func TestRunMaintenanceDrainsBacklog(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	old := time.Now().Add(-48 * time.Hour)
@@ -746,17 +747,42 @@ func TestRunMaintenanceIsBatched(t *testing.T) {
 	if err := svc.DB.Model(&model.EmailCode{}).Count(&left).Error; err != nil {
 		t.Fatalf("统计验证码失败: %v", err)
 	}
-	if want := int64(total - maintenanceBatchSize); left != want {
-		t.Fatalf("单轮最多删 %d 条，实际剩 %d 条（期望 %d）", maintenanceBatchSize, left, want)
+	if left != 0 {
+		t.Fatalf("一轮维护应在预算内清完积压，实际剩 %d 条", left)
+	}
+}
+
+// TestPruneBatchIsBatched 覆盖「清理任务一次删太多」。
+//
+// 一次性大删会长时间占住写锁（SQLite 更是整库阻塞），在业务高峰期尤其危险。
+// 单条 DELETE 必须仍然有上限。
+func TestPruneBatchIsBatched(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	old := time.Now().Add(-48 * time.Hour)
+	total := maintenanceBatchSize + 50
+	for i := 0; i < total; i++ {
+		rec := model.EmailCode{
+			Email: fmt.Sprintf("batch%d@example.com", i), Scene: EmailSceneRegister,
+			CodeHash: "h", ExpireAt: old.Add(10 * time.Minute), CreatedAt: old,
+		}
+		if err := svc.DB.Create(&rec).Error; err != nil {
+			t.Fatalf("建验证码失败: %v", err)
+		}
 	}
 
-	// 再跑一轮：剩下的应当被清掉（说明「剩余下轮继续」确实成立）。
-	svc.RunMaintenance()
+	n := svc.pruneBatch("过期验证码", &model.EmailCode{},
+		"created_at < ?", time.Now().Add(-emailCodeRetention))
+	if n != maintenanceBatchSize {
+		t.Fatalf("单批最多删 %d 条，实际 %d", maintenanceBatchSize, n)
+	}
+
+	var left int64
 	if err := svc.DB.Model(&model.EmailCode{}).Count(&left).Error; err != nil {
 		t.Fatalf("统计验证码失败: %v", err)
 	}
-	if left != 0 {
-		t.Fatalf("第二轮应把剩余的清完，实际剩 %d 条", left)
+	if want := int64(total - maintenanceBatchSize); left != want {
+		t.Fatalf("剩余应为 %d 条，实际 %d", want, left)
 	}
 }
 

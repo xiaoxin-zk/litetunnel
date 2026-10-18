@@ -43,11 +43,25 @@ async function loadState() {
 // 清空前发出、清空后才到达的批次代次更小，直接丢弃——否则用户会看到
 // 「刚清空，旧日志又自己回来了」。
 const logEpoch = ref(0)
+// 已显示的最大日志序号。快照与实时事件可能包含同一行，
+// 只比代次会重复追加，必须按序号去重。
+const lastSeq = ref(0)
 
 async function loadLogs() {
   const snap = await api.logs()
   if (snap && Array.isArray(snap.lines)) {
+    const seqs = snap.seqs || []
+    let maxSeq = 0
+    for (const s of seqs) {
+      if (s > maxSeq) maxSeq = s
+    }
+    // 快照可能比当前已显示的内容旧（请求在途时又来了新日志）：
+    // 同代次下不覆盖，避免把新行丢掉。
+    if ((snap.epoch || 0) === logEpoch.value && maxSeq < lastSeq.value) {
+      return
+    }
     logEpoch.value = snap.epoch || 0
+    lastSeq.value = maxSeq
     logs.value = snap.lines
     return
   }
@@ -73,18 +87,26 @@ const maxPendingLogs = 2000
 let logTimer = null
 
 function pushLog(payload) {
-  // 主进程成批推送 {epoch, lines}；也接受数组与单行字符串，这样前端热重载、
-  // 或与旧版主进程混跑时都不会丢日志。
+  // 主进程成批推送 {epoch, seqs, lines}；也接受数组与单行字符串，这样前端
+  // 热重载、或与旧版主进程混跑时都不会丢日志。
   let batch = payload
+  let seqs = null
   if (payload && !Array.isArray(payload) && typeof payload === 'object') {
     if (typeof payload.epoch === 'number' && payload.epoch < logEpoch.value) {
       return // 清空前的在途批次
     }
     batch = payload.lines || []
+    seqs = payload.seqs || null
   }
   if (Array.isArray(batch)) {
-    for (const line of batch) pendingLogs.push(line)
-  } else {
+    for (let i = 0; i < batch.length; i++) {
+      const seq = seqs ? seqs[i] : 0
+      // seq 为 0 的是客户端合成行（如「已丢弃 N 行」），始终显示。
+      if (seq !== 0 && seq <= lastSeq.value) continue
+      if (seq > lastSeq.value) lastSeq.value = seq
+      pendingLogs.push(batch[i])
+    }
+  } else if (batch) {
     pendingLogs.push(batch)
   }
   if (pendingLogs.length > maxPendingLogs) {
@@ -121,6 +143,7 @@ async function onClearLogs() {
   }
   pendingLogs.length = 0
   logs.value = []
+  lastSeq.value = 0
 }
 
 onMounted(async () => {

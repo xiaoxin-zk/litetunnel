@@ -74,7 +74,9 @@ type process struct {
 type Manager struct {
 	mu    sync.Mutex
 	procs map[uint]*process
-	logs  []string
+	// logs 保存带序号的日志行。序号让调用方能把快照与实时事件对齐，
+	// 避免「快照里已有的行又被实时事件追加一次」。
+	logs []LogEntry
 	// logBytes 是 logs 里所有行的总字节数，用于按字节预算裁剪。
 	logBytes int
 
@@ -394,11 +396,27 @@ func (m *Manager) Closed() bool {
 	return m.closed
 }
 
-// Logs 返回日志快照。
+// LogEntry 是一条带序号的日志。
+type LogEntry struct {
+	Seq  uint64
+	Text string
+}
+
+// Logs 返回日志文本快照。
 func (m *Manager) Logs() []string {
+	entries := m.LogEntries()
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Text
+	}
+	return out
+}
+
+// LogEntries 返回带序号的日志快照。
+func (m *Manager) LogEntries() []LogEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, len(m.logs))
+	out := make([]LogEntry, len(m.logs))
 	copy(out, m.logs)
 	return out
 }
@@ -581,20 +599,19 @@ func (m *Manager) recordLocked(tunnelID uint, tunnelName, line string, now time.
 // recordTextLocked 写入一行已经格式化好的文本，并返回它分配的序号。
 func (m *Manager) recordTextLocked(text string) uint64 {
 	m.logSeq++
-	stamped := text
-	m.logs = append(m.logs, stamped)
-	m.logBytes += len(stamped)
+	m.logs = append(m.logs, LogEntry{Seq: m.logSeq, Text: text})
+	m.logBytes += len(text)
 
 	// 先按行数裁，再按总字节裁：两个上限针对的是不同的失控方式
 	// （行数爆炸 / 单行过大），只留一个都会被另一个绕过。
 	if over := len(m.logs) - maxLogLines; over > 0 {
 		for i := 0; i < over; i++ {
-			m.logBytes -= len(m.logs[i])
+			m.logBytes -= len(m.logs[i].Text)
 		}
 		m.logs = m.logs[over:]
 	}
 	for len(m.logs) > 1 && m.logBytes > maxLogBytes {
-		m.logBytes -= len(m.logs[0])
+		m.logBytes -= len(m.logs[0].Text)
 		m.logs = m.logs[1:]
 	}
 	return m.logSeq

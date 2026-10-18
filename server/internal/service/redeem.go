@@ -244,14 +244,16 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 		updates := map[string]any{}
 		switch c.Type {
 		case model.RedeemTypeTraffic:
-			// 若用户此前继承分组配额，则以「分组配额 + 兑换值」作为显式配额。
+			// 若用户此前继承分组配额，则以「**当前生效**分组的配额 + 兑换值」
+			// 作为显式配额。
+			//
+			// 必须用生效分组而不是原始 GroupID：会员过期后运行期会回落到
+			// 默认分组（见 EffectiveGroup），此时若按旧分组取值，就会把已经
+			// 不再生效的配额固化成显式配额——而显式配额优先于分组配额，
+			// 到期迁移完成后它依然生效，用户凭空多出一份旧权益。
 			base := u.TrafficQuota
 			if base == 0 {
-				var g model.Group
-				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-					First(&g, u.GroupID).Error; err == nil {
-					base = g.TrafficQuota
-				}
+				base = s.effectiveGroupQuotaTx(tx, &u)
 			}
 			// 溢出检查：负的配额会被 EffectiveQuota 当成「继承分组配额」，
 			// 超额保护直接失效。生成侧已有面值上限，这里兜住老数据里
@@ -370,6 +372,26 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 		log.Printf("[redeem] 兑换已成功（用户 %d），但配额标记刷新失败，用户可能要等下一轮采集才能解除拦截: %v", userID, err)
 	}
 	return &result, nil
+}
+
+// effectiveGroupQuotaTx 返回用户**当前生效**分组的流量配额。
+//
+// 口径必须与 EffectiveGroup 一致：会员过期后运行期会回落到默认分组。
+// 这里用 tx 而不是 s.DB —— 事务正持有连接，另开一条连接在 SQLite
+// （单连接池）上会直接死锁。
+func (s *Services) effectiveGroupQuotaTx(tx *gorm.DB, u *model.User) int64 {
+	expired := u.GroupExpireAt != nil && !u.GroupExpireAt.After(time.Now())
+	if !expired && u.GroupID != 0 {
+		var g model.Group
+		if err := tx.First(&g, u.GroupID).Error; err == nil {
+			return g.TrafficQuota
+		}
+	}
+	var def model.Group
+	if err := tx.Where("is_default = ?", true).First(&def).Error; err == nil {
+		return def.TrafficQuota
+	}
+	return 0
 }
 
 // recordRedeem 写一条兑换流水。

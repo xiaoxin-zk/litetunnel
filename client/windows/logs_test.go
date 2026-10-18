@@ -260,6 +260,41 @@ func TestClearLogsDropsInFlightLines(t *testing.T) {
 	}
 }
 
+// TestTakeLogBatchCapturesEpoch 覆盖「清空插在取批次与读代次之间」。
+//
+// 两步分开时，清空前取出的批次会被标成清空后的代次，前端就过滤不掉了。
+func TestTakeLogBatchCapturesEpoch(t *testing.T) {
+	a := &App{mgr: frpc.New("")}
+	a.pushLog(1, "old line")
+
+	items, epoch := a.takeLogBatchWithEpoch()
+	if len(items) != 1 || epoch != 0 {
+		t.Fatalf("清空前取出的批次代次应为 0，实际 items=%d epoch=%d", len(items), epoch)
+	}
+
+	a.ClearLogs()
+	a.pushLog(2, "new line")
+	items, epoch = a.takeLogBatchWithEpoch()
+	if len(items) != 1 || epoch != 1 {
+		t.Fatalf("清空后取出的批次代次应为 1，实际 items=%d epoch=%d", len(items), epoch)
+	}
+}
+
+// TestGetLogsReturnsSeqs 覆盖「快照没有序号，前端无法与实时事件去重」。
+func TestGetLogsReturnsSeqs(t *testing.T) {
+	a := &App{mgr: frpc.New("")}
+	a.emitLog("first")
+	a.emitLog("second")
+
+	snap := a.GetLogs()
+	if len(snap.Seqs) != 2 || len(snap.Lines) != 2 {
+		t.Fatalf("序号与文本必须一一对应，实际 seqs=%v lines=%v", snap.Seqs, snap.Lines)
+	}
+	if snap.Seqs[1] <= snap.Seqs[0] {
+		t.Fatalf("序号必须递增，实际 %v", snap.Seqs)
+	}
+}
+
 // TestGetLogsIncludesClientLines 覆盖「客户端自身日志不在历史快照里」。
 //
 // 启动同步、重连说明过去只进待推送队列，不进历史；界面重新加载日志后

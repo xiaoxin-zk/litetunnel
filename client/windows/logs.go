@@ -163,11 +163,24 @@ func (a *App) pushLog(seq uint64, line string) bool {
 // 一次最多取 maxLogBatch 行，剩下的留给下一轮：单次事件的尺寸因此有上界，
 // 与积压了多久无关。
 func (a *App) takeLogBatch() []string {
+	items, _ := a.takeLogBatchWithEpoch()
+	out := make([]string, len(items))
+	for i, it := range items {
+		out[i] = it.text
+	}
+	return out
+}
+
+// takeLogBatchWithEpoch 取出批次，并在**同一把锁内**捕获当时的代次。
+//
+// 分两步（先取批次、再读代次）会有一个窄窗口：清空恰好发生在两步之间时，
+// 清空前的批次会被标成新代次，前端就过滤不掉了。
+func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 
 	if len(a.logBuf) == 0 && a.logDropped == 0 {
-		return nil
+		return nil, a.logEpoch
 	}
 
 	n := len(a.logBuf)
@@ -194,28 +207,30 @@ func (a *App) takeLogBatch() []string {
 	n = limit
 
 	// 丢弃提示单独占一行插在最前面：静默丢日志比丢日志本身更糟——
-	// 用户会以为自己看到了完整的现场。
-	batch := make([]string, 0, n+1)
+	// 用户会以为自己看到了完整的现场。它没有序号（seq=0），前端总是显示。
+	batch := make([]pendingLog, 0, n+1)
 	if a.logDropped > 0 {
-		batch = append(batch, fmt.Sprintf("%s  [客户端] 日志积压，已丢弃 %d 行较早的记录",
-			time.Now().Format("15:04:05"), a.logDropped))
+		batch = append(batch, pendingLog{text: fmt.Sprintf("%s  [客户端] 日志积压，已丢弃 %d 行较早的记录",
+			time.Now().Format("15:04:05"), a.logDropped)})
 		a.logDropped = 0
 	}
 	for i := 0; i < n; i++ {
-		batch = append(batch, a.logBuf[i].text)
+		batch = append(batch, a.logBuf[i])
 		a.logBufBytes -= len(a.logBuf[i].text)
 	}
 
 	// 从头部截断而不是重新分配：剩下的是「更新的那部分」，顺序不变。
 	a.logBuf = a.logBuf[n:]
-	return batch
+	return batch, a.logEpoch
 }
 
 // logBatchEvent 是推送给前端的日志批次。
 //
-// 带 epoch：前端据此丢弃「清空之前发出、清空之后才到」的旧批次。
+// epoch 用来丢弃「清空之前发出、清空之后才到」的旧批次；
+// seqs 用来让前端按序号去重——快照与实时事件可能包含同一行。
 type logBatchEvent struct {
 	Epoch uint64   `json:"epoch"`
+	Seqs  []uint64 `json:"seqs"`
 	Lines []string `json:"lines"`
 }
 
@@ -224,14 +239,16 @@ func (a *App) flushLogs() {
 	if a.ctx == nil {
 		return
 	}
-	batch := a.takeLogBatch()
+	batch, epoch := a.takeLogBatchWithEpoch()
 	if len(batch) == 0 {
 		return
 	}
-	a.logMu.Lock()
-	epoch := a.logEpoch
-	a.logMu.Unlock()
-	wailsruntime.EventsEmit(a.ctx, "logs", logBatchEvent{Epoch: epoch, Lines: batch})
+	ev := logBatchEvent{Epoch: epoch, Seqs: make([]uint64, len(batch)), Lines: make([]string, len(batch))}
+	for i, item := range batch {
+		ev.Seqs[i] = item.seq
+		ev.Lines[i] = item.text
+	}
+	wailsruntime.EventsEmit(a.ctx, "logs", ev)
 }
 
 // startLogFlusher 启动批量推送协程，进程生命周期内常驻。
@@ -252,9 +269,13 @@ func (a *App) startLogFlusher() {
 	}()
 }
 
-// LogSnapshot 是日志快照，连同它所属的代次一起返回。
+// LogSnapshot 是日志快照，连同它所属的代次与每行序号一起返回。
+//
+// 序号是去重的依据：前端加载快照时，可能有同一批日志正通过事件到达，
+// 只比代次会把它们重复追加一次。
 type LogSnapshot struct {
 	Epoch uint64   `json:"epoch"`
+	Seqs  []uint64 `json:"seqs"`
 	Lines []string `json:"lines"`
 }
 
@@ -262,14 +283,25 @@ type LogSnapshot struct {
 //
 // 快照来自 Manager 的统一缓冲，因此 frpc 输出与客户端自身说明都在里面，
 // 顺序也与实时推送一致（两者由同一把锁串行化）。
+//
+// 代次与快照在同一把锁内读取：分开读会让「清空」插在中间，
+// 返回一份代次与内容对不上的快照。
 func (a *App) GetLogs() LogSnapshot {
 	a.logMu.Lock()
-	epoch := a.logEpoch
-	a.logMu.Unlock()
+	defer a.logMu.Unlock()
+
+	snap := LogSnapshot{Epoch: a.logEpoch}
 	if a.mgr == nil {
-		return LogSnapshot{Epoch: epoch}
+		return snap
 	}
-	return LogSnapshot{Epoch: epoch, Lines: a.mgr.Logs()}
+	entries := a.mgr.LogEntries()
+	snap.Seqs = make([]uint64, len(entries))
+	snap.Lines = make([]string, len(entries))
+	for i, e := range entries {
+		snap.Seqs[i] = e.Seq
+		snap.Lines[i] = e.Text
+	}
+	return snap
 }
 
 // LogCleared 是清空操作的结果。

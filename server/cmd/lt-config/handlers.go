@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
@@ -61,9 +60,19 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.Available {
 		for _, f := range []string{s.paths.caddyTpl, s.paths.frpsTpl, s.paths.envFile, s.paths.composeFile} {
-			if _, err := os.Stat(f); err != nil {
+			// 这里同样是三态（见 statcheck.go）：Stat 失败不等于「文件不存在」。
+			// 判不出来（权限不足、目录挂载丢了、I/O 出错）时报「缺少文件」会把
+			// 管理员引去补一个其实还在的文件，所以两种情况分开写。
+			state, err := statFileState(f)
+			switch state {
+			case fileMissing:
 				h.Available = false
 				h.Reason = fmt.Sprintf("缺少文件 %s", f)
+			case fileUnknown:
+				h.Available = false
+				h.Reason = fmt.Sprintf("无法读取 %s（%v）：请检查部署目录的权限与挂载", f, err)
+			}
+			if !h.Available {
 				break
 			}
 		}

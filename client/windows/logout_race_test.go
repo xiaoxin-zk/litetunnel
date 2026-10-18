@@ -196,3 +196,109 @@ func TestPruneTunnelStateDropsStartRecord(t *testing.T) {
 		t.Fatal("服务端已删除的隧道应清掉启动记账，否则这张表会随「建了又删」一直长")
 	}
 }
+
+// TestStateSeqMonotonicAndCarriedInState 覆盖「状态事件序号必须单调且随状态下发」。
+//
+// 前端靠 (auth_gen, state_seq) 的字典序丢弃乱序事件（见 State.StateSeq）。
+// 序号不单调，或 GetState 不带它，前端就没有排序依据——退出登录后迟到的
+// 「已登录」事件会被当成最新状态，界面闪回一次登录后的界面。
+//
+// 这里直接调 snapshotForEmit（emitState 的取号路径）：它不依赖 a.ctx，
+// 而 EventsEmit 需要真实的 Wails 上下文，单测里起不来。
+func TestStateSeqMonotonicAndCarriedInState(t *testing.T) {
+	withTempConfigDir(t)
+	a := &App{mgr: testManager(t)}
+
+	var last uint64
+	for i := 0; i < 5; i++ {
+		seq, _, st := a.snapshotForEmit()
+		if seq <= last {
+			t.Fatalf("第 %d 次取号 = %d，未超过上一次的 %d：前端无法排序", i+1, seq, last)
+		}
+		last = seq
+		if st.StateSeq != seq {
+			t.Fatalf("快照里的 StateSeq = %d，与本次取到的 %d 不一致", st.StateSeq, seq)
+		}
+	}
+
+	// GetState 不消耗序号，但必须带出**当前**值：前端拿快照与事件比较时，
+	// 快照的序号不能凭空前进（否则每次刷新都会让在途的合法事件被判旧）。
+	before := a.GetState().StateSeq
+	if got := a.GetState().StateSeq; got != before {
+		t.Fatalf("GetState 不该推进序号：连续两次读到 %d 与 %d", before, got)
+	}
+	if before != last {
+		t.Fatalf("GetState 的序号 = %d，期望等于最后一次取号 %d", before, last)
+	}
+}
+
+// TestLogoutAdvancesAuthGenSoStaleEventsAreDropped 覆盖「登出后旧账号的事件
+// 无论何时到达都进不来」。
+//
+// 这是缺陷 7 的核心：光有序号不够。回调若在登出**之后**才取号，它会拿到
+// 比登出推送更大的序号——前端按序号比较会接受它，界面在用户已经退出后
+// 又闪回已登录。账号代次补上这一维：登出让它前进，旧回调持有的代次更小，
+// 前端按字典序整份丢弃。
+func TestLogoutAdvancesAuthGenSoStaleEventsAreDropped(t *testing.T) {
+	withTempConfigDir(t)
+	panel, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, panel)
+
+	// 登出前先取一份，模拟「旧账号下的状态」。
+	_, oldGen, oldState := a.snapshotForEmit()
+
+	cleanup := func() error { return nil }
+	if _, err := a.logout(cleanup, cleanup); err != nil {
+		t.Fatalf("退出登录失败: %v", err)
+	}
+
+	_, newGen, newState := a.snapshotForEmit()
+
+	if newGen <= oldGen {
+		t.Fatalf("退出登录必须推进账号代次：登出前 %d，登出后 %d", oldGen, newGen)
+	}
+	// 前端的丢弃判据是字典序 (auth_gen, state_seq)：旧代次必须整份判旧，
+	// 哪怕它的序号更大。
+	if oldGen >= newGen {
+		t.Fatal("旧账号代次必须小于新账号代次，否则前端会把迟到事件当成最新的")
+	}
+	if oldState.AuthGen != oldGen || newState.AuthGen != newGen {
+		t.Fatalf("State.AuthGen 未与代次同步：旧 %d/%d，新 %d/%d",
+			oldState.AuthGen, oldGen, newState.AuthGen, newGen)
+	}
+	if newState.LoggedIn {
+		t.Fatal("登出后的状态必须是未登录：否则界面不会切回登录页")
+	}
+}
+
+// TestStaleStateAfterLogoutIsOlder 用前端同一套比较规则验证丢弃判据。
+//
+// 前端是 JS 不便单测，但判据本身是纯函数（字典序比较），在 Go 侧复刻一份
+// 就能守住「改动比较规则时两端会不一致」这个风险。
+func TestStaleStateAfterLogoutIsOlder(t *testing.T) {
+	// 与 App.vue 的 stateIsStale 完全一致的实现。
+	stale := func(prevGen, prevSeq, gen, seq uint64) bool {
+		if gen != prevGen {
+			return gen < prevGen
+		}
+		return seq < prevSeq
+	}
+
+	// 旧账号（gen=1）的迟到事件，序号比登出推送（gen=2, seq=9）还大。
+	// 按字典序必须判旧——这正是「只比序号」做不到的。
+	if !stale(2, 9, 1, 100) {
+		t.Fatal("旧账号代次的事件必须判旧，哪怕它的序号更大：否则界面会闪回已登录")
+	}
+	// 同代次内序号更小的判旧。
+	if !stale(2, 9, 2, 8) {
+		t.Fatal("同代次内序号更小的事件必须判旧")
+	}
+	// 同代次内序号相等不算旧（同一次推送可能被投递两次）。
+	if stale(2, 9, 2, 9) {
+		t.Fatal("序号相等应视为重复投递，重复应用同一份状态无害")
+	}
+	// 新账号代次的事件必须接受，哪怕序号基线重来后更小。
+	if stale(2, 9, 3, 1) {
+		t.Fatal("新账号代次的事件必须接受：序号基线随账号重来")
+	}
+}

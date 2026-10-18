@@ -105,6 +105,19 @@ func (h *Handler) SystemMetrics(c *gin.Context) {
 		// 一起下发的理由与 recovery 相同：这类故障不影响功能，只影响事后追查，
 		// 单独开接口的话没人会去看。
 		"audit": h.svc.AuditHealth(),
+		// 断流（删号/禁用后主动断开已建立代理）的两个盲区：
+		//
+		//   drain_fallback —— 意图没能落库、只留在进程内存里的队列。非空或
+		//     dropped 非零说明数据库曾经不可用，且有账号的断流意图一度只存在
+		//     于内存（进程重启就丢）。这是「需要人看一眼」的状态。
+		//   drain_race —— 关闭请求成功后同名代理又以另一个实例身份出现的次数。
+		//     frps 只支持按名字关闭，这个竞态无法消除，只能计数；非零意味着
+		//     有关闭动作的结果无法确认（可能误关了刚重连的新实例）。
+		//
+		// 两者都不影响接口成功与否，正是「不单独开接口就没人会看」的那一类，
+		// 所以跟 recovery/audit 一起下发。
+		"drain_fallback": h.svc.ProxyDrainFallback(),
+		"drain_race":     h.svc.ProxyDrainRaceHealth(),
 	})
 }
 

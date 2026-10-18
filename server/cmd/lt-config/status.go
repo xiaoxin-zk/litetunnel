@@ -167,8 +167,15 @@ func (s *service) handleCerts(w http.ResponseWriter, r *http.Request) {
 func (s *service) certStatus() tlscfg.CertStatus {
 	root := filepath.Join(s.paths.caddyData, "certificates")
 	st := tlscfg.CertStatus{}
-	if _, err := os.Stat(root); err != nil {
+	// 三态（见 statcheck.go）：目录不存在与读不了是两件事。把「权限不足」
+	// 报成「尚未发现证书」，会把管理员引去查 Caddy 的签发日志，而真正该
+	// 看的是这个目录的权限与挂载。
+	switch state, err := statFileState(root); state {
+	case fileMissing:
 		st.Reason = fmt.Sprintf("尚未发现证书：%s 不存在（Caddy 还没为任何域名签发过证书）", root)
+		return st
+	case fileUnknown:
+		st.Reason = fmt.Sprintf("无法读取证书目录 %s（%v）：请检查权限与挂载", root, err)
 		return st
 	}
 	st.Available = true

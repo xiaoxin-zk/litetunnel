@@ -66,10 +66,21 @@ func (h *Handler) onNewUserConn(req *request) response {
 				}
 				return h.allowUserConn(&content)
 			}
-			if h.svc.Runtime.IsUserBlocked(s.UserID) {
+			// 没有会话级快照：读本机标记。与代理注册路径用同一套判断
+			// （见 localAdmission），保证「同一个账号在两条路径上得到同一个结论」。
+			//
+			// 这里读不出可信判定同样要拒绝：这是**每次**建连都经过的拦截点，
+			// 放行一个已禁用账号的代价是它的数据流一直跑到客户端自己退出，
+			// 而没有任何后续事件会关掉它（断流是另一条独立路径，不保证成功）。
+			blocked, exceeded, ok := h.localAdmission(s.UserID)
+			if !ok {
+				log.Printf("[plugin] 用户 %d 的准入状态在读取期间持续变化，无法确认是否已禁用，已拒绝新建连接", s.UserID)
+				return deny("账号状态正在变更，请稍后重试")
+			}
+			if blocked {
 				return deny("账号已被禁用")
 			}
-			if h.svc.Runtime.IsQuotaExceeded(s.UserID) {
+			if exceeded {
 				return deny("流量额度已用尽")
 			}
 			return h.allowUserConn(&content)
@@ -82,10 +93,18 @@ func (h *Handler) onNewUserConn(req *request) response {
 	if u.Status != model.UserStatusActive {
 		return deny("账号已被禁用")
 	}
-	if h.svc.Runtime.IsUserBlocked(u.ID) {
+	// 这条路径刚读过数据库里的用户行（u.Status 就是最新状态），
+	// 但内存标记仍然要看：禁用标记还承担「封禁」语义（banned 之外的管理动作），
+	// 且库里的状态可能被本实例的缓存掩盖。同样走 localAdmission 保证一致。
+	blocked, exceeded, ok := h.localAdmission(u.ID)
+	if !ok {
+		log.Printf("[plugin] 用户 %d 的准入状态在读取期间持续变化，无法确认是否已禁用，已拒绝新建连接", u.ID)
+		return deny("账号状态正在变更，请稍后重试")
+	}
+	if blocked {
 		return deny("账号已被禁用")
 	}
-	if h.svc.Runtime.IsQuotaExceeded(u.ID) {
+	if exceeded {
 		return deny("流量额度已用尽")
 	}
 	return h.allowUserConn(&content)

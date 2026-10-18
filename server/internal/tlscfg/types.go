@@ -147,16 +147,40 @@ type Health struct {
 	// 它只回答「docker 命令在不在」——命令在而 daemon 没起来时它仍为 true。
 	// 要判断「宿主机现在能不能真的起容器」，看 DockerReady。
 	Docker bool `json:"docker"`
-	// DockerReady 表示 docker 命令存在**且**宿主机侧可用（daemon 可达、
-	// 当前身份有权限、compose 插件在位）。
+	// DockerReady 表示 docker 命令存在**且**宿主机侧 daemon 可用（daemon
+	// 可达、当前身份有权限）。
 	//
 	// 单独一个字段的理由：Docker 为真只能证明命令在 PATH 里。装在宿主机上
 	// 但 daemon 没启动、或本服务没有 socket 权限时，它照样为真，于是面板
 	// 一路放行到「保存」才在重建容器那步失败——而那时文件已经写盘了。
+	//
+	// 语义刻意**只**覆盖 daemon：compose 是否可用由 ComposeReady 单独报告。
+	// 把 compose 折进来会让「装个插件」被界面报成「Docker 不可用」。
 	DockerReady bool `json:"docker_ready"`
 	// DockerErr 是 DockerReady 为假时的可读中文原因（例如命令存在但 daemon
 	// 不可达），供界面直接展示；DockerReady 为真时为空。
 	DockerErr string `json:"docker_err,omitempty"`
+	// ComposeReady 表示 compose 可用：daemon 可用**且** `docker compose`
+	// （或独立 docker-compose）能跑起来。
+	//
+	// 为什么在 DockerReady 之外还要一个字段：本服务重建容器只用
+	// `docker compose up`（见 cmd/lt-config/compose.go），从不直接
+	// `docker run`。而「daemon 能用」不等于「compose 能用」——docker 装好、
+	// daemon 起来了，但 compose 插件没装（或只有 V1 的独立二进制）时，
+	// `docker info` 照样成功。只看 DockerReady 的话，面板会一路放行到
+	// 「保存并应用」，失败发生在文件已经写盘之后，配置与容器分处两个版本。
+	//
+	// 恒有 ComposeReady ⇒ DockerReady。DockerReady 的语义**不**因此改变：
+	// 它仍然只回答「daemon 能不能用」，否则「装个 compose 插件」这件事
+	// 会被界面报成「Docker 不可用」，把管理员引向完全错误的排查方向。
+	ComposeReady bool `json:"compose_ready"`
+	// ComposeErr 是 ComposeReady 为假、但 daemon 可用时的可读中文原因
+	// （compose 插件与 docker-compose 都不在、或跑了不成功）。
+	//
+	// daemon 本身就不可用时留空：那时 ComposeReady 为假只是连带结果，
+	// 多说一句「compose 不可用」只会把管理员引去装插件。界面据此在
+	// 「Docker 不可用」与「compose 不可用」两种告警之间选择。
+	ComposeErr string `json:"compose_err,omitempty"`
 	// Reason 在不可用时说明原因，供界面直接展示。
 	Reason string `json:"reason"`
 	// Ports 是部署目录 .env 里那几个**与入口路由直接相关**的端口。

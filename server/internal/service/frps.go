@@ -132,7 +132,8 @@ func (c *FrpsClient) ListProxies(ctx context.Context) ([]FrpsProxy, error) {
 	return nil, lastErr
 }
 
-// errFrpsListUnstable 表示分页期间代理集合发生了变化（总数变了或出现重复项）。
+// errFrpsListUnstable 表示分页期间代理集合发生了变化（总数变了、复检对不上
+// 或出现重复项）。
 //
 // 这类结果既不能采信也不能「尽力去重」：总量变化说明翻页期间有代理增删，
 // 重复项会让同一份流量在 runtime 里被累加两次。规则很简单——整轮重取一次，
@@ -158,6 +159,10 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 	var all []FrpsProxy
 	seen := make(map[string]struct{}, 256)
 	total := -1
+	// firstPageNames 记下第 1 页的代理名序列，收尾时拿它复核「翻页期间集合
+	// 有没有被改过」（见 recheckFirstPage）。
+	var firstPageNames []string
+	pagesRead := 0
 
 	for page := 1; page <= frpsMaxPages; page++ {
 		endpoint := fmt.Sprintf("%s/api/v2/proxies?page=%d&pageSize=%d", c.baseURL, page, frpsPageSize)
@@ -165,6 +170,7 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 		if err := c.getJSON(ctx, endpoint, &out); err != nil {
 			return nil, err
 		}
+		pagesRead++
 
 		if out.Total == nil {
 			// total 缺失 = 读不懂这份响应，**不能**按「0 条」处理：
@@ -191,6 +197,9 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 			}
 			seen[p.Name] = struct{}{}
 			all = append(all, p)
+			if page == 1 {
+				firstPageNames = append(firstPageNames, p.Name)
+			}
 		}
 
 		// 完整性判定只认 total：累计数量达到它才算读全了。
@@ -206,6 +215,18 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 			if len(all) > total {
 				return nil, fmt.Errorf("%w：已取 %d 条，超过上报的 total=%d",
 					errFrpsListUnstable, len(all), total)
+			}
+			// 条数对上不等于集合对上：翻页期间「删一条 + 加一条」时 total 不变，
+			// 但删除点之后的页会整体错位一格——旧代理有一条被跳过、新代理被多读
+			// 一条，累计条数依然精确等于 total，前面所有校验都发现不了。
+			//
+			// 只有翻过一页以上才有这个窗口：单页时 total 与 items 出自 frps 的同
+			// 一次请求（同一个切片算出来的），本身就是一致快照。多页时才有多个
+			// 时刻，需要复核。
+			if pagesRead > 1 {
+				if err := c.recheckFirstPage(ctx, total, firstPageNames); err != nil {
+					return nil, err
+				}
 			}
 			return all, nil
 		}
@@ -227,6 +248,54 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 	// 是分页被截断导致的——正是这次故障那种最难查的形态。
 	return nil, fmt.Errorf("frps 代理数超过分页上限（%d 页 × %d 条），拒绝返回不完整列表",
 		frpsMaxPages, frpsPageSize)
+}
+
+// recheckFirstPage 重新取一次第 1 页，比对它和翻页开始时读到的是不是同一份名单。
+//
+// 为什么需要这一步：分页接口没有稳定快照（frps v0.71 的 /api/v2/proxies 只认
+// page/pageSize，服务端按 (type, name) 排序后切片，没有 cursor、也没有集合版本
+// 号），所以「翻页期间有人删了一条又加了一条」会让删除点之后的页整体错位：被跳过
+// 的那条旧代理不在结果里（随后被判离线），新加的那条被多读一次（随后被判在线），
+// 而 total 自始至终没变——条数校验、重复校验、total 校验全部失效。这是不重取整份
+// 列表就能发现它的唯一办法。
+//
+// 成本取舍：整轮多花 1 个请求，与代理规模无关（页数 n 时是 n+1 次）。相比「整轮
+// 重取」的 2n 次，以及「每页都复核」的 2n 次，这个代价可以忽略；而一旦误采错位
+// 的列表，后果是有人被判离线、有人被多计流量，靠下一轮采集才能纠正。所以固定加
+// 一次的代价是值得的。
+//
+// 已知残余风险：增删点如果恰好落在最后一页之后、或第 1 页之内（改为在翻页结束后
+// 才发生），复核可能看不到。但这两类情形对本次结果的影响面很小（错位的条目数不
+// 会超过被跳过的那一条），且下一轮采集即纠正；相比之下「中途一删一增」是真实运维
+// 里最常见的形态（客户端重连时旧代理先关、新代理后开），复核正是对着它做的。
+//
+// 判定口径取「名单序列完全一致」而不是「集合一致」：frps 侧排序是确定性的，同一份
+// 集合翻两次必然得到同样的顺序；顺序变了同样意味着集合被改过（排序键 name 在用户
+// 内唯一，名字没变顺序就不会变），一并按不稳定处理。
+func (c *FrpsClient) recheckFirstPage(ctx context.Context, wantTotal int, first []string) error {
+	endpoint := fmt.Sprintf("%s/api/v2/proxies?page=1&pageSize=%d", c.baseURL, frpsPageSize)
+	var out frpsPage[FrpsProxy]
+	if err := c.getJSON(ctx, endpoint, &out); err != nil {
+		return err
+	}
+	if out.Total == nil {
+		return fmt.Errorf("frps 代理列表缺少 total 字段（复核第 1 页），无法确认完整性")
+	}
+	if *out.Total != wantTotal {
+		return fmt.Errorf("%w：复核第 1 页时 total=%d，本轮开始是 %d",
+			errFrpsListUnstable, *out.Total, wantTotal)
+	}
+	if len(out.Items) != len(first) {
+		return fmt.Errorf("%w：复核第 1 页拿到 %d 条，本轮开始时是 %d 条",
+			errFrpsListUnstable, len(out.Items), len(first))
+	}
+	for i, p := range out.Items {
+		if p.Name != first[i] {
+			return fmt.Errorf("%w：复核第 1 页第 %d 条是 %q，本轮开始时是 %q（总量没变但集合变了）",
+				errFrpsListUnstable, i+1, p.Name, first[i])
+		}
+	}
+	return nil
 }
 
 // doJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。

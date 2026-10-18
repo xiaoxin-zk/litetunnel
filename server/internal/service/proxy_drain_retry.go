@@ -231,8 +231,20 @@ func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOut
 		return
 	}
 	if req.intent == "" {
-		log.Printf("[proxy-drain] 用户 %d 仍有 %d 个代理未能关闭，但本次意图没有落库（数据库故障或已有更强的待办），由现有待办的后台重试兜底",
-			req.userID, len(out.residual))
+		// 意图没落库：两种情况——数据库故障，或已有更强的待办覆盖了本次。
+		//
+		// 两种情况都**不能只记日志**（缺陷 4）：前者说明这次残留没有任何
+		// 持久化补偿，必须进进程内队列等数据库恢复；后者虽然已有待办兜底，
+		// 但那条待办可能是「禁用」而本次是「删号」（更强的语义），补写一次
+		// 无害且更准确——recordProxyDrainPending 的覆盖规则会自己判断。
+		if s.drainFallback != nil {
+			s.drainFallback.enqueue(req)
+			log.Printf("[proxy-drain] 用户 %d 仍有 %d 个代理未能关闭，本次意图未落库，已放入进程内补偿队列",
+				req.userID, len(out.residual))
+		} else {
+			log.Printf("[proxy-drain] 用户 %d 仍有 %d 个代理未能关闭，但本次意图没有落库且无补偿队列（数据库故障），由现有待办的后台重试兜底",
+				req.userID, len(out.residual))
+		}
 		return
 	}
 
@@ -507,6 +519,15 @@ func (s *Services) ProxyDrainPendingCount() (int64, error) {
 // 是运行期才知道的，让协程自己每轮判断，比在启动时猜一次更不容易漏。
 // 返回值在协程退出时关闭，供关闭阶段等待（见 cmd/panel/main.go 的 workers）。
 func (s *Services) StartProxyDrainWorker(ctx context.Context) <-chan struct{} {
+	// 未配置 frps 管理接口是**静态**配置缺失，不是暂时故障：重试一万次也
+	// 不会成功，进补偿队列只会让内存涨满并刷日志。但也不能静默——那意味着
+	// 这个部署**根本没有断流手段**，删号/禁用之后已建立的流量会一直跑到
+	// 客户端自己退出。所以启动时就明确告警一次（见缺陷 4）。
+	if s.Frps == nil {
+		log.Printf("[proxy-drain] 未配置 frps 管理接口：本部署无法主动断开已建立的代理流量，" +
+			"删除/禁用账号后残留的转发只能等客户端自己退出。请配置 frps 管理地址以启用断流。")
+	}
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -516,6 +537,9 @@ func (s *Services) StartProxyDrainWorker(ctx context.Context) <-chan struct{} {
 		if n := s.retryPendingProxyDrains(ctx); n > 0 {
 			log.Printf("[proxy-drain] 启动时恢复了 %d 份待办的断流，将继续重试", n)
 		}
+		// 补偿队列里可能有上一个进程周期遗留的意图吗？没有——它在内存里。
+		// 这里 flush 一次是为了覆盖「启动瞬间数据库刚恢复」的情况。
+		s.flushProxyDrainFallback()
 
 		for {
 			select {
@@ -525,6 +549,10 @@ func (s *Services) StartProxyDrainWorker(ctx context.Context) <-chan struct{} {
 				if n := s.retryPendingProxyDrains(ctx); n > 0 {
 					log.Printf("[proxy-drain] 仍有 %d 份断流待办未完成，将在下个周期继续重试", n)
 				}
+				// 顺带尝试补写进程内补偿队列（数据库可能已经恢复）。
+				// 放在同一个 ticker 里而不是另起一个：两者都是「每 30 秒检查
+				// 一次断流相关状态」，分开只会多一个协程与一个定时器。
+				s.flushProxyDrainFallback()
 			}
 		}
 	}()

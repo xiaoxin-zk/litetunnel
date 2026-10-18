@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os/exec"
@@ -12,10 +11,20 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
-// 本文件是**唯一**执行 docker 命令的地方。
+// 本文件是**Compose 执行器**：本服务唯一会起容器的地方。
 //
 // 单独成文件是为了让「本服务到底能动宿主机的什么」一目了然：
 // 只有这里能起容器，而它只认一个 compose 文件与两个写死的服务名。
+//
+// # 各部分在哪
+//
+//	docker_exec.go —— 怎么调 docker、调不动时算哪一类错误
+//	本文件          —— 用 compose 做什么：重建、核对状态、读状态
+//	dockerprobe.go —— 宿主机「能不能用」（只读探测，不改变任何状态）
+//
+// 拆开的理由：前者的正确性只关乎「命令跑没跑起来、错误归哪一类」，后者关乎
+// 「重建什么、怎么确认它真的起来了」。混在一起时，改一处错误分类就得重读
+// 整段 compose 逻辑。
 
 // dockerTimeout 覆盖一次 docker 调用的最长时间。
 // 校验要起一个临时容器（首次可能要拉镜像），重建容器也要几秒到几十秒。
@@ -123,11 +132,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	out, err := runDockerIn(probeCtx, s.paths.deployDir,
-		"compose",
-		"--env-file", s.paths.envFile,
-		"-f", s.paths.composeFile,
-		"ps", "-a", "--format", "{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}")
+	out, err := runDockerIn(probeCtx, s.paths.deployDir, composePSArgs(s.paths)...)
 	if err != nil {
 		return nil
 	}
@@ -161,11 +166,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 func (s *service) notRunningServices(ctx context.Context) ([]string, error) {
 	// 用 --all + 明确分隔符读取状态、健康度和退出码；只看 --services 会把
 	// 「容器启动后立即退出」误认为服务存在并返回成功。
-	out, err := runDockerIn(ctx, s.paths.deployDir,
-		"compose",
-		"--env-file", s.paths.envFile,
-		"-f", s.paths.composeFile,
-		"ps", "-a", "--format", "{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}")
+	out, err := runDockerIn(ctx, s.paths.deployDir, composePSArgs(s.paths)...)
 	if err != nil {
 		return nil, hostError(fmt.Errorf("重建后无法确认容器状态: %v\n%s", err, out))
 	}
@@ -196,84 +197,16 @@ func (s *service) notRunningServices(ctx context.Context) ([]string, error) {
 	return missing, nil
 }
 
-func runDocker(ctx context.Context, args ...string) (string, error) {
-	return runDockerIn(ctx, "", args...)
-}
-
-// runDockerIn 在指定目录执行 docker 命令；dir 为空时沿用当前目录。
-func runDockerIn(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.CombinedOutput()
-	text := strings.TrimSpace(string(out))
-	if err != nil {
-		if ctx.Err() != nil {
-			// 保留 context 错误，让调用方能用 errors.Is 判断超时/取消——
-			// 这两者都意味着「宿主机动不了」，该按 502 处理。
-			return text, fmt.Errorf("docker 调用中断: %w", ctx.Err())
-		}
-		// daemon 不可用 / socket 权限不足同样是 ExitError：在这里就把它
-		// 标出来，调用方不必再去猜输出文本里哪一段才是原因。
-		if looksLikeDockerHostFailure(text) {
-			return text, fmt.Errorf("%w: %v", errDockerHost, err)
-		}
-		return text, err
-	}
-	return text, nil
-}
-
-// errDockerHost 表示 docker 命令确实执行了，但宿主机侧不可用：daemon 没起来、
-// socket 权限不足、命名管道不存在、compose 插件缺失。
+// composePSArgs 组装 `docker compose ps` 的参数。
 //
-// 这类失败必须与「配置写错了」分开：它们不是用户能靠改配置文件解决的，
-// 报 422 会把运维问题指向错误的方向（用户会一直怀疑自己的 Caddyfile）。
-var errDockerHost = errors.New("docker 宿主机不可用")
-
-// dockerHostFailureHints 是 docker CLI 在这些情形下的固定说法（小写匹配）。
-//
-// docker daemon 不可用、权限拒绝、socket 断开都表现为 ExitCode != 0，
-// 而不是启动失败（*exec.Error）——只按错误类型判断时，它们会被归成
-// 「命令执行了但没通过」，于是统统变成 422 配置错误。
-var dockerHostFailureHints = []string{
-	"cannot connect to the docker daemon",
-	"is the docker daemon running",
-	"error during connect",
-	"permission denied while trying to connect to the docker daemon",
-	"connect: permission denied",
-	"docker.sock",
-	"is not a docker command",
-	"docker: not found",
-	"the system cannot find the file specified",
-}
-
-// looksLikeDockerHostFailure 判断 docker 的输出是否指向宿主机侧故障。
-func looksLikeDockerHostFailure(output string) bool {
-	lower := strings.ToLower(output)
-	for _, hint := range dockerHostFailureHints {
-		if strings.Contains(lower, hint) {
-			return true
-		}
+// serviceStates 与 notRunningServices 查的是同一件事，参数必须一模一样：
+// 一处多给或少给一个 flag，两边的状态判断就会分叉——而它们一个用于「如实
+// 上报」，一个用于「认定应用成功」，分叉的表现是界面说成功、实际没起来。
+func composePSArgs(p paths) []string {
+	return []string{
+		"compose",
+		"--env-file", p.envFile,
+		"-f", p.composeFile,
+		"ps", "-a", "--format", "{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}",
 	}
-	return false
-}
-
-// isHostDockerError 判断一次 docker 调用失败是「宿主机动不了」（docker 命令
-// 不存在/不可执行、daemon 连不上、调用超时或被取消），还是「命令执行了但
-// 没通过」（例如 caddy 拒绝了这份配置）。前者按 502 处理，后者是配置问题
-// 按 422 处理。
-func isHostDockerError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var ee *exec.Error
-	if errors.As(err, &ee) {
-		// 命令都没能启动：docker 二进制不存在或不可执行。
-		return true
-	}
-	if errors.Is(err, errDockerHost) {
-		return true
-	}
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }

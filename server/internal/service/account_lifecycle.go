@@ -27,6 +27,9 @@ package service
 
 import (
 	"errors"
+	"fmt"
+	"log"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -35,7 +38,7 @@ import (
 )
 
 // accountPurgeTx 在调用方已持有用户锁的前提下，把账号及其关联数据全部删掉，
-// 返回需要回收的防火墙端口清单。
+// 并在**同一个事务内**登记断流与收回端口的意图。
 //
 // 调用方必须持有 s.userLock(userID)：这里只做数据库操作，不做加锁。
 // 把加锁留给调用方是为了让「锁罩住的范围」在调用点可见——锁必须只罩住
@@ -43,7 +46,11 @@ import (
 //
 // verify 非空时在锁内、事务内复核密码：注销必须基于**当前**密码，而不是
 // 请求开始时的旧快照（并发改密会让事务外的校验结论作废）。
-func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) ([]portProto, error) {
+//
+// 返回值 intents 是事务内已登记的防火墙意图，供提交后立刻执行一次
+// （见 executePortIntentsAfterCommit）。它不承担正确性——意图已经在库里，
+// 执行失败由后台 worker 接手（见 outbox.go 开头的说明）。
+func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) ([]portIntent, error) {
 	// 锁住用户行：userLock 只在进程内互斥，多副本下挡不住另一台实例
 	// 同时在给这个账号建隧道。建隧道的事务也锁这一行（见 CreateTunnel），
 	// 锁上之后两者只剩先后关系——要么隧道已在端口清单里，要么建隧道
@@ -63,7 +70,7 @@ func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) 
 		}
 	}
 
-	// 端口在**事务内**读取：删完之后再由调用方回收（见 purgeAccountAfterCommit）。
+	// 端口在**事务内**读取：删完之后就再也查不回来了（见 portsOfTunnels）。
 	var tunnels []model.Tunnel
 	if err := tx.Where("user_id = ? AND remote_port > 0", userID).Find(&tunnels).Error; err != nil {
 		return nil, err
@@ -97,11 +104,79 @@ func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) 
 	if err := purgeAccountCredentialsTx(tx, userID, u.Email); err != nil {
 		return nil, err
 	}
+
+	// 关键：意图必须在删 users 行**之前**、且在同一事务内登记（见缺陷 1）。
+	// 这里失败会让整个事务回滚——宁可这次删除失败让用户重试，也不能留下
+	// 「账号没了、流量还活着、端口还开着、没有任何待办」的状态。
+	intents, err := recordPurgeIntentsTx(tx, userID, ports)
+	if err != nil {
+		return nil, err
+	}
+
 	// 兑换流水与登录日志保留：它们属于审计数据，删除会让风控出现盲区。
 	if err := tx.Delete(&model.User{}, userID).Error; err != nil {
 		return nil, err
 	}
-	return ports, nil
+	return intents, nil
+}
+
+// recordPurgeIntentsTx 在删号事务内登记「断流」与「收回端口」两组意图。
+//
+// # 为什么必须在事务内、且在删 users 行之前
+//
+// 这是缺陷 1 的根本修复点。以前的顺序是「事务提交 → 善后里登记待办」，
+// 中间存在一个提交后崩溃窗口：账号与隧道已经删了，而 frps 上的数据流还在
+// 转发、宿主机上的放行规则还开着，重启后**没有任何线索**能找回它们
+// （users 行已不存在，无从反推前缀；隧道记录已删，无从反推端口）。
+//
+// 把意图与 DELETE 写进同一个事务之后，「数据已删」与「待办已存在」成为同一个
+// 原子事实：提交点之前任何一步失败都整体回滚，提交之后进程无论何时死掉，
+// 重启后的后台 worker 都能捡到那行待办继续执行。
+//
+// 放在删 users 行**之前**是因为：断流意图要记录 userID 与状态代次，这些信息
+// 在事务内随时可读，但把「写意图」放在最后一条 DELETE 之前能让「事务里最后
+// 一个动作是删除」这件事保持直观——真出问题时 binlog/慢日志里看到的顺序
+// 与代码一致。
+func recordPurgeIntentsTx(tx *gorm.DB, userID uint, ports []portProto) ([]portIntent, error) {
+	// 断流意图：复用既有的 ProxyDrainPending（按用户一条，带围栏令牌）。
+	//
+	// 这里只登记「意图」，真正的关闭动作在提交后由 drainProxies 立即尝试一次，
+	// 失败留给 proxy_drain_retry.go 的后台 worker。Deleted=true 让 worker 知道
+	// 账号已不存在，走「按前缀 + 实例身份尽力关闭」那条路径。
+	now := time.Now()
+	pending := model.ProxyDrainPending{
+		UserID:    userID,
+		Prefix:    FrpUserOf(userID) + ".",
+		StatusGen: 0, // 删除路径没有状态代次可比（见 StatusGen 的说明）
+		NotAfter:  0, // 删除路径用 IntentAt 作时间水位
+		Deleted:   true,
+		IntentAt:  now.Unix(),
+		// NextAt 兼作租约到期时间：登记时设成「现在就到期」，
+		// 后台 worker 下一轮就能领到它（提交后立即执行失败时）。
+		NextAt: now,
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"prefix", "status_gen", "not_after", "deleted", "intent_at", "next_at", "attempts", "exhausted", "fence", "last_err"}),
+	}).Create(&pending).Error; err != nil {
+		// 写不进去就让整个删号回滚：宁可这次删除失败让管理员重试，
+		// 也不能留下「账号没了、流量还活着、没有任何待办」的状态。
+		return nil, fmt.Errorf("登记断流待办失败，已回滚本次删除: %w", err)
+	}
+
+	// 防火墙意图：每个端口一条，与删隧道那条路径共用同一套收敛语义。
+	var intents []portIntent
+	for _, p := range ports {
+		if p.port <= 0 {
+			continue
+		}
+		gen, err := firewallIntentTx(tx, p.port, p.proto, false)
+		if err != nil {
+			return nil, err
+		}
+		intents = append(intents, portIntent{port: p.port, proto: p.proto, open: false, gen: gen})
+	}
+	return intents, nil
 }
 
 // purgeAccountAfterCommit 是两条删除路径共用的善后流程。
@@ -128,13 +203,16 @@ func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) 
 //
 //  3. 回收防火墙端口：隧道没了，宿主机上的放行规则要收回，否则会一直留着。
 //     放在最后：回收失败（helper 不可达、端口受保护）不该让已经完成的删除
-//     回滚；失败会记日志，由人工清理。
+//     回滚。
 //
-// ports 来自事务内收集的端口清单。并发建隧道的窗口已由事务开头的用户行锁
-// 关掉：建隧道的事务同样要先锁用户行，本事务提交之前它插不进来；提交之后
-// 它重读用户会得到「不存在」而整体失败。所以 ports 与这次 DELETE 删掉的
-// 隧道是同一批，不会漏出孤儿端口。
-func (s *Services) purgeAccountAfterCommit(userID uint, ports []portProto) {
+// intents 来自**事务内**登记的防火墙意图（见 recordPurgeIntentsTx）。并发建隧道
+// 的窗口已由事务开头的用户行锁关掉：建隧道的事务同样要先锁用户行，本事务提交
+// 之前它插不进来；提交之后它重读用户会得到「不存在」而整体失败。所以这批意图
+// 与这次 DELETE 删掉的隧道是同一批，不会漏出孤儿端口。
+//
+// 注意这里**不是**补偿的来源：意图已经在库里，本函数只是「提交后立刻尝试一次」
+// 以缩短窗口。失败会由后台 worker 继续处理（见 outbox.go 开头的说明）。
+func (s *Services) purgeAccountAfterCommit(userID uint, intents []portIntent) {
 	// 所有管理路径写准入标记前都递增版本号（见 Runtime.guardVer），
 	// 让在途的后台刷新识别「快照已过时」并让路。
 	s.Runtime.BumpGuardVer()
@@ -148,5 +226,16 @@ func (s *Services) purgeAccountAfterCommit(userID uint, ports []portProto) {
 	s.Runtime.DropUserSessions(userID)
 
 	s.closeUserProxiesAfterDelete(userID)
-	s.closePorts(ports)
+	// 端口意图已经随事务提交落库；这里立刻执行一次，失败留给后台 worker。
+	if pending, fatal, warnings := s.executePortIntentsAfterCommit(intents); pending > 0 {
+		if fatal != nil {
+			// 连重试队列都没进去：这些端口可能永久开着，必须人工处理。
+			// 账号已经删了，没有任何接口能再触发一次收回。
+			log.Printf("[user] 删除用户 %d 后有 %d 个端口规则未能收回且无法自动重试（%v），需手工关闭：%s",
+				userID, pending, fatal, firewallPendingWarning(warnings, pending))
+		} else {
+			log.Printf("[user] 删除用户 %d 后仍有 %d 个端口规则未收回，已进入重试队列：%s",
+				userID, pending, firewallPendingWarning(warnings, pending))
+		}
+	}
 }

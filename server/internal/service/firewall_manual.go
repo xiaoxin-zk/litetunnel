@@ -33,17 +33,6 @@ func portsOfTunnels(tunnels []model.Tunnel) []portProto {
 	return out
 }
 
-// closePorts 逐个回收端口。
-//
-// 不返回错误：调用方此刻已经删完数据了，让回收失败把「删除成功」
-// 变成错误返回，只会让管理员以为没删掉而重复操作。
-// 但失败不能只留一行日志——会进待重试队列，由后台反复尝试。
-func (s *Services) closePorts(ports []portProto) {
-	for _, p := range ports {
-		s.applyPortIntent(p.port, p.proto, false)
-	}
-}
-
 // FirewallManualOpen 管理员手工放行端口。
 //
 // 与 FirewallOpenPort 的区别在于「失败时的态度」：

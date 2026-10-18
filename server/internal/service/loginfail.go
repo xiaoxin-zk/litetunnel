@@ -64,8 +64,19 @@ const (
 type loginFailCounter interface {
 	// record 记一次失败。
 	record(account string, now time.Time)
-	// count 返回窗口内的失败次数。窗口过期即视为 0。
-	count(account string, now time.Time) int
+	// count 返回窗口内的失败次数，以及这个数字是否**完整可信**。
+	//
+	// 第二个返回值是为 fail-closed 准备的，不是装饰。落库版在读库失败时
+	// 只能返回本实例的补记数——它可能是 0，也可能只是真实计数的一小部分。
+	// 如果签名只给 int，调用方（CaptchaRequired）就只能把「读不到」当成
+	// 「没有失败」，多实例下攻击者可以用一次数据库抖动绕开账号级验证码。
+	//
+	// 所以这里显式区分「数是几」与「数是否可信」，让调用方必须处理后者：
+	// ok=false 时调用方按「更严格」的方向走，而不是按数字大小走。
+	//
+	// 不用 -1 之类的哨兵值：那要求每个调用点都记得判哨兵，漏一处就静默
+	// 失效；而两个返回值不判就用不掉（至少会多一个变量），编译器会盯着。
+	count(account string, now time.Time) (n int, ok bool)
 	// reset 在登录成功时清零。
 	reset(account string)
 }
@@ -139,12 +150,15 @@ func (c *memoryLoginFailureCounter) record(account string, now time.Time) {
 	c.entries[account] = e
 }
 
-// count 返回窗口内的失败次数。窗口过期即视为 0，且不立刻删除条目——
-// 下次 record 会把它覆盖掉，没必要为一次读多拿一次写锁。
-func (c *memoryLoginFailureCounter) count(account string, now time.Time) int {
+// count 返回窗口内的失败次数。
+//
+// 纯进程内的实现**永远**返回 ok=true：这份数据就在本进程内存里，
+// 不存在「读不到」这个状态，要么读到值、要么根本没有这条记录。
+// ok=false 只对落库版有意义（见 dbLoginFailureCounter.count）。
+func (c *memoryLoginFailureCounter) count(account string, now time.Time) (int, bool) {
 	account = normalizeAccount(account)
 	if account == "" {
-		return 0
+		return 0, true
 	}
 
 	c.mu.Lock()
@@ -152,9 +166,9 @@ func (c *memoryLoginFailureCounter) count(account string, now time.Time) int {
 
 	e, ok := c.entries[account]
 	if !ok || now.Sub(e.since) >= loginFailWindow {
-		return 0
+		return 0, true
 	}
-	return e.count
+	return e.count, true
 }
 
 // reset 在登录成功时清零。

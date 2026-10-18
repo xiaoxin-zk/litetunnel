@@ -441,6 +441,89 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 	}
 }
 
+// TestListProxiesDetectsCollectionChangeWithSameTotal 覆盖「删一条 + 加一条、
+// total 不变」这种最隐蔽的分页错位。
+//
+// 分页接口没有稳定快照：frps 按 (type, name) 排序后切片，翻页期间有人删了一条
+// 又加了一条，total 自始至终不变，但删除点之后的页整体错位一格——被跳过的那条
+// 旧代理不在结果里（随后被判离线），新加的那条被多读一次（随后被判在线）。
+// 条数校验、total 校验、重复校验**全部发现不了**，只有翻页结束后复检第 1 页
+// 才能看出来（见 recheckFirstPage）。
+//
+// 构造：第 1 轮第 1 页是 A 组、第 2 页是 B 组；第 2 轮（复检）第 1 页换成 A'
+// 组（条数完全相同、只有内容变了），于是复检必须报不稳定。
+func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	// total 固定 2：一页放 1 条，共两页，保证一定翻页（单页不走复检）。
+	const total = 2
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+
+		page := r.URL.Query().Get("page")
+		// 第 1 页在第 3 次请求（= 第 2 轮复检）时换名字：
+		// 条数没变、total 没变，只有集合变了。
+		var name string
+		switch {
+		case page == "1" && n <= 2:
+			name = "lt_u1.a"
+		case page == "1":
+			name = "lt_u1.a-new" // 一删一增之后的名单
+		default:
+			name = "lt_u1.b"
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%s,"pageSize":1,"items":[{"name":%q,"status":{"phase":"online"}}]}}`,
+			total, page, name)
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("total 不变但集合变化应报错，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("结果不稳定时不应返回代理列表：错位的条目会让人被判离线、让新代理被多计流量")
+	}
+	if !strings.Contains(err.Error(), "分页期间") {
+		t.Fatalf("错误信息应说明分页期间发生变化，实际: %v", err)
+	}
+}
+
+// TestListProxiesRechecksFirstPageOnlyWhenPaginated 覆盖「单页不做复检」。
+//
+// 单页时 total 与 items 出自 frps 的同一次请求（同一个切片算出来的），本身就是
+// 一致快照，再复检一次只是白花一个往返。健康检查与采集是高频路径，这个开销必须
+// 省掉。
+func TestListProxiesRechecksFirstPageOnlyWhenPaginated(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":%d,"items":[{"name":"lt_u1.only","status":{"phase":"online"}}]}}`,
+			frpsPageSize)
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err != nil {
+		t.Fatalf("单页列表不该报错: %v", err)
+	}
+	if len(proxies) != 1 {
+		t.Fatalf("期望 1 条，实际 %d 条", len(proxies))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 1 {
+		t.Fatalf("单页只应请求 1 次（不做复检），实际 %d 次", requests)
+	}
+}
+
 // TestCloseUserProxiesStopsWhenStatusChanges 覆盖「断流途中账号被重新启用」。
 //
 // 禁用流程在放掉用户锁之后才断流（断流可能十几秒）。这段时间里管理员可以把

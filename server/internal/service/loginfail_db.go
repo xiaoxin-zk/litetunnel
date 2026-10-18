@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,14 @@ const (
 	loginFailLogInterval = time.Minute
 )
 
+// errLoginFailCounterDegraded 是「失败计数暂时不可信」时的哨兵错误。
+//
+// 不用它做错误串拼接：count 走的是 (int, bool) 而不是 error 返回，
+// 因为这里的调用方（CaptchaRequired）需要的是一个明确的布尔判断，
+// 而不是去 errors.Is 一个字符串。保留它是为了让日志与测试有共同的锚点：
+// 日志里用它说明「这不是某个具体数据库错误，而是降级本身」。
+var errLoginFailCounterDegraded = errors.New("账号级失败计数已降级：跨实例计数不可读")
+
 // dbLoginFailureCounter 是落库版计数。
 type dbLoginFailureCounter struct {
 	db *gorm.DB
@@ -84,6 +93,24 @@ type dbLoginFailureCounter struct {
 	// 两类错误各自限流，避免抖动期间刷日志。
 	lastWriteErrAt atomic.Int64
 	lastReadErrAt  atomic.Int64
+
+	// degraded 表示「最近一次读库失败了，跨实例计数暂时不可信」。
+	//
+	// 这个标志是给**外部观察者**的（健康检查、管理页）：原先降级只体现为
+	// 一行限流日志，而日志会被滚动掉、也没人会去翻。一个能被查询的状态
+	// 才能让运维知道「这段时间账号级阈值只在单实例内成立」。
+	//
+	// 只在读成功后清除（见 markRecovered）：一次成功的读就说明库又看得见了。
+	degraded atomic.Bool
+
+	// degradedTotal 是累计降级次数（读库失败次数）。
+	//
+	// 与布尔标志的区别：标志回答「现在是否降级」，计数回答「降级有多频繁」。
+	// 反复抖动（每次都在阈值窗口内被攻击者利用）与一次瞬时故障，在运维
+	// 判断上是完全不同的事，而布尔值区分不了。
+	//
+	// 不清零：它是历史事实，清掉等于掩盖「这里曾经不稳定」。
+	degradedTotal atomic.Int64
 }
 
 // newLoginFailureCounter 构造账号级失败计数。
@@ -154,20 +181,74 @@ func (c *dbLoginFailureCounter) bump(account string, now time.Time) error {
 	}).Create(&row).Error
 }
 
-// count 返回窗口内的失败次数：库里的计数 + 本实例写库失败的补记。
-func (c *dbLoginFailureCounter) count(account string, now time.Time) int {
+// count 返回窗口内的失败次数，以及这个数字是否完整可信。
+//
+// # 为什么读失败时不能返回「本实例补记数 + ok=true」
+//
+// 这是本函数原先的写法，也是缺陷 6：读库失败时返回 c.missed.count(...)，
+// 那个值在没有写库失败的情况下**就是 0**。而 count 的唯一用途是
+// CaptchaRequired 的阈值判定，于是：
+//
+//	数据库短暂读故障 → 读到 0 → 未达阈值 → 不要求验证码
+//
+// 多实例下这是个可利用的绕过：攻击者只要等到（或制造）一次数据库抖动，
+// 就能让账号级验证码阈值失效；而账号级验证码恰恰是分布式爆破的唯一克星
+// （硬锁按「账号+IP」计，分布式来源每个 IP 各有额度）。
+//
+// 所以这里改成两件事：
+//   - 第二个返回值 ok=false 表示「这个数是不完整的」，由调用方按更严格的
+//     方向处理（见 CaptchaRequired）；
+//   - 同时置降级标志并计入降级计数，供健康检查/管理页展示，
+//     用 logThrottled 告警（限流，避免抖动期间刷屏）。
+//
+// 返回值仍然给出补记数（而不是 0）：调用方若需要「至少有这么多」时
+// 可以直接用，但**不能**把它当成完整计数。
+//
+// # 恢复
+//
+// 降级标志只在读成功后清除：一次成功的读说明数据库又看得见了，
+// 此时库里的计数（加上补记）是完整的。
+func (c *dbLoginFailureCounter) count(account string, now time.Time) (int, bool) {
 	account = normalizeAccount(account)
 	if account == "" {
-		return 0
+		return 0, true
 	}
-	missed := c.missed.count(account, now)
+	// 补记表是进程内的，它的 count 永远可信（第二个返回值恒为 true），
+	// 这里显式丢弃：本函数自己的可信度只取决于**读库**是否成功。
+	missed, _ := c.missed.count(account, now)
 	n, err := c.read(account, now)
 	if err != nil {
-		// 读不到时只能信补记。这里不当成 0，也不缓存历史值（见文件头）。
-		c.logThrottled(&c.lastReadErrAt, "读取", err)
-		return missed
+		// 读不到：这个数不完整，方向必须是 fail-closed。
+		//
+		// 不缓存历史值到进程内（见文件头）：那会让别的实例上的
+		// 「登录成功清零」失效，本实例拿着旧值继续要求验证码。
+		c.markDegraded()
+		c.logDegradedThrottled(err)
+		return missed, false
 	}
-	return n + missed
+	c.markRecovered()
+	return n + missed, true
+}
+
+// markDegraded 记录「本次读库失败，计数已降级」。
+//
+// 两个动作分开看：
+//   - degraded 置位：给 CaptchaRequired / 健康检查一个可查询的信号，
+//     不再依赖「有人恰好看到了那行日志」；
+//   - degradedTotal 累加：抖动可能反复发生，累计次数能说明「这是常态还是
+//     一次性故障」，而布尔标志只能说明「刚刚发生过」。
+//
+// 用 atomic 而不是加锁：这条路径在登录热路径上，且只是两个独立的计数器，
+// 不需要原子性地一起更新（读到「标志已置位、计数还没加」不会导致误判，
+// 两个方向都是 fail-closed）。
+func (c *dbLoginFailureCounter) markDegraded() {
+	c.degraded.Store(true)
+	c.degradedTotal.Add(1)
+}
+
+// markRecovered 在读成功后清除降级标志。降级累计次数不清：它是历史事实。
+func (c *dbLoginFailureCounter) markRecovered() {
+	c.degraded.Store(false)
 }
 
 // read 做一次主键等值查询。
@@ -209,6 +290,49 @@ func (c *dbLoginFailureCounter) reset(account string) {
 		Delete(&model.LoginFailCounter{}).Error; err != nil {
 		c.logThrottled(&c.lastWriteErrAt, "清除", err)
 	}
+}
+
+// LoginFailDegraded 报告账号级失败计数当前是否处于降级状态。
+//
+// 降级意味着「最近一次读库失败，跨实例的失败计数暂时不可信」——
+// 此时 CaptchaRequired 会按 fail-closed 处理（见它的注释），
+// 账号级验证码阈值在多实例下只在单实例范围内成立。
+//
+// 供健康检查与管理页展示。为什么需要它能被查询：
+//   - 原先降级只留下一行限流日志，日志会被滚动掉，运维无从判断
+//     「刚才那波登录异常时防线是不是弱了」；
+//   - 多实例部署里这是个**安全状态**而不是性能指标，应该能被告警系统抓取，
+//     而不是等出了事再翻日志。
+//
+// 纯进程内实现永远返回 false：那份计数就在内存里，不存在读不到的情况。
+func (s *Services) LoginFailDegraded() bool {
+	if s == nil || s.loginFails == nil {
+		return false
+	}
+	c, ok := s.loginFails.(*dbLoginFailureCounter)
+	if !ok {
+		return false
+	}
+	return c.degraded.Load()
+}
+
+// LoginFailDegradedTotal 返回累计的计数降级次数（读库失败次数）。
+//
+// 与 LoginFailDegraded 的区别：那个回答「现在是否降级」，这个回答
+// 「一共降级过多少次」。反复抖动与一次性故障在运维判断上完全不同，
+// 而布尔值区分不了——攻击者恰好卡在抖动窗口里时，只看到 false/true
+// 的翻转是察觉不到规律的。
+//
+// 不清零：它是历史事实。
+func (s *Services) LoginFailDegradedTotal() int64 {
+	if s == nil || s.loginFails == nil {
+		return 0
+	}
+	c, ok := s.loginFails.(*dbLoginFailureCounter)
+	if !ok {
+		return 0
+	}
+	return c.degradedTotal.Load()
 }
 
 // purgeExpired 分批删除窗口已过期的行，返回删除条数。
@@ -301,6 +425,23 @@ func (c *dbLoginFailureCounter) logThrottled(last *atomic.Int64, action string, 
 	}
 	log.Printf("[loginfail] 账号级失败计数%s失败（跨实例累加已退化，本实例仍按补记/库内值判定；"+
 		"窗口 %s）: %v", action, loginFailWindow, err)
+}
+
+// logDegradedThrottled 是专供「读失败导致降级」的限流日志。
+//
+// 与 logThrottled 分开一条日志，因为这两件事对运维的含义不同：
+//   - 写失败：这一次累加没进库，但**已经记进补记**，判定仍然成立；
+//   - 读失败：整个计数不可信，CaptchaRequired 会按 fail-closed 强制要求
+//     验证码。用户侧会看到「本来不用验证码，现在要了」——这是有意的，
+//     但它说明防线正在靠「多要一次验证码」兜底，需要尽快修数据库。
+//
+// 两件事共用同一个 lastReadErrAt 会互相压制（读失败限流一次之后，
+// 写失败的日志就被吞掉），所以这里用 errLoginFailCounterDegraded 作为
+// 日志内容的锚点，而不是再抢一个独立的限流窗口——降级本身已经由
+// degraded / degradedTotal 两个字段暴露给外部，日志只是补充。
+func (c *dbLoginFailureCounter) logDegradedThrottled(cause error) {
+	c.logThrottled(&c.lastReadErrAt, "读取",
+		fmt.Errorf("%w: %v", errLoginFailCounterDegraded, cause))
 }
 
 // PurgeExpiredLoginFails 清理窗口已过期的计数行，返回删除条数。

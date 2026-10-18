@@ -171,6 +171,27 @@ type Services struct {
 	fwMu      sync.Mutex
 	fwPending map[int]pendingFW
 
+	// drainFallback 是断流意图**写不进数据库**时的进程内兜底队列（缺陷 4）。
+	//
+	// 为什么需要它：断流意图已经改成「先落库再动手」，但数据库整体不可用时
+	// recordProxyDrainPending 只能返回空串，于是本次若也没关干净，残留代理就
+	// 只剩日志里那一行。日志会被滚动掉，重启后没有任何线索。
+	//
+	// 这个队列把意图留在内存里，由后台每 30 秒尝试补写回库（见
+	// proxy_drain_fallback.go）。它不是正确性的来源——真正的来源是「意图与
+	// 业务变更同事务」（见 outbox.go）；它只覆盖「连事务都写不进去」这种
+	// 数据库整体故障。
+	drainFallback *proxyDrainFallbackQueue
+
+	// drainRaceSuspects 统计「关闭请求返回成功，但同名代理随后以**另一个实例
+	// 身份**重新出现」的次数（缺陷 3）。
+	//
+	// 这个数不是错误计数，而是「我们可能误关了刚重连的新实例」的计数器：
+	// frps 的关闭接口只认名字，比对与删除之间必然有窗口，无法彻底消除。
+	// 既然无法消除，至少要让它**可见**——否则一次误关只会表现为「用户说
+	// 连上又断了」，从日志里分不清是断流、是网络还是客户端自身问题。
+	drainRaceSuspects atomic.Int64
+
 	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
 	userLocks [userLockShards]sync.Mutex
 
@@ -328,6 +349,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		recoveryCounters: &recoveryCounters{},
 		fwPending:        map[int]pendingFW{},
 		fwKick:           make(chan struct{}, 1),
+		drainFallback:    newProxyDrainFallbackQueue(),
 		statusGens:       map[uint]userStatusEntry{},
 		auditCounters:    &auditCounters{},
 	}

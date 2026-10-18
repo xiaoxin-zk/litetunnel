@@ -156,10 +156,12 @@ func TestRenderCaddyHTTPMode(t *testing.T) {
 		t.Skipf("跳过：%v", err)
 	}
 	vars := map[string]string{
-		"LT_USER_DOMAIN": "203.0.113.10",
-		"LT_USER_SCHEME": "http",
-		"LT_HSTS_ON":     "",
-		"LT_USER_PORT":   "7848",
+		"LT_USER_DOMAIN":      "203.0.113.10",
+		"LT_USER_SCHEME":      "http",
+		"LT_HSTS_ON":          "",
+		"LT_USER_PORT":        "7848",
+		"LT_ACME_EMAIL":       "admin@example.com",
+		"LT_ADMIN_ALLOW_CIDR": "127.0.0.1/32",
 	}
 	out, err := Render(string(raw), vars)
 	if err != nil {

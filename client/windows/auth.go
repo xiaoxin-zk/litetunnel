@@ -249,28 +249,12 @@ func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 	a.authGeneration++
 	a.cfg.APIKey = ""
 	a.cfg.ServerURL = ""
-	a.username = ""
-	a.apiKeyMask = ""
-	a.tunnels = nil
-	a.gatewayHost = ""
-	a.gatewayPort = 0
-	a.tunnelDomain = ""
-	a.trafficUsed = 0
-	a.trafficQuota = 0
-	a.exceeded = false
-	a.group = nil
-	a.paymentEnabled = false
-	a.balanceCents = 0
-	// 清掉已写入的配置记录：换个账号接入后，旧账号的配置文本不该再参与比对。
-	a.applied = map[uint]string{}
-	// 隧道错误记录与退避状态也一并清掉：换个账号后，旧账号的失败原因会指向
-	// 错误的排查方向，而退避时间会让新账号的隧道白白多等一会儿。
-	a.tunnelErrs = map[uint]tunnelErr{}
-	a.retries = map[uint]*retryState{}
-	// 连接起点也是按隧道 id 记账的：换了账号之后这些 id 指向别的隧道，
-	// 留着只会让新账号的隧道显示一段不属于它的等待时长。
-	a.connectAt = map[uint]time.Time{}
+	a.resetPerAccountState()
 	a.mu.Unlock()
+
+	// 日志缓冲属于「旧账号的历史」，也必须清掉：否则换账号后界面上会先冒出一段
+	// 上一个账号的日志。单独在 a.mu 之外清——ClearLogs 自己拿 logMu。
+	a.ClearLogs()
 
 	// 磁盘上**所有**含凭据的文件都要清掉，不只是主配置。
 	//
@@ -298,6 +282,44 @@ func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
 		}
 	}
 	return a.GetState(), nil
+}
+
+// resetPerAccountState 清空一切账号派生状态。
+//
+// 调用方必须已持有 a.mu。
+//
+// 退出登录后这些字段若不清空，换账号接入（或新账号复用了旧账号的隧道 id）时，
+// 会短暂显示旧账号的连接状态、错误与提示：
+//   - registered / registeredAt：让新账号的隧道被标成「运行中」；
+//   - tunnelErrs / errEmitAt：界面显示旧账号的失败原因与限频残留；
+//   - cleanupWarned / cfgRev：指向已经不存在的配置与清理提示；
+//   - retries / connectAt：让新隧道多等一段退避，或显示不属于它的等待时长。
+//
+// 日志缓冲不在这里清：它由 logMu 保护，这里已持有 a.mu，再拿 logMu 会引入
+// 锁序；由 logout 在 a.mu 之外调 ClearLogs 单独清。
+func (a *App) resetPerAccountState() {
+	a.username = ""
+	a.apiKeyMask = ""
+	a.tunnels = nil
+	a.gatewayHost = ""
+	a.gatewayPort = 0
+	a.tunnelDomain = ""
+	a.trafficUsed = 0
+	a.trafficQuota = 0
+	a.exceeded = false
+	a.group = nil
+	a.paymentEnabled = false
+	a.balanceCents = 0
+
+	a.applied = map[uint]string{}
+	a.cfgRev = map[uint]string{}
+	a.tunnelErrs = map[uint]tunnelErr{}
+	a.retries = map[uint]*retryState{}
+	a.registered = map[uint]bool{}
+	a.registeredAt = map[uint]time.Time{}
+	a.connectAt = map[uint]time.Time{}
+	a.errEmitAt = map[uint]time.Time{}
+	a.cleanupWarned = map[uint]bool{}
 }
 
 // currentCredential 返回当前接入用的长期凭据。

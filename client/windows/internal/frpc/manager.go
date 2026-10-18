@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +113,13 @@ type Manager struct {
 	// 由单一协程按序投递」。
 	pending  []logEntry
 	emitWake chan struct{}
+	// pendingDropped 记录投递队列溢出时被丢掉的条数，由投递协程补一条
+	// 合成记录说明「中间还有 N 行没显示」——静默丢弃会让用户以为日志完整。
+	pendingDropped int
+	// emitQuit 关闭后投递协程把剩余队列排空即退出；emitWG 供 Close 等待。
+	emitQuit chan struct{}
+	emitOnce sync.Once
+	emitWG   sync.WaitGroup
 
 	// onLog 收到的行已经带好前缀；seq 是该行的单调序号。
 	onLog func(tunnelID uint, tunnelName string, seq uint64, line string)
@@ -133,7 +141,9 @@ func New(exePath string) *Manager {
 		exePath:  exePath,
 		procs:    map[uint]*process{},
 		emitWake: make(chan struct{}, 1),
+		emitQuit: make(chan struct{}),
 	}
+	m.emitWG.Add(1)
 	go m.dispatchLogs()
 	return m
 }
@@ -402,7 +412,23 @@ func (m *Manager) Close() error {
 	m.mu.Lock()
 	m.closed = true
 	m.mu.Unlock()
-	return m.StopAll()
+	err := m.StopAll()
+
+	// 停完进程再停投递：进程退出的收尾日志已经进了队列，
+	// 立刻掐掉投递协程会把它们吞掉。
+	m.emitOnce.Do(func() { close(m.emitQuit) })
+	done := make(chan struct{})
+	go func() {
+		m.emitWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		// 回调卡住时不能让退出流程无限等待：日志可以丢，进程必须退。
+		log.Printf("[frpc] 日志投递未在 2 秒内退出，继续关闭")
+	}
+	return err
 }
 
 // Closed 报告是否已进入关闭状态。
@@ -606,6 +632,7 @@ func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 	m.pending = append(m.pending, entries...)
 	if over := len(m.pending) - maxPendingEmits; over > 0 {
 		m.pending = append(m.pending[:0], m.pending[over:]...)
+		m.pendingDropped += over
 	}
 	select {
 	case m.emitWake <- struct{}{}:
@@ -619,26 +646,49 @@ func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 // 在锁外调用回调是关键：上层收到「start proxy success」会写一条说明日志，
 // 那会再次请求 Manager 的锁；持锁调用就是死锁。
 func (m *Manager) dispatchLogs() {
-	for range m.emitWake {
-		for {
-			m.mu.Lock()
-			batch := m.pending
-			m.pending = nil
-			cb := m.onLog
-			m.mu.Unlock()
+	defer m.emitWG.Done()
+	for {
+		select {
+		case <-m.emitQuit:
+			// 退出前把剩余队列排空：进程退出通知产生的收尾日志不该被吞掉。
+			m.emitPending()
+			return
+		case <-m.emitWake:
+		}
+		m.emitPending()
+	}
+}
 
-			if cb != nil {
-				for _, e := range batch {
-					cb(e.id, e.name, e.seq, e.text)
-				}
-			}
+// emitPending 取空当前队列并按序调用回调。
+func (m *Manager) emitPending() {
+	for {
+		m.mu.Lock()
+		batch := m.pending
+		m.pending = nil
+		dropped := m.pendingDropped
+		m.pendingDropped = 0
+		cb := m.onLog
+		m.mu.Unlock()
 
-			m.mu.Lock()
-			more := len(m.pending) > 0
-			m.mu.Unlock()
-			if !more {
-				break
+		if dropped > 0 {
+			// seq=0：合成记录不参与去重，前端总是显示。
+			batch = append([]logEntry{{
+				text: fmt.Sprintf("%s  [客户端] 日志过多，已丢弃 %d 条较早的记录",
+					time.Now().Format("15:04:05"), dropped),
+			}}, batch...)
+		}
+
+		if cb != nil {
+			for _, e := range batch {
+				cb(e.id, e.name, e.seq, e.text)
 			}
+		}
+
+		m.mu.Lock()
+		more := len(m.pending) > 0 || m.pendingDropped > 0
+		m.mu.Unlock()
+		if !more {
+			return
 		}
 	}
 }

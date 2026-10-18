@@ -128,39 +128,23 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 		res.Created = append(res.Created, *t)
 	}
 
-	// 防火墙放行挪到用户锁临界区之外异步补做。
+	// 防火墙放行不在用户锁内同步做：helper 不可达时单次操作可达 10 秒，
+	// 20 条的批次能拖上几分钟，同一用户的其他操作全部排队。
 	//
-	// helper 不可达时，单次探测/操作的网络调用可达 10 秒；在锁内逐条
-	// 同步放行的话，20 条的批次能拖上几分钟，同一用户的其他隧道操作
-	// 全部排队。改为：放行失败本就进重试队列兜底（见 applyPortIntent），
-	// 这里再用一个协程按序补一次立即尝试，让规则尽快生效——协程只拿
-	// 端口锁，不碰用户锁，不会阻塞该用户的任何其他操作。
+	// 但也**不另起协程**：协程没有生命周期，且「执行完再删待办」会与
+	// 期间产生的新意图竞争——隧道刚被停用（登记了「待收回」），旧任务
+	// 收尾时把这条新待办删掉，规则就再也没人去改。
+	//
+	// 改为只登记待办并唤醒协调器：重试循环在端口锁内完成「读意图 → 校验
+	// → 执行 → 提交状态」，天然不会覆盖或误删新意图，也随服务退出而停止。
 	if len(res.Created) > 0 {
-		created := res.Created
-		// 先把这些端口登记为「待放行」再返回：异步补做的这段时间里，
-		// 管理页的待办列表能看出规则还没生效，而不是显示一切正常、
-		// 用户却连不上。补做成功后立即移除。
-		for i := range created {
-			if created[i].RemotePort > 0 {
-				s.markFirewallPending(created[i].RemotePort, ProtoOfTunnel(created[i].Type), true)
+		for i := range res.Created {
+			if res.Created[i].RemotePort > 0 {
+				s.markFirewallPending(res.Created[i].RemotePort, ProtoOfTunnel(res.Created[i].Type), true)
 			}
 		}
-		go func() {
-			for i := range created {
-				port := created[i].RemotePort
-				if port <= 0 {
-					continue
-				}
-				acted, err := s.applyPortIntent(port, ProtoOfTunnel(created[i].Type), true)
-				// 失败时 applyPortIntent 已经重新登记为待办；这里只处理
-				// 「成功」与「意图已过时」两种情况。
-				if err == nil {
-					s.dropPending(port)
-				} else if !acted {
-					s.dropPending(port)
-				}
-			}
-		}()
+		// 不必等下一个 2 分钟周期。
+		s.KickFirewall()
 	}
 	return res, nil
 }

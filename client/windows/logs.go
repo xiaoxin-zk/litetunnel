@@ -315,19 +315,22 @@ type LogCleared struct {
 // 只清历史的话，队列里已经攒下的行会在下一次 flush 时照常出现，
 // 用户看到的就是「点了清空，日志又自己冒回来」。
 func (a *App) ClearLogs() LogCleared {
+	// 整个清理都在 logMu 内完成：GetLogs 也在这把锁内读历史与代次，
+	// 两者因此互斥。分开做的话，并发刷新可能读到「新代次 + 旧历史」
+	// 或反过来，表现为清空后日志短暂恢复、顺序错乱。
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+
 	var dropped uint64
 	if a.mgr != nil {
 		dropped = a.mgr.ClearLogs()
 	}
 
-	a.logMu.Lock()
 	a.logBuf = nil
 	a.logBufBytes = 0
 	a.logDropped = 0
 	a.logDroppedSeq = dropped
 	a.logEpoch++
-	epoch := a.logEpoch
-	a.logMu.Unlock()
 
-	return LogCleared{Epoch: epoch}
+	return LogCleared{Epoch: a.logEpoch}
 }

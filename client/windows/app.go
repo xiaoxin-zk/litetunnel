@@ -630,13 +630,19 @@ func (a *App) OpenDataDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		_ = exec.Command("explorer", dir).Start()
+		cmd = exec.Command("explorer", dir)
 	case "darwin":
-		_ = exec.Command("open", dir).Start()
+		cmd = exec.Command("open", dir)
 	default:
-		_ = exec.Command("xdg-open", dir).Start()
+		cmd = exec.Command("xdg-open", dir)
+	}
+	// 失败必须报给界面：只返回目录的话，用户点了按钮什么都没发生，
+	// 也看不到原因（没有文件管理器、被策略禁用等）。
+	if err := cmd.Start(); err != nil {
+		return dir, fmt.Errorf("打开数据目录失败: %w", err)
 	}
 	return dir, nil
 }

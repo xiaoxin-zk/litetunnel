@@ -47,10 +47,12 @@ type cfgResult struct {
 // （调用方传入），到点后未派发的任务直接放弃，由下一轮同步补上。
 // 通道在全部结果流出（或截止）后关闭，调用方 range 到结束即可。
 //
-// 第二个返回值是**实际派发出去的条数**：调用方据此推进续传位置
-// （见 applySyncData 里的 syncStart）。不能用「收到的结果条数」代替——
-// 截止时 worker 的 fetch 失败后可能直接返回、不再投递结果，那样算出来
-// 的位置会原地不动，下一轮又从头开始处理同一批隧道。
+// 第二个返回值是**实际派发出去的条数**。它只用于一种兜底：整轮一条都没
+// 落定（所有请求都撞上截止时间）时，游标按派发进度轮转，避免同样的前几条
+// 反复吃掉整笔预算、尾部永远轮不到（见 sync_cursor.go 的 nextStart）。
+//
+// 注意它**不再**用来推进游标——派发不等于应用：截止时间一到，已派发的隧道
+// 会在应用阶段被直接跳过，按派发数推进游标就会越过它们。
 func (a *App) streamTunnelConfigs(ctx context.Context, base, apiKey string, tunnels []TunnelVO) (<-chan cfgResult, *atomic.Int64) {
 	dispatched := &atomic.Int64{}
 	results := make(chan cfgResult, len(tunnels))

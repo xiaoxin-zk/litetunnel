@@ -159,7 +159,7 @@ func (s *Services) trackLoginFailure(a LoginAttempt) {
 //
 // 只供审计与排查（例如后台识别可疑账号），**不能**用作认证门槛的数据源：
 // 它查的是异步登录日志，日志队列满了会丢弃。验证码阈值用的是
-// loginFailureCounter（见 loginfail.go）。
+// loginFailCounter（默认落库，见 loginfail.go / loginfail_db.go）。
 func (s *Services) CountRecentFailedLogins(kind, username string, within time.Duration) int64 {
 	var n int64
 	// 查询失败时返回 0，而 0 在排查语境里正好表示「没有失败记录」，

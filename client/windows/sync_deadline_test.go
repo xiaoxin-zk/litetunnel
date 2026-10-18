@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -373,4 +374,238 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// ---- 游标只按「落定」推进（缺陷 2） ----
+
+// TestSyncCursorStopsAtFirstUnappliedTunnel 覆盖「派发出去但没应用的隧道被跳过」。
+//
+// 构造：前 fast 条隧道配置秒回、能被正常应用（启动失败也算落定——失败已经
+// 记进退避）；后面几条的配置请求挂住，等前几条处理完之后取消本轮预算。
+//
+// 旧实现按**派发数**推进游标：派发出去的隧道即使因为截止时间一条都没应用，
+// 也已经被算作「处理过」，游标于是越过它们。被越过的隧道要等整整一圈才会
+// 再被看到——隧道多、轮次又被截止时间砍短时就是好几分钟，用户侧表现为
+// 「隧道一直离线，重启客户端也没用」。
+//
+// 新实现只按落定推进：游标应停在第一条没落定的隧道上（下标 fast）。
+func TestSyncCursorStopsAtFirstUnappliedTunnel(t *testing.T) {
+	if defaultServerURL() != "" {
+		t.Skip("当前构建注入了服务端地址，本用例需要自己控制服务端")
+	}
+	const (
+		fast  = 5
+		total = 12
+	)
+
+	var fastReplied atomic.Int32
+
+	// 本轮预算由测试自己控制：不使用整轮超时，而是在「前几条都已落定」之后
+	// 主动取消，从而精确复现「派发成功、应用被截止时间砍掉」的窗口。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/client/config") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[]}}`))
+			return
+		}
+		id, _ := strconv.Atoi(r.URL.Query().Get("tunnel_id"))
+		if id <= fast {
+			w.Header().Set(configRevHeader, "rev-"+itoa(id))
+			_, _ = w.Write([]byte("serverAddr = \"127.0.0.1\"\n"))
+			fastReplied.Add(1)
+			return
+		}
+		// 挂到本轮被取消：模拟「请求还没回来，截止时间先到」。
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newSyncTestApp(t, srv)
+
+	tunnels := make([]TunnelVO, total)
+	for i := range tunnels {
+		tunnels[i] = TunnelVO{
+			ID: uint(i + 1), Name: "t" + itoa(i+1), Type: "tcp", Status: tunnelStatusActive,
+			LocalIP: "127.0.0.1", LocalPort: 25565,
+		}
+	}
+
+	// 等前几条真的落定（启动失败 → 记进退避），再取消。
+	// 用 retryAllowed 观察而不是固定 sleep：它拿的是同一把锁，读到 false
+	// 就说明 noteStartFailure 已经执行，即 failStart 已经发生（落定）。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 1; i <= fast; i++ {
+			for a.retryAllowed(uint(i)) {
+				if ctx.Err() != nil {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+		// 留一点余量让 settle 记账落定（它紧跟在 applyCfg 返回之后）。
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, _ = a.applySyncData(ctx, &clientInfoData{Username: "u", Tunnels: tunnels}, 1)
+	<-done
+
+	// 游标应停在第一条没落定的隧道（下标 fast，即 id=fast+1）。
+	// 旧实现会推到「派发到的最后一条之后」，也就是 total（回绕到 0）附近。
+	if a.syncStart != fast {
+		t.Fatalf("续传位置 = %d，期望 %d：游标必须停在第一条没落定的隧道上，"+
+			"按派发数推进会越过它们，让它们整整一轮不再被处理", a.syncStart, fast)
+	}
+	// 被截止时间砍掉的隧道不是失败：不该有失败记录，也不该进退避。
+	for i := fast + 1; i <= total; i++ {
+		if st, ok := a.retries[uint(i)]; ok && st != nil {
+			t.Fatalf("隧道 %d 因截止时间未处理，却被记了退避 %+v", i, st)
+		}
+		if e, ok := a.tunnelErrs[uint(i)]; ok && e.msg != "" {
+			t.Fatalf("隧道 %d 因截止时间未处理，却被记了失败原因 %q", i, e.msg)
+		}
+	}
+}
+
+// TestSyncRoundNextStart 覆盖游标落点的三种情况（纯函数，无网络）。
+//
+// 这是缺陷 2 的核心判据，单独测它可以把「环形下标」的算术钉死，
+// 不必依赖网络时序。
+func TestSyncRoundNextStart(t *testing.T) {
+	const n = 6
+	order := make([]TunnelVO, n)
+	for i := range order {
+		order[i] = TunnelVO{ID: uint(i + 1)}
+	}
+	// 派发顺序覆盖全部 6 条（下标 0..5）。
+	allPos := []int{0, 1, 2, 3, 4, 5}
+
+	cases := []struct {
+		name    string
+		rot     int
+		settle  []int // 落定的下标
+		dispat  int
+		pos     []int
+		want    int
+		comment string
+	}{
+		{
+			name: "全部落定回到起点", rot: 0, settle: []int{0, 1, 2, 3, 4, 5},
+			dispat: 6, pos: allPos, want: 0,
+			comment: "整轮完成，顺序不变",
+		},
+		{
+			name: "停在前缀之后", rot: 0, settle: []int{0, 1}, dispat: 6, pos: allPos, want: 2,
+			comment: "第一条没落定的位置就是下一轮起点",
+		},
+		{
+			name: "非连续落定仍停在第一个缺口", rot: 0, settle: []int{0, 1, 3, 4},
+			dispat: 6, pos: allPos, want: 2,
+			comment: "缺口之前都落定、之后有落定，也不能越过缺口",
+		},
+		{
+			name: "环形左移后加回 rot", rot: 4, settle: []int{0, 1, 2}, dispat: 6, pos: allPos, want: 1,
+			comment: "(4+3) % 6 = 1，不能漏掉 rot",
+		},
+		{
+			name: "颗粒无收退回派发轮转", rot: 0, settle: nil, dispat: 3, pos: allPos, want: 3,
+			comment: "整轮没落定：按派发进度轮转，避免尾部饿死",
+		},
+		{
+			name: "颗粒无收且没派发", rot: 2, settle: nil, dispat: 0, pos: allPos, want: 2,
+			comment: "什么都没发生，游标不动",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newSyncRound(order, c.pos)
+			for _, i := range c.settle {
+				r.settle(order[i].ID)
+			}
+			r.setDispatched(c.dispat)
+			if got := r.nextStart(c.rot, n); got != c.want {
+				t.Fatalf("nextStart = %d，期望 %d（%s）", got, c.want, c.comment)
+			}
+		})
+	}
+}
+
+// ---- 最后一道截止闸紧贴启动（缺陷 3） ----
+
+// gateCtx 是一个「第 errAt 次 Err() 调用开始报错」的 context。
+//
+// writeAndStart 只用 ctx.Err() 判断截止时间，所以可以用它把「第几道闸」
+// 精确地打出来——真实的超时无法稳定地卡在两道闸之间。
+type gateCtx struct {
+	calls int
+	errAt int
+}
+
+func (c *gateCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *gateCtx) Done() <-chan struct{}       { return nil }
+func (c *gateCtx) Value(any) any               { return nil }
+func (c *gateCtx) Err() error {
+	c.calls++
+	if c.calls >= c.errAt {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// TestWriteAndStartFinalGateLeavesNoState 覆盖「最后一道闸拦下时留下脏状态」。
+//
+// 前两道闸都通过（否则测不到最后一道），第三道报错。此时必须：
+//   - 返回 errSyncDeadline（调用方据此不记失败、不推进退避）；
+//   - 不登记连接起点（否则界面会显示一段并不存在的等待）；
+//   - 不登记启动代次（否则迟到的退出回调会把它当成一次真启动的产物）；
+//   - 不清退避（这一轮根本没尝试启动，清掉等于把正在退避的隧道提前放行）。
+func TestWriteAndStartFinalGateLeavesNoState(t *testing.T) {
+	withTempConfigDir(t)
+
+	srv, _, _, _ := fakePanel(t)
+	a := newSyncTestApp(t, srv)
+
+	// 先让它处于退避中，用来验证最后一道闸之后不会清退避。
+	for i := 0; i < 3; i++ {
+		a.noteStartFailure(1, "mc", "启动失败")
+	}
+
+	ctx := &gateCtx{errAt: 3}
+	tun := TunnelVO{
+		ID: 1, Name: "mc", Type: "tcp", Status: tunnelStatusActive,
+		LocalIP: "127.0.0.1", LocalPort: 25565,
+	}
+	err := a.writeAndStart(ctx, tun, "serverAddr = \"127.0.0.1\"\n")
+
+	if !errors.Is(err, errSyncDeadline) {
+		t.Fatalf("最后一道闸拦下时应返回 errSyncDeadline，实际 %v", err)
+	}
+	if ctx.calls != 3 {
+		t.Fatalf("writeAndStart 应恰好检查 3 次截止时间，实际 %d 次", ctx.calls)
+	}
+	if a.mgr.Running(1) {
+		t.Fatal("截止后不得拉起进程")
+	}
+	a.mu.RLock()
+	_, hasConnectAt := a.connectAt[1]
+	_, hasStartGen := a.startGen[1]
+	a.mu.RUnlock()
+	if hasConnectAt {
+		t.Fatal("最后一道闸拦下时不该登记连接起点：界面会显示一段并不存在的等待")
+	}
+	if hasStartGen {
+		t.Fatal("最后一道闸拦下时不该登记启动代次：迟到的回调会把它当成真启动")
+	}
+	if got := a.retries[1].attempts; got != 3 {
+		t.Fatalf("退避计数 = %d，期望仍是 3：没尝试启动就不该清退避", got)
+	}
+	if a.appliedConfigOf(1) != "" {
+		t.Fatal("最后一道闸拦下时不该记「已应用」：下一轮必须重新拉取")
+	}
 }

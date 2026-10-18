@@ -47,6 +47,18 @@ const (
 	KeyRegisterTrustedSkipLimits SettingKey = "register.trusted_domain_skip_limits"
 
 	// ---- 登录防护 ----
+	//
+	// KeyLoginCaptchaAfter 是「同一账号连续失败几次后要求验证码」的阈值。
+	//
+	// 计数落在数据库（lt_login_fail_counters，见 loginfail_db.go），因此
+	// **多实例共用一个库时阈值仍然成立**。这一点很关键：账号级验证码是
+	// 分布式爆破的唯一克星（硬锁按「账号 + IP」计数，分布式来源每个 IP
+	// 各有一份额度），若计数只在进程内，N 个实例就等于 N 倍额度，而且
+	// 退化时没有任何报错或指标。
+	//
+	// 注意同层的硬锁（middleware.LoginGuard，账号 + IP 的锁定）仍是进程内的：
+	// 多实例部署时锁定状态不共享，要么在网关层做会话粘滞，要么接受
+	// 「硬锁按实例计、账号级验证码兜底」这一组合。
 	KeyLoginCaptchaAfter SettingKey = "login.captcha_after_failures"
 	KeyLoginMaxPerMinute SettingKey = "login.max_per_minute"
 

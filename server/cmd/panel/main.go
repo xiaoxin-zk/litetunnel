@@ -88,6 +88,11 @@ func main() {
 		// 没有它，公网服务跑久了这几张表会一直膨胀。
 		svc.StartMaintenanceWorker(ctx),
 		svc.StartFirewallReconciler(ctx),
+		// 断流待办的补偿重试：禁用/删号时若 frps 管理接口不可用，那批代理
+		// 关不掉，只把意图落库（lt_proxy_drain_pending）。没有这个 worker，
+		// 落库的待办就没有任何执行者——账号已禁用、流量却一直跑着，重启
+		// 也不会好转，而这从业务界面上完全看不出来。
+		svc.StartProxyDrainWorker(ctx),
 	}
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
 	go svc.Monitor.Start(ctx)

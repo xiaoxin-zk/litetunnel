@@ -343,6 +343,11 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 主动关闭该用户在 frps 侧已建立的代理：只清会话拦得住新连接，
 		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
 		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
+		//
+		// 超时/失败不是终点：CloseUserProxies 在动手之前先把这次断流意图写进
+		// 待办表（见 proxy_drain_retry.go），没关掉的代理由后台重试器按退避
+		// 继续关。所以这里不需要（也不能）等它成功——禁用必须立刻生效，
+		// 而「关流量」是个可以慢慢补偿的外部动作。
 		closeCtx, cancel := context.WithTimeout(context.Background(), closeProxiesTimeout)
 		s.CloseUserProxies(closeCtx, id, gen, disabledAt)
 		cancel()

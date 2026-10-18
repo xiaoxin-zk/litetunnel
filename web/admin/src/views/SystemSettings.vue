@@ -212,6 +212,15 @@
             <el-input-number v-model="numForm['login.captcha_after_failures']" :min="0" :max="20" />
             <span class="hint">0 表示始终不要求；默认 3</span>
           </el-form-item>
+          <!--
+            多实例这条必须写在界面上：阈值「共享」与硬锁「不共享」是两个不同
+            的层次，运维只看到这个输入框时很容易以为整层防护都跨实例。
+          -->
+          <div class="hint" style="margin: -8px 0 18px 160px; line-height: 1.8">
+            计数存在数据库表 <code>lt_login_fail_counters</code>（30 分钟窗口，登录成功即清零），
+            因此多实例部署共用一个数据库时该阈值仍然成立。但「账号 + IP」的登录硬锁仍在各实例进程内，
+            多实例下需要网关会话粘滞，详见 README「多实例部署」。
+          </div>
           <el-form-item label="单 IP 每分钟登录上限">
             <el-input-number v-model="numForm['login.max_per_minute']" :min="1" :max="600" />
           </el-form-item>
@@ -448,5 +457,15 @@ onMounted(load)
   color: #6b7280;
   font-size: 12.5px;
   line-height: 1.7;
+}
+
+/* 表名/键名用等宽字体，避免和中文说明糊在一起看不清边界。 */
+code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  background: #f5f7fa;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #303133;
 }
 </style>

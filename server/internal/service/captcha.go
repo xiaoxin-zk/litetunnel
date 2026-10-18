@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +73,43 @@ func (s *CaptchaStore) Close() {
 	s.closeOnce.Do(func() { close(s.stop) })
 }
 
+// evictLocked 在容量触顶时腾出空间。调用方必须持有 s.mu。
+//
+// 不整表清空。旧实现是「满了就换一张新表」，代价不只是内存：验证码是
+// 一次性的，清表等于让**所有**正在填验证码的用户当场失效——攻击者用
+// 随机来源刷满票据表，就能把正常登录一起打掉，而且看起来像「验证码
+// 总是错」，没有任何线索指向容量。
+//
+// 先删过期的；仍然满就按到期时间淘汰最早的 1/8——它们本来也是最先失效的。
+func (s *CaptchaStore) evictLocked(now time.Time) {
+	for k, e := range s.entries {
+		if now.After(e.expireAt) {
+			delete(s.entries, k)
+		}
+	}
+	if len(s.entries) < captchaMaxEntries {
+		return
+	}
+	target := captchaMaxEntries - captchaMaxEntries/8
+	type candidate struct {
+		key    string
+		expire time.Time
+	}
+	cands := make([]candidate, 0, len(s.entries))
+	for k, e := range s.entries {
+		cands = append(cands, candidate{key: k, expire: e.expireAt})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		return cands[i].expire.Before(cands[j].expire)
+	})
+	for _, c := range cands {
+		if len(s.entries) <= target {
+			break
+		}
+		delete(s.entries, c.key)
+	}
+}
+
 func (s *CaptchaStore) gc() {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
@@ -122,9 +160,9 @@ func (s *Services) NewCaptcha(ip string) (*Captcha, error) {
 	ticket := hex.EncodeToString(buf)
 
 	s.Captchas.mu.Lock()
-	// 容量保护：达到上限时直接清空，宁可让少数人重取也不让内存无限增长。
+	// 容量保护：按到期时间淘汰，**不**整表清空（见 evictLocked）。
 	if len(s.Captchas.entries) >= captchaMaxEntries {
-		s.Captchas.entries = make(map[string]captchaEntry)
+		s.Captchas.evictLocked(time.Now())
 	}
 	s.Captchas.entries[ticket] = captchaEntry{
 		answer:   answer,

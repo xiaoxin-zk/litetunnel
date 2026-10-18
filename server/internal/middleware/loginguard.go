@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -116,12 +118,10 @@ func (g *LoginGuard) Fail(scope, account, ip string) {
 	now := time.Now()
 
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	// 容量保护：达到上限时整表清空。
-	// 宁可让少数攻击者重新开始计数，也不让内存被随机用户名撑爆。
+	// 容量保护：按代价从低到高淘汰（见 evictLocked），**不**整表清空。
+	evicted := 0
 	if len(g.records) >= maxLoginRecords {
-		g.records = make(map[string]*failureRecord)
+		evicted = g.evictLocked(now)
 	}
 
 	rec, ok := g.records[key]
@@ -143,6 +143,13 @@ func (g *LoginGuard) Fail(scope, account, ip string) {
 			lock = g.maxLock
 		}
 		rec.lockedTill = now.Add(lock)
+	}
+	g.mu.Unlock()
+
+	if evicted > 0 {
+		// 淘汰必须留痕：它意味着某些来源的计数被重置，排查「为什么没锁住」
+		// 时这是唯一能看到的线索。
+		log.Printf("[loginguard] 记录达到上限 %d，已按代价从低到高淘汰 %d 条", maxLoginRecords, evicted)
 	}
 }
 
@@ -172,4 +179,76 @@ func (g *LoginGuard) gc() {
 			g.mu.Unlock()
 		}
 	}
+}
+
+// evictLocked 在容量触顶时腾出空间。调用方必须持有 g.mu，返回淘汰条数。
+//
+// 不能整表清空。旧实现是「满了就 make 一张新表」，那等于给攻击者一个
+// 重置所有锁定的开关：用海量随机账号/IP 把表灌满，正在被锁定的真实账号
+// 会跟着一起解封——而这恰好发生在攻击进行中，是最不该放宽的时刻。
+//
+// 按代价从低到高逐级淘汰：
+//
+//  1. 已解锁且超过观察窗口的：本来就该消失，最没有代价；
+//  2. 只失败过一次且已解锁的：丢掉最多让某个来源重新开始计数；
+//  3. 仍然满：按最后失败时间淘汰仍未锁定的（最旧的先走）；
+//  4. 极端情况（表里全是锁定中的）：只能按最后失败时间淘汰，
+//     锁定状态提前失效——这是容量上限下无法避免的代价，但至少
+//     只影响最旧的那批，而不是全体。
+func (g *LoginGuard) evictLocked(now time.Time) int {
+	removed := 0
+	cutoff := now.Add(-2 * time.Hour)
+	for k, rec := range g.records {
+		if rec.lastFail.Before(cutoff) && now.After(rec.lockedTill) {
+			delete(g.records, k)
+			removed++
+		}
+	}
+	if len(g.records) < maxLoginRecords {
+		return removed
+	}
+
+	// 一次腾出 1/8：避免每来一个新键就全表扫一遍。
+	target := maxLoginRecords - maxLoginRecords/8
+	for k, rec := range g.records {
+		if len(g.records) <= target {
+			break
+		}
+		if rec.count <= 1 && now.After(rec.lockedTill) {
+			delete(g.records, k)
+			removed++
+		}
+	}
+	if len(g.records) <= target {
+		return removed
+	}
+
+	// 排序一次后按顺序删除：逐个找最旧是 O(n²)，而这里恰恰是满表状态。
+	type candidate struct {
+		key    string
+		last   time.Time
+		locked bool
+	}
+	cands := make([]candidate, 0, len(g.records))
+	for k, rec := range g.records {
+		cands = append(cands, candidate{
+			key:    k,
+			last:   rec.lastFail,
+			locked: !now.After(rec.lockedTill),
+		})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].locked != cands[j].locked {
+			return !cands[i].locked // 未锁定的排在前面，优先淘汰
+		}
+		return cands[i].last.Before(cands[j].last)
+	})
+	for _, c := range cands {
+		if len(g.records) <= target {
+			break
+		}
+		delete(g.records, c.key)
+		removed++
+	}
+	return removed
 }

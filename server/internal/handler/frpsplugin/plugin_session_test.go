@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -238,6 +239,19 @@ func TestCallbacksFailClosedBeforeGuardLoaded(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 	const runID = "run-guard"
+	// 真实路径里内存会话是「数据库写入成功之后」才登记的（见 UpsertClientSession）：
+	// 两者必须成对出现。这里直接造内存会话，就要把对应的数据库行一起补上，
+	// 否则 NewUserConn 的撤销复核会把它判成「已撤销」并拒绝——那测到的是
+	// 会话失效，而不是本用例要验证的「准入状态未加载」。
+	if err := db.Create(&model.ClientSession{
+		UserID:     u.ID,
+		Username:   u.Username,
+		RunID:      runID,
+		Online:     true,
+		LastSeenAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("建会话失败: %v", err)
+	}
 	svc.Runtime.RecordLogin(runID, u.ID, u.Username)
 
 	if svc.Runtime.AccessGuardReady() {

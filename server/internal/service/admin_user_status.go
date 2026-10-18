@@ -118,49 +118,38 @@ type AdminUpdateUserInput struct {
 }
 
 // AdminUpdateUser 更新用户基础信息。
+//
+// 整组变更走 updateProfileLocked：邮箱、昵称、备注必须在同一个用户锁与同一个
+// 事务里落库。以前邮箱先单独提交、其余字段后提交，后一步失败时接口返回失败，
+// 而邮箱（连同 token_version 递增、旧地址恢复凭据作废）已经生效——管理员看到
+// 一次失败，实际上账号已经被改了一半。
 func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
-	updates := map[string]any{}
-	emailChanged := false
+	fields := map[string]any{}
+	var email *string
 	if in.Email != nil {
-		email := strings.ToLower(strings.TrimSpace(*in.Email))
-		if email != "" && !IsValidEmail(email) {
+		e := strings.ToLower(strings.TrimSpace(*in.Email))
+		if e != "" && !IsValidEmail(e) {
 			return fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
 		}
-		// 管理员改邮箱与作废旧地址的恢复凭据必须在用户行锁内同一个事务完成，
-		// 并递增 token_version 让既有网页会话失效（邮箱是找回密码的入口）。
-		// 管理员直接填的地址没走过验证码，因此 email_verified 置 false。
-		changed, err := s.changeEmailLocked(id, email, false, true)
-		if err != nil {
-			return err
-		}
-		emailChanged = changed
+		// 管理员直接填的地址没走过验证码，email_verified 由落库处置 false。
+		email = &e
 	}
 	if in.Nickname != nil {
-		updates["nickname"] = truncate(*in.Nickname, 64)
+		fields["nickname"] = truncate(*in.Nickname, 64)
 	}
 	if in.Remark != nil {
-		updates["remark"] = truncate(*in.Remark, 200)
+		fields["remark"] = truncate(*in.Remark, 200)
 	}
-	if len(updates) == 0 && !emailChanged {
+	if len(fields) == 0 && email == nil {
 		return ErrInvalidParam
 	}
-	if len(updates) > 0 {
-		res := s.DB.Model(&model.User{}).Where("id = ?", id).Updates(updates)
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected == 0 {
-			// 可能只是值未变化，仍需确认用户存在。
-			var n int64
-			if err := s.DB.Model(&model.User{}).Where("id = ?", id).Count(&n).Error; err != nil {
-				return err
-			}
-			if n == 0 {
-				return ErrNotFound
-			}
-		}
-	}
-	return nil
+	_, err := s.updateProfileLocked(id, profilePatch{
+		email: email,
+		// 邮箱是找回密码的入口：管理员改过之后，既有的网页会话必须失效。
+		bumpTokenVersion: true,
+		fields:           fields,
+	})
+	return err
 }
 
 // bumpUserStatusGen 递增并返回该用户的状态代次。

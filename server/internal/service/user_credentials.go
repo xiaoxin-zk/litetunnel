@@ -1,12 +1,9 @@
 package service
 
 import (
-	"errors"
-	"fmt"
 	"strings"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -82,69 +79,7 @@ func purgeAccountCredentialsTx(tx *gorm.DB, userID uint, email string) error {
 		}).Error
 }
 
-// changeEmailLocked 在用户行锁内改邮箱：重读当前邮箱、做唯一性校验、写库并
-// 作废旧地址的恢复凭据（重置令牌/验证码/待发邮件）。
-//
-// 邮箱是找回密码的入口，改邮箱与作废旧凭据必须同一个事务；而且判断必须基于
-// 行锁后的当前值，不能用调用方事务外读到的旧邮箱——否则会漏清新邮箱的凭据，
-// 或覆盖并发换绑刚写入的新地址。
-//
-// requireVerification：自助改邮箱时若站点开了邮件，必须走「更换邮箱」验证流程；
-// 管理员改邮箱不设此约束。incrementTokenVersion：让该用户的既有网页会话失效。
-// 返回 changed 表示邮箱是否真的发生了变更。
-func (s *Services) changeEmailLocked(userID uint, email string, requireVerification, incrementTokenVersion bool) (bool, error) {
-	lock := s.userLock(userID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	changed := false
-	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		var cur model.User
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			First(&cur, userID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrNotFound
-			}
-			return err
-		}
-		if email == strings.ToLower(strings.TrimSpace(cur.Email)) {
-			return nil
-		}
-		if requireVerification && s.MailEnabled() {
-			return fmt.Errorf("%w: 修改邮箱需要验证新地址，请使用「更换邮箱」流程", ErrInvalidParam)
-		}
-		if email != "" {
-			var taken int64
-			if err := tx.Model(&model.User{}).
-				Where("lower(email) = ? AND id <> ?", email, userID).
-				Count(&taken).Error; err != nil {
-				return err
-			}
-			if taken > 0 {
-				return ErrEmailTaken
-			}
-		}
-		updates := map[string]any{
-			"email":          email,
-			"email_verified": false,
-		}
-		if incrementTokenVersion {
-			updates["token_version"] = gorm.Expr("token_version + 1")
-		}
-		if err := tx.Model(&model.User{}).Where("id = ?", userID).Updates(updates).Error; err != nil {
-			return err
-		}
-		if err := purgeEmailCredentialsTx(tx, userID, cur.Email); err != nil {
-			return err
-		}
-		changed = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	if changed && incrementTokenVersion {
-		s.Runtime.InvalidateIdentity(IdentityKindUser, userID)
-	}
-	return changed, nil
-}
+// 说明：改邮箱不再有单独入口。它曾经是一个独立函数（先锁、先提交），
+// 与随后写入的昵称/备注分开提交，于是「后一步失败」会留下「接口报失败、
+// 邮箱却已经改了」的半成品。现在整组资料变更统一走 user_profile.go 的
+// updateProfileLocked：一把用户锁、一个事务、一次提交。

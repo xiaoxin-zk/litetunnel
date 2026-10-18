@@ -472,6 +472,49 @@ func TestConfirmEmailChangeBlocksStaleResetActivation(t *testing.T) {
 	}
 }
 
+// TestUpdateProfileRollsBackEmailWhenOtherFieldFails 覆盖「邮箱与昵称分开提交」。
+//
+// 以前邮箱先单独提交，用户名/昵称随后再提交。后者失败时接口返回失败，
+// 而邮箱（连同旧地址恢复凭据的作废）已经生效——用户看到「保存失败」，
+// 重试又会撞上「邮箱已被占用」，占用者就是他自己。
+// 整组放进同一事务之后，用户名冲突必须把邮箱一起回滚。
+func TestUpdateProfileRollsBackEmailWhenOtherFieldFails(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	if err := svc.DB.Create(&model.User{
+		Username: "takenname", Password: "not-used", Status: model.UserStatusActive,
+		Email: "taken@example.com",
+	}).Error; err != nil {
+		t.Fatalf("建占用用户失败: %v", err)
+	}
+	u := &model.User{
+		Username: "oldname", Password: "not-used", Status: model.UserStatusActive,
+		Email: "old@example.com", EmailVerified: true,
+	}
+	if err := svc.DB.Create(u).Error; err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+
+	_, err := svc.UpdateProfile(u.ID, ProfileUpdateInput{
+		Username: strPtr("takenname"),
+		Email:    strPtr("new@example.com"),
+	})
+	if !errors.Is(err, ErrUsernameTaken) {
+		t.Fatalf("重名应返回 ErrUsernameTaken，实际 %v", err)
+	}
+
+	var got model.User
+	if err := svc.DB.First(&got, u.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Email != "old@example.com" {
+		t.Fatalf("用户名冲突时邮箱必须一起回滚，实际 %q", got.Email)
+	}
+	if !got.EmailVerified {
+		t.Fatal("回滚后「已验证」标记应保持原样")
+	}
+}
+
 // seedChangeCode 直接写一条「换绑邮箱」的验证码记录，等价于邮件已经送达。
 //
 // 走完整链路（发信 → 投递 → 激活）拿不到明文验证码，而这里要验证的是

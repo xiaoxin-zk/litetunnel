@@ -46,6 +46,46 @@ func TestCreateTunnelRefreshFailureIsNotCreateFailure(t *testing.T) {
 	}
 }
 
+// TestCreateTunnelHoldsSyncMuThroughRequest 覆盖「创建隧道期间全程持 syncMu」。
+//
+// 读凭据 → 发创建请求 → 对账必须是一个不被退出登录/重新接入打断的整体，
+// 否则凭据可能在读到之后、发出之前被清空或切换，隧道会被建到旧账号上。
+// 这里在服务端收到 POST 的那一刻检查客户端是否仍持有 syncMu。
+func TestCreateTunnelHoldsSyncMuThroughRequest(t *testing.T) {
+	withTempConfigDir(t)
+
+	var app *App
+	var postSeen atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/api/user/tunnels") {
+			postSeen.Store(true)
+			if app == nil {
+				t.Error("发出创建请求前应用对象应已就绪")
+			} else if app.syncMu.TryLock() {
+				app.syncMu.Unlock()
+				t.Error("创建隧道发出请求期间 syncMu 应被持有")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"id":1}}`))
+			return
+		}
+		// 对账所用的 /client/info 返回空清单即可。
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"message":"ok","data":{"username":"u","tunnels":[]}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newSyncTestApp(t, srv)
+	app = a
+
+	if _, err := a.CreateTunnel("mc", "tcp", "127.0.0.1", 25565, 0, ""); err != nil {
+		t.Fatalf("创建隧道失败: %v", err)
+	}
+	if !postSeen.Load() {
+		t.Fatal("应当发出创建请求")
+	}
+}
+
 // pagedVersionPanel 起一个列表版本逐页变化的假面板：
 // 第 1 页版本 A，之后版本 B（模拟分页期间「删一条 + 增一条」）。
 func pagedVersionPanel(t *testing.T, n int) *httptest.Server {

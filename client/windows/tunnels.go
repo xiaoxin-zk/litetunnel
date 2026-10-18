@@ -32,6 +32,15 @@ func (a *App) ListLocalServices() ([]localsvc.Service, error) {
 // 这个概念，用户只需要知道「本机服务跑在哪个端口」。
 // 端口池的挑选、系统占用排除、保留端口过滤全在服务端完成。
 func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePort int, subdomain string) (State, error) {
+	// 「读凭据 → 发创建请求 → 对账」必须是一个整体，不能被退出登录或重新接入打断。
+	//
+	// 不互斥的话：本方法读到凭据后、发出 POST 前，用户点了退出登录——凭据已被清空、
+	// 进程已停，这一发请求仍会用旧凭据把隧道建到旧账号上；紧接着的对账又可能把
+	// 刚被停止的进程重新拉起（凭据却已不在）。全程持 syncMu 后，Logout 与 Connect
+	// 都会等这一笔完成，凭据在请求期间保持稳定——与 DeleteTunnel/StartTunnel 同一语义。
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
 		return a.GetState(), err
@@ -59,10 +68,9 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	// 同步失败**不**把创建判为失败：POST 已经成功，隧道在服务端建好了。
 	// 报失败会让用户重试，遇到「名称已存在」或重复资源；错误通过
 	// SyncErr 呈现，下一轮自动同步会把列表补齐——与批量创建同一语义。
-	state, rerr := a.Refresh()
-	if rerr != nil {
-		return a.GetState(), nil
-	}
+	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu，Refresh 会再去抢
+	// 同一把锁而死锁。
+	state := a.syncAndState()
 	return state, nil
 }
 
@@ -88,6 +96,11 @@ type BatchResult struct {
 // 而不是「一条失败就全都没了」。失败原因逐条带回，用户才知道
 // 该去改哪一个。
 func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports []int) (BatchResult, State, error) {
+	// 与 CreateTunnel 同理：读凭据 → 发创建请求 → 对账必须与退出登录、
+	// 重新接入互斥，否则会用失效凭据把隧道建到旧账号，或在退出后重新拉起进程。
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
 		return BatchResult{}, a.GetState(), err
@@ -115,10 +128,8 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 
 	// 建完立刻同步：新建的隧道会带上下发的公网地址。
 	// 同步失败时不把整体判为失败——隧道其实已经建好了。
-	state, rerr := a.Refresh()
-	if rerr != nil {
-		return out, a.GetState(), nil
-	}
+	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。
+	state := a.syncAndState()
 	return out, state, nil
 }
 
@@ -386,6 +397,11 @@ func (a *App) findTunnel(id uint) (TunnelVO, bool) {
 // 由调用方直接提示用户——不同兑换码类型的文案差别很大，
 // 在客户端里猜类型容易说错。
 func (a *App) Redeem(code string) (string, State, error) {
+	// 与 CreateTunnel 同理：读凭据 → 发兑换请求 → 对账必须与退出登录、
+	// 重新接入互斥，否则会用失效凭据兑换，或把配额/分组写到错误的账号视角。
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
 		return "", a.GetState(), err
@@ -410,9 +426,7 @@ func (a *App) Redeem(code string) (string, State, error) {
 	_ = json.Unmarshal(raw, &out)
 
 	// 兑换可能改变配额或分组，同步一次让界面立刻反映最新状态。
-	state, rerr := a.Refresh()
-	if rerr != nil {
-		return out.Message, a.GetState(), nil
-	}
+	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。
+	state := a.syncAndState()
 	return out.Message, state, nil
 }

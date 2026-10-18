@@ -229,16 +229,19 @@ func (c *FrpsClient) listProxiesOnce(ctx context.Context) ([]FrpsProxy, error) {
 		frpsMaxPages, frpsPageSize)
 }
 
-// getJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。
+// doJSON 请求 frps 管理接口，解开 {code,msg,data} 后把 data 解到 out。
 //
 // 每一步不对都返回错误：HTTP 状态码非 200、响应不是合法 JSON、缺少 code、
 // code 不是成功码、缺少 data、data 解不出来。**绝不返回「零值 + nil」**
 // ——那等于告诉调用方「代理列表是空的」，而真实情况是我们根本没读懂响应。
-func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) error {
+//
+// allowEmptyData 为 true 时，允许 data 为空或 null：删除/关闭类操作的成功响应
+// 常常没有 data，此时空 data 是正常结果而不是「读不懂」。
+func (c *FrpsClient) doJSON(ctx context.Context, method, endpoint string, out any, allowEmptyData bool) error {
 	if _, err := url.Parse(endpoint); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -276,12 +279,32 @@ func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) erro
 		return fmt.Errorf("frps 管理接口返回非成功码 %d: %s", *env.Code, msg)
 	}
 	if len(env.Data) == 0 || string(env.Data) == "null" {
+		if allowEmptyData {
+			return nil
+		}
 		return errors.New("frps 管理接口响应缺少 data 字段")
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(env.Data, out); err != nil {
 		return fmt.Errorf("解析 frps 管理接口 data 失败: %w", err)
 	}
 	return nil
+}
+
+// getJSON 请求 frps 管理接口（GET），data 必须存在且能解到 out。
+func (c *FrpsClient) getJSON(ctx context.Context, endpoint string, out any) error {
+	return c.doJSON(ctx, http.MethodGet, endpoint, out, false)
+}
+
+// CloseProxy 请求 frps 关闭指定名称的代理，实现「立即断流」。
+//
+// name 是 frp 侧的完整代理名（"<user>.<proxy_name>"，见 ParseProxyName）。
+// 关闭成功即触发 frps 下线该代理，已建立的连接随之断开。
+func (c *FrpsClient) CloseProxy(ctx context.Context, name string) error {
+	endpoint := fmt.Sprintf("%s/api/proxies?name=%s", c.baseURL, url.QueryEscape(name))
+	return c.doJSON(ctx, http.MethodDelete, endpoint, nil, true)
 }
 
 // ParseProxyName 拆分 frp 代理名。

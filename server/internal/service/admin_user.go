@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -278,6 +279,12 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 同时撤销其运行时会话：插件热路径命中会话后只看这两个标记，
 		// 但会话本身留着也没有意义——账号都禁用了。
 		s.Runtime.DropUserSessions(id)
+		// 主动关闭该用户在 frps 侧已建立的代理：只清会话拦得住新连接，
+		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
+		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
+		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		s.CloseUserProxies(closeCtx, id)
+		cancel()
 		return nil
 	}
 	s.Runtime.BumpGuardVer()

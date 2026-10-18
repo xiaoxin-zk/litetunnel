@@ -1,11 +1,13 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"strconv"
 	"strings"
 
@@ -131,6 +133,32 @@ func (s *Services) RevokeClientSessions(userID uint) error {
 	}
 	s.Runtime.DropUserSessions(userID)
 	return nil
+}
+
+// CloseUserProxies 关闭某用户在 frps 侧的所有已建立代理，实现「立即断流」。
+//
+// 禁用/封禁账号时调用：只更新阻断标记与清会话，拦得住**新**连接，却拦不住
+// 已经建立的代理流——frps 与 frpc 之间的数据连接会一直转发。逐个关闭该用户
+// 名下的代理，frps 会下线它们、断开已建立的数据连接。
+//
+// 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
+func (s *Services) CloseUserProxies(ctx context.Context, userID uint) {
+	prefix := FrpUserOf(userID) + "."
+	proxies, err := s.Frps.ListProxies(ctx)
+	if err != nil {
+		log.Printf("[user] 拉取代理列表失败，本次无法主动断流（新连接仍会被拒）: %v", err)
+		return
+	}
+	for _, p := range proxies {
+		if !strings.HasPrefix(p.Name, prefix) {
+			continue
+		}
+		if err := s.Frps.CloseProxy(ctx, p.Name); err != nil {
+			log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", userID, p.Name, err)
+			continue
+		}
+		log.Printf("[user] 已关闭用户 %d 的代理 %q", userID, p.Name)
+	}
 }
 
 // revokeClientSessionsTx 是「让数据库里的会话失效」这一步，

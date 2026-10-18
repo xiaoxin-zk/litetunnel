@@ -235,20 +235,30 @@ func TestPrepareWritesLeavesDiskUntouchedOnFailure(t *testing.T) {
 	}
 }
 
-// TestWriteBatchCommitReportsPartialState 覆盖替换阶段中途失败：不回滚，
-// 但必须说清边界（已经替换了几个文件），且不留临时文件。
-func TestWriteBatchCommitReportsPartialState(t *testing.T) {
+// TestWriteBatchCommitRollsBackOnPartialFailure 覆盖替换阶段中途失败：必须整体
+// 回滚到旧配置，且不留临时文件。
+//
+// 三个文件互相引用（Caddyfile 的域名要与 frps.toml 的 subDomainHost 一致，
+// .env 的凭据要被 Caddyfile 的 {env.X} 取到），逐个替换到一半失败时若只报错
+// 不回滚，磁盘上就是新旧混合的配置，要到下次容器重建才以错误形式爆炸。
+func TestWriteBatchCommitRollsBackOnPartialFailure(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "Caddyfile")
 	second := filepath.Join(dir, "frps.toml")
 	if err := os.WriteFile(first, []byte("old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// 目标路径是个非空目录：把文件 rename 上去必然失败。
-	if err := os.Mkdir(second, 0o755); err != nil {
+	if err := os.WriteFile(second, []byte("old-second\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(second, "keep"), []byte("x"), 0o600); err != nil {
+	// 让第二个文件的「备份旧文件」这一步失败：预先放一个同名非空目录占据
+	// 备份路径。于是 second 在 commit 的备份阶段就报错（磁盘上 second 仍是旧
+	// 内容），而已经成功替换的 first 必须被回滚回旧内容。
+	bakDir := second + ".lt-config-bak"
+	if err := os.Mkdir(bakDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bakDir, "keep"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -263,11 +273,14 @@ func TestWriteBatchCommitReportsPartialState(t *testing.T) {
 	if err == nil {
 		t.Fatal("替换失败时应当报错")
 	}
-	if !strings.Contains(err.Error(), "已替换 1 个文件") {
-		t.Errorf("错误里应说明已经替换了几个文件，实际 %q", err.Error())
+	if !strings.Contains(err.Error(), "已回滚") {
+		t.Errorf("错误里应说明已回滚，实际 %q", err.Error())
 	}
-	if raw, rerr := os.ReadFile(first); rerr != nil || string(raw) != "new\n" {
-		t.Errorf("排在前面的文件应当已经替换，实际 %q / %v", raw, rerr)
+	if raw, rerr := os.ReadFile(first); rerr != nil || string(raw) != "old\n" {
+		t.Errorf("排在前面的文件应当被回滚回旧内容，实际 %q / %v", raw, rerr)
+	}
+	if raw, rerr := os.ReadFile(second); rerr != nil || string(raw) != "old-second\n" {
+		t.Errorf("未替换成功的文件应保持旧内容，实际 %q / %v", raw, rerr)
 	}
 	if leftovers := tempLeftovers(t, dir); len(leftovers) > 0 {
 		t.Errorf("替换失败后残留临时文件: %v", leftovers)

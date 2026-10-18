@@ -253,6 +253,8 @@ type stagedFile struct {
 	name string
 	path string
 	tmp  string
+	// backup 是替换前旧文件的备份路径；替换成功后删除，失败时用于回滚。
+	backup string
 }
 
 // stageFile 把内容写进同目录的临时文件并设好权限，内容尚未生效。
@@ -286,9 +288,42 @@ func stageFile(name, path, content string, mode os.FileMode) (*stagedFile, error
 	return st, nil
 }
 
-// commit 把候选内容原子替换到目标路径。
+// commit 把候选内容原子替换到目标路径，替换前先把旧文件备份下来。
+//
+// 替换失败时自行恢复旧文件，返回错误。备份是回滚的关键：三个文件互相引用，
+// 逐个替换时若第二个失败、第一个已生效，磁盘上就是新旧混合的配置——那份
+// 状态要到下次容器重建才以配置错误的形式爆炸。有备份就能在失败时整体回滚。
 func (s *stagedFile) commit() error {
-	return os.Rename(s.tmp, s.path)
+	// 备份旧文件（若存在）。用 rename：原子且不跨文件系统（备份与目标同目录）。
+	if _, err := os.Stat(s.path); err == nil {
+		backup := s.path + ".lt-config-bak"
+		if err := os.Rename(s.path, backup); err != nil {
+			return fmt.Errorf("备份旧文件失败: %w", err)
+		}
+		s.backup = backup
+	}
+	if err := os.Rename(s.tmp, s.path); err != nil {
+		// 替换失败：把旧文件放回原位。
+		s.restore()
+		return err
+	}
+	return nil
+}
+
+// restore 回滚：把备份的旧文件放回原位。
+func (s *stagedFile) restore() {
+	if s.backup != "" {
+		_ = os.Rename(s.backup, s.path)
+		s.backup = ""
+	}
+}
+
+// cleanupBackup 删除备份文件。全部替换成功后在 writeBatch.commit 里调用。
+func (s *stagedFile) cleanupBackup() {
+	if s.backup != "" {
+		_ = os.Remove(s.backup)
+		s.backup = ""
+	}
 }
 
 // discard 放弃候选内容，删掉临时文件。成功 commit 之后调用它也无害。

@@ -292,20 +292,37 @@ func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 	return b, nil
 }
 
-// commit 逐个替换目标文件。
+// commit 逐个替换目标文件，失败时整体回滚。
 //
-// 刻意不做回滚：回滚得先备份旧内容，而多一份「磁盘上到底是新是旧」的疑问
-// 比多写一次更难收拾。中途失败时如实报出边界——哪些文件已经替换、哪些还没
-// 动过——管理员再点一次下发即可收敛。
+// 三个文件互相引用（Caddyfile 的域名要与 frps.toml 的 subDomainHost 一致，
+// .env 的凭据要被 Caddyfile 的 {env.X} 取到），必须要么全换成新的、要么全
+// 保持旧的。逐个替换到一半失败就会留下新旧混合——那份配置要到下次容器重建
+// 才以错误形式爆炸。所以每个文件替换前先备份旧内容（见 stagedFile.commit），
+// 失败时把已替换的文件恢复，最终磁盘回到「全部旧配置」。
 func (b *writeBatch) commit() error {
-	for i, st := range b.staged {
+	for i := range b.staged {
+		st := b.staged[i]
 		if err := st.commit(); err != nil {
+			// 当前文件替换失败（它已自行恢复），回滚前面已成功替换的文件，
+			// 丢弃尚未替换的临时文件。
+			b.rollbackCommitted()
 			b.discardFrom(i)
-			return fmt.Errorf("替换 %s 失败（已替换 %d 个文件，其余未改动）: %w", st.name, b.done, err)
+			return fmt.Errorf("替换 %s 失败，已回滚（磁盘仍为旧配置）: %w", st.name, err)
 		}
 		b.done++
 	}
+	// 全部成功：清掉备份。
+	for _, st := range b.staged {
+		st.cleanupBackup()
+	}
 	return nil
+}
+
+// rollbackCommitted 把已成功替换的文件恢复到备份的旧内容。
+func (b *writeBatch) rollbackCommitted() {
+	for i := 0; i < b.done; i++ {
+		b.staged[i].restore()
+	}
 }
 
 // discard 放弃整批候选内容。

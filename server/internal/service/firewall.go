@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
@@ -173,6 +175,8 @@ type pendingFW struct {
 	attempts  int
 	lastErr   string
 	exhausted bool
+	// gen 是这条意图的版本号，来自 Services.fwGen；落库用它做条件写。
+	gen int64
 }
 
 const (
@@ -215,7 +219,8 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) {
 			pendingFWLimit, port)
 		return
 	}
-	item := pendingFW{open: open, proto: proto, attempts: attempts}
+	s.fwGen++
+	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: s.fwGen}
 	s.fwPending[port] = item
 	s.fwMu.Unlock()
 
@@ -227,28 +232,43 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) {
 // 只是这次重启后会丢——比让整个防火墙操作失败要好）。
 func (s *Services) persistPending(port int, item pendingFW) {
 	rec := model.FirewallPending{
-		Port:      port,
-		Proto:     item.proto,
-		Open:      item.open,
-		Attempts:  item.attempts,
-		Exhausted: item.exhausted,
-		LastErr:   truncate(item.lastErr, 255),
+		Port:       port,
+		Proto:      item.proto,
+		Open:       item.open,
+		Attempts:   item.attempts,
+		Exhausted:  item.exhausted,
+		Generation: item.gen,
+		LastErr:    truncate(item.lastErr, 255),
 	}
+	// 条件 upsert：只允许「版本号 ≥ 库里那代」的写回覆盖旧记录。
+	// 落库在锁外，旧意图的写回可能晚于新意图——无条件覆盖会让旧「收回」
+	// 顶掉新「放行」。等号允许「同一代的重试次数/终态更新」正常落库。
 	if err := s.DB.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "port"}},
-		DoUpdates: clause.AssignmentColumns([]string{"proto", "open", "attempts", "exhausted", "last_err"}),
+		Columns: []clause.Column{{Name: "port"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"proto", "open", "attempts", "exhausted", "generation", "last_err",
+		}),
+		Where: clause.Where{Exprs: []clause.Expression{
+			gorm.Expr("excluded.generation >= lt_firewall_pending.generation"),
+		}},
 	}).Create(&rec).Error; err != nil {
 		log.Printf("[firewall] 待办落库失败（端口 %d，重启后会丢失这条意图）: %v", port, err)
 	}
 }
 
-// dropPending 从内存与数据库里同时移除一条待办。
-func (s *Services) dropPending(port int) {
+// dropPending 从内存与数据库里同时移除一条待办，但只在它仍是**同代**时。
+//
+// 旧任务的删除可能晚于新意图的登记：无条件按端口删会把新待办一起删掉，
+// 重启后那条新意图就没了。版本号让删除只作用于「我要删的那代」。
+func (s *Services) dropPending(port int, gen int64) {
 	s.fwMu.Lock()
-	delete(s.fwPending, port)
+	if cur, ok := s.fwPending[port]; ok && cur.gen == gen {
+		delete(s.fwPending, port)
+	}
 	s.fwMu.Unlock()
 
-	if err := s.DB.Where("port = ?", port).Delete(&model.FirewallPending{}).Error; err != nil {
+	if err := s.DB.Where("port = ? AND generation = ?", port, gen).
+		Delete(&model.FirewallPending{}).Error; err != nil {
 		log.Printf("[firewall] 清除待办记录失败（端口 %d）: %v", port, err)
 	}
 }
@@ -274,7 +294,11 @@ func (s *Services) loadPendingFirewall() {
 	for _, r := range recs {
 		s.fwPending[r.Port] = pendingFW{
 			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
-			exhausted: r.Exhausted,
+			exhausted: r.Exhausted, gen: r.Generation,
+		}
+		if r.Generation > s.fwGen {
+			// 新登记的意图必须比库里所有旧代都大，否则条件写永远不生效。
+			s.fwGen = r.Generation
 		}
 	}
 	n := len(s.fwPending)
@@ -457,7 +481,7 @@ func (s *Services) ClearFirewallFailed(port int) error {
 	if !ok || !item.exhausted {
 		return fmt.Errorf("%w: 端口 %d 没有已终止的失败记录", ErrNotFound, port)
 	}
-	s.dropPending(port)
+	s.dropPending(port, item.gen)
 	return nil
 }
 
@@ -508,7 +532,7 @@ func (s *Services) retryPendingFirewall() int {
 		if item.exhausted {
 			valid, verr := s.portIntentValid(port, item.open)
 			if verr == nil && !valid {
-				s.dropPending(port)
+				s.dropPending(port, item.gen)
 				pl.Unlock()
 				log.Printf("[firewall] 端口 %d 的终态失败记录已过时（当前状态与%s不符），已作废",
 					port, actionName(item.open))
@@ -527,7 +551,7 @@ func (s *Services) retryPendingFirewall() int {
 			continue
 		}
 		if !valid {
-			s.dropPending(port)
+			s.dropPending(port, item.gen)
 			pl.Unlock()
 			log.Printf("[firewall] 端口 %d 的待办已过时（当前状态与%s不符），已作废，未做任何操作",
 				port, actionName(item.open))
@@ -569,7 +593,7 @@ func (s *Services) retryPendingFirewall() int {
 			continue
 		}
 
-		s.dropPending(port)
+		s.dropPending(port, item.gen)
 		pl.Unlock()
 		log.Printf("[firewall] 端口 %d/%s 已补%s（此前失败 %d 次）",
 			port, item.proto, actionName(item.open), item.attempts)

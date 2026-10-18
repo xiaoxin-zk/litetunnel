@@ -600,6 +600,12 @@ type FirewallPending struct {
 	// 以前到上限是直接删记录，只留一行日志——日志一滚动就什么线索都没有了，
 	// 「该收回的端口一直开着」这件事从此在界面上任何地方都看不出来。
 	Exhausted bool `gorm:"not null;default:0" json:"exhausted"`
+	// Generation 是这条意图的单调版本号。
+	//
+	// 落库在锁外执行：旧意图的写回可能晚于新意图，用无条件 upsert/delete 时，
+	// 旧的「收回」会覆盖新的「放行」、或旧任务删掉新待办——重启后动作就错了。
+	// 版本号让更新与删除都带上「只允许覆盖/删除同代或更旧记录」的条件。
+	Generation int64 `gorm:"not null;default:0" json:"generation"`
 	// LastErr 最后一次失败原因，供排查用。
 	LastErr   string    `gorm:"size:255" json:"last_err"`
 	CreatedAt time.Time `json:"created_at"`

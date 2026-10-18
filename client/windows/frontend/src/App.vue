@@ -156,10 +156,8 @@ async function onClearLogs() {
 }
 
 onMounted(async () => {
-  await loadState()
-  await loadLogs()
-
-  // 主进程推送的实时状态与日志。
+  // 先注册事件、再读快照：反过来的话，两次 await 之间主进程推送的状态
+  // 和日志会被丢掉——它们不属于任何快照，只能靠事件到达。
   onEvent('state', (payload) => {
     state.value = payload
   })
@@ -168,6 +166,9 @@ onMounted(async () => {
   onEvent('notice', (msg) => {
     notice.value = { text: msg, at: Date.now() }
   })
+
+  await loadState()
+  await loadLogs()
 })
 </script>
 

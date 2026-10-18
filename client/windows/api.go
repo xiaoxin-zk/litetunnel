@@ -144,6 +144,12 @@ var errTunnelListChanged = errors.New("隧道清单在同步期间发生变化")
 // 两轮都对不上就报错，让下一轮自动同步再来。
 const clientInfoFetchAttempts = 2
 
+// maxClientTunnels 是客户端愿意相信的隧道总数上限。
+//
+// tunnel_total 直接来自服务端响应：把它当容量用之前必须先设限——负值会让
+// make 直接 panic，一个被篡改/出错的极大值则会一次性分配天文数字的内存。
+const maxClientTunnels = 100000
+
 // fetchClientInfo 拉取接入信息与**完整**隧道清单。
 //
 // 服务端按 before_id 游标分页并返回 tunnel_total；老服务端不认这两个
@@ -181,8 +187,21 @@ func (a *App) fetchClientInfoOnce(ctx context.Context, base, apiKey string) (*cl
 		return &first, nil
 	}
 
-	all := make([]TunnelVO, 0, first.TunnelTotal)
-	seen := make(map[uint]bool, first.TunnelTotal)
+	// 不信任服务端容量字段：负值、或大到不像真实账号的总数，直接按清单
+	// 异常处理，绝不拿它去 make（负值 panic、极大值 OOM）。
+	if first.TunnelTotal < 0 || first.TunnelTotal > maxClientTunnels {
+		return nil, fmt.Errorf("%w：服务端报告的隧道总数异常（%d）",
+			errTunnelListChanged, first.TunnelTotal)
+	}
+
+	// 预分配只取一个温和的上限：总数再大也是靠 append 动态增长，
+	// 容量给太多毫无意义，还可能因一个错误总数吃掉大量内存。
+	prealloc := first.TunnelTotal
+	if prealloc > 4096 {
+		prealloc = 4096
+	}
+	all := make([]TunnelVO, 0, prealloc)
+	seen := make(map[uint]bool, prealloc)
 	appendPage := func(page []TunnelVO) error {
 		for _, tun := range page {
 			if seen[tun.ID] {

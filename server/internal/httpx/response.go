@@ -56,12 +56,22 @@ func Conflict(c *gin.Context, message string) { Fail(c, http.StatusConflict, mes
 // ServerError 服务端错误。
 func ServerError(c *gin.Context, message string) { Fail(c, http.StatusInternalServerError, message) }
 
+// maxPage 是允许的最大页码。
+//
+// OFFSET 越大数据库要跳过的行越多，恶意的大页码能把一次列表查询拖成
+// 全表扫描；而且 (page-1)*pageSize 在窄 int 平台上可能溢出。设个上限，
+// 异常页码直接夹到边界，比让查询自己扛要稳。
+const maxPage = 100000
+
 // Pagination 解析分页参数，带安全上限，防止恶意超大 page_size 拖垮数据库。
 func Pagination(c *gin.Context) (page, pageSize, offset int) {
 	page, _ = strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ = strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if page < 1 {
 		page = 1
+	}
+	if page > maxPage {
+		page = maxPage
 	}
 	if pageSize < 1 {
 		pageSize = 20

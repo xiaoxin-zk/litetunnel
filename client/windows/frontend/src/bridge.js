@@ -139,13 +139,30 @@ export const api = {
   redeem: (code) => go.Redeem(code)
 }
 
-/** 订阅 Wails 事件；非桌面环境下静默忽略。 */
+/**
+ * 订阅 Wails 事件；非桌面环境下静默忽略。
+ *
+ * 返回的取消函数必须由调用方保存并在卸载时调用：热重载或组件重复挂载时，
+ * 不注销就会累积多个同名监听——同一批日志被处理多遍、同一次状态推送被
+ * 重复应用，而序号去重会把这些症状掩盖成「偶发的顺序错乱」。
+ *
+ * 取消是幂等的：重复调用不会重复注销，也不会误伤别的订阅者。
+ */
 export function onEvent(name, handler) {
   if (typeof window === 'undefined' || !window.runtime?.EventsOn) {
     return () => {}
   }
-  window.runtime.EventsOn(name, handler)
+  const off = window.runtime.EventsOn(name, handler)
+  let done = false
   return () => {
+    if (done) return
+    done = true
+    if (typeof off === 'function') {
+      off()
+      return
+    }
+    // 老版本运行时只提供按事件名注销：同名监听会被一起移除，
+    // 因此一个事件名只应有一个订阅者（见 App.vue 的 subscribe）。
     window.runtime.EventsOff?.(name)
   }
 }

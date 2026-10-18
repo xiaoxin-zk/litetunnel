@@ -15,7 +15,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import LoginView from './components/LoginView.vue'
 import MainView from './components/MainView.vue'
 import { api, onEvent } from './bridge'
@@ -112,8 +112,21 @@ function pushLog(payload) {
   let batch = payload
   let seqs = null
   if (payload && !Array.isArray(payload) && typeof payload === 'object') {
-    if (typeof payload.epoch === 'number' && payload.epoch < logEpoch.value) {
-      return // 清空前的在途批次
+    if (typeof payload.epoch === 'number') {
+      if (payload.epoch < logEpoch.value) {
+        return // 清空前的在途批次
+      }
+      if (payload.epoch > logEpoch.value) {
+        // 主进程已经清空过缓冲（代次前进），而本端还没看到清空回执：
+        // 可能是清空请求仍在途中，也可能是热重载后本地状态被重置。
+        // 此时手上的旧行都属于上一个代次，留着它们就会与新代次的行混在
+        // 一起；而且代次不追赶的话，后面每一批都会按旧代次比较，旧批次
+        // 永远拦不住。序号一并归零：新代次的序号基线可能已经不同。
+        logEpoch.value = payload.epoch
+        pendingLogs.length = 0
+        logs.value = []
+        lastSeq.value = 0
+      }
     }
     batch = payload.lines || []
     seqs = payload.seqs || null
@@ -169,21 +182,42 @@ async function onClearLogs() {
   lastSeq.value = 0
 }
 
+// 事件取消函数必须保存：热重载或组件重复挂载时，不注销就会累积多个同名
+// 监听。日志表面上看不出问题（序号去重会挡掉重复行），但同一批行会被处理
+// 多遍；更麻烦的是上一次挂载留下的回调仍持有旧的 ref，写进一个已经没人看的
+// 组件实例，表现为「改了却不生效」这类无法复现的现象。
+const unsubscribes = []
+
+function subscribe(name, handler) {
+  unsubscribes.push(onEvent(name, handler))
+}
+
 onMounted(async () => {
   // 先注册事件、再读快照：反过来的话，两次 await 之间主进程推送的状态
   // 和日志会被丢掉——它们不属于任何快照，只能靠事件到达。
-  onEvent('state', (payload) => {
+  subscribe('state', (payload) => {
     stateSeq++ // 事件状态比任何在途快照都新，让它们失效
     state.value = payload
   })
-  onEvent('logs', pushLog)
-  onEvent('log', pushLog)
-  onEvent('notice', (msg) => {
+  subscribe('logs', pushLog)
+  subscribe('log', pushLog)
+  subscribe('notice', (msg) => {
     notice.value = { text: msg, at: Date.now() }
   })
 
   await loadState()
   await loadLogs()
+})
+
+onUnmounted(() => {
+  while (unsubscribes.length) {
+    const off = unsubscribes.pop()
+    try {
+      off()
+    } catch {
+      // 注销失败不该影响卸载；下一次挂载会重新订阅。
+    }
+  }
 })
 </script>
 

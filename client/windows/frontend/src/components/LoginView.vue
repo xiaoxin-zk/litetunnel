@@ -135,6 +135,14 @@ const loading = ref(false)
 const error = ref('')
 const form = reactive({ server: '', apiKey: '' })
 
+// 请求代次：地址或模式一变就推进，旧响应到达时直接丢弃。
+//
+// 不做这一步的后果很具体：先发的那次请求（例如填错了服务器、或点了重置）
+// 晚到时会把页面状态盖回去——地址已经改了却登录进旧账号，或者切回登录页
+// 之后又弹出上一次重置的结果。请求本身没法取消（Wails 调用没有取消入口），
+// 所以只能在回来时判断「这还是不是当前这一次」。
+let attempt = 0
+
 async function submit() {
   error.value = ''
   if (!form.apiKey.trim()) {
@@ -146,11 +154,14 @@ async function submit() {
     return
   }
 
+  const seq = ++attempt
   loading.value = true
   try {
     const next = await api.connect(form.apiKey.trim(), form.server.trim())
+    if (seq !== attempt) return
     emit('connected', next)
   } catch (e) {
+    if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
   } finally {
     loading.value = false
@@ -160,6 +171,12 @@ async function submit() {
 // ---- 重置密码 ----
 
 const mode = ref('login')
+
+// 地址或模式一变，在途请求立即作废。flush: 'sync' 是必须的：默认的批处理
+// 会让回调晚于同一段同步代码执行，刚取到的代次紧跟着被递增作废——
+// 请求会把自己判成过期，页面永远停在「加载中」。
+watch(() => form.server, () => { attempt++ }, { flush: 'sync' })
+watch(mode, () => { attempt++ }, { flush: 'sync' })
 const sending = ref(false)
 const countdown = ref(0)
 // 由服务端决定走哪种验证方式，不在客户端写死
@@ -183,10 +200,14 @@ onUnmounted(stopCountdown)
 async function openReset() {
   error.value = ''
   notice.value = ''
-  mode.value = 'reset'
+  mode.value = 'reset' // 上面的 watch 会推进代次
+  const seq = ++attempt
   try {
-    mailEnabled.value = await api.serverMailEnabled(form.server.trim())
+    const enabled = await api.serverMailEnabled(form.server.trim())
+    if (seq !== attempt) return
+    mailEnabled.value = enabled
   } catch {
+    if (seq !== attempt) return
     // 探测失败按「未启用邮件」处理：旧密码模式在任何配置下都能用，
     // 而验证码模式在未启用邮件时根本无法发送。
     mailEnabled.value = false
@@ -200,9 +221,11 @@ async function sendCode() {
     return
   }
   error.value = ''
+  const seq = ++attempt
   sending.value = true
   try {
     await api.sendEmailCode(form.server.trim(), account, 'reset')
+    if (seq !== attempt) return
     countdown.value = 60
     // 重新发送前先停掉旧计时器，避免叠起多个 interval。
     stopCountdown()
@@ -211,6 +234,7 @@ async function sendCode() {
       if (countdown.value <= 0) stopCountdown()
     }, 1000)
   } catch (e) {
+    if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '验证码发送失败'
   } finally {
     sending.value = false
@@ -242,6 +266,7 @@ async function submitReset() {
     return
   }
 
+  const seq = ++attempt
   loading.value = true
   try {
     await api.resetPassword(
@@ -251,6 +276,8 @@ async function submitReset() {
       reset.emailCode.trim(),
       reset.password
     )
+    // 期间换了服务器或退了模式：这次成功属于另一套上下文，不再提示。
+    if (seq !== attempt) return
     // 清掉敏感字段，避免残留在界面上
     reset.oldPassword = ''
     reset.emailCode = ''
@@ -259,6 +286,7 @@ async function submitReset() {
     mode.value = 'login'
     notice.value = '密码已重置。请用新密码登录控制台，并重新获取 API Key 后连接。'
   } catch (e) {
+    if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '重置失败，请检查填写的信息'
   } finally {
     loading.value = false

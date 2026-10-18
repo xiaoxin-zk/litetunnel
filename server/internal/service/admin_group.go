@@ -171,10 +171,18 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 		return nil, err
 	}
 	var g model.Group
-	if err := s.DB.First(&g, id).Error; err != nil {
-		return nil, ErrNotFound
-	}
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// FOR UPDATE 锁分组行：并发删除分组 / 核销兑换码 / 用户改组都以这一行
+		// 为序（见 Redeem 里的锁序说明）。不锁的话，「检查存在 → 更新」之间
+		// 分组可能被删，接口返回成功而分组已经没了，隧道限速快照也写进了
+		// 一个已删除的分组。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&g, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
 		updates := map[string]any{
 			"name":                  in.Name,
 			"description":           truncate(in.Description, 200),
@@ -187,8 +195,12 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 			"allow_privileged_port": in.AllowPrivilegedPort,
 			"priority":              in.Priority,
 		}
-		if err := tx.Model(&model.Group{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-			return err
+		res := tx.Model(&model.Group{}).Where("id = ?", id).Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
 		}
 		return tx.Model(&model.Tunnel{}).
 			Where("user_id IN (?)", tx.Model(&model.User{}).Select("id").Where("group_id = ?", id)).

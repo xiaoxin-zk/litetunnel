@@ -438,3 +438,49 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 		t.Fatalf("请求了 %d 次，期望重取一次（两轮 × 两页）", requests)
 	}
 }
+
+// TestCloseUserProxiesStopsWhenStatusChanges 覆盖「断流途中账号被重新启用」。
+//
+// 禁用流程在放掉用户锁之后才断流（断流可能十几秒）。这段时间里管理员可以把
+// 账号重新启用，客户端随即重连并建立新代理——继续按几秒前那份列表往下关，
+// 关的就是刚放行的人。代次一变，本次断流必须停手。
+func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
+	svc := newTestServices(t, nil)
+	t.Cleanup(svc.Close)
+
+	const userID = 7
+	var (
+		mu     sync.Mutex
+		closed []string
+		bumped bool
+	)
+	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(frpsOK(`{"total":2,"page":1,"pageSize":200,"items":[` +
+				`{"name":"lt_u7.mc","status":{"phase":"online"}},` +
+				`{"name":"lt_u7.nas","status":{"phase":"online"}}]}`)))
+		case r.Method == http.MethodDelete:
+			mu.Lock()
+			closed = append(closed, r.URL.Query().Get("name"))
+			// 第一次关闭生效期间，管理端把账号重新启用：代次推进。
+			if !bumped {
+				bumped = true
+				svc.bumpUserStatusGen(userID)
+			}
+			mu.Unlock()
+			_, _ = w.Write([]byte(frpsOK("null")))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	gen := svc.bumpUserStatusGen(userID)
+	svc.CloseUserProxies(context.Background(), userID, gen)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(closed) != 1 {
+		t.Fatalf("状态变更后不应继续关闭剩余代理，实际关闭了 %v", closed)
+	}
+}

@@ -177,6 +177,15 @@ type Services struct {
 	// 之后，只可能是先后关系（见 portLock）。
 	portLocks [portLockShards]sync.Mutex
 
+	// statusGenMu 保护 statusGens：每个用户「状态被改过几次」。
+	//
+	// 用途只有一个：让跨锁操作能判断自己是否已经过期。禁用账号要先写库，
+	// 再释放用户锁去做断流（断流可能要十几秒），期间管理员可能已经重新
+	// 启用账号并建立新代理——旧流程手里的那份「要关哪些代理」的判断
+	// 已经作废，继续关就是打自己刚放行的人。
+	statusGenMu sync.Mutex
+	statusGens  map[uint]uint64
+
 	// adminMu 串行化「涉及超级管理员数量」的变更（改角色/状态、删除）。
 	//
 	// 光有事务不够：UpdateAdmin / DeleteAdmin 都是「先数一数、再改」，两个请求
@@ -304,6 +313,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		recoveryCounters: &recoveryCounters{},
 		fwPending:        map[int]pendingFW{},
 		fwKick:           make(chan struct{}, 1),
+		statusGens:       map[uint]uint64{},
 	}
 }
 

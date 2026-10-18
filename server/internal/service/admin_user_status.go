@@ -163,6 +163,24 @@ func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 	return nil
 }
 
+// bumpUserStatusGen 递增并返回该用户的状态代次。
+//
+// 调用时机必须在「状态已写入数据库」之后、释放用户锁之前：它标记的是
+// 「第几次状态生效」，跨锁的后续动作拿它当自己是否过期的凭据。
+func (s *Services) bumpUserStatusGen(userID uint) uint64 {
+	s.statusGenMu.Lock()
+	defer s.statusGenMu.Unlock()
+	s.statusGens[userID]++
+	return s.statusGens[userID]
+}
+
+// userStatusGen 返回该用户当前的状态代次；从未改过状态时为 0。
+func (s *Services) userStatusGen(userID uint) uint64 {
+	s.statusGenMu.Lock()
+	defer s.statusGenMu.Unlock()
+	return s.statusGens[userID]
+}
+
 // AdminSetUserStatus 禁用/启用/封禁用户。
 func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	switch status {
@@ -188,6 +206,9 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		lock.Unlock()
 		return ErrNotFound
 	}
+	// 状态已落库，立刻推进代次：后面那段断流要放掉用户锁去做（可能十几秒），
+	// 这期间若账号被重新启用，代次变化就是「本次断流已过期」的信号。
+	gen := s.bumpUserStatusGen(id)
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	if status != model.UserStatusActive {
@@ -210,7 +231,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
 		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
 		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		s.CloseUserProxies(closeCtx, id)
+		s.CloseUserProxies(closeCtx, id, gen)
 		cancel()
 		return nil
 	}

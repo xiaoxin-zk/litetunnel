@@ -163,8 +163,18 @@ func (s *Services) RevokeClientSessions(userID uint) error {
 // 已经建立的代理流——frps 与 frpc 之间的数据连接会一直转发。逐个关闭该用户
 // 名下的代理，frps 会下线它们、断开已建立的数据连接。
 //
+// gen 是「这次禁用」对应的状态代次（见 bumpUserStatusGen）。断流要访问 frps
+// 管理接口，最长可拖十几秒，而这段时间里用户可以已经被重新启用：客户端会
+// 重连、建立新代理，甚至新代理就出现在下面这份列表里。此时继续关就不是
+// 「断掉禁用前的流量」，而是把刚放行的人又踢下线。所以每关一个之前复查
+// 代次，一变就停手——剩下的代理交给新状态自己决定。
+//
 // 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
-func (s *Services) CloseUserProxies(ctx context.Context, userID uint) {
+func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64) {
+	if s.userStatusGen(userID) != gen {
+		log.Printf("[user] 用户 %d 的状态在断流开始前已变更，跳过本次断流", userID)
+		return
+	}
 	prefix := FrpUserOf(userID) + "."
 	proxies, err := s.Frps.ListProxies(ctx)
 	if err != nil {
@@ -174,6 +184,11 @@ func (s *Services) CloseUserProxies(ctx context.Context, userID uint) {
 	for _, p := range proxies {
 		if !strings.HasPrefix(p.Name, prefix) {
 			continue
+		}
+		// 每次关闭前复查：列表是几秒前拉的，期间状态可能已经翻转。
+		if s.userStatusGen(userID) != gen {
+			log.Printf("[user] 用户 %d 的状态在断流过程中已变更，停止关闭剩余代理（避免误伤重新启用后的新代理）", userID)
+			return
 		}
 		if err := s.Frps.CloseProxy(ctx, p.Name); err != nil {
 			log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", userID, p.Name, err)

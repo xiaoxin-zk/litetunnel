@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -93,15 +95,35 @@ func (s *Services) ResetClientSecret(u *model.User) (string, error) {
 		return "", err
 	}
 
-	// 换凭据与让旧会话失效必须在**同一个事务**里。
+	// 换凭据与让旧会话失效必须在**同一个事务**里，并在用户行锁内串行。
 	//
 	// 分两步写会留下一个谁都说不清的中间态：凭据已经换掉、会话还没失效，
 	// 而接口此时报错返回。用户以为没成功，实际旧凭据已经作废（客户端连不上），
 	// 同时内存里的旧会话还在——插件热路径照样放行。两边都不对。
+	//
+	// 行锁还防并发重置：两个请求都「成功」但库里只剩最后写入的那份明文，
+	// 先返回的客户端拿到的已经作废。行锁让它们排队，并校验 RowsAffected，
+	// 用户不存在时不再静默成功。
+	lock := s.userLock(u.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&model.User{}).Where("id = ?", u.ID).
-			Update("client_secret", secret).Error; err != nil {
+		var cur model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&cur, u.ID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
 			return err
+		}
+		res := tx.Model(&model.User{}).Where("id = ?", u.ID).
+			Update("client_secret", secret)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
 		}
 		return revokeClientSessionsTx(tx, u.ID)
 	})

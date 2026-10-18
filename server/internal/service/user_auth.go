@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/auth"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -537,12 +538,37 @@ func (s *Services) RotateAPIKey(userID uint) (plain, prefix string, err error) {
 		return "", "", err
 	}
 	now := time.Now()
-	err = s.DB.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
-		"api_key_hash":       hash,
-		"api_key_prefix":     prefix,
-		"api_key_enc":        enc,
-		"api_key_created_at": now,
-	}).Error
+
+	// 与重置客户端凭据同一套：用户锁 + 行锁串行并发轮换，并校验 RowsAffected。
+	// 否则两个请求都可能返回「成功」，库里却只有最后写入的一份密钥；用户不
+	// 存在时也会静默成功。
+	lock := s.userLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		var cur model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&cur, userID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		res := tx.Model(&model.User{}).Where("id = ?", userID).Updates(map[string]any{
+			"api_key_hash":       hash,
+			"api_key_prefix":     prefix,
+			"api_key_enc":        enc,
+			"api_key_created_at": now,
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 	if err != nil {
 		return "", "", err
 	}

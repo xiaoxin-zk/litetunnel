@@ -246,7 +246,7 @@ func TestLogBufferRespectsByteBudget(t *testing.T) {
 	bytes, lines := m.logBytes, len(m.logs)
 	sum := 0
 	for _, l := range m.logs {
-		sum += len(l)
+		sum += len(l.Text)
 	}
 	m.mu.Unlock()
 

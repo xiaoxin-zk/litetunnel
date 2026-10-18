@@ -42,46 +42,64 @@ type AdminProfileInput struct {
 // 改名不使当前令牌失效（版本号未变）：否则管理员每次改名都要重新登录，
 // 而账号名本身不是密钥，改名也不意味着凭据泄露。
 func (s *Services) AdminUpdateProfile(id uint, in AdminProfileInput) (*model.Admin, error) {
-	a, err := s.LoadAdmin(id)
+	var result model.Admin
+	s.adminMu.Lock()
+	defer s.adminMu.Unlock()
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		// 资料修改与改密/改角色/双因素同用 adminMu，并在事务内 FOR UPDATE
+		// 重读目标行：事务外读到的快照在并发下可能已经过时（例如并发改名
+		// 已经把登录账号占掉），用旧快照做唯一性判断会漏判，返回对象也会过期。
+		var a model.Admin
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&a, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+
+		updates := map[string]any{}
+		if in.Username != nil {
+			name := strings.TrimSpace(*in.Username)
+			if name != a.Username {
+				if len(name) < 3 || len(name) > 32 || !isSafeName(name) {
+					return fmt.Errorf("%w: 登录账号需为 3-32 位字母、数字或下划线", ErrInvalidParam)
+				}
+				var n int64
+				if err := tx.Model(&model.Admin{}).Where("username = ? AND id <> ?", name, id).Count(&n).Error; err != nil {
+					return err
+				}
+				if n > 0 {
+					return ErrUsernameTaken
+				}
+				updates["username"] = name
+			}
+		}
+		if in.Nickname != nil {
+			nick := strings.TrimSpace(*in.Nickname)
+			if len([]rune(nick)) > 32 {
+				return fmt.Errorf("%w: 昵称不得超过 32 个字符", ErrInvalidParam)
+			}
+			updates["nickname"] = nick
+		}
+
+		if len(updates) == 0 {
+			result = a
+			return nil
+		}
+		res := tx.Model(&model.Admin{}).Where("id = ?", id).Updates(updates)
+		if res.Error != nil {
+			// 并发改名撞唯一索引，同样按占用处理。
+			return ErrUsernameTaken
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return tx.First(&result, id).Error
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	updates := map[string]any{}
-
-	if in.Username != nil {
-		name := strings.TrimSpace(*in.Username)
-		if name != a.Username {
-			if len(name) < 3 || len(name) > 32 || !isSafeName(name) {
-				return nil, fmt.Errorf("%w: 登录账号需为 3-32 位字母、数字或下划线", ErrInvalidParam)
-			}
-			var n int64
-			if err := s.DB.Model(&model.Admin{}).Where("username = ?", name).Count(&n).Error; err != nil {
-				return nil, err
-			}
-			if n > 0 {
-				return nil, ErrUsernameTaken
-			}
-			updates["username"] = name
-		}
-	}
-
-	if in.Nickname != nil {
-		nick := strings.TrimSpace(*in.Nickname)
-		if len([]rune(nick)) > 32 {
-			return nil, fmt.Errorf("%w: 昵称不得超过 32 个字符", ErrInvalidParam)
-		}
-		updates["nickname"] = nick
-	}
-
-	if len(updates) == 0 {
-		return a, nil
-	}
-	if err := s.DB.Model(&model.Admin{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		// 并发改名撞唯一索引，同样按占用处理。
-		return nil, ErrUsernameTaken
-	}
-	return s.LoadAdmin(id)
+	return &result, nil
 }
 
 // ListAdmins 列出全部管理员账号，供后台自查是否残留无用账号。

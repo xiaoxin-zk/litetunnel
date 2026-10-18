@@ -121,7 +121,33 @@ type AdminUpdateUserInput struct {
 func (s *Services) AdminUpdateUser(id uint, in AdminUpdateUserInput) error {
 	updates := map[string]any{}
 	if in.Email != nil {
-		updates["email"] = strings.TrimSpace(*in.Email)
+		// 与自助改邮箱（UpdateProfile）同一套口径：小写归一、格式校验、
+		// 唯一性检查，并且换地址后清掉「已验证」——管理员直接填的地址没有
+		// 经过验证码，标成已验证会在「邮箱即身份凭证」的场景下造成误判。
+		var cur model.User
+		if err := s.DB.Select("email").First(&cur, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		email := strings.ToLower(strings.TrimSpace(*in.Email))
+		if email != "" && !IsValidEmail(email) {
+			return fmt.Errorf("%w: 邮箱格式不正确", ErrInvalidParam)
+		}
+		updates["email"] = email
+		if email != strings.ToLower(strings.TrimSpace(cur.Email)) {
+			// 唯一性显式判一次：数据库上的 lower(email) 唯一索引是「尽力而为」
+			// （历史重复时建不起来），撞上时这里兜住并给出准确报错。
+			taken, err := s.emailTaken(email, id)
+			if err != nil {
+				return err
+			}
+			if taken {
+				return ErrEmailTaken
+			}
+			updates["email_verified"] = false
+		}
 	}
 	if in.Nickname != nil {
 		updates["nickname"] = truncate(*in.Nickname, 64)

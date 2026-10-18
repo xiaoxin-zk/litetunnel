@@ -295,14 +295,17 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 	}
 
 	// 当日上限：把这封推到冷却窗口之外，再补到上限。
-	old := time.Now().Add(-10 * time.Minute)
+	nowTs := time.Now()
+	dayStart := time.Date(nowTs.Year(), nowTs.Month(), nowTs.Day(), 0, 0, 0, 0, nowTs.Location())
+	old := nowTs.Add(-10 * time.Minute)
+	if old.Before(dayStart) {
+		old = dayStart
+	}
 	if err := svc.DB.Model(&model.MailOutbox{}).
 		Where("lower(to_addr) = ? AND kind = ?", u.Email, model.MailKindResetLink).
 		Update("created_at", old).Error; err != nil {
 		t.Fatal(err)
 	}
-	nowTs := time.Now()
-	dayStart := time.Date(nowTs.Year(), nowTs.Month(), nowTs.Day(), 0, 0, 0, 0, nowTs.Location())
 	for i := int64(1); i < resetLinkDailyPerEmail; i++ {
 		row := &model.MailOutbox{
 			To: u.Email, Subject: "s", Kind: model.MailKindResetLink,

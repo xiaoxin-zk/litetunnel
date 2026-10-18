@@ -290,14 +290,43 @@ func (s *Services) ResetPasswordByOldPassword(account, oldPassword, newPassword,
 	if u.Status != model.UserStatusActive {
 		return ErrAccountDisabled
 	}
-	if !auth.VerifyPassword(u.Password, oldPassword) {
-		return ErrBadCredentials
+
+	hashed, newSecret, err := s.preparePasswordReset(newPassword)
+	if err != nil {
+		return err
 	}
-	// 新旧密码相同没有意义，且会让用户误以为改成功了。
-	if auth.VerifyPassword(u.Password, newPassword) {
-		return fmt.Errorf("%w: 新密码不能与当前密码相同", ErrInvalidParam)
+
+	// 旧密码校验放在锁内重做，而不是锁外先验一遍（与 UpdatePassword 同一套
+	// 语义）：并发改密时，锁外的 findUserByAccount 读到的是旧快照，等本事务
+	// 拿到行锁时密码可能已被别的请求改掉，「旧密码正确」的结论已经作废。
+	// 锁内重读并校验，保证重置一定基于当前密码。
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		var locked model.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&locked, u.ID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrBadCredentials
+			}
+			return err
+		}
+		if locked.Status != model.UserStatusActive {
+			return ErrAccountDisabled
+		}
+		if !auth.VerifyPassword(locked.Password, oldPassword) {
+			return ErrBadCredentials
+		}
+		// 新旧密码相同没有意义，且会让用户误以为改成功了。
+		if auth.VerifyPassword(locked.Password, newPassword) {
+			return fmt.Errorf("%w: 新密码不能与当前密码相同", ErrInvalidParam)
+		}
+		return s.applyPasswordResetTx(tx, u.ID, hashed, newSecret)
+	})
+	if err != nil {
+		return err
 	}
-	return s.applyPasswordReset(u.ID, newPassword, ip)
+
+	s.finishPasswordReset(u.ID, ip)
+	return nil
 }
 
 // ResetPasswordByEmailCode 用邮箱一次性验证码重置密码。
@@ -370,30 +399,6 @@ func validateNewPassword(p string) error {
 	if len(p) > 128 {
 		return fmt.Errorf("%w: 密码长度不得超过 128 位", ErrInvalidParam)
 	}
-	return nil
-}
-
-// applyPasswordReset 执行重置的公共部分。
-//
-// 三件事必须一起做，缺任何一件都会留下「旧凭据仍然可用」的窗口：
-//  1. 自增令牌版本 → 所有已签发的 JWT 立即失效（改密即全端下线）
-//  2. 轮换 client_secret → 已下发的 frpc 配置立即失效
-//  3. 客户端会话标记离线 → 迫使客户端重新认证
-//
-// 注意这里**不动** API Key：它与登录会话是两套独立的吊销通道，
-// 需要用户在控制台显式重置。这与 GitHub PAT / AWS Access Key 的语义一致。
-func (s *Services) applyPasswordReset(userID uint, newPassword, ip string) error {
-	hashed, newSecret, err := s.preparePasswordReset(newPassword)
-	if err != nil {
-		return err
-	}
-	if err := s.DB.Transaction(func(tx *gorm.DB) error {
-		return s.applyPasswordResetTx(tx, userID, hashed, newSecret)
-	}); err != nil {
-		return err
-	}
-
-	s.finishPasswordReset(userID, ip)
 	return nil
 }
 

@@ -2,16 +2,19 @@
 # ---------- 前端：用户控制台 ----------
 FROM node:22-alpine AS web-user
 WORKDIR /src
-COPY web/user/package.json web/user/
-RUN cd web/user && npm install --no-audit --no-fund
+COPY web/user/package.json web/user/package-lock.json web/user/
+# 用户端使用 vitest 4 + jsdom；npm 10 的 peer 解析需要与 lockfile 生成时保持一致。
+# Alpine 的 Rollup musl 原生包已锁入 package-lock.json。
+RUN cd web/user && npm ci --no-audit --no-fund --legacy-peer-deps
 COPY web/user web/user
 RUN cd web/user && npm run build
 
 # ---------- 前端：管理后台 ----------
 FROM node:22-alpine AS web-admin
 WORKDIR /src
-COPY web/admin/package.json web/admin/
-RUN cd web/admin && npm install --no-audit --no-fund
+COPY web/admin/package.json web/admin/package-lock.json web/admin/
+# Alpine 需要 Rollup 的 linux-x64-musl 原生包；它已锁入 package-lock.json。
+RUN cd web/admin && npm ci --no-audit --no-fund
 COPY web/admin web/admin
 RUN cd web/admin && npm run build
 

@@ -44,27 +44,51 @@ type captchaEntry struct {
 type CaptchaStore struct {
 	mu      sync.Mutex
 	entries map[string]captchaEntry
+
+	// stop 用于结束 gc 协程（见 Close）。
+	stop      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewCaptchaStore 构造验证码存储。
 func NewCaptchaStore() *CaptchaStore {
-	s := &CaptchaStore{entries: make(map[string]captchaEntry)}
+	s := &CaptchaStore{
+		entries: make(map[string]captchaEntry),
+		stop:    make(chan struct{}),
+	}
 	go s.gc()
 	return s
+}
+
+// Close 停止后台清理协程。
+//
+// 验证码本身就是短命数据，关闭不必清表：进程退出后它们随内存一起消失，
+// 重启后票据本就应该失效。Close 只负责不让那个 ticker 协程活过使用者。
+// 可重复调用。
+func (s *CaptchaStore) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() { close(s.stop) })
 }
 
 func (s *CaptchaStore) gc() {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		s.mu.Lock()
-		for k, e := range s.entries {
-			if now.After(e.expireAt) {
-				delete(s.entries, k)
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			s.mu.Lock()
+			for k, e := range s.entries {
+				if now.After(e.expireAt) {
+					delete(s.entries, k)
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 

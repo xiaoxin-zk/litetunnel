@@ -75,6 +75,9 @@ func newLoginPolicyStack(t *testing.T, captchaAfter string) (*gin.Engine, *servi
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	svc := service.New(db, cfg)
+	// Services 自带两个 gc 协程（验证码存储、登录锁定器），它们不监听 ctx，
+	// 只能显式关闭；不关的话每个用例都会留下一个 ticker 协程。
+	t.Cleanup(svc.Close)
 
 	// 登录日志是异步落库的（内存队列 → 协程写库），而验证码要求是**查库**
 	// 统计的。不把写库协程跑起来，计数永远是 0，用例会假通过。

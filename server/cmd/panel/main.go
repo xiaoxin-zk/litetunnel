@@ -66,12 +66,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 登录日志落库协程用**独立的** ctx，不能与其它 worker 共用信号 ctx。
+	//
+	// 那个协程在结束时会先把队列里剩下的日志刷完再返回。若共用信号 ctx，
+	// 结束信号与 HTTP 关闭同时到达，而在途请求此时还在写登录日志：它们
+	// 入队的记录落在 drain 之后，退出时被静默丢掉——丢的恰好是「退出前
+	// 最后几条」，而审计记录的价值往往就在出事那一段。
+	// 所以它的取消时机推迟到 srv.Shutdown 之后（见下方 stopLog）。
+	logCtx, stopLog := context.WithCancel(context.Background())
+	defer stopLog()
+
 	// 统一收集后台 worker 的退出信号，关闭阶段逐个等待（见 waitWorkers）。
 	// 之前只有防火墙协调器被等待，其余 worker 在进程退出时可能还握着
 	// 数据库连接或 SMTP 会话，尾部数据会丢。
 	workers := []<-chan struct{}{
 		svc.StartTrafficCollector(ctx),
-		svc.StartLoginLogWriter(ctx),
+		svc.StartLoginLogWriter(logCtx),
 		svc.StartMailWorker(ctx),
 		svc.StartRecoveryWorker(ctx),
 		// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
@@ -107,9 +117,17 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 
+	// HTTP 已停止接收新请求、在途请求处理完毕，这时才让日志协程收尾：
+	// 它会把队列里剩下的记录刷进库再返回（见 logCtx 处的说明）。
+	stopLog()
+
 	// 统一等待所有后台 worker 退出再返回：它们可能正在访问数据库或调用
 	// helper/SMTP，进程先走会让那次写操作停在半路、尾部数据丢失。
 	waitWorkers(workers)
+
+	// 最后关掉 Services 自己起的 gc 协程（验证码存储、登录锁定器）。
+	// 放在 worker 之后：它们可能仍在读这两份内存状态。
+	svc.Close()
 	log.Println("已退出")
 }
 

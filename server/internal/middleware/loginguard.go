@@ -26,6 +26,13 @@ type LoginGuard struct {
 	threshold int
 	baseLock  time.Duration
 	maxLock   time.Duration
+
+	// stop 用于结束 gc 协程。没有它，每次 NewLoginGuard 都会留下一个
+	// 永不退出的协程——常驻进程里只是多一个 ticker，测试里则是每次
+	// 建栈泄漏一个，长期跑下去 goroutine 数只增不减。
+	stop chan struct{}
+	// closeOnce 让 Close 可被重复调用（defer 里再叫一次也不会 panic）。
+	closeOnce sync.Once
 }
 
 // maxLoginRecords 是失败记录表的容量上限。
@@ -60,9 +67,21 @@ func NewLoginGuard(threshold int, baseLock, maxLock time.Duration) *LoginGuard {
 		threshold: threshold,
 		baseLock:  baseLock,
 		maxLock:   maxLock,
+		stop:      make(chan struct{}),
 	}
 	go g.gc()
 	return g
+}
+
+// Close 停止 gc 协程。
+//
+// 只终止后台清理，不动记录表：关闭之后记录仍可读，调用方不必区分
+// 「已关闭」与「没有记录」——两者都不该影响任何一次判定。
+func (g *LoginGuard) Close() {
+	if g == nil {
+		return
+	}
+	g.closeOnce.Do(func() { close(g.stop) })
 }
 
 // guardKey 组合锁定维度：作用域 + 账号 + 来源 IP。
@@ -138,14 +157,19 @@ func (g *LoginGuard) Reset(scope, account, ip string) {
 func (g *LoginGuard) gc() {
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		cutoff := time.Now().Add(-2 * time.Hour)
-		g.mu.Lock()
-		for k, rec := range g.records {
-			if rec.lastFail.Before(cutoff) && time.Now().After(rec.lockedTill) {
-				delete(g.records, k)
+	for {
+		select {
+		case <-g.stop:
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-2 * time.Hour)
+			g.mu.Lock()
+			for k, rec := range g.records {
+				if rec.lastFail.Before(cutoff) && time.Now().After(rec.lockedTill) {
+					delete(g.records, k)
+				}
 			}
+			g.mu.Unlock()
 		}
-		g.mu.Unlock()
 	}
 }

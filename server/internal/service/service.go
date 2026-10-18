@@ -307,6 +307,28 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 	}
 }
 
+// Close 释放 Services 自己启动的、不归 ctx 管的资源。
+//
+// 为什么需要它：后台 worker 都监听 ctx（见 cmd/panel/main.go 的 workers），
+// 但验证码存储与登录锁定器是在 New 里各起一个 gc 协程，没有任何 ctx 能
+// 让它们退出。常驻进程里这只多一个 ticker，可在测试里每 New 一次就漏一个，
+// 泄漏量随用例数增长而累积。
+//
+// 这里刻意**不**做的事：
+//   - 不释放端口锁、用户锁、adminMu 等互斥量——Go 的 Mutex 没有「释放」
+//     这一步，它们随 Services 一起被回收；
+//   - 不清空 fwPending：关闭阶段没人会再读它，清空只会白白丢一份现场；
+//   - 不关数据库：连接的生命周期归调用方（main 与测试各自负责）。
+//
+// 可重复调用。
+func (s *Services) Close() {
+	if s == nil {
+		return
+	}
+	s.Captchas.Close()
+	s.LoginGuard.Close()
+}
+
 // newInstanceID 生成一个进程级随机标识。
 //
 // 取不到随机数时退回时间戳：租约只要求「不同实例不同值」，

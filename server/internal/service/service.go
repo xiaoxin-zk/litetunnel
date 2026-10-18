@@ -91,6 +91,11 @@ var (
 	// 也没能进入重试队列。必须让调用方（创建/启用隧道）明确报错，否则会出现
 	// 「隧道已启用、端口未放行、管理页也没有待办」的永久不一致。
 	ErrFirewallQueueFull = errors.New("防火墙待办队列已满，端口操作无法排队重试")
+	// ErrFirewallQueueUnavailable 表示防火墙待办队列本身不可用（取不到落库代次，
+	// 通常是数据库故障），本次端口操作既没执行、也没能持久化到重试队列。
+	// 与 ErrFirewallQueueFull 必须分开：后者是「队列满了，需要人工清理」，
+	// 前者是「数据库故障，需要查库」——把两者都报成队列满会让管理员找错方向。
+	ErrFirewallQueueUnavailable = errors.New("防火墙待办队列不可用（数据库故障），端口操作无法持久化重试")
 
 	// 邮箱验证码相关
 	ErrEmailRequired     = errors.New("请填写有效的邮箱地址")

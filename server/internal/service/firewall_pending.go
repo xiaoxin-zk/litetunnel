@@ -67,10 +67,12 @@ func (s *Services) nextFirewallGen() (int64, error) {
 
 // markFirewallPending 记下一条待重试的端口操作（内存 + 落库）。
 //
-// 返回 false 表示**没有**入队（队列已满且这是一个新端口）：这条意图既没执行、
-// 也没进入重试队列，属于永久丢失，调用方必须据此明确报错，否则会出现
-// 「隧道已启用、端口未放行、管理页也没有待办」的永久不一致。
-func (s *Services) markFirewallPending(port int, proto string, open bool) bool {
+// 返回 error 表示**没有**入队，调用方必须据此明确报错，否则会出现
+// 「隧道已启用、端口未放行、管理页也没有待办」的永久不一致。错误分两种：
+//
+//   - ErrFirewallQueueFull：队列已满且这是一个新端口，需要人工清理队列；
+//   - ErrFirewallQueueUnavailable：取不到落库代次（数据库故障），需要查库。
+func (s *Services) markFirewallPending(port int, proto string, open bool) error {
 	s.fwMu.Lock()
 	if s.fwPending == nil {
 		s.fwPending = map[int]pendingFW{}
@@ -91,13 +93,13 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) bool {
 		s.fwMu.Unlock()
 		log.Printf("[firewall] 待处理端口操作已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
 			pendingFWLimit, port)
-		return false
+		return ErrFirewallQueueFull
 	}
 	gen, err := s.nextFirewallGen()
 	if err != nil {
 		s.fwMu.Unlock()
 		log.Printf("[firewall] 获取待办代次失败（端口 %d），本次意图无法登记: %v", port, err)
-		return false
+		return fmt.Errorf("%w: %v", ErrFirewallQueueUnavailable, err)
 	}
 	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: gen}
 	s.fwPending[port] = item
@@ -105,7 +107,7 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) bool {
 
 	// 落库放在锁外：这是 IO，不该让建/删隧道的请求排在它后面。
 	s.persistPending(port, item)
-	return true
+	return nil
 }
 
 // persistPending 把一条待办写入数据库（写失败只记日志：内存里那份仍然有效，
@@ -233,9 +235,10 @@ func (s *Services) applyPortIntentLocked(port int, proto string, open bool) (act
 
 	valid, verr := s.portIntentValid(port, open)
 	if verr != nil {
-		// 读不出状态：不动手，但记住意图等下一轮。
-		if !s.markFirewallPending(port, proto, open) {
-			return false, ErrFirewallQueueFull
+		// 读不出状态：不动手，但记住意图等下一轮。队列满与队列不可用要分开
+		// 报：后者是数据库故障，管理员该去查库而不是清队列。
+		if perr := s.markFirewallPending(port, proto, open); perr != nil {
+			return false, perr
 		}
 		log.Printf("[firewall] 无法确认端口 %d 的当前状态，本次不动手、已加入重试队列: %v", port, verr)
 		return false, nil
@@ -253,10 +256,10 @@ func (s *Services) applyPortIntentLocked(port int, proto string, open bool) (act
 	if err == nil {
 		return true, nil
 	}
-	// 入队失败（队列满且是新端口）时，这条意图既没执行也没排队——比普通
-	// 失败严重得多，必须让调用方区分出来，而不能只报「动手失败」。
-	if !s.markFirewallPending(port, proto, open) {
-		return true, fmt.Errorf("%w: %v", ErrFirewallQueueFull, err)
+	// 入队失败时，这条意图既没执行也没排队——比普通失败严重得多，必须让
+	// 调用方区分出来（队列满 vs 队列不可用），而不能只报「动手失败」。
+	if perr := s.markFirewallPending(port, proto, open); perr != nil {
+		return true, fmt.Errorf("%w: %v", perr, err)
 	}
 	log.Printf("[firewall] 端口 %d/%s %s失败，已加入重试队列: %v", port, proto, actionName(open), err)
 	return true, err

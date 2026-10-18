@@ -14,8 +14,12 @@ func TestFirewallPendingGenerationGuardsWrites(t *testing.T) {
 	svc := newTestServices(t, nil)
 
 	// 先放行（gen 1）、再收回（gen 2）：同一端口后来的意图覆盖先前的。
-	svc.markFirewallPending(20001, "tcp", true)
-	svc.markFirewallPending(20001, "tcp", false)
+	if err := svc.markFirewallPending(20001, "tcp", true); err != nil {
+		t.Fatalf("登记放行待办失败: %v", err)
+	}
+	if err := svc.markFirewallPending(20001, "tcp", false); err != nil {
+		t.Fatalf("登记收回待办失败: %v", err)
+	}
 
 	// 模拟旧意图（gen 1）的落库晚到：条件写必须拒绝它，不能顶掉 gen 2。
 	svc.persistPending(20001, pendingFW{open: true, proto: "tcp", gen: 1})
@@ -44,14 +48,18 @@ func TestFirewallPendingGenerationGuardsWrites(t *testing.T) {
 // TestFirewallPendingLoadSeedsGeneration 覆盖「重启后新意图的代次仍单调」。
 func TestFirewallPendingLoadSeedsGeneration(t *testing.T) {
 	svc := newTestServices(t, nil)
-	svc.markFirewallPending(20002, "tcp", true) // gen 1
+	if err := svc.markFirewallPending(20002, "tcp", true); err != nil { // gen 1
+		t.Fatalf("登记待办失败: %v", err)
+	}
 	svc.persistPending(20002, pendingFW{open: true, proto: "tcp", gen: 1})
 
 	// 模拟重启：代次来自落库序列，重启后取号仍然单调递增（不会撞回旧值）。
 	svc.fwPending = nil
 	svc.loadPendingFirewall()
 
-	svc.markFirewallPending(20002, "tcp", false)
+	if err := svc.markFirewallPending(20002, "tcp", false); err != nil {
+		t.Fatalf("登记待办失败: %v", err)
+	}
 	svc.persistPending(20002, pendingFW{open: false, proto: "tcp", gen: 1}) // 旧代写回
 
 	var rec model.FirewallPending

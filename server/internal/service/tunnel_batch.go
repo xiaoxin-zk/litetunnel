@@ -149,14 +149,18 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 			if t.RemotePort <= 0 {
 				continue
 			}
-			// 队列满（且是新端口）时 markFirewallPending 返回 false：隧道已经
+			// markFirewallPending 返回错误（队列满或队列不可用）时：隧道已经
 			// 建好，但放行既没执行也没入队，属于永久丢失。必须单独回报，
 			// 否则管理员看到「创建成功」，端口却一直连不上、界面也没有待办。
-			if !s.markFirewallPending(t.RemotePort, ProtoOfTunnel(t.Type), true) {
+			if perr := s.markFirewallPending(t.RemotePort, ProtoOfTunnel(t.Type), true); perr != nil {
+				reason := "隧道已创建，但防火墙放行未进入重试队列（队列已满），请稍后重试"
+				if errors.Is(perr, ErrFirewallQueueUnavailable) {
+					reason = "隧道已创建，但防火墙放行未进入重试队列（队列不可用，数据库故障），请稍后重试"
+				}
 				res.FirewallFailures = append(res.FirewallFailures, BatchFailure{
 					LocalPort: t.LocalPort,
 					Name:      t.Name,
-					Reason:    "隧道已创建，但防火墙放行未进入重试队列（队列已满），请稍后重试",
+					Reason:    reason,
 				})
 			}
 		}

@@ -260,6 +260,17 @@ type stagedFile struct {
 	// 不是「把备份放回去」，而是「把刚创建的新文件删掉」——否则会留下
 	// 半套配置（新文件在、旧文件从来没有）。
 	existed bool
+
+	// newSum 是候选内容的 sha256（十六进制）。
+	//
+	// 崩溃恢复时它比「备份文件在不在」更硬：备份存在只说明动过这个文件，
+	// 而目标内容与候选一致，才证明替换**确实已经发生**。两者结合可以区分
+	// 「还没进入替换」和「替换完成但备份丢了」——后者不能当成前者处理，
+	// 否则会把一份新内容留在磁盘上、还把恢复记录删掉。
+	newSum string
+	// bakSum 是备份内容的 sha256（十六进制），替换前算好。
+	// 读不出来时留空：恢复退回旧判据，而不是让整次应用失败。
+	bakSum string
 }
 
 // stageFile 把内容写进同目录的临时文件并设好权限，内容尚未生效。
@@ -269,7 +280,7 @@ func stageFile(name, path, content string, mode os.FileMode) (*stagedFile, error
 		return nil, err
 	}
 	tmp := f.Name()
-	st := &stagedFile{name: name, path: path, tmp: tmp}
+	st := &stagedFile{name: name, path: path, tmp: tmp, newSum: contentSum(content)}
 
 	if _, err := f.WriteString(content); err != nil {
 		_ = f.Close()
@@ -307,6 +318,14 @@ func (s *stagedFile) commit() error {
 			return fmt.Errorf("备份旧文件失败: %w", err)
 		}
 		s.backup = backup
+		// 备份内容的摘要：恢复前用它确认「这份备份确实是当时那份旧文件」，
+		// 而不是一份写了一半、或从别处串过来的东西。
+		// 算不出来不影响本次替换，只是让恢复少一层校验（留空即退回旧判据）。
+		if sum, err := fileSum(backup); err != nil {
+			log.Printf("[lt-config] 计算备份摘要失败（%s），恢复时将退回报份存在性判断: %v", backup, err)
+		} else {
+			s.bakSum = sum
+		}
 		syncDirBestEffort(filepath.Dir(s.path))
 	}
 	if err := os.Rename(s.tmp, s.path); err != nil {

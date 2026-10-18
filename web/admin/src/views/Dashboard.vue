@@ -105,6 +105,25 @@
       <el-alert v-if="metrics.recovery?.failed || metrics.recovery?.rejected" type="warning" :closable="false" title="恢复请求出现拒绝或处理失败，请检查邮件配置、对外地址及服务日志。" style="margin-top: 10px" />
     </div>
 
+    <div class="lt-card" style="margin-top: 16px">
+      <div class="lt-card-title">认证审计写入（当前实例）</div>
+      <el-descriptions :column="3" border size="small">
+        <el-descriptions-item label="写入失败累计">{{ metrics.audit?.failures ?? 0 }}</el-descriptions-item>
+        <el-descriptions-item label="最近失败时间">
+          {{ metrics.audit?.last_at ? new Date(metrics.audit.last_at).toLocaleString() : '无' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="最近失败位置">{{ metrics.audit?.last_scope || '无' }}</el-descriptions-item>
+      </el-descriptions>
+      <!-- 这类失败不影响登录（认证已通过），所以界面上不出现任何异常；
+           正因如此才需要在这里点名，否则「审计字段一直是旧值」可以几个月无人察觉。 -->
+      <div class="lt-muted" style="margin-top: 10px">
+        登录、动态口令验证、兑换核销成功时，若审计字段没能写进数据库，认证仍会放行——避免一次数据库抖动把管理员锁在门外。失败次数与最近原因记在这里。计数在进程重启后清零。
+      </div>
+      <el-alert v-if="metrics.audit?.failures" type="warning" :closable="false"
+        :title="`有 ${metrics.audit.failures} 次审计写入失败（最近：${metrics.audit.last_scope || '未知位置'}｜${metrics.audit.last_error || '未记录原因'}），请检查数据库状态：锁表、磁盘空间、目录权限。`"
+        style="margin-top: 10px" />
+    </div>
+
     <!-- ============ 业务指标 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">平台业务数据</div>

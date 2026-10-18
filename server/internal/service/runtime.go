@@ -364,6 +364,7 @@ func (s *Services) MarkStaleSessionsOffline(maxIdle time.Duration) {
 		Where("online = ? AND last_seen_at < ?", true, cutoff).
 		Update("online", false).Error; err != nil {
 		log.Printf("[session] 标记陈旧会话离线失败（在线列表可能残留幽灵会话）: %v", err)
+		s.recordAuditFailure(auditScopeSessionSweep, err)
 	}
 }
 

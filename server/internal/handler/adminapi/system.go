@@ -101,6 +101,10 @@ func (h *Handler) SystemMetrics(c *gin.Context) {
 		"sample_interval": int(monitor.SampleInterval.Seconds()),
 		"max_samples":     monitor.MaxSamples,
 		"recovery":        h.svc.RecoveryStats(),
+		// 审计字段写库失败（认证仍通过）的累计次数与最近原因。
+		// 一起下发的理由与 recovery 相同：这类故障不影响功能，只影响事后追查，
+		// 单独开接口的话没人会去看。
+		"audit": h.svc.AuditHealth(),
 	})
 }
 

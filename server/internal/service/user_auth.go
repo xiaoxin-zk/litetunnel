@@ -474,6 +474,7 @@ func (s *Services) Authenticate(username, password, ip string) (*model.User, err
 	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error; err != nil {
 		log.Printf("[auth] 记录用户 %d 的登录时间/IP 失败（登录已通过，审计字段未更新）: %v", u.ID, err)
+		s.recordAuditFailure(auditScopeUserLogin, err)
 	}
 
 	return s.LoadUser(u.ID)

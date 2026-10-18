@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -70,6 +73,38 @@ type manifestEntry struct {
 	// Existed 表示目标文件在提交前是否存在。原本不存在的文件，回滚是
 	// 「删掉新文件」而不是「放回备份」。
 	Existed bool `json:"existed"`
+
+	// NewSum / BakSum 是候选内容与备份内容的 sha256（十六进制）。
+	//
+	// 恢复时不能只看「备份在不在」：备份存在只说明动过这个文件，而
+	// 「目标内容等于候选」才是替换发生过的硬证据。少了这个判据，
+	// 「替换已完成、备份却丢了」会被当成「还没开始替换」，于是新内容
+	// 被留在磁盘上、恢复记录还被删掉——半套配置再也无人知晓。
+	//
+	// 旧版本写下的记录没有这两个字段（空串），恢复时自动跳过校验，
+	// 退回原有判据，不会因为升级而无法恢复。
+	NewSum string `json:"new_sum,omitempty"`
+	BakSum string `json:"bak_sum,omitempty"`
+}
+
+// contentSum 返回内容的 sha256 十六进制表示。
+func contentSum(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// fileSum 返回文件内容的 sha256 十六进制表示。
+func fileSum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // writeManifest 把本批候选文件的身份落盘，返回可交给 removeManifest 的现场。
@@ -85,6 +120,10 @@ func (b *writeBatch) writeManifest() (batchManifest, error) {
 			Path:    st.path,
 			Tmp:     st.tmp,
 			Existed: err == nil,
+			// BakSum 此刻还是空的（备份尚未创建），由 refreshBackupSums
+			// 在整批替换完成后补写一次。
+			NewSum: st.newSum,
+			BakSum: st.bakSum,
 		})
 	}
 	if len(m.Files) == 0 {
@@ -106,6 +145,28 @@ func writeManifestFile(m batchManifest) error {
 	}
 	// 记录里是部署目录的绝对路径，可能包含宿主机拓扑信息，按凭据文件对待。
 	return writeFileAtomic(filepath.Join(m.Dir, batchManifestName), string(raw)+"\n", modeSecret)
+}
+
+// refreshBackupSums 把备份摘要补写进批次记录。
+//
+// 摘要只有在每个文件真正完成备份之后才算得出来，而记录必须在第一次替换
+// **之前**就落盘（否则崩溃时没有记录可依）。所以这里多写一次。
+//
+// 补写失败不影响本批的推进：记录里少一层校验，恢复退回「备份是否存在」
+// 的老判据，与升级前的行为一致。真正危险的是「记录写着摘要、备份却不是
+// 那份内容」，那是恢复时的校验负责挡住的事。
+func (b *writeBatch) refreshBackupSums() {
+	if b.manifest.Dir == "" || len(b.manifest.Files) == 0 {
+		return
+	}
+	for i := range b.manifest.Files {
+		if i < len(b.staged) {
+			b.manifest.Files[i].BakSum = b.staged[i].bakSum
+		}
+	}
+	if err := writeManifestFile(b.manifest); err != nil {
+		log.Printf("[lt-config] 补写备份摘要失败（恢复时退回备份存在性判断）: %v", err)
+	}
 }
 
 // removeManifest 在整批文件已经确定落定（新配置生效或已完整回滚）后撤掉记录。
@@ -190,6 +251,23 @@ func recoverBatch(dir string) bool {
 	for _, f := range m.Files {
 		bak := f.Path + backupSuffix
 		if _, err := os.Stat(bak); err == nil {
+			// 备份存在 = 这个文件的替换进行过。先用记录里的摘要确认备份
+			// 确实是当时那份旧文件：写了一半、被别的进程覆盖、卷映射错位
+			// 都会让「备份文件在」与「备份内容对」不一致，拿坏备份覆盖
+			// 等于把一份损坏的配置扶正，比不动更糟。
+			if f.BakSum != "" {
+				sum, err := fileSum(bak)
+				switch {
+				case err != nil:
+					log.Printf("[lt-config] 批次回滚：备份读不出来，拒绝盲目覆盖（%s）: %v", bak, err)
+					failed = append(failed, f.Name)
+					continue
+				case sum != f.BakSum:
+					log.Printf("[lt-config] 批次回滚：备份内容与记录摘要不符（%s），拒绝用它覆盖", bak)
+					failed = append(failed, f.Name)
+					continue
+				}
+			}
 			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
 				log.Printf("[lt-config] 批次回滚：删除新文件失败（%s）: %v", f.Path, err)
 				failed = append(failed, f.Name)
@@ -203,7 +281,19 @@ func recoverBatch(dir string) bool {
 			log.Printf("[lt-config] 已回滚：%s", f.Name)
 			continue
 		}
-		// 没有备份只有两种可能：这个文件还没进入替换（旧内容还在，不必动），
+		// 没有备份时先看目标内容是不是**候选内容**。
+		//
+		// 若是，说明替换已经发生、而备份已经不在了——旧内容无从恢复。
+		// 旧实现会把它当成「还没进入替换」放过，于是新内容留在磁盘上、
+		// 记录随后被删掉，半套配置再也无人知晓。这里必须报失败并保留现场。
+		if f.NewSum != "" {
+			if sum, err := fileSum(f.Path); err == nil && sum == f.NewSum {
+				log.Printf("[lt-config] 批次回滚：%s 已是新内容但没有备份可用于恢复", f.Name)
+				failed = append(failed, f.Name)
+				continue
+			}
+		}
+		// 其余情况只有两种：这个文件还没进入替换（旧内容还在，不必动），
 		// 或者它原本不存在而现在多了一个新文件（必须删掉，否则就是半套配置）。
 		if !f.Existed {
 			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
@@ -215,6 +305,25 @@ func recoverBatch(dir string) bool {
 	for _, f := range m.Files {
 		if f.Tmp != "" {
 			_ = os.Remove(f.Tmp)
+		}
+	}
+
+	// 删记录之前再核对一遍内容：上面的循环只保证 rename 返回成功，
+	// 而「rename 成功了」不等于「文件里就是那份旧内容」（备份可能来自
+	// 另一份副本，或文件系统把写入落到了别处）。日志摘要可用的文件，
+	// 此刻必须是旧内容，否则保留现场，别把「看起来回滚了」当成回滚完成。
+	for _, f := range m.Files {
+		if f.BakSum == "" {
+			continue
+		}
+		sum, err := fileSum(f.Path)
+		switch {
+		case err != nil:
+			log.Printf("[lt-config] 批次回滚后校验失败：读不出目标文件（%s）: %v", f.Path, err)
+			failed = append(failed, f.Name)
+		case sum != f.BakSum:
+			log.Printf("[lt-config] 批次回滚后校验失败：内容与备份摘要不符（%s）", f.Path)
+			failed = append(failed, f.Name)
 		}
 	}
 

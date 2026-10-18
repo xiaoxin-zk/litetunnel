@@ -42,10 +42,9 @@ func TestLoginGuardEvictStaysUnderLimit(t *testing.T) {
 		g.Fail("login", fmt.Sprintf("u%d", i), "127.0.0.1")
 	}
 
-	g.mu.Lock()
-	n := len(g.records)
-	g.mu.Unlock()
-	if n > maxLoginRecords {
+	// 记录表已按 key 分片，总数要逐片统计（见 size）。
+	// 断言的是**总容量**：分片不能变成悄悄放宽上限的手段。
+	if n := g.size(); n > maxLoginRecords {
 		t.Fatalf("记录表大小 %d 超过上限 %d", n, maxLoginRecords)
 	}
 }

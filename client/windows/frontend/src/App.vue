@@ -7,8 +7,9 @@
         :state="state"
         :logs="logs"
         :notice="notice"
+        :clear-logs="onClearLogs"
+        :open-data-dir="onOpenDataDir"
         @update="onUpdate"
-        @clearlogs="onClearLogs"
       />
     </transition>
   </div>
@@ -184,6 +185,12 @@ async function onClearLogs() {
   pendingLogs.length = 0
   logs.value = []
   lastSeq.value = 0
+}
+
+// 打开数据目录。失败原因由主进程带回（见 App.OpenDataDir），
+// 这里原样抛出，交给 MainView 的统一命令执行去提示——不吞掉。
+async function onOpenDataDir() {
+  await api.openDataDir()
 }
 
 // 事件取消函数必须保存：热重载或组件重复挂载时，不注销就会累积多个同名

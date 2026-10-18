@@ -141,7 +141,7 @@
         <div class="card-head">
           <span>运行日志</span>
           <div class="head-actions">
-            <button class="btn-ghost mini" @click="clearLogs">清空</button>
+            <button class="btn-ghost mini" @click="handleClearLogs">清空</button>
           </div>
         </div>
         <div ref="logBox" class="log-box">
@@ -325,7 +325,7 @@
              藏进关于页反而多一步。 -->
         <span class="muted mono" v-if="state.version">{{ state.version }}</span>
         <span class="muted mono" v-if="state.config_path">{{ state.config_path }}</span>
-        <button class="btn-ghost mini" @click="openDataDir">打开数据目录</button>
+        <button class="btn-ghost mini" @click="handleOpenDataDir">打开数据目录</button>
       </div>
     </footer>
   </div>
@@ -339,7 +339,13 @@ const props = defineProps({
   state: { type: Object, required: true },
   logs: { type: Array, default: () => [] },
   // 主进程推送的轻提示，例如「检测到配置变更，已自动同步并重新连接」
-  notice: { type: Object, default: null }
+  notice: { type: Object, default: null },
+  // 这两个动作由 App 执行，以函数 prop 传入而不是 emit：
+  //   - 清空日志：只有 App 同时持有主进程缓冲、页面数组与待合并队列；
+  //   - 打开数据目录：后端会返回失败原因（没有文件管理器、被策略禁用）。
+  // 用 emit 的话拿不到返回值，失败原因就丢在半路，界面只能假装成功。
+  clearLogs: { type: Function, required: true },
+  openDataDir: { type: Function, required: true }
 })
 const emit = defineEmits(['update'])
 
@@ -915,7 +921,9 @@ async function run(fn, successText) {
   busy.value = true
   try {
     const next = await fn()
-    emit('update', next)
+    // 只有真的返回了新状态才派发。像「打开数据目录」这类动作没有状态可更新，
+    // 无条件派发会让 App 收到 undefined 再白跑一次 loadState。
+    if (next !== undefined) emit('update', next)
     if (successText) flash(successText)
   } catch (e) {
     flash(typeof e === 'string' ? e : e?.message || '操作失败', 'warn')
@@ -929,16 +937,16 @@ async function run(fn, successText) {
 // 后端接口保留（api.refresh 仍可用），需要时能随时加回入口。
 const logout = () => run(() => api.logout())
 
-function clearLogs() {
-  // 交给 App 处理：它同时持有主进程缓冲、页面数组与待合并队列三份状态，
-  // 只在这里调 api.clearLogs() 的话，页面上的旧行会留在原地。
-  emit('clearlogs')
-  flash('日志已清空')
-}
+// 交给 App 处理：它同时持有主进程缓冲、页面数组与待合并队列三份状态，
+// 只在这里调 api.clearLogs() 的话，页面上的旧行会留在原地。
+//
+// 但「提示成功」必须等它真的清完：以前是先 flash 再 emit，清空过程中
+// 一旦出错，用户看到的仍是一句「日志已清空」——看起来像成功，实则没有。
+const handleClearLogs = () => run(props.clearLogs, '日志已清空')
 
-async function openDataDir() {
-  await api.openDataDir()
-}
+// 打开目录可能失败（没有文件管理器、被组策略禁用、数据目录不存在），
+// 后端把原因放在 error 里带回来，这里原样提示给用户。
+const handleOpenDataDir = () => run(props.openDataDir)
 
 async function copy(text) {
   try {

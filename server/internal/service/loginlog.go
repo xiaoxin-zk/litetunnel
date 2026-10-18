@@ -70,6 +70,7 @@ func (s *Services) StartLoginLogWriter(ctx context.Context) <-chan struct{} {
 			case e := <-s.loginLogCh:
 				if err := s.DB.Create(&e).Error; err != nil {
 					log.Printf("[loginlog] 写入失败: %v", err)
+					s.recordAuditFailure(auditScopeLoginLog, err)
 				}
 			case <-ticker.C:
 				s.PurgeOldLoginLogs(time.Now().AddDate(0, 0, -loginLogRetentionDays))
@@ -86,6 +87,7 @@ func (s *Services) drainLoginLogs() {
 		case e := <-s.loginLogCh:
 			if err := s.DB.Create(&e).Error; err != nil {
 				log.Printf("[loginlog] 退出前落库失败（该条日志已丢失）: %v", err)
+				s.recordAuditFailure(auditScopeLoginLog, err)
 			}
 		default:
 			return

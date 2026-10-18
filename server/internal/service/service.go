@@ -233,6 +233,14 @@ type Services struct {
 	// 全量校准低频执行（见 refreshGuardDue）。
 	// 用原子变量而不是普通字段：写入在采集协程，读取可能来自启动路径。
 	guardFullAt atomic.Int64
+
+	// auditCounters 记录「认证已通过、但审计字段没写进库」的次数与最近一次原因。
+	//
+	// 这类失败刻意不让登录失败（见 admin_auth.go），代价是它只留一行日志：
+	// 日志会被轮转、也没人整天翻，管理端因此无法区分「一切正常」与
+	// 「认证成功但审计写入一直失败」。计数与最近原因随系统指标一起下发，
+	// 让这种「不影响功能、但影响事后追查」的故障能被看见。
+	auditCounters *auditCounters
 }
 
 // portLockShards 是端口锁的分片数。
@@ -317,6 +325,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		fwPending:        map[int]pendingFW{},
 		fwKick:           make(chan struct{}, 1),
 		statusGens:       map[uint]userStatusEntry{},
+		auditCounters:    &auditCounters{},
 	}
 }
 

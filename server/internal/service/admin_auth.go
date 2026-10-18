@@ -64,6 +64,7 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 		if err := s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
 			Update("totp_verified_at", now).Error; err != nil {
 			log.Printf("[admin] 记录管理员 %d 的 TOTP 验证时间失败（认证已通过，审计字段未更新）: %v", a.ID, err)
+			s.recordAuditFailure(auditScopeAdminTOTP, err)
 		} else {
 			a.TOTPVerifiedAt = &now
 		}
@@ -75,6 +76,7 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 	if err := s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
 		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error; err != nil {
 		log.Printf("[admin] 记录管理员 %d 的登录时间/IP 失败（登录已通过，审计字段未更新）: %v", a.ID, err)
+		s.recordAuditFailure(auditScopeAdminLogin, err)
 	} else {
 		a.LastLoginAt = &now
 		a.LastLoginIP = ip

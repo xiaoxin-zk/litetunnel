@@ -38,6 +38,22 @@
         :title="`配置服务不可用`"
         :description="status.helper_reason || '请确认 lt-config 服务已启动、令牌一致、docker 可用。'"
       />
+      <!--
+        helper 本身可用、但宿主机 Docker 不可用（daemon 没起来 / 没有 socket
+        权限 / compose 插件缺失）。这一档以前完全没有区分：available 只表示
+        「helper 能读配置、能渲染」，而校验与重建容器都要起容器，那时点
+        「保存并应用」会在写盘之后才失败，磁盘与容器分处两个版本。
+        这里把「能保存」与「能应用」的边界直接画出来。
+      -->
+      <el-alert
+        v-else-if="!dockerReady"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px"
+        title="宿主机 Docker 不可用：可以保存，但暂时不能校验或应用"
+        :description="dockerDownText"
+      />
       <el-alert
         v-else
         type="success"
@@ -133,13 +149,30 @@
       <div class="lt-card-title">
         <span>域名与证书设置</span>
         <div>
+          <!--
+            「仅保存」只写数据库，不碰宿主机，因此在 Docker 不可用时仍然可用：
+            管理员可以先把配置存下来，等 daemon 修好再下发（见 save 的注释）。
+          -->
           <el-button :loading="saving" @click="save(false)">仅保存</el-button>
-          <el-button :loading="saving" :disabled="!status.helper?.available" @click="save(false, true)">
-            保存并校验
-          </el-button>
-          <el-button type="primary" :loading="saving" :disabled="!status.helper?.available" @click="save(true)">
-            保存并应用
-          </el-button>
+          <!--
+            下面两个按钮都会让 helper 起容器（校验用目标镜像跑一遍、应用要重建
+            caddy/frps），所以必须同时看 DockerReady。只看 available 的话，
+            daemon 停着时按钮仍可点，失败发生在文件已经写盘之后。
+          -->
+          <el-tooltip :disabled="!applyBlockedReason" :content="applyBlockedReason" placement="top">
+            <span>
+              <el-button :loading="saving" :disabled="applyDisabled" @click="save(false, true)">
+                保存并校验
+              </el-button>
+            </span>
+          </el-tooltip>
+          <el-tooltip :disabled="!applyBlockedReason" :content="applyBlockedReason" placement="top">
+            <span>
+              <el-button type="primary" :loading="saving" :disabled="applyDisabled" @click="save(true)">
+                保存并应用
+              </el-button>
+            </span>
+          </el-tooltip>
         </div>
       </div>
 
@@ -377,6 +410,44 @@ const secretPlaceholder = (key) =>
 
 const modeText = (m) => (m === 'e2e' ? '端到端' : '边缘')
 
+// helper 可用只说明「它能读配置、能渲染」，不代表宿主机能起容器。
+// 后端把这两层拆成了 helper.available（helper 自身）与 helper.docker_ready
+// （docker 命令存在**且** daemon 可达、当前身份有权限、compose 插件在位）。
+// 前端必须用后者门控「应用类」操作，否则 daemon 停着时按钮仍可点，
+// 失败要等到文件写盘之后才发生。
+const dockerReady = computed(() => status.value.helper?.docker_ready === true)
+
+// 应用类按钮的禁用状态：helper 不可用、或宿主机 Docker 不可用，都不允许点。
+const applyDisabled = computed(() => !status.value.helper?.available || !dockerReady.value)
+
+// 禁用原因：优先用后端给的 docker_err（它带着 docker 的原始报错，能直接
+// 指向「daemon 未启动 / 无 socket 权限 / 缺 compose 插件」中的哪一种），
+// 缺失时给一句兜底。空串表示不禁用，tooltip 也就不显示。
+const applyBlockedReason = computed(() => {
+  if (!status.value.helper?.available) {
+    return status.value.helper_reason || '配置服务不可用，无法校验或应用'
+  }
+  if (!dockerReady.value) {
+    return status.value.helper?.docker_err || '宿主机 Docker 不可用，无法校验或应用'
+  }
+  return ''
+})
+
+// 告警里的完整说明：把「保存仍可用」这一点写清楚，否则管理员会以为整页都废了。
+//
+// 末尾提醒手动刷新是有意的：本页只在挂载与保存后拉状态，没有轮询。
+// helper 侧探测缓存是 12 秒，但页面不会自己重新取——写成「稍后自动恢复」
+// 会让管理员盯着一个不会变的界面等下去。
+const dockerDownText = computed(() => {
+  const reason = status.value.helper?.docker_err || '未给出原因'
+  return (
+    `Docker 命令存在，但宿主机侧用不了：${reason}。` +
+    '「仅保存」仍然可用（只写数据库，不碰宿主机），但「保存并校验」与「保存并应用」' +
+    '需要起容器，已暂时禁用。请先启动 Docker（或让本服务能访问 /var/run/docker.sock），' +
+    '然后点右上角「刷新状态」重新检测。'
+  )
+})
+
 // 宿主机上实际在用的配置（由后端记录「已下发」的那一份，不是表单里的值）。
 const appliedText = computed(() => {
   const a = status.value.applied || {}
@@ -456,6 +527,13 @@ async function load() {
 // 校验与保存分开是有意的：宿主机上的渲染/校验可能失败（插件没编进镜像、
 // 端口没放行），那时配置值得先存下来，让管理员改完环境再重试下发。
 async function save(apply, validateOnly = false) {
+  // 二次拦截：按钮虽然按 docker_ready 禁用了，但状态可能已经过期
+  // （页面开着不动、daemon 中途挂掉），回车/重复点击也不经过按钮。
+  // 这里直接挡下并说明原因，避免把配置写盘之后才在校验/重建那步失败。
+  if ((apply || validateOnly) && !dockerReady.value) {
+    ElMessage.warning(applyBlockedReason.value || '宿主机 Docker 不可用，无法校验或应用')
+    return
+  }
   saving.value = true
   result.value = null
   try {

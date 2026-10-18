@@ -23,8 +23,9 @@ func (s *Services) AdminDeleteUser(id uint) error {
 //
 // 锁只罩住事务，用 defer 释放：
 //   - 事务提交之后账号行已经不存在，建隧道不可能再成功，锁没有继续占着的理由；
-//   - 善后里的断流要访问 frps 管理接口（最长十几秒），而 closeUserProxies
-//     内部按代理逐条取**同一把**用户锁——持锁调用会自死锁（sync.Mutex 不可重入）；
+//   - 善后里的断流要访问 frps 管理接口（最长十几秒），而断流实现
+//     （proxy_drain.go 的 closeDrainedProxy）内部按代理逐条取**同一把**用户锁
+//     ——持锁调用会自死锁（sync.Mutex 不可重入）；
 //   - 用 defer 而不是「提交后手写 Unlock」：事务回调里一旦 panic，手写的那行
 //     永远执行不到，这把分片锁会被永久占住，之后落到同一分片的所有建隧道/
 //     删号请求全部挂死。

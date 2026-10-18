@@ -147,8 +147,12 @@ type Services struct {
 	//
 	// 与上面那条队列刻意分开：队列满了会丢弃（写日志不能拖住登录判定），
 	// 而「要不要出验证码」是认证门槛，数据源不能是可丢弃的。
+	//
+	// 默认实现落库（见 loginfail_db.go）：进程内计数在多实例部署下会按
+	// 实例数衰减——同一账号的失败被分散到各实例，阈值形同虚设且没有任何
+	// 报错。落库后多实例共用一份计数；db 为 nil 的构造路径退化为进程内。
 	// 缘由见 loginfail.go。
-	loginFails *loginFailureCounter
+	loginFails loginFailCounter
 
 	// mailWake 用于唤醒发信协程（邮件本身存在发件箱表里，不走内存队列：
 	// 内存队列重启即丢，而验证码/重置链接一旦丢了，用户就找不回账号）。
@@ -318,7 +322,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
-		loginFails:       newLoginFailureCounter(),
+		loginFails:       newLoginFailureCounter(db),
 		mailWake:         make(chan struct{}, 1),
 		recoveryCh:       make(chan recoveryRequest, recoveryBuffer),
 		recoveryCounters: &recoveryCounters{},

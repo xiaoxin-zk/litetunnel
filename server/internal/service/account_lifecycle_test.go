@@ -38,6 +38,8 @@ type fakeFrpsProxies struct {
 	mu     sync.Mutex
 	items  []string
 	closed []string
+	// lists 是成功返回的列表请求次数，用来断言「一次批量列表替代了 N 次全量拉取」。
+	lists int
 	// failAll 为真时所有请求都返回 500，模拟 frps 管理接口不可用。
 	failAll bool
 	// onDelete 在每次收到关闭请求时被调用，用来断言「关代理时账号已经不在库里」。
@@ -59,6 +61,7 @@ func newFakeFrpsProxies(t *testing.T, items ...string) *fakeFrpsProxies {
 		switch r.Method {
 		case http.MethodGet:
 			// total 必须如实等于条数：分页完整性只认 total，少报会被判成残缺响应。
+			f.lists++
 			body := fmt.Sprintf(`{"total":%d,"page":1,"pageSize":200,"items":[%s]}`,
 				len(f.items), strings.Join(f.items, ","))
 			_, _ = w.Write([]byte(frpsOK(body)))
@@ -95,6 +98,16 @@ func (f *fakeFrpsProxies) closedNames() []string {
 	return out
 }
 
+// listCount 返回成功返回的列表请求次数。
+//
+// 用来断言「一轮断流只拉一次批量列表」：缺陷 5 的形态就是每关一条代理重拉
+// 一次全量列表，N 条代理 = N+1 次，frps 稍慢就把 15 秒预算耗在拉列表上。
+func (f *fakeFrpsProxies) listCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lists
+}
+
 // setFailAll / setOnDelete 在锁内改字段：假服务的 handler 跑在另一个 goroutine
 // 里，直接赋值会被 -race 判成数据竞争。
 func (f *fakeFrpsProxies) setFailAll(v bool) {
@@ -106,6 +119,17 @@ func (f *fakeFrpsProxies) setFailAll(v bool) {
 func (f *fakeFrpsProxies) setOnDelete(fn func(name string)) {
 	f.mu.Lock()
 	f.onDelete = fn
+	f.mu.Unlock()
+}
+
+// setItems 替换列表内容。
+//
+// 用来模拟「客户端重连后用同一个名字重新注册」：代理名不变，但 clientID /
+// lastStartAt 已经是新实例。断流的重试若不做意图复核、直接按名字关，
+// 关掉的就是这条新实例。
+func (f *fakeFrpsProxies) setItems(items ...string) {
+	f.mu.Lock()
+	f.items = items
 	f.mu.Unlock()
 }
 

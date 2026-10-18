@@ -79,6 +79,11 @@ func (s *Services) RunMaintenance() {
 	s.pruneTable(deadline, "失败邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailFailed, now.Add(-mailFailedRetention))
 	s.pruneMailOutbox(deadline)
+	// 账号级失败计数（见 loginfail_db.go）：按用户名增长，窗口过后就没用了。
+	// 与上面几张表不同，它只影响「是否要出验证码」的强度，不承担审计，
+	// 所以过期即可删，不必保留观察期。共用同一个 deadline：它的量级取决于
+	// 过去半小时失败过的账号数，被海量随机用户名灌过之后可能很大。
+	s.PurgeExpiredLoginFails(now.Add(-loginFailWindow), deadline)
 
 	// 限流器的空闲桶：请求路径上只在有流量时才顺手清理，流量退潮后
 	// 就轮不到它了。这里兜底，顺带让「没有 gc 协程」的方案成立。

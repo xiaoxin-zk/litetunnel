@@ -1,6 +1,6 @@
 package service
 
-// 本文件是「代理断流协调器」：把已经建立的 frps 代理关掉。
+// 本文件是「代理断流协调器」的对外入口与文档；实现拆在同目录的三个文件里。
 //
 // 从 frpc.go 拆出来的理由不是行数，而是**职责**。frpc.go 原先同时负责
 // 「生成客户端配置」与「在运行期收回已建立的流量」两件事，而两者的失败
@@ -9,6 +9,13 @@ package service
 // 混在一个文件里时，缺陷 1（删号不断流）与缺陷 9（按名字盲关）都属于
 // 「这块逻辑没有被单独审视」的后果：断流代码散落在配置生成函数之间，
 // 读的人不会意识到「账号已删除」是一条必须单独处理的路径。
+//
+// 一次断流按四个阶段推进，各自落在自己的文件里：
+//
+//	发现        本文件 runProxyDrain —— 一次批量列表，按前缀与时间水位筛候选
+//	身份校验    proxy_drain_identity.go —— 实例身份快照与比对，防误关同名新实例
+//	关闭        本文件 closeDrainedProxy —— 复查代次后逐条 CloseProxy
+//	持久化残留  proxy_drain_retry.go —— 待办落库 + 后台重试器（frps 不可用后补偿）
 //
 // 对外只暴露三个入口，调用方按「账号还在」与「账号已删」二选一：
 //
@@ -57,16 +64,27 @@ import (
 // 这是现有接口条件下能做到的最强保证。彻底原子需要 frps 关闭接口支持
 // 「按版本条件关闭」，那是协议改动，不在本服务控制范围内。
 //
-// 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
+// # 失败不再是一次性的
+//
+// 以前 frps 一不可用，这次断流就只留一行日志：已建立的数据流继续转发，
+// 恢复之后也没有任何补偿。现在进入这里会**先落一条待办**（见
+// proxy_drain_retry.go），本轮没关干净的代理由后台重试器按退避继续关，
+// 直到关完才删待办。关闭失败依然不中断主流程：能关一个是一个。
 func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64, notAfter time.Time) {
-	s.closeUserProxies(ctx, userID, gen, notAfter, false)
+	s.drainProxies(ctx, proxyDrainRequest{
+		userID:   userID,
+		prefix:   FrpUserOf(userID) + ".",
+		gen:      gen,
+		notAfter: notAfter,
+	})
 }
 
 // closeProxiesTimeout 是断流访问 frps 管理接口的总超时。
 //
-// 断流要逐条拉列表 + 复查 + 关闭，frps 变慢时可能拖十几秒。调用方（禁用、
-// 删除）都在事务提交之后同步执行，必须有个上限，否则 frps 一卡住，管理端
-// 的禁用/删除请求就一起卡住。
+// 断流要逐条复查 + 关闭，frps 变慢时可能拖十几秒。调用方（禁用、删除）都在
+// 事务提交之后同步执行，必须有个上限，否则 frps 一卡住，管理端的禁用/删除
+// 请求就一起卡住。后台重试器对**每个**待办也套用这个预算，于是「一轮重试」
+// 的最坏时长 = 批量上限 × 该预算（见 proxy_drain_retry.go 的租期说明）。
 const closeProxiesTimeout = 15 * time.Second
 
 // CloseDeletedUserProxies 关闭**账号已被删除**的用户在 frps 侧残留的代理。
@@ -85,12 +103,24 @@ const closeProxiesTimeout = 15 * time.Second
 // **绝不能静默跳过**——账号在面板里已经删除、代理却还在转发流量，这是最不
 // 该出现的状态，而且从任何界面上都看不出来。
 //
-// 判不出实例身份的代理一律跳过（见 closeUserProxies 里的双空判据）：同名
+// 判不出实例身份的代理一律跳过（见 closeDrainedProxy 里的双空判据）：同名
 // 代理可能已经是客户端重连后注册的新实例，关掉它等于让用户随机断流。
+//
+// 关不掉的那部分会留在落库待办里由后台继续重试（见 proxy_drain_retry.go）：
+// 账号已删除，删除事务本身不可能因为这次失败而回滚，补偿只能放在这条路径上。
 func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
-	if n := s.closeUserProxies(ctx, userID, 0, time.Time{}, true); n > 0 {
-		log.Printf("[service] 账号 %d 已删除，但仍有 %d 个代理未能关闭（frps 管理接口不可用或实例身份不可判定），请人工排查",
-			userID, n)
+	out := s.drainProxies(ctx, proxyDrainRequest{
+		userID:  userID,
+		prefix:  FrpUserOf(userID) + ".",
+		deleted: true,
+	})
+	switch {
+	case out.unknown:
+		log.Printf("[service] 账号 %d 已删除，但拉取代理列表失败，残留代理数量无法确认（已记入待办由后台继续重试）；同时靠客户端重连被拒兜底，请人工排查",
+			userID)
+	case len(out.residual) > 0:
+		log.Printf("[service] 账号 %d 已删除，但仍有 %d 个代理未能关闭（frps 管理接口不可用或实例身份不可判定），已记入待办由后台继续重试；同时靠客户端重连被拒兜底，请人工排查",
+			userID, len(out.residual))
 	}
 }
 
@@ -106,129 +136,270 @@ func (s *Services) closeUserProxiesAfterDelete(userID uint) {
 	s.CloseDeletedUserProxies(ctx, userID)
 }
 
-// closeUserProxies 是断流的实现。
+// proxyDrainRequest 是一次断流请求的完整判据。
 //
-// deleted 为 true 表示账号行已经不存在：没有任何状态版本可比，只能按前缀与
-// 实例身份尽力关闭（见 CloseDeletedUserProxies）。返回值为「本该关掉、但没
-// 能确认关掉」的代理数量，供调用方按残留数量记日志。
-func (s *Services) closeUserProxies(ctx context.Context, userID uint, gen uint64, notAfter time.Time, deleted bool) int {
+// 「关谁的代理」与「凭什么关」收成一个结构，是因为同一套判据要在三个时机
+// 复用：立即断流（禁用/删号）、后台重试、以及重试时按落库待办重建。以前
+// 判据散在函数参数与局部变量里，新增一条路径时很容易漏掉某一条——缺陷 1
+// 正是「断流只做一次、失败就丢」的后果。
+type proxyDrainRequest struct {
+	userID   uint
+	prefix   string
+	gen      uint64
+	notAfter time.Time
+	deleted  bool
+	// attempts 是这条意图此前已经重试失败的次数（立即路径为 0）。
+	// 只用于算退避，不参与「关不关」的判定。
+	attempts int
+	// known 是从落库待办里恢复出来的「发现时观测到的实例身份快照」。
+	//
+	// 非空时重试**只盯着这些名字**，不再按前缀重新扫一遍全表：账号禁用/删除
+	// 之后客户端可能已经重连并注册了同名的新实例，重新扫一遍会把新实例当成
+	// 「残留」再关一次；而按快照对齐能确保重试关的仍是当初那批实例。
+	known []proxyDrainTarget
+	// intent 是本次落库待办的写入凭据（随机串）。
+	//
+	// 所有回写（改次数、删待办）都带上它：期间可能有更新的意图覆盖这一行
+	// （账号再次被禁用、或删号路径写入自己那条），旧任务的回写不能把新意图
+	// 改掉或删掉，否则那条真正该执行的断流就再也不会被重试。
+	intent string
+}
+
+// proxyDrainOutcome 是一轮断流的结果。
+//
+// 三态必须分开，因为它们的收尾动作完全不同：
+//
+//	abandoned  —— 意图已作废（账号被重新启用）：删待办，不关任何代理
+//	unknown    —— 没拿到可信的代理列表：残留数量无法确认，待办必须留着
+//	residual   —— 明确知道还有哪些代理没关掉：记进待办，等下一轮
+type proxyDrainOutcome struct {
+	residual  []proxyDrainTarget
+	unknown   bool
+	abandoned bool
+	closed    int
+	lastErr   string
+}
+
+// drainProxies 是断流的协调器入口：先落待办 → 跑一轮 → 按结果收尾。
+//
+// # 为什么先落待办再动手
+//
+// 落库与断流之间有一个无法消除的顺序问题：先断流后落库的话，frps 不可用
+// （或进程就在这两步之间退出）时，待办根本不存在——补偿机会彻底丢失，
+// 而这正是缺陷 1 的形态。先落待办则最坏只是留下一条「其实已经关干净了」的
+// 待办，后台重试发现没有残留就把它删掉，代价只是一次空转。
+//
+// 返回值是本轮的结果（残留清单 / 列表是否可信 / 意图是否作废），供调用方
+// 决定怎么记日志。注意它与「已关掉几条」不是一回事：失败的、身份判不出的
+// 都算残留，而它们已经记进待办等下一轮。
+func (s *Services) drainProxies(ctx context.Context, req proxyDrainRequest) proxyDrainOutcome {
+	var out proxyDrainOutcome
 	if s.Frps == nil {
 		// 未配置 frps 管理接口时无从断流。不 panic 也不上抛错误：此刻账号已经
-		// 删掉/禁用掉了，一个可选依赖缺失不该让主流程失败。
-		log.Printf("[service] 未配置 frps 管理接口，无法关闭用户 %d 的已建立代理", userID)
-		return 0
+		// 删掉/禁用掉了，一个可选依赖缺失不该让主流程失败。也不落待办：
+		// 没有 frps 客户端，重试一万次也不会成功。
+		log.Printf("[service] 未配置 frps 管理接口，无法关闭用户 %d 的已建立代理", req.userID)
+		return out
 	}
-	// gen 来自 users.state_version（见 AdminSetUserStatus），是跨实例的版本。
-	// 内存里可能还没有这个用户（刚启动，或状态变更发生在别的实例上），
-	// 所以「0」只能当作「没有信息」，不能当成「版本不符」。
-	//
-	// 账号已删除时跳过这段：没有版本可比，而且删号本身就是最新状态，
-	// 不存在「期间被重新启用」这种情况。
-	if !deleted {
-		if cached := s.userStatusGen(userID); cached != 0 && cached != gen {
-			log.Printf("[user] 用户 %d 的状态在断流开始前已变更，跳过本次断流", userID)
-			return 0
+	if req.prefix == "" {
+		req.prefix = FrpUserOf(req.userID) + "."
+	}
+
+	req.intent = s.recordProxyDrainPending(req)
+	if req.intent == "" {
+		log.Printf("[proxy-drain] 用户 %d 的断流待办落库失败：本次若也没关干净，重启后将没有任何补偿机会", req.userID)
+	}
+
+	out = s.runProxyDrain(ctx, req)
+	switch {
+	case out.abandoned:
+		s.clearProxyDrainPending(req.userID, req.intent)
+		log.Printf("[proxy-drain] 用户 %d 的断流意图已作废（账号在断流期间被重新启用），不再关闭其代理", req.userID)
+	case out.unknown || len(out.residual) > 0:
+		s.rescheduleProxyDrain(req, out)
+	default:
+		s.clearProxyDrainPending(req.userID, req.intent)
+		if out.closed > 0 {
+			log.Printf("[proxy-drain] 用户 %d 的代理已全部关闭（%d 条），无残留", req.userID, out.closed)
 		}
 	}
-	prefix := FrpUserOf(userID) + "."
-	proxies, err := s.Frps.ListProxies(ctx)
+	return out
+}
+
+// runProxyDrain 执行「发现 → 身份校验 → 关闭」三个阶段。
+//
+// 发现只拉**一次**批量列表（结果在同轮内按窗口复用，见
+// proxy_drain_identity.go 的 proxySnapshotCache）：原先每关一条代理就重新
+// 拉一次全量列表，N 条代理就是 N 次分页请求，frps 稍慢就会把 15 秒预算
+// 耗在拉列表上，只关掉一部分。
+func (s *Services) runProxyDrain(ctx context.Context, req proxyDrainRequest) proxyDrainOutcome {
+	var out proxyDrainOutcome
+
+	// 进程内代次先看一眼：本实例上刚发生的状态变更不必再花一次 frps 往返。
+	// 「0」只能当作「没有信息」，不能当成「版本不符」（实例可能刚启动，
+	// 也可能状态变更发生在别的实例上）。
+	if !req.deleted {
+		if cached := s.userStatusGen(req.userID); cached != 0 && cached != req.gen {
+			log.Printf("[user] 用户 %d 的状态在断流开始前已变更，跳过本次断流", req.userID)
+			out.abandoned = true
+			return out
+		}
+	}
+
+	cache := newProxySnapshotCache(s)
+	// 有落库快照时按快照对齐，不再按前缀重扫：账号禁用/删除之后客户端可能
+	// 已经重连并注册了同名的新实例，重扫会把新实例当成「残留」再关一次。
+	// 快照里的每条仍然要过 cache.lookup + matches 的身份比对（见
+	// closeDrainedProxy），所以「世界已经变了」的情况不会漏判。
+	if len(req.known) > 0 {
+		return s.closeDrainTargets(ctx, req, cache, req.known)
+	}
+
+	snap, err := cache.current(ctx)
 	if err != nil {
-		log.Printf("[user] 拉取代理列表失败，本次无法主动断流（新连接仍会被拒）: %v", err)
-		if deleted {
-			log.Printf("[service] 账号 %d 已删除且代理列表拉取失败，残留代理数量无法确认，靠客户端重连被拒兜底", userID)
+		log.Printf("[user] 拉取代理列表失败，本次无法主动断流（新连接仍会被拒，已记入待办等 frps 恢复后重试）: %v", err)
+		if req.deleted {
+			log.Printf("[service] 账号 %d 已删除且代理列表拉取失败，残留代理数量无法确认，靠客户端重连被拒兜底", req.userID)
 		}
-		return 0
+		out.unknown = true
+		out.lastErr = err.Error()
+		return out
 	}
-	residual := 0
-	for _, p := range proxies {
-		if !strings.HasPrefix(p.Name, prefix) {
-			continue
+
+	return s.closeDrainTargets(ctx, req, cache, snap.discoveryTargets(req.userID, req.prefix, req.notAfter))
+}
+
+// closeDrainTargets 逐条关闭候选代理，按阶段结果汇总。
+//
+// 与发现分开是因为它有**两个入口**：首次断流按前缀扫描得到的候选，以及
+// 后台重试时按落库快照恢复的候选。两者的关闭判据完全一致，区别只在
+// 「候选从哪来」——把关闭逻辑复制两份，是缺陷 1（两条路径各自维护、慢慢
+// 走偏）的同一个教训。
+func (s *Services) closeDrainTargets(ctx context.Context, req proxyDrainRequest, cache *proxySnapshotCache, candidates []proxyDrainTarget) proxyDrainOutcome {
+	var out proxyDrainOutcome
+	for i, t := range candidates {
+		// 每处理一条前看一次截止：超时后继续发请求只会让调用方（禁用/删除
+		// 请求）等更久，而剩下的代理已经记进待办，由后台接着关。
+		if ctx.Err() != nil {
+			out.residual = append(out.residual, candidates[i:]...)
+			out.lastErr = "断流超出时间预算，剩余代理未处理"
+			return out
 		}
-		// 代理在禁用生效之后才启动 = 重新启用后的新连接（或被客户端重连
-		// 重新注册过），关掉它就等于把刚放行的人又踢下线。
-		// lastStartAt 缺失（老版本 frps）时不作判断，退回只靠代次与锁。
-		if p.Status.LastStartAt > 0 && !notAfter.IsZero() {
-			if startedAt := time.Unix(p.Status.LastStartAt, 0); startedAt.After(notAfter) {
-				log.Printf("[user] 用户 %d 的代理 %q 在禁用之后才启动（%s），跳过关闭",
-					userID, p.Name, startedAt.Format(time.RFC3339))
-				continue
+		step, errMsg := s.closeDrainedProxy(ctx, req, cache, t)
+		switch step {
+		case drainStepClosed:
+			out.closed++
+		case drainStepGone:
+			// 代理已消失，或已经不是发现时那个实例（客户端重连后重新注册）。
+			// 两种情况都**不是**残留：没有需要关的旧实例，也不该误关新的。
+		case drainStepResidual:
+			out.residual = append(out.residual, t)
+			if out.lastErr == "" && errMsg != "" {
+				out.lastErr = errMsg
 			}
+		case drainStepAbandoned:
+			out.abandoned = true
+			return out
 		}
-		// 复查代次与关闭动作在同一把用户锁内完成：列表是几秒前拉的，
-		// 期间状态可能已经翻转，而这个窗口必须以锁关闭，不能只靠一次读。
-		lock := s.userLock(userID)
-		lock.Lock()
-		// 账号已删除时跳过两段版本复查：users 行已随删除事务消失，既没有
-		// 状态版本可比，也不存在「期间被重新启用」这回事（见 CloseDeletedUserProxies）。
-		if !deleted {
-			if cached := s.userStatusGen(userID); cached != 0 && cached != gen {
-				lock.Unlock()
-				log.Printf("[user] 用户 %d 的状态在断流过程中已变更，停止关闭剩余代理（避免误伤重新启用后的新代理）", userID)
-				return residual
-			}
-			// 进程内代次只覆盖「本实例」。启用请求完全可能落在另一台实例上，
-			// 而那台实例写下的状态版本，这里只能查库才看得到。
-			// 查不到账号（已删除）或数据库暂时不可用时不据此中止：禁用本身
-			// 已经生效，新连接会被拒，漏关的代理影响远小于误判。
-			if dbGen, err := s.userStateVersionFromDB(userID); err == nil && dbGen != gen {
-				lock.Unlock()
-				log.Printf("[user] 用户 %d 的状态在其他实例上已变更（版本 %d ≠ %d），停止关闭剩余代理",
-					userID, dbGen, gen)
-				return residual
-			}
-		}
-		// 列表快照可能已经过时：同名代理在这里被重新注册后，直接按名称
-		// CloseProxy 会把新实例误关。关闭前再取一次状态，并用 frps 返回的
-		// clientID/lastStartAt 对齐同一个代理实例；无法确认身份时宁可漏关，
-		// 也不误伤刚重新启用的连接。
-		//
+	}
+	// 本轮一次关闭失败都没记下原因，但期间重拉列表失败过（沿用了旧快照继续
+	// 判断）：把这个原因写进待办的 last_err。否则运维看到一行
+	// 「残留 N 条、last_err 为空」，会以为是 frps 拒绝关闭，而实际是列表接口
+	// 已经在抖——两者要查的东西完全不同。
+	if out.lastErr == "" && cache.listErr != nil {
+		out.lastErr = cache.listErr.Error()
+	}
+	return out
+}
+
+// proxyDrainStep 是「处理一条候选代理」的结果。
+type proxyDrainStep int
+
+const (
+	// drainStepClosed 已确认关闭。
+	drainStepClosed proxyDrainStep = iota
+	// drainStepGone 已不存在，或已是另一个实例：不是本次要关的对象。
+	drainStepGone
+	// drainStepResidual 本该关掉却没关成，要记入待办等下一轮。
+	drainStepResidual
+	// drainStepAbandoned 整轮作废（账号被重新启用），立即停止且不留待办。
+	drainStepAbandoned
+)
+
+// closeDrainedProxy 在用户锁内复查身份并关闭一条代理。
+//
+// 复查与关闭必须同锁：状态变更路径持同一把锁，因此「确认代次未变」与
+// 「发出关闭请求」之间不可能插进一次重新启用。锁只罩住单条代理而不是
+// 整段，理由见 CloseUserProxies 的注释。
+//
+// 实例身份复查拿的是带窗口的快照（见 proxySnapshotCache）：快照过旧时
+// 会重新拉一次列表，既避免「每条代理一次全量列表」，又不让身份判定的
+// 窗口无限拉长。
+func (s *Services) closeDrainedProxy(ctx context.Context, req proxyDrainRequest, cache *proxySnapshotCache, t proxyDrainTarget) (proxyDrainStep, string) {
+	if !t.identifiable() {
 		// clientID 与 lastStartAt **都**缺失时，这条代理没有任何可比的身份
 		// 字段：按名字关等于赌「同名的一定还是同一个实例」。而客户端重连
 		// （禁用被撤销、网络抖动、进程重启）会立刻用同一个名字重新注册，
 		// 赌错就是把刚恢复的用户随机踢下线——用户侧只看到「连上又断」，
-		// 从日志里也看不出是断流而不是网络问题。所以这种情况一律跳过并留日志：
+		// 从日志里也看不出是断流而不是网络问题。所以一律跳过并留日志：
 		// 漏关一个代理最多多跑一会儿流量，误杀一条新连接是可见的故障。
-		if p.ClientID == "" && p.Status.LastStartAt <= 0 {
-			lock.Unlock()
-			log.Printf("[service] 用户 %d 的代理 %q 缺少 clientID 与 lastStartAt，身份不可判定，跳过关闭，待下一轮/兜底", userID, p.Name)
-			residual++
-			continue
-		}
-		current, listErr := s.Frps.ListProxies(ctx)
-		if listErr != nil {
-			lock.Unlock()
-			log.Printf("[user] 关闭代理 %q 前复查状态失败，跳过以避免误关新实例: %v", p.Name, listErr)
-			residual++
-			continue
-		}
-		matched := false
-		for _, q := range current {
-			if q.Name != p.Name {
-				continue
-			}
-			if p.ClientID != "" && q.ClientID != p.ClientID {
-				continue
-			}
-			if p.Status.LastStartAt > 0 && q.Status.LastStartAt != p.Status.LastStartAt {
-				continue
-			}
-			matched = true
-			break
-		}
-		if !matched {
-			lock.Unlock()
-			log.Printf("[user] 代理 %q 的实例身份已变化或已消失，跳过关闭", p.Name)
-			residual++
-			continue
-		}
-		err := s.Frps.CloseProxy(ctx, p.Name)
-		lock.Unlock()
-		if err != nil {
-			log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", userID, p.Name, err)
-			residual++
-			continue
-		}
-		log.Printf("[user] 已关闭用户 %d 的代理 %q", userID, p.Name)
+		log.Printf("[service] 用户 %d 的代理 %q 缺少 clientID 与 lastStartAt，身份不可判定，跳过关闭，待下一轮/兜底",
+			req.userID, t.Name)
+		return drainStepResidual, ""
 	}
-	return residual
+
+	lock := s.userLock(req.userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// 账号已删除时跳过两段版本复查：users 行已随删除事务消失，既没有
+	// 状态版本可比，也不存在「期间被重新启用」这回事。
+	if !req.deleted {
+		if cached := s.userStatusGen(req.userID); cached != 0 && cached != req.gen {
+			log.Printf("[user] 用户 %d 的状态在断流过程中已变更，停止关闭剩余代理（避免误伤重新启用后的新代理）", req.userID)
+			return drainStepAbandoned, ""
+		}
+		// 进程内代次只覆盖「本实例」。启用请求完全可能落在另一台实例上，
+		// 而那台实例写下的状态版本，这里只能查库才看得到。
+		// 查不到账号（已删除）或数据库暂时不可用时不据此中止：禁用本身
+		// 已经生效，新连接会被拒，漏关的代理影响远小于误判。
+		if dbGen, err := s.userStateVersionFromDB(req.userID); err == nil && dbGen != req.gen {
+			log.Printf("[user] 用户 %d 的状态在其他实例上已变更（版本 %d ≠ %d），停止关闭剩余代理",
+				req.userID, dbGen, req.gen)
+			return drainStepAbandoned, ""
+		}
+	}
+
+	// 列表快照可能已经过时：同名代理在这里被重新注册后，直接按名称
+	// CloseProxy 会把新实例误关。关闭前再取一次状态（按窗口复用，必要时
+	// 重拉），并用 frps 返回的 clientID/lastStartAt 对齐同一个代理实例；
+	// 无法确认身份时宁可漏关，也不误伤刚重新启用的连接。
+	cur, ok, err := cache.lookup(ctx, t.Name)
+	if err != nil {
+		log.Printf("[user] 关闭代理 %q 前复查状态失败，跳过以避免误关新实例: %v", t.Name, err)
+		return drainStepResidual, err.Error()
+	}
+	if !ok {
+		log.Printf("[user] 代理 %q 已从 frps 列表消失，无需关闭", t.Name)
+		return drainStepGone, ""
+	}
+	if !t.matches(cur) {
+		log.Printf("[user] 代理 %q 的实例身份已变化，跳过关闭", t.Name)
+		return drainStepGone, ""
+	}
+
+	if err := s.Frps.CloseProxy(ctx, t.Name); err != nil {
+		log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", req.userID, t.Name, err)
+		return drainStepResidual, err.Error()
+	}
+	log.Printf("[user] 已关闭用户 %d 的代理 %q", req.userID, t.Name)
+	return drainStepClosed, ""
+}
+
+// topLevelPrefix 判断代理名是否属于该用户前缀。
+//
+// 单独一个函数而不是内联 strings.HasPrefix：前缀比较是最外层的过滤条件，
+// 它写错了的后果是「关别人的代理」——必须一眼能看出比较的到底是什么。
+func topLevelPrefix(name, prefix string) bool {
+	return strings.HasPrefix(name, prefix)
 }

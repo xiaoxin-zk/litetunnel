@@ -185,8 +185,9 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		cached    []cachedCfg
 		needFetch []TunnelVO
 		// fetchPos 是 needFetch[i] 在 pending(本轮环形顺序)里的下标。
-		// 续传位置必须按这个下标推进,不能按「派发数 + 命中数」——
-		// 命中的隧道散落在清单各处,按总数推进会越过还没处理的那一段。
+		// 只用于「整轮颗粒无收」时的兜底轮转（见 sync_cursor.go 的
+		// nextStart）：必须按这个下标而不是按条数，否则环形左移之后
+		// 算出的位置会往回走。
 		fetchPos []int
 	)
 	for i, t := range pending {
@@ -211,7 +212,10 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	// 等齐的话最慢的那一条会把已经取到配置的隧道也挡住。所有状态变更
 	// （写文件、起停、记失败）仍然只发生在主协程的这段循环里，
 	// 并发只存在于网络请求。
-	applyCfg := func(t TunnelVO, cfgText, servedRev string, cfgErr error) {
+	//
+	// 返回值 settled 决定游标能不能越过这条隧道（见 sync_cursor.go）：
+	// 只有走到明确结论的才算落定，因截止时间提前返回的不算。
+	applyCfg := func(t TunnelVO, cfgText, servedRev string, cfgErr error) (settled bool) {
 		// 截止时间已经过了：这一条完全不碰。
 		//
 		// 必须放在最前面，包括「取到配置之后」这条路径：配置正文是在截止
@@ -223,16 +227,16 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		// 之所以不杀本轮早期已经起来的进程：那是截止之前完成的有效工作，
 		// 为了一个时间点去杀它只会让已经连上的连接抖一下。
 		//
-		// 这一条**不记失败**：它没做错任何事，只是没轮到。游标与续传位置
-		// 由下面的 dispatched / fetchPos 决定，下一轮会优先重试它。
+		// 这一条**不落定**：它没做错任何事，只是没轮到。游标必须停在它这里，
+		// 让下一轮优先重试它（见 sync_cursor.go 的 nextStart）。
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		if cfgErr != nil {
 			// 单条隧道的配置拉不到，不该让整次同步中断——
 			// 其他隧道仍然要对账，否则一条坏隧道会拖住全部。
 			failSync(t, "拉取配置失败："+cfgErr.Error())
-			return
+			return true
 		}
 		if cfgText == "" {
 			// 空配置必须当成失败，不能静默跳过。
@@ -241,7 +245,7 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 			// 而那条隧道什么都没连上，界面上也没有任何原因——
 			// 用户只能看到一个「连接中」，等多久都不会变。
 			failSync(t, "服务端未返回该隧道的配置")
-			return
+			return true
 		}
 
 		// 摘要一律以**产出这份正文的那次响应**为准(响应头 X-Config-Rev),
@@ -275,11 +279,13 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 				// 截止时间是 writeAndStart 里最后一道闸：它可能是刚过期的
 				// （上面那次检查之后又走了一段）。这里同样不能记成启动失败
 				// ——隧道什么都没做错，下一轮会优先重试。
+				//
+				// 不落定：游标停在这里，下一轮从它开始（见 sync_cursor.go）。
 				if errors.Is(err, errSyncDeadline) {
-					return
+					return false
 				}
 				failStart(t, "启动失败："+err.Error())
-				return
+				return true
 			}
 			// 退避已在 writeAndStart 里、启动之前清掉。这里**不能**再清一次：
 			// 进程秒退时退出回调可能已经登记了新退避，这一下会把它抹掉。
@@ -288,7 +294,7 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 			// 停旧进程之前再确认一次预算：停了却因超时不再拉起，
 			// 等于把一条本来能用的连接停在那里——比什么都不做更糟。
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			// 只重启这一条：其他隧道的连接不受影响。
 			a.emitTunnelLog(t.Name, "配置有变化（"+diffHint(prev, cfgText)+"），正在重连")
@@ -296,22 +302,29 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 				// 停不下来属于环境级故障（进程管理器异常）：
 				// 这一条做不了，下一轮同步还会再来。
 				failStart(t, "重连失败：停止旧进程失败："+err.Error())
-				return
+				return true
 			}
 			if err := a.writeAndStart(ctx, t, cfgText); err != nil {
 				if errors.Is(err, errSyncDeadline) {
-					return
+					return false
 				}
 				failStart(t, "重连失败："+err.Error())
-				return
+				return true
 			}
 			changed = true
 		}
+		// 走到这里说明这条隧道有了明确结论（成功应用，或本来就不用动）。
+		return true
 	}
+
+	// 本轮进度账：谁落定了、派发到哪儿（见 sync_cursor.go）。
+	round := newSyncRound(pending, fetchPos)
 
 	results, dispatched := a.streamTunnelConfigs(ctx, base, apiKey, needFetch)
 	for res := range results {
-		applyCfg(res.tunnel, res.text, res.rev, res.err)
+		if applyCfg(res.tunnel, res.text, res.rev, res.err) {
+			round.settle(res.tunnel.ID)
+		}
 	}
 	// 命中缓存的隧道同样要走一遍应用逻辑：进程可能没在跑、配置可能还没落盘。
 	// 它们不产生网络请求，所以放在拉取之后处理——先完成要等网络的，
@@ -319,26 +332,18 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	// 摘要沿用清单里那一份:命中缓存的前提本就是「清单摘要与本地记账一致」,
 	// 把同一个值写回去,记账的含义不变。
 	for _, c := range cached {
-		applyCfg(c.t, c.text, c.t.ConfigRev, nil)
-	}
-	// 记下续传位置：派发是从本轮起点开始、按顺序进行的，派发到哪儿就意味着
-	// 这一轮走到哪儿。下一轮从那里接着来，被截止时间砍掉的尾部排到最前。
-	// 全派发完时它会回到本次的起点（rot + 条数 ≡ rot），顺序保持不变。
-	if n := len(pending); n > 0 {
-		// 必须按**原清单里的位置**推进,不能按「派发数 + 命中缓存数」:
-		// 缓存命中散布在清单各处(哪条没变就跳过哪条),按个数相加等于把游标
-		// 推到更靠后的位置,中间那些还没轮到请求的隧道会被整段跳过;
-		// 极端情况下游标会在两个位置之间来回,尾部几条永远进不了请求队列。
-		next := rot
-		if d := int(dispatched.Load()); d > 0 {
-			if d > len(fetchPos) {
-				d = len(fetchPos)
-			}
-			// fetchPos 是**环形左移之后**的下标,而 syncStart 是在原清单里
-			// 的位置,所以要加回 rot —— 漏掉这一步游标会往回走。
-			next = (rot + fetchPos[d-1] + 1) % n
+		if applyCfg(c.t, c.text, c.t.ConfigRev, nil) {
+			round.settle(c.t.ID)
 		}
-		a.syncStart = next
+	}
+	// 记下续传位置：只按**落定**推进，本轮没轮到的隧道下一轮优先。
+	// 旧实现按「派发数」推进，把截止时间之后没应用的隧道也算成已处理，
+	// 于是游标越过它们（详见 sync_cursor.go 开头的说明）。
+	if n := len(pending); n > 0 {
+		// 派发在独立协程里进行，必须等结果通道关闭（此时 worker 与派发协程
+		// 都已退出）再读计数，否则读到的是中间值。
+		round.setDispatched(int(dispatched.Load()))
+		a.syncStart = round.nextStart(rot, n)
 	}
 
 	if ctx.Err() != nil {

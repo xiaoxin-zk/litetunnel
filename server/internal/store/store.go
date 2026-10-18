@@ -113,6 +113,15 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		// 跨实例租约：多实例部署时用它保证「同一件事只有一个实例在做」
 		// （目前是流量采集）。放在库里而不是内存里，正是为了让别的进程看得见。
 		&model.RuntimeLease{},
+		// 待重试的代理断流：必须落库，否则 frps 临时不可用那一次断流就永久
+		// 丢了——账号已禁用/已删除，数据流却还在转发，且重启后连日志线索
+		// 都没有。删号路径下 users 行已经不存在，所以待办自己存 UserID 与
+		// 前缀，不能靠 join 用户表。
+		&model.ProxyDrainPending{},
+		// 账号级登录失败计数：必须落库，否则多实例部署时同一账号的失败次数
+		// 被负载均衡分散到各实例，验证码阈值按实例数衰减——攻击者拿到 N 倍
+		// 额度，而且没有任何报错。累加走唯一索引上的原子 upsert。
+		&model.LoginFailCounter{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}

@@ -636,6 +636,153 @@ type FirewallSeq struct {
 // TableName 固定表名。
 func (FirewallSeq) TableName() string { return "lt_firewall_seq" }
 
+// ProxyDrainPending 是一条「账号已禁用/已删除，但 frps 侧代理还没能关掉」的待办。
+//
+// # 为什么必须落库
+//
+// 断流要访问 frps 管理接口。frps 临时不可用时，禁用/删号只能把这次尝试记进
+// 日志就算了——而 frps 与 frpc 之间的数据连接**不经过任何准入判断**，已经建立
+// 的那些会一直转发到客户端自己退出。于是出现最不该有的状态：账号在面板上
+// 已经禁用/删除，流量却还在跑，从任何界面上都看不出来；进程一重启，连日志
+// 里的线索也没了。
+//
+// 落库之后，重启只是「换个人继续关」：后台重试器按 NextAt 到期再试，直到
+// 把该关的代理都关掉才删掉这一行。
+//
+// 待办必须自己保存 UserID 与前缀：删号路径下 users 行已经随删除事务消失，
+// 「join 用户表拿前缀」在事实上不可能实现（账号都不在了）。
+//
+// 一个用户同时只有一条待办：同一账号上的意图天然都是「把它的代理关掉」，
+// 后来的意图覆盖先前的即可（与 FirewallPending 按端口收敛是同一个理由）。
+type ProxyDrainPending struct {
+	// UserID 同时是主键：见上面「一个用户一条待办」的说明。
+	UserID uint `gorm:"primarykey;autoIncrement:false" json:"user_id"`
+	// Prefix 是 frp 侧的 user 前缀（"lt_u<ID>."），来自 FrpUserOf。
+	//
+	// 它是从 UserID 现算得了的冗余列，落一份是为了两件事：后台重试器可以
+	// 直接按前缀扫描、运维用一条 SQL 就能看懂这一行在处理谁的代理；更重要的
+	// 是它把「该关哪批名字」的依据固定成**待办登记那一刻**的值——将来前缀
+	// 规则若变（历史代理名仍带旧前缀），重启后的重试仍按旧前缀去找，
+	// 而不是用新规则去猜一批根本不存在的名字。
+	Prefix string `gorm:"size:64;not null" json:"prefix"`
+	// StatusGen 是禁用/封禁路径的状态代次（users.state_version）；删除路径为 0。
+	//
+	// 重试前必须拿它与库里的 state_version 比对：账号可能已经被重新启用
+	// （甚至启用后又禁用了一次），代次不等就说明这条意图作废——继续关就是
+	// 把刚放行的人踢下线。
+	StatusGen uint64 `gorm:"not null;default:0" json:"status_gen"`
+	// NotAfter 是本次禁用生效的时刻（Unix 秒）；删除路径为 0。
+	//
+	// 重试时据此跳过「禁用之后才启动」的代理：客户端重连会用同一个名字重新
+	// 注册，frps 会刷新该时间——那已经是新实例，关它等于误杀。
+	NotAfter int64 `gorm:"not null;default:0" json:"not_after"`
+	// Deleted 表示账号行已经不存在，重试时不再查状态版本，改按「账号确实不在了」
+	// 与实例身份快照判断。
+	Deleted bool `gorm:"not null;default:0" json:"deleted"`
+	// IntentAt 是这条待办**本次**被登记的时刻（Unix 秒），每次意图覆盖都会刷新。
+	//
+	// 删除路径没有「禁用生效时刻」可用（NotAfter=0），而重试又必须知道一个
+	// 时间水位：登记之后才启动的代理只可能是客户端重连/重新注册出来的新实例
+	// （账号都删了，不存在合法的重新注册流程），关它是误杀。
+	//
+	// 为什么不复用 CreatedAt：意图被新一次禁用/删号覆盖时 CreatedAt 仍是第一次
+	// 登记的时间，水位会往前漂——水位越早，被当成「旧实例」的代理越多，正好
+	// 偏向误杀。所以单独存一列，随意图一起刷新。
+	IntentAt int64 `gorm:"not null;default:0" json:"intent_at"`
+	// Targets 是发现那一刻观测到的代理实例身份快照（JSON 数组）。
+	//
+	// 删除路径没有 NotAfter 可比，也没有状态版本可查：账号已删，之后不可能有
+	// 合法的重新启用，唯一的判据是「现在这条同名代理还是不是删除时看到的那条」。
+	// 没有这份快照时只能退化成按时间水位（IntentAt）判断，见 proxy_drain_retry.go。
+	Targets string `gorm:"type:text" json:"targets,omitempty"`
+	// Attempts 是已重试次数，用于指数退避与上限判定。
+	Attempts int `gorm:"not null;default:0" json:"attempts"`
+	// Exhausted 表示重试已到上限、自动补偿终止。记录**保留**而不是删掉：
+	// 删了之后「这个已删除账号的代理可能还在跑」就再没有任何线索。
+	// 与 FirewallPending.Exhausted 同一个理由，区别是那边还有管理页可看，
+	// 这里只能靠查库（所以日志里必须把 user_id 与前缀写清楚）。
+	Exhausted bool `gorm:"not null;default:0" json:"exhausted"`
+	// NextAt 是下次重试时间。失败后按指数退避往后推；成功则由删除待办收尾。
+	//
+	// 同时充当**租约到期时间**（与 MailOutbox 的做法一致）：重试器领取时把它
+	// 推到「现在 + 租期」，多实例共用一个库时只有条件更新成功的那一个实例
+	// 在动手；实例在断流途中崩溃，租约到期后另一个实例可以接手。
+	//
+	// 建索引：重试器每轮按「已到期」筛，不筛就得把整张表读出来才能发现谁到期。
+	NextAt time.Time `gorm:"not null;index" json:"next_at"`
+	// Fence 是当前持有这份待办的围栏令牌（每次领取/登记重新生成）。
+	//
+	// 所有回写（改重试次数、删待办）都必须带上它：期间可能有更新的意图覆盖
+	// 这一行（账号再次被禁用、或删号路径写入自己那条），旧任务的回写不能把
+	// 新意图改掉或删掉——否则那条真正该执行的断流就再也不会被重试。
+	// 与 MailOutbox.ClaimToken 同一个理由。
+	Fence string `gorm:"size:32" json:"-"`
+	// LastErr 是最后一次失败原因，供排查。
+	LastErr   string    `gorm:"size:255" json:"last_err"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (ProxyDrainPending) TableName() string { return "lt_proxy_drain_pending" }
+
+// LoginFailCounter 是账号级登录失败计数的**共享存储**版本（单行一个账号）。
+//
+// # 为什么落库
+//
+// 这个计数唯一的用途是「该账号连续失败若干次后要求验证码」（见
+// service.CaptchaRequired）。它原先是进程内 map：单实例部署没问题，但一旦
+// 前面挂了负载均衡，同一账号的失败请求被分到不同实例，每个实例各记一份，
+// 阈值就按实例数衰减——N 个实例等于 N 倍额度。而账号级验证码正是分布式
+// 爆破的唯一克星（硬锁按「账号 + IP」计数，分布式来源每个 IP 各有一份
+// 额度），它一旦被摊薄，整个账号级防线就没有兜底了。
+//
+// 更麻烦的是这种退化**没有任何报错、没有任何指标**：多实例部署本身看起来
+// 一切正常，只是攻击变得更容易成功。落库之后，多实例共用一个库即共享同一份
+// 计数，默认行为在两种部署形态下都是正确的。
+//
+// # 为什么是主键而不是「先查再写」
+//
+// 累加走唯一索引上的原子 upsert（INSERT ... ON CONFLICT DO UPDATE），
+// 「窗口是否过期 + 加一」在一条语句里完成。先 SELECT 再 UPDATE 会丢更新：
+// 两个实例同时失败时各自读到旧计数，写回后只算一次。Account 做主键，
+// 冲突必然落在同一行上，upsert 的 DO UPDATE 分支就是并发下的正确累加。
+//
+// # 生命周期
+//
+// 窗口（30 分钟）过后这条记录就没有意义了：读的时候按 Since 判过期视为 0，
+// 下一次失败由 upsert 直接覆盖成新窗口；另有后台清理按 Since 批量删除
+// （见 maintenance.go），避免被海量随机用户名撑大。
+type LoginFailCounter struct {
+	// Account 是规范化（小写、去空白、按字符截断到 191）后的账号，同时是主键。
+	//
+	// 规范化必须在写入与查询两侧一致：登录本身不区分大小写，不归一化的话
+	// 攻击者交替提交 Admin / admin 就能把计数摊薄到永远到不了阈值。截断同理
+	// （见 service.normalizeAccount）：Postgres 的 varchar(191) 会拒绝更长的值，
+	// 于是每一次超长用户名登录都写库失败并退化成补记；SQLite 的 TEXT 不校验
+	// 长度，不截断就能被几 KB 的用户名撑大。
+	Account string `gorm:"primarykey;size:191" json:"account"`
+	// Count 是窗口内的连续失败次数。
+	Count int `gorm:"not null;default:0" json:"count"`
+	// Since 是当前窗口的起点，Unix 秒。
+	//
+	// # 为什么是整数而不是 time.Time
+	//
+	// 窗口是否过期必须在**数据库里**判断（upsert 的 CASE WHEN），不能先读到
+	// Go 里再决定：两个实例同时失败时各自读到旧计数，写回后只剩一次累加。
+	// 而时间在两种方言里的存储/比较并不一致——SQLite 把时间存成文本、比较
+	// 走字符串序（时区偏移不同就会比错），Postgres 是 timestamptz。存整数秒
+	// 则两边都是数值比较，语义完全一致，也不需要关心时区。
+	//
+	// 建索引：后台清理按它删过期行，不建就得全表扫。
+	Since int64 `gorm:"not null;default:0;index" json:"since"`
+	// UpdatedAt 是最近一次累加时刻，仅用于排查「计数是什么时候攒起来的」。
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (LoginFailCounter) TableName() string { return "lt_login_fail_counters" }
+
 // Setting 运行期可调的键值配置。
 type Setting struct {
 	Key       string    `gorm:"primarykey;size:64" json:"key"`

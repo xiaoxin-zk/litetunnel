@@ -144,8 +144,10 @@ foreach ($k in $vars.Keys) {
 function Assert-VhostPort([string]$name, [string]$value, [string]$other) {
     if ([string]::IsNullOrWhiteSpace($value)) { return }
     $port = 0
-    if (-not [int]::TryParse($value, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
-        throw "$name=$value is not a port between 1 and 65535."
+    # 与 render.sh 一致：只接受十进制数字文本，+7848 等写法直接拒绝，
+    # 避免跨平台对同一份 .env 得出不同的冲突判断。
+    if ($value -notmatch '^\d+$' -or -not [int]::TryParse($value, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "$name=$value is not a decimal port between 1 and 65535."
     }
     # Every port this host actually listens on: a collision fails at startup.
     $conflicts = @(

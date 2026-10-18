@@ -11,6 +11,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -176,8 +177,19 @@ func (s *Services) RevokeClientSessions(userID uint) error {
 // 锁的粒度是单条而不是整段：整段持锁会在 frps 变慢时把启用操作挡十几秒，
 // 而用户点「启用」时最不该看到的就是长时间无响应。
 //
+// notAfter 是「本次禁用生效的时刻」。跨实例时锁与代次都挡不住最后一次竞态：
+// 另一台实例上的启用可以正好插在查库之后、关闭请求到达 frps 之前。所以再
+// 加一道基于 frps 自身数据的判据——代理的 lastStartAt：
+//
+//   - 新代理一定晚于 notAfter 启动（客户端重连会重新注册，frps 会刷新该时间），
+//     这类直接跳过；
+//   - 只有「禁用前就在跑、期间没有重新注册」的代理才关。
+//
+// 这是现有接口条件下能做到的最强保证。彻底原子需要 frps 关闭接口支持
+// 「按版本条件关闭」，那是协议改动，不在本服务控制范围内。
+//
 // 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
-func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64) {
+func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64, notAfter time.Time) {
 	// gen 来自 users.state_version（见 AdminSetUserStatus），是跨实例的版本。
 	// 内存里可能还没有这个用户（刚启动，或状态变更发生在别的实例上），
 	// 所以「0」只能当作「没有信息」，不能当成「版本不符」。
@@ -194,6 +206,16 @@ func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64
 	for _, p := range proxies {
 		if !strings.HasPrefix(p.Name, prefix) {
 			continue
+		}
+		// 代理在禁用生效之后才启动 = 重新启用后的新连接（或被客户端重连
+		// 重新注册过），关掉它就等于把刚放行的人又踢下线。
+		// lastStartAt 缺失（老版本 frps）时不作判断，退回只靠代次与锁。
+		if p.Status.LastStartAt > 0 && !notAfter.IsZero() {
+			if startedAt := time.Unix(p.Status.LastStartAt, 0); startedAt.After(notAfter) {
+				log.Printf("[user] 用户 %d 的代理 %q 在禁用之后才启动（%s），跳过关闭",
+					userID, p.Name, startedAt.Format(time.RFC3339))
+				continue
+			}
 		}
 		// 复查代次与关闭动作在同一把用户锁内完成：列表是几秒前拉的，
 		// 期间状态可能已经翻转，而这个窗口必须以锁关闭，不能只靠一次读。

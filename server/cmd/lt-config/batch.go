@@ -54,6 +54,13 @@ const (
 // 同时在结果里注明现场未清理——把两者混为一谈会让管理员以为配置还是新的。
 var errBatchCleanupPending = errors.New("批次现场未清理")
 
+// errBatchRecoveryAtRisk 表示「配置已生效，但现场状态无法落定」。
+//
+// 具体是：容器已经按新配置启动，而批次记录既标不成 committed、也删不掉。
+// 下一次启动看到这条「未提交」记录会回滚磁盘，容器却仍是新版本——这是
+// 需要人介入的状态，不能只用一句 warning 带过。
+var errBatchRecoveryAtRisk = errors.New("批次现场无法落定，重启可能回滚磁盘")
+
 // manifestEntry 记录一个文件在提交前的状态。
 type manifestEntry struct {
 	Name string `json:"name"`

@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -57,16 +58,27 @@ func (s *Services) AdminAuthenticate(username, password, totpCode, ip string) (*
 			return nil, ErrTOTPReplay
 		}
 		now := time.Now()
-		_ = s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
-			Update("totp_verified_at", now).Error
-		a.TOTPVerifiedAt = &now
+		// 审计字段写失败不让登录失败（认证已经通过，卡在这里等于把一次
+		// 正确的第二因素验证变成「登录失败」），但必须留痕：否则后台会
+		// 长期显示旧时间，排查「谁在什么时候用过动态口令」时被误导。
+		if err := s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
+			Update("totp_verified_at", now).Error; err != nil {
+			log.Printf("[admin] 记录管理员 %d 的 TOTP 验证时间失败（认证已通过，审计字段未更新）: %v", a.ID, err)
+		} else {
+			a.TOTPVerifiedAt = &now
+		}
 	}
 
 	now := time.Now()
-	_ = s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
-		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error
-	a.LastLoginAt = &now
-	a.LastLoginIP = ip
+	// 同上：内存里的返回值只在写库成功后才更新，避免接口回显一个
+	// 数据库里并不存在的时间。
+	if err := s.DB.Model(&model.Admin{}).Where("id = ?", a.ID).
+		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error; err != nil {
+		log.Printf("[admin] 记录管理员 %d 的登录时间/IP 失败（登录已通过，审计字段未更新）: %v", a.ID, err)
+	} else {
+		a.LastLoginAt = &now
+		a.LastLoginIP = ip
+	}
 	return &a, nil
 }
 

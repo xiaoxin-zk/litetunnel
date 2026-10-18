@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -466,8 +467,14 @@ func (s *Services) Authenticate(username, password, ip string) (*model.User, err
 	}
 
 	now := time.Now()
-	_ = s.DB.Model(&model.User{}).Where("id = ?", u.ID).
-		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error
+	// 凭据已经校验通过，审计字段写失败不该把用户挡在门外（fail-open）；
+	// 但也不能像以前那样 `_ =` 丢掉错误——否则后台的「最后登录」会长期陈旧
+	// 且没有任何线索可查。这里记一条日志，返回值仍由 LoadUser 重新读库，
+	// 因此接口回显的永远是库里的真实值，不会出现「时间对得上、库里没有」。
+	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error; err != nil {
+		log.Printf("[auth] 记录用户 %d 的登录时间/IP 失败（登录已通过，审计字段未更新）: %v", u.ID, err)
+	}
 
 	return s.LoadUser(u.ID)
 }

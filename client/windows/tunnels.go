@@ -480,7 +480,12 @@ func (a *App) Redeem(code string) (string, State, error) {
 	var out struct {
 		Message string `json:"message"`
 	}
-	_ = json.Unmarshal(raw, &out)
+	// 兑换请求已经成功（码已核销、权益已发放），解析失败不能让这次操作看起来是失败的。
+	// 但也不能把空字符串交给界面——那样用户只会看到一条空白提示，比没有提示更让人困惑，
+	// 还容易让人以为兑换没生效而重复操作。解不出来就给一句中性兜底文案。
+	if err := json.Unmarshal(raw, &out); err != nil || out.Message == "" {
+		out.Message = "兑换成功"
+	}
 
 	// 兑换可能改变配额或分组，同步一次让界面立刻反映最新状态。
 	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
@@ -199,8 +200,20 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	}
 
 	// 容器已按新配置起来，这时才算「生效」——可以撤记录、清备份了。
-	// 收尾失败不影响运行中的配置，记成 warning 而不是让整个请求失败。
+	//
+	// 收尾失败分两类：记录已清掉或标成 committed（只是备份没清干净）→ 记
+	// warning；记录既标不成也删不掉 → 必须报 partial，因为重启时启动恢复
+	// 会把磁盘回滚到旧配置，而运行中的容器仍是新版本。
 	if err := batch.finalize(); err != nil {
+		if errors.Is(err, errBatchRecoveryAtRisk) {
+			statesCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			states := s.serviceStates(statesCtx)
+			cancel()
+			return res, &partialApplyError{
+				msg:      fmt.Sprintf("配置与容器均已生效，但批次现场无法落定：重启可能把磁盘回滚到旧配置，需人工处理\n%v", err),
+				services: states,
+			}
+		}
 		res.Warnings = append(res.Warnings, err.Error())
 	}
 	res.Applied = true
@@ -226,17 +239,33 @@ func (e *partialApplyError) Error() string { return e.msg }
 // 两步都成功才算真的回滚。任何一步失败都必须明确说「现在不是已知状态」，
 // 并给出每个容器的实际状态——只说「重建失败」，管理员既不知道该重试
 // 还是该手工修，也看不出磁盘与新配置哪个已经生效。
-func (s *service) recoverFromFailedApply(ctx context.Context, batch *writeBatch, upErr error, upOut string) error {
+// rollbackTimeout 是「回滚重建」的独立预算。
+//
+// 必须独立：走到这里最常见的原因就是请求超时或客户端断开，那时请求的
+// ctx 已经取消，用它去重建容器会立刻失败——磁盘恢复成旧配置，容器却
+// 停在新配置上，正好制造出最需要避免的跨版本状态。
+const rollbackTimeout = 3 * time.Minute
+
+func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBatch, upErr error, upOut string) error {
 	detail := strings.TrimSpace(upOut)
 	if detail != "" {
 		detail = "\n" + detail
 	}
+	// 请求被取消是「为什么走到回滚」的一部分，写进结论里，别让管理员
+	// 以为是配置本身有问题。
+	if err := reqCtx.Err(); err != nil {
+		detail += fmt.Sprintf("\n（原请求已中断：%v；回滚使用独立预算继续执行）", err)
+	}
+
+	// 回滚阶段全程用独立预算（见 rollbackTimeout），重建与查状态共用它。
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
 
 	rbErr := batch.revert()
 	// 「文件已恢复、只是记录没清掉」不算回滚失败：磁盘是自洽的旧版本。
 	cleanupPending := errors.Is(rbErr, errBatchCleanupPending)
 	if rbErr != nil && !cleanupPending {
-		states := s.serviceStates(ctx)
+		states := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
 				"\n重建错误: %v\n回滚错误: %v%s", upErr, rbErr, detail),
@@ -249,10 +278,10 @@ func (s *service) recoverFromFailedApply(ctx context.Context, batch *writeBatch,
 	}
 
 	// 文件已回到旧配置。再重建一次，尽量让容器也回到旧版本。
-	if reOut, reErr := s.composeUp(ctx); reErr == nil {
+	if _, reErr := s.composeUp(rollbackCtx); reErr == nil {
 		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置%s，可修改后重试）%s", upErr, note, detail)
 	} else {
-		states := s.serviceStates(ctx)
+		states := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("新配置重建失败，磁盘已回滚为旧配置，但按旧配置重建也失败：容器当前版本未知"+
 				"\n新配置重建错误: %v\n回滚重建错误: %v%s", upErr, reErr, detail),
@@ -437,7 +466,22 @@ func (b *writeBatch) finalize() error {
 	m := b.manifest
 	m.Status = batchStatusCommitted
 	if err := writeManifestFile(m); err != nil {
-		return fmt.Errorf("标记批次为已提交失败（保留记录与备份，重启后会按未提交处理并回滚）: %w", err)
+		// 标记写不进去（磁盘满、目录权限被改）。这时**不能**把记录留在
+		// 「未提交」状态：容器已经按新配置跑起来了，下次启动按记录回滚
+		// 会把磁盘退回旧配置，而容器仍是新版本——磁盘与容器分叉。
+		//
+		// 退而删除记录：删除比写入更可能成功（不需要新空间），而
+		// 「没有记录」正是启动恢复理解的「已落定」。
+		if b.removeManifest(b.manifest) {
+			for _, st := range b.staged {
+				st.cleanupBackup()
+			}
+			return fmt.Errorf("批次状态未能标记，已直接清除记录（配置与容器均已生效）: %w", err)
+		}
+		// 标记与删除都失败：只能如实告知。清理备份会把最后一点现场也抹掉，
+		// 所以保留它们，留给人工判断。
+		return fmt.Errorf("%w: 批次状态未能标记、记录也未能删除，请手动删除部署目录下的 %s 与 %s 备份: %v",
+			errBatchRecoveryAtRisk, batchManifestName, backupSuffix, err)
 	}
 	if !b.removeManifest(m) {
 		// 记录已经标成 committed，留着无害；备份也留着，等下次启动清理。

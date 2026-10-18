@@ -264,6 +264,11 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 可能以不同顺序完成：数据库最后落到「已启用」，内存却被较早那笔
 	// 置成「已封禁」——用户看到账号正常，新连接却一直被拒。持有用户锁
 	// 之后，两者只可能是先后关系，内存标记随之与数据库一致。
+	// 记下「这次禁用生效的时刻」，用于断流时区分新旧代理（见 CloseUserProxies
+	// 的 notAfter）。取在实际写库之前：宁可多留一点余量，也不要漏掉一台实例上
+	// 更早写下的状态。
+	disabledAt := time.Now()
+
 	lock := s.userLock(id)
 	lock.Lock()
 
@@ -320,7 +325,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 拦不住已经建立的代理流。逐个关闭，实现「立即断流」。
 		// 用带超时的上下文，避免 frps 管理接口不可用时把禁用操作卡死。
 		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		s.CloseUserProxies(closeCtx, id, gen)
+		s.CloseUserProxies(closeCtx, id, gen, disabledAt)
 		cancel()
 		return nil
 	}

@@ -173,8 +173,18 @@ func (s *service) certStatus() tlscfg.CertStatus {
 	}
 	st.Available = true
 
+	// 回调吞掉单条错误是为了「一棵子树读不了不要拖垮整份列表」，
+	// 但吞掉之后 WalkDir 的返回值和「一切正常」就分不出来了，
+	// 所以这里自己记住第一个失败，供下面的诊断文案使用。
+	var walkErr error
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			if walkErr == nil {
+				walkErr = err
+			}
+			return nil
+		}
+		if d.IsDir() {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
@@ -189,7 +199,14 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		return nil
 	})
 
-	if len(st.Certs) == 0 {
+	// 遍历失败（权限不足、IO 错误）与「目录里确实没有证书」是两种完全不同的状况：
+	// 前者报成「还没签发成功」会把管理员引向错误的方向去查 Caddy 日志。
+	switch {
+	case walkErr != nil && len(st.Certs) == 0:
+		st.Reason = fmt.Sprintf("读取证书目录失败：%v", walkErr)
+	case walkErr != nil:
+		st.Reason = fmt.Sprintf("证书列表可能不完整（遍历中断：%v）", walkErr)
+	case len(st.Certs) == 0:
 		st.Reason = "Caddy 数据目录里没有可解析的证书文件（可能还没签发成功，请查看 caddy 容器日志）"
 	}
 	// 最快到期的排最前：这才是管理员需要动手的那一张。

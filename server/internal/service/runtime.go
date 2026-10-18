@@ -358,9 +358,13 @@ func (s *Services) FindTrustedClientSession(runID string) (*model.ClientSession,
 // MarkStaleSessionsOffline 把长时间未上报心跳的会话标记为离线。
 func (s *Services) MarkStaleSessionsOffline(maxIdle time.Duration) {
 	cutoff := time.Now().Add(-maxIdle)
-	_ = s.DB.Model(&model.ClientSession{}).
+	// 写失败会让陈旧会话一直挂在「在线」列表里，虽然信任校验还有 last_seen_at
+	// 窗口兜底（不影响准入），但后台在线数会失真，因此要留下线索。
+	if err := s.DB.Model(&model.ClientSession{}).
 		Where("online = ? AND last_seen_at < ?", true, cutoff).
-		Update("online", false).Error
+		Update("online", false).Error; err != nil {
+		log.Printf("[session] 标记陈旧会话离线失败（在线列表可能残留幽灵会话）: %v", err)
+	}
 }
 
 // RecordLogin 记录一次成功登录。

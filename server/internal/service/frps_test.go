@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 )
@@ -477,7 +478,7 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	})
 
 	gen := svc.bumpUserStatusGen(userID)
-	svc.CloseUserProxies(context.Background(), userID, gen)
+	svc.CloseUserProxies(context.Background(), userID, gen, time.Now())
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -515,9 +516,53 @@ func TestCloseUserProxiesHoldsUserLockWhileClosing(t *testing.T) {
 	})
 
 	gen := svc.bumpUserStatusGen(userID)
-	svc.CloseUserProxies(context.Background(), userID, gen)
+	svc.CloseUserProxies(context.Background(), userID, gen, time.Now())
 
 	if atomic.LoadInt32(&lockHeld) == 0 {
 		t.Fatal("关闭代理时没有持有用户锁：复查与关闭之间仍可能插入一次重新启用")
+	}
+}
+
+// TestCloseUserProxiesSkipsProxiesStartedAfterDisable 覆盖跨实例的最后一跳竞态。
+//
+// 锁与代次都只能覆盖本实例：另一台实例上的启用可以正好插在查库之后、
+// 关闭请求到达 frps 之前。frps 记录的 lastStartAt 是这种情形下唯一可信的
+// 判据——重新注册过的代理一定晚于禁用时刻启动，关它等于把刚放行的人
+// 又踢下线。
+func TestCloseUserProxiesSkipsProxiesStartedAfterDisable(t *testing.T) {
+	svc := newTestServices(t, nil)
+	t.Cleanup(svc.Close)
+
+	const userID = 11
+	var (
+		mu     sync.Mutex
+		closed []string
+	)
+	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			now := time.Now().Unix()
+			_, _ = w.Write([]byte(frpsOK(fmt.Sprintf(
+				`{"total":2,"page":1,"pageSize":200,"items":[`+
+					`{"name":"lt_u11.old","status":{"phase":"online","lastStartAt":%d}},`+
+					`{"name":"lt_u11.new","status":{"phase":"online","lastStartAt":%d}}]}`,
+				now-60, now+10))))
+		case http.MethodDelete:
+			mu.Lock()
+			closed = append(closed, r.URL.Query().Get("name"))
+			mu.Unlock()
+			_, _ = w.Write([]byte(frpsOK("null")))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	gen := svc.bumpUserStatusGen(userID)
+	svc.CloseUserProxies(context.Background(), userID, gen, time.Now())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(closed) != 1 || closed[0] != "lt_u11.old" {
+		t.Fatalf("只应关闭禁用前就存在的代理，实际关闭了 %v", closed)
 	}
 }

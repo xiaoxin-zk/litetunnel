@@ -244,7 +244,10 @@ func (s *Services) Redeem(userID uint, code, ip string) (*RedeemResult, error) {
 		// 这类尝试是风控最关心的信号（有人在撞码），而它原先写在事务里，
 		// 紧接着就随回滚消失了——等于从来没记录过。
 		if errors.Is(err, ErrCodeInvalid) {
-			_ = s.recordRedeem(s.DB, userID, 0, code, "", 0, "invalid", ip)
+			// 撞码流水是风控最关心的信号，写失败必须留痕，不能静默丢掉。
+			if e := s.recordRedeem(s.DB, userID, 0, code, "", 0, "invalid", ip); e != nil {
+				log.Printf("[redeem] 记录无效兑换码尝试失败（用户 %d，码 %q）: %v", userID, code, e)
+			}
 		}
 		return nil, err
 	}

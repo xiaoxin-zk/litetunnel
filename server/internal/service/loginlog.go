@@ -84,7 +84,9 @@ func (s *Services) drainLoginLogs() {
 	for {
 		select {
 		case e := <-s.loginLogCh:
-			_ = s.DB.Create(&e).Error
+			if err := s.DB.Create(&e).Error; err != nil {
+				log.Printf("[loginlog] 退出前落库失败（该条日志已丢失）: %v", err)
+			}
 		default:
 			return
 		}
@@ -158,9 +160,15 @@ func (s *Services) trackLoginFailure(a LoginAttempt) {
 // loginFailureCounter（见 loginfail.go）。
 func (s *Services) CountRecentFailedLogins(kind, username string, within time.Duration) int64 {
 	var n int64
-	_ = s.DB.Model(&model.LoginLog{}).
+	// 查询失败时返回 0，而 0 在排查语境里正好表示「没有失败记录」，
+	// 两者混淆会误导判断，因此必须留痕。
+	if err := s.DB.Model(&model.LoginLog{}).
 		Where("kind = ? AND username = ? AND result <> ? AND created_at > ?",
 			kind, username, model.LoginResultSuccess, time.Now().Add(-within)).
-		Count(&n).Error
+		Count(&n).Error; err != nil {
+		log.Printf("[loginlog] 统计 %s 账号 %q 最近 %s 的失败登录数失败（返回 0 不代表无失败）: %v",
+			kind, username, within, err)
+		return 0
+	}
 	return n
 }

@@ -87,6 +87,10 @@ var (
 	// 处理不了」。混为一谈的后果不只是提示不准——失败次数记不上的话，
 	// 猜测次数上限就形同不存在，攻击者可以无限试。
 	ErrEmailCodeCheckFailed = errors.New("验证码校验暂时不可用，请稍后重试")
+	// ErrFirewallQueueFull 表示防火墙待办队列已满，本次端口操作既没能执行、
+	// 也没能进入重试队列。必须让调用方（创建/启用隧道）明确报错，否则会出现
+	// 「隧道已启用、端口未放行、管理页也没有待办」的永久不一致。
+	ErrFirewallQueueFull = errors.New("防火墙待办队列已满，端口操作无法排队重试")
 
 	// 邮箱验证码相关
 	ErrEmailRequired     = errors.New("请填写有效的邮箱地址")

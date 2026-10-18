@@ -56,8 +56,10 @@ func (s *Services) RecordLogin(a LoginAttempt) {
 }
 
 // StartLoginLogWriter 启动日志落库协程，直到 ctx 结束。
-func (s *Services) StartLoginLogWriter(ctx context.Context) {
+func (s *Services) StartLoginLogWriter(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(6 * time.Hour)
 		defer ticker.Stop()
 		for {
@@ -74,6 +76,7 @@ func (s *Services) StartLoginLogWriter(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }
 
 // drainLoginLogs 在退出前把缓冲里的日志尽力落库。

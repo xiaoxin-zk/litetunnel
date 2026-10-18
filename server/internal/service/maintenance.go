@@ -42,8 +42,10 @@ const (
 // 这些行以前没有任何清理路径：验证码过期、令牌用完、邮件发送失败之后就一直留着
 // （发件箱原本只清「已送达且超过保留期」的，failed 的永远不清）。公网服务跑上
 // 几个月，这几张表会明显变大，索引也跟着变慢。
-func (s *Services) StartMaintenanceWorker(ctx context.Context) {
+func (s *Services) StartMaintenanceWorker(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(maintenanceInterval)
 		defer ticker.Stop()
 
@@ -59,6 +61,7 @@ func (s *Services) StartMaintenanceWorker(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }
 
 // RunMaintenance 执行一轮清理。

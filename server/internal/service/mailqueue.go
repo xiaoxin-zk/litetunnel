@@ -215,14 +215,16 @@ func (s *Services) kickMailWorker() {
 // 协程始终启动，而不是在未配置邮件时跳过：
 // 邮件配置可以在管理端随时开启，启动时禁用不代表之后一直禁用。
 // 未启用时只是不发信（待发的信留在发件箱里，配置好之后自然会被发出去）。
-func (s *Services) StartMailWorker(ctx context.Context) {
+func (s *Services) StartMailWorker(ctx context.Context) <-chan struct{} {
 	if s.MailEnabled() {
 		log.Printf("[mail] 邮件发送已启用，发件人 %s", s.SMTPConfig().From)
 	} else {
 		log.Printf("[mail] 邮件发送未启用，可在管理端「系统设置 → 邮件」中配置")
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(mailRetryInterval)
 		defer ticker.Stop()
 
@@ -239,6 +241,7 @@ func (s *Services) StartMailWorker(ctx context.Context) {
 			s.processMailOutbox(ctx)
 		}
 	}()
+	return done
 }
 
 // processMailOutbox 处理一批到期的工作。

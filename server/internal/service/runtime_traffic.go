@@ -117,12 +117,14 @@ type tunnelDelta struct {
 }
 
 // StartTrafficCollector 启动后台采集协程，直到 ctx 结束。
-func (s *Services) StartTrafficCollector(ctx context.Context) {
+func (s *Services) StartTrafficCollector(ctx context.Context) <-chan struct{} {
 	interval := s.Cfg.TrafficPollInterval
 	if interval < 5*time.Second {
 		interval = 5 * time.Second
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		// 退出时主动交还采集租约：正常重启不必等租期到期，新进程立刻能接手。
 		defer s.releaseLease(leaseTrafficCollector)
 
@@ -191,6 +193,7 @@ func (s *Services) StartTrafficCollector(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }
 
 // inQueryBatch 是 IN (?) 查询的单批参数个数。

@@ -68,8 +68,10 @@ func (s *Services) processRecovery(req recoveryRequest) {
 }
 
 // StartRecoveryWorker 与 SMTP worker 独立，防止慢投递阻塞请求预处理。
-func (s *Services) StartRecoveryWorker(ctx context.Context) {
+func (s *Services) StartRecoveryWorker(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for {
 			if ctx.Err() != nil {
 				return
@@ -88,4 +90,5 @@ func (s *Services) StartRecoveryWorker(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }

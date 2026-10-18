@@ -389,7 +389,13 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 	// 提交前查不到新隧道、判定该关，然后在放行之后把端口关掉——新隧道
 	// 刚建好就连不上。现在它只能在「提交 + 放行」整段结束之后才动得了。
 	if firewallNow && created.RemotePort > 0 {
-		s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true)
+		if _, ferr := s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true); errors.Is(ferr, ErrFirewallQueueFull) {
+			// 隧道已在服务端建好，但防火墙放行既没成功、也没能进入重试队列：
+			// 这条隧道会一直「连不上」，而管理页上没有任何待办提示。必须明确
+			// 报错让用户知道需要管理员介入；隧道对象仍一并返回，避免「报失败
+			// 却已创建」的困惑。
+			return &created, fmt.Errorf("隧道已创建，但防火墙放行失败且无法自动重试：%w", ErrFirewallQueueFull)
+		}
 	}
 	return &created, nil
 }
@@ -610,7 +616,11 @@ func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
 
 	if t.RemotePort > 0 {
 		if status == model.TunnelStatusActive {
-			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true)
+			if _, ferr := s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true); errors.Is(ferr, ErrFirewallQueueFull) {
+				// 同创建隧道：启用已经写库，但放行没成功也没进重试队列，
+				// 隧道会一直连不上且管理页无待办，必须如实报错。
+				return fmt.Errorf("隧道已启用，但防火墙放行失败且无法自动重试：%w", ErrFirewallQueueFull)
+			}
 		} else {
 			// 收回失败要进重试队列：数据库状态已经改了、接口也返回成功，
 			// 只写一行日志的话规则会一直开着，而且没有任何地方会再尝试。

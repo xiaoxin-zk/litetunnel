@@ -66,14 +66,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	svc.StartTrafficCollector(ctx)
-	svc.StartLoginLogWriter(ctx)
-	svc.StartMailWorker(ctx)
-	svc.StartRecoveryWorker(ctx)
-	// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
-	// 没有它，公网服务跑久了这几张表会一直膨胀。
-	svc.StartMaintenanceWorker(ctx)
-	fwDone := svc.StartFirewallReconciler(ctx)
+	// 统一收集后台 worker 的退出信号，关闭阶段逐个等待（见 waitWorkers）。
+	// 之前只有防火墙协调器被等待，其余 worker 在进程退出时可能还握着
+	// 数据库连接或 SMTP 会话，尾部数据会丢。
+	workers := []<-chan struct{}{
+		svc.StartTrafficCollector(ctx),
+		svc.StartLoginLogWriter(ctx),
+		svc.StartMailWorker(ctx),
+		svc.StartRecoveryWorker(ctx),
+		// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
+		// 没有它，公网服务跑久了这几张表会一直膨胀。
+		svc.StartMaintenanceWorker(ctx),
+		svc.StartFirewallReconciler(ctx),
+	}
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
 	go svc.Monitor.Start(ctx)
 
@@ -102,14 +107,30 @@ func main() {
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 
-	// 等协调器退出再返回：它可能正在访问数据库或调用 helper，
-	// 进程先走会让那次写操作停在半路。
-	select {
-	case <-fwDone:
-	case <-time.After(5 * time.Second):
-		log.Println("防火墙协调器未在 5 秒内退出，继续关闭")
-	}
+	// 统一等待所有后台 worker 退出再返回：它们可能正在访问数据库或调用
+	// helper/SMTP，进程先走会让那次写操作停在半路、尾部数据丢失。
+	waitWorkers(workers)
 	log.Println("已退出")
+}
+
+// workerShutdownWait 是关闭阶段等待全部后台 worker 退出的总上限。
+//
+// 各 worker 都在 select 里监听 ctx.Done()，正常情况下收到退出信号后几毫秒内
+// 就会返回；留这个上限是防止某个 worker 卡在写盘、网络调用上，让窗口/进程
+// 无限期关不掉。
+const workerShutdownWait = 5 * time.Second
+
+// waitWorkers 等待所有后台 worker 退出，超过总上限则记录并继续关闭。
+func waitWorkers(workers []<-chan struct{}) {
+	deadline := time.After(workerShutdownWait)
+	for _, done := range workers {
+		select {
+		case <-done:
+		case <-deadline:
+			log.Println("后台 worker 未在 5 秒内退出，继续关闭")
+			return
+		}
+	}
 }
 
 // printStartupWarnings 输出启动期的安全提示。

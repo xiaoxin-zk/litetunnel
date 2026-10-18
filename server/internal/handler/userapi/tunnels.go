@@ -117,9 +117,10 @@ func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
 	}
 
 	httpx.OK(c, gin.H{
-		"created":  created,
-		"failures": res.Failures,
-		"message":  batchMessage(len(created), len(res.Failures)),
+		"created":           created,
+		"failures":          res.Failures,
+		"firewall_failures": res.FirewallFailures,
+		"message":           batchMessage(len(created), len(res.Failures), len(res.FirewallFailures)),
 	})
 }
 
@@ -128,15 +129,20 @@ func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
 // 全部成功、部分失败、全部失败三种情况应当给出不同的措辞——
 // 让用户只看到「创建完成」而漏掉失败的那几条，是最容易积累
 // 「怎么少了几条」这类困惑的地方。
-func batchMessage(ok, failed int) string {
+func batchMessage(ok, failed, fwFailed int) string {
+	var base string
 	switch {
 	case failed == 0:
-		return fmt.Sprintf("已创建 %d 条隧道，公网端口由服务端自动分配", ok)
+		base = fmt.Sprintf("已创建 %d 条隧道，公网端口由服务端自动分配", ok)
 	case ok == 0:
-		return "没有成功创建任何隧道，请查看失败原因"
+		base = "没有成功创建任何隧道，请查看失败原因"
 	default:
-		return fmt.Sprintf("成功创建 %d 条，%d 条失败，请查看失败原因", ok, failed)
+		base = fmt.Sprintf("成功创建 %d 条，%d 条失败，请查看失败原因", ok, failed)
 	}
+	if fwFailed > 0 {
+		base += fmt.Sprintf("；另有 %d 条已创建但防火墙放行未入队，请稍后重试", fwFailed)
+	}
+	return base
 }
 
 // UpdateTunnel 修改隧道。

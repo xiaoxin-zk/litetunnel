@@ -41,6 +41,12 @@ type BatchFailure struct {
 type BatchCreateResult struct {
 	Created  []model.Tunnel `json:"created"`
 	Failures []BatchFailure `json:"failures"`
+	// FirewallFailures 是「隧道已创建、但防火墙放行未进入重试队列」的条目。
+	//
+	// 与 Failures 分开：这些隧道确实建好了，只是端口可能没放行、也没有待办，
+	// 需要单独提示——否则用户会以为「创建失败」而反复重试，或看到「创建成功」
+	// 却连不上却找不到任何待办记录。
+	FirewallFailures []BatchFailure `json:"firewall_failures"`
 }
 
 // CreateTunnelsBatch 批量创建隧道。
@@ -139,8 +145,19 @@ func (s *Services) CreateTunnelsBatch(u *model.User, in CreateTunnelBatchInput) 
 	// → 执行 → 提交状态」，天然不会覆盖或误删新意图，也随服务退出而停止。
 	if len(res.Created) > 0 {
 		for i := range res.Created {
-			if res.Created[i].RemotePort > 0 {
-				s.markFirewallPending(res.Created[i].RemotePort, ProtoOfTunnel(res.Created[i].Type), true)
+			t := &res.Created[i]
+			if t.RemotePort <= 0 {
+				continue
+			}
+			// 队列满（且是新端口）时 markFirewallPending 返回 false：隧道已经
+			// 建好，但放行既没执行也没入队，属于永久丢失。必须单独回报，
+			// 否则管理员看到「创建成功」，端口却一直连不上、界面也没有待办。
+			if !s.markFirewallPending(t.RemotePort, ProtoOfTunnel(t.Type), true) {
+				res.FirewallFailures = append(res.FirewallFailures, BatchFailure{
+					LocalPort: t.LocalPort,
+					Name:      t.Name,
+					Reason:    "隧道已创建，但防火墙放行未进入重试队列（队列已满），请稍后重试",
+				})
 			}
 		}
 		// 不必等下一个 2 分钟周期。

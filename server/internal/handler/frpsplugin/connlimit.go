@@ -23,9 +23,14 @@ import (
 // 让 frps 尽早关掉它们，避免一直陪着做握手与回调。
 const (
 	// connRatePerSec 是每条隧道每秒可持续接受的新连接数。
-	connRatePerSec = 50
+	//
+	// 取值偏高是有意的：联机游戏的连接模式比网页激进得多——服务器列表刷新、
+	// 大厅重连、每个玩家进入都要新建连接，热门房间一秒几百个并不罕见。
+	// 限得太紧会把正常联机挡在门外，那比被刷更糟（用户找不到原因）。
+	// 这里的阈值只拦「持续到不像人类操作」的量级。
+	connRatePerSec = 300
 	// connBurst 是允许的瞬时突发连接数。
-	connBurst = 100
+	connBurst = 800
 	// connCooldown 是熔断后的冷却时长。
 	connCooldown = time.Minute
 	// connIdleTTL 是空闲隧道的计数记录保留时长。

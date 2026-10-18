@@ -183,6 +183,32 @@ func (s *Services) bumpUserStatusGen(userID uint) uint64 {
 	return e.gen
 }
 
+// setUserStatusGen 用落库的状态版本覆盖内存代次。
+//
+// 内存这份只用于同实例的快速判断；跨实例的判据必须查库
+// （见 userStateVersionFromDB）。两者值域一致，都是 users.state_version。
+func (s *Services) setUserStatusGen(userID uint, gen uint64) {
+	s.statusGenMu.Lock()
+	defer s.statusGenMu.Unlock()
+	s.statusGens[userID] = userStatusEntry{gen: gen, at: time.Now()}
+	if len(s.statusGens) > statusGenMaxEntries {
+		s.sweepStatusGensLocked(time.Now())
+	}
+}
+
+// userStateVersionFromDB 读取账号状态版本。
+//
+// 返回 ErrRecordNotFound 表示账号已不存在（此时「谁先谁后」已无意义，
+// 调用方不应据此放弃断流）。其它错误表示数据库暂时不可用，同样不构成
+// 「状态已变」的证据。
+func (s *Services) userStateVersionFromDB(userID uint) (uint64, error) {
+	var u model.User
+	if err := s.DB.Select("id", "state_version").First(&u, userID).Error; err != nil {
+		return 0, err
+	}
+	return u.StateVersion, nil
+}
+
 // userStatusGen 返回该用户当前的状态代次；从未改过状态时为 0。
 func (s *Services) userStatusGen(userID uint) uint64 {
 	s.statusGenMu.Lock()
@@ -241,18 +267,33 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	lock := s.userLock(id)
 	lock.Lock()
 
-	res := s.DB.Model(&model.User{}).Where("id = ?", id).Update("status", status)
-	if res.Error != nil {
+	// 状态与状态版本必须一起落库：断流任务跨锁、跨实例执行，只靠进程内
+	// 代次的话，实例 B 上的重新启用不会被实例 A 的断流看到。
+	var gen uint64
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.User{}).Where("id = ?", id).
+			Updates(map[string]any{
+				"status":        status,
+				"state_version": gorm.Expr("state_version + 1"),
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		// 读回本次写入的版本：后面那段断流要放掉用户锁去做（可能十几秒），
+		// 这期间若账号被重新启用（任何实例上），版本变化就是「本次断流
+		// 已过期」的信号。
+		return tx.Model(&model.User{}).Where("id = ?", id).
+			Pluck("state_version", &gen).Error
+	})
+	if err != nil {
 		lock.Unlock()
-		return res.Error
+		return err
 	}
-	if res.RowsAffected == 0 {
-		lock.Unlock()
-		return ErrNotFound
-	}
-	// 状态已落库，立刻推进代次：后面那段断流要放掉用户锁去做（可能十几秒），
-	// 这期间若账号被重新启用，代次变化就是「本次断流已过期」的信号。
-	gen := s.bumpUserStatusGen(id)
+	// 内存代次跟随落库版本，供同实例的快速判断（见 CloseUserProxies）。
+	s.setUserStatusGen(id, gen)
 	// 令牌只验签不查状态，因此必须主动失效缓存，让禁用立即生效。
 	s.Runtime.InvalidateIdentity(IdentityKindUser, id)
 	if status != model.UserStatusActive {

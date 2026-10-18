@@ -178,7 +178,10 @@ func (s *Services) RevokeClientSessions(userID uint) error {
 //
 // 关闭失败不中断：能关一个是一个，失败的由「客户端重连被拒」兜底。
 func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64) {
-	if s.userStatusGen(userID) != gen {
+	// gen 来自 users.state_version（见 AdminSetUserStatus），是跨实例的版本。
+	// 内存里可能还没有这个用户（刚启动，或状态变更发生在别的实例上），
+	// 所以「0」只能当作「没有信息」，不能当成「版本不符」。
+	if cached := s.userStatusGen(userID); cached != 0 && cached != gen {
 		log.Printf("[user] 用户 %d 的状态在断流开始前已变更，跳过本次断流", userID)
 		return
 	}
@@ -196,9 +199,19 @@ func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64
 		// 期间状态可能已经翻转，而这个窗口必须以锁关闭，不能只靠一次读。
 		lock := s.userLock(userID)
 		lock.Lock()
-		if s.userStatusGen(userID) != gen {
+		if cached := s.userStatusGen(userID); cached != 0 && cached != gen {
 			lock.Unlock()
 			log.Printf("[user] 用户 %d 的状态在断流过程中已变更，停止关闭剩余代理（避免误伤重新启用后的新代理）", userID)
+			return
+		}
+		// 进程内代次只覆盖「本实例」。启用请求完全可能落在另一台实例上，
+		// 而那台实例写下的状态版本，这里只能查库才看得到。
+		// 查不到账号（已删除）或数据库暂时不可用时不据此中止：禁用本身
+		// 已经生效，新连接会被拒，漏关的代理影响远小于误判。
+		if dbGen, err := s.userStateVersionFromDB(userID); err == nil && dbGen != gen {
+			lock.Unlock()
+			log.Printf("[user] 用户 %d 的状态在其他实例上已变更（版本 %d ≠ %d），停止关闭剩余代理",
+				userID, dbGen, gen)
 			return
 		}
 		err := s.Frps.CloseProxy(ctx, p.Name)

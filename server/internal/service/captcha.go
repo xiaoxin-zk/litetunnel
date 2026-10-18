@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,23 +89,35 @@ func (s *CaptchaStore) evictLocked(now time.Time) {
 	if len(s.entries) < captchaMaxEntries {
 		return
 	}
+
+	// 一次腾出 1/8，避免每来一个新票据就全表扫一遍。
 	target := captchaMaxEntries - captchaMaxEntries/8
-	type candidate struct {
-		key    string
-		expire time.Time
-	}
-	cands := make([]candidate, 0, len(s.entries))
+
+	// 按「剩余有效期」分桶，桶 0 最早失效、优先淘汰。
+	//
+	// 不排序：这条路径在全局锁内，2 万条排序会让集中领取验证码的请求
+	// 排成一队（攻击者恰好能借此放大影响）。分桶是一次遍历加一次按桶删除，
+	// 与记录数成线性，且淘汰顺序仍是「最早失效的先走」。
+	const bucketCount = 8
+	bucketWidth := captchaTTL / bucketCount
+	byBucket := make([][]string, bucketCount)
 	for k, e := range s.entries {
-		cands = append(cands, candidate{key: k, expire: e.expireAt})
-	}
-	sort.Slice(cands, func(i, j int) bool {
-		return cands[i].expire.Before(cands[j].expire)
-	})
-	for _, c := range cands {
-		if len(s.entries) <= target {
-			break
+		idx := int(e.expireAt.Sub(now) / bucketWidth)
+		if idx < 0 {
+			idx = 0
 		}
-		delete(s.entries, c.key)
+		if idx >= bucketCount {
+			idx = bucketCount - 1
+		}
+		byBucket[idx] = append(byBucket[idx], k)
+	}
+	for _, keys := range byBucket {
+		for _, k := range keys {
+			if len(s.entries) <= target {
+				return
+			}
+			delete(s.entries, k)
+		}
 	}
 }
 

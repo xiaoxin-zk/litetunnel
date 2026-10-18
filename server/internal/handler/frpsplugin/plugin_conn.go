@@ -40,6 +40,13 @@ func (h *Handler) onNewUserConn(req *request) response {
 	// 优先走会话缓存；缓存未命中时才回落数据库。
 	if content.User.RunID != "" {
 		if s, ok := h.svc.Runtime.LookupSession(content.User.RunID); ok {
+			// 会话可能已被**别的实例**撤销（改密、重置密码、轮换 client secret）：
+			// 撤销方只清自己的内存会话，并把数据库里的会话置为离线；本机的
+			// 内存会话不会消失，缓存在这里就直接放行了。按短 TTL 回查一次，
+			// 让撤销在几秒内生效，而不是等下一个 Ping 周期刷到准入快照。
+			if !h.svc.EnsureSessionOnline(content.User.RunID) {
+				return deny("会话已失效，请重新连接")
+			}
 			// 两个标记都要看，缺一不可：
 			//   - blocked：账号被禁用/封禁；
 			//   - exceeded：流量用超了。

@@ -250,6 +250,12 @@ func (h *Handler) resolveUser(frpUser, runID string, metas map[string]string) (*
 					runID, userID, s.UserID)
 				return nil, false
 			}
+			// 内存命中不等于会话仍有效：撤销发生在哪台实例上是随机的，
+			// 本机缓存的会话要按短 TTL 与数据库核对一次（见 EnsureSessionOnline）。
+			if !h.svc.EnsureSessionOnline(runID) {
+				log.Printf("[plugin] run_id %s 的会话已在其他实例撤销，已拒绝", runID)
+				return nil, false
+			}
 			u, err := h.svc.LoadUser(s.UserID)
 			if err != nil {
 				return nil, false

@@ -50,6 +50,14 @@ type User struct {
 	Nickname string `gorm:"size:64" json:"nickname"`
 	Status   string `gorm:"size:16;index;default:active" json:"status"`
 
+	// StateVersion 是账号状态的跨进程版本号，每次状态变更（启用/禁用/封禁）自增。
+	//
+	// 断流任务要跨锁、跨实例关闭 frps 代理：进程内的代次只对当前实例可见，
+	// 实例 A 的断流看不到实例 B 上的重新启用，仍会把刚建立的新代理关掉。
+	// 版本落库之后，每次关闭前读一次这一列，任何实例上的状态变更都能被看到。
+	// 与 TrafficResetGen 是同一个思路（见它的注释）。
+	StateVersion uint64 `gorm:"not null;default:0" json:"-"`
+
 	GroupID uint   `gorm:"index" json:"group_id"`
 	Group   *Group `gorm:"foreignKey:GroupID" json:"group,omitempty"`
 

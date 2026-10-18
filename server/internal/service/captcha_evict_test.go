@@ -21,8 +21,10 @@ func TestCaptchaEvictKeepsNewest(t *testing.T) {
 		s.entries[fmt.Sprintf("t-%d", i)] = captchaEntry{
 			answer: 1,
 			ip:     "127.0.0.1",
-			// 到期时间递增：i 越大越晚失效，也就是越该保留。
-			expireAt: now.Add(time.Duration(i) * time.Millisecond),
+			// 到期时间均匀铺满整个有效期：i 越大越晚失效，也就是越该保留。
+			// 只铺开几毫秒的话所有票据都落在同一个分桶里，淘汰顺序退化成遍历
+			// 顺序，就测不出「最早失效的先走」了。
+			expireAt: now.Add(captchaTTL * time.Duration(i) / captchaMaxEntries),
 		}
 	}
 	s.evictLocked(now)

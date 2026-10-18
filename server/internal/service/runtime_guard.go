@@ -85,6 +85,37 @@ func (s *Services) RefreshSessionGuard(runID string) {
 		s.QuotaExceeded(&u))
 }
 
+// sessionAliveTTL 是「会话仍在线」的核验间隔。
+//
+// 撤销（改密/重置/轮换 secret）之后旧客户端不该再建连接。单实例下本地
+// 清会话就是即时的；多实例下必须回查数据库，而每次新建连接都查会把这
+// 条热路径压到数据库上。3 秒是权衡：撤销最多延迟 3 秒生效，代价是每条
+// 会话每 3 秒最多一次按主键的查询。
+const sessionAliveTTL = 3 * time.Second
+
+// EnsureSessionOnline 复核会话在数据库里是否仍然有效。
+//
+// 返回 false 表示已被撤销（或账号已删），调用方应当拒绝本次请求。
+// 内存会话不存在时也返回 false：那种情况下调用方本来就会回落数据库。
+func (s *Services) EnsureSessionOnline(runID string) bool {
+	if runID == "" {
+		return false
+	}
+	sess, ok := s.Runtime.LookupSession(runID)
+	if !ok {
+		return false
+	}
+	if !sess.AliveCheckedAt.IsZero() && time.Since(sess.AliveCheckedAt) < sessionAliveTTL {
+		return !sess.Revoked
+	}
+	alive := true
+	if _, err := s.FindTrustedClientSession(runID); err != nil {
+		alive = false
+	}
+	s.Runtime.SetSessionAlive(runID, alive)
+	return alive
+}
+
 // SessionGuard 返回会话级准入快照，ok=false 表示快照尚未建立。
 //
 // 代理注册与新连接两条路径共用它：两边各查各的（一个看全局缓存、一个看快照）

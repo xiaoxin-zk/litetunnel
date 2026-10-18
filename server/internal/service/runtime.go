@@ -25,6 +25,16 @@ type sessionInfo struct {
 	GuardAt  time.Time
 	Blocked  bool
 	Exceeded bool
+
+	// AliveCheckedAt / Revoked 是「这个会话在数据库里是否还有效」的短周期核验。
+	//
+	// 会话撤销（改密、重置密码、轮换 client secret）只发生在某一台实例上：
+	// 它清掉自己的内存会话并把数据库里的会话置为离线，其它实例的内存会话
+	// 不会跟着消失。准入快照要等一个 Ping 周期（30 秒）才刷新，而旧 frpc
+	// 在这段时间里可以继续建新代理——改密的语义是「立刻把旧客户端踢掉」，
+	// 不该留这么久。
+	AliveCheckedAt time.Time
+	Revoked        bool
 }
 
 // Runtime 保存插件回调与流量采集共用的内存态。
@@ -389,6 +399,17 @@ func (r *Runtime) SetSessionGuard(runID string, blocked, exceeded bool) {
 		s.Blocked = blocked
 		s.Exceeded = exceeded
 		s.GuardAt = time.Now()
+		r.sessions[runID] = s
+	}
+}
+
+// SetSessionAlive 记录一次会话有效性核验的结果。
+func (r *Runtime) SetSessionAlive(runID string, alive bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.sessions[runID]; ok {
+		s.AliveCheckedAt = time.Now()
+		s.Revoked = !alive
 		r.sessions[runID] = s
 	}
 }

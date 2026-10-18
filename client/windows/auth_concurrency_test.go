@@ -23,8 +23,7 @@ func TestLogoutKeepsCredentialLockThroughCleanup(t *testing.T) {
 				a.authMu.Unlock()
 				t.Error("磁盘清理期间认证锁已释放")
 			}
-			if a.syncMu.TryLock() {
-				a.syncMu.Unlock()
+			if !syncGateHeld(a) {
 				t.Error("磁盘清理期间同步锁已释放")
 			}
 			if calls == 1 && failMain {

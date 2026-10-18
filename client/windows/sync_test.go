@@ -21,6 +21,20 @@ import (
 // 每 20 秒重试一次就多推一次退避——配置接口恢复之后，客户端还要白白多等
 // 最长 5 分钟才把隧道拉起来。而用户看到的现象是「网络早就好了，还是连不上」。
 
+// syncGateHeld 报告同步门闩当前是否被占用。
+//
+// 门闩是容量 1 的 channel 而不是 Mutex，所以不能用 TryLock 判断：这里尝试
+// 放入一个令牌，放得进去说明没人持有（随即取回），放不进去说明正被占用。
+func syncGateHeld(a *App) bool {
+	select {
+	case a.syncGateChan() <- struct{}{}:
+		<-a.syncGateChan()
+		return false
+	default:
+		return true
+	}
+}
+
 // fakePanel 起一个假面板：/info 返回一条启用中的隧道（可切换成空列表），
 // /config 的响应由调用方控制，并统计被请求的次数。
 func fakePanel(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32, *atomic.Bool) {
@@ -79,11 +93,11 @@ func TestShutdownWaitsForSyncThenClosesManager(t *testing.T) {
 	root, cancel := context.WithCancel(context.Background())
 	a.syncRoot, a.syncCancel = root, cancel
 
-	// 模拟一轮正在跑的同步：整轮持着 syncMu。
-	a.syncMu.Lock()
+	// 模拟一轮正在跑的同步：整轮持着同步门闩。
+	a.lockSyncBlocking()
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		a.syncMu.Unlock()
+		a.unlockSync()
 	}()
 
 	done := make(chan struct{})

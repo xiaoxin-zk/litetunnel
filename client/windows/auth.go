@@ -154,8 +154,12 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	// 若接入流程在它执行到一半时写盘、发布状态，就会出现「界面已登录、
 	// 磁盘上没有凭据」的状态——重启后凭空丢号。
 	//
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	// 用可取消的等待：接入前若正有一轮同步在跑，用户可能已经改了主意
+	// （关窗口、或换了服务器重试），不该被锁住几十秒。
+	if err := a.lockSync(ctx); err != nil {
+		return a.GetState(), err
+	}
+	defer a.unlockSync()
 	a.authMu.Lock()
 	defer a.authMu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -242,29 +246,13 @@ func (a *App) Logout() (State, error) {
 // 让用户重试，比无限期挂住强。
 const logoutSyncWait = 10 * time.Second
 
-// lockSyncWithin 在期限内拿到 syncMu，拿不到返回 false。
-//
-// 用 TryLock 轮询而不是 Lock：sync.Mutex 的等待不可取消，只有这一条路径
-// 需要「可放弃的等待」。第一次尝试几乎总能成功（真正并发的时刻很少），
-// 轮询只在同步正在跑的时候发生，10ms 的间隔对这里完全够用。
-func (a *App) lockSyncWithin(d time.Duration) bool {
-	deadline := time.Now().Add(d)
-	for {
-		if a.syncMu.TryLock() {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func (a *App) logout(clearMain, clearTunnels func() error) (State, error) {
-	if !a.lockSyncWithin(logoutSyncWait) {
+	waitCtx, waitCancel := context.WithTimeout(a.rootContext(), logoutSyncWait)
+	defer waitCancel()
+	if err := a.lockSync(waitCtx); err != nil {
 		return a.GetState(), errors.New("正在同步隧道，请稍后再退出登录")
 	}
-	defer a.syncMu.Unlock()
+	defer a.unlockSync()
 
 	if err := a.mgr.StopAll(); err != nil {
 		return a.GetState(), fmt.Errorf("停止隧道失败，未退出登录: %w", err)

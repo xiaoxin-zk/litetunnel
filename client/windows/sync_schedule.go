@@ -100,8 +100,12 @@ func (a *App) autoSyncOnce() {
 // 抽出这个方法而不是让两处各自组合：手动同步和自动同步一旦逻辑分叉，
 // 迟早会出现「按钮点的能用、后台同步的不能用」这类难以复现的问题。
 func (a *App) syncLocked() (changed bool, err error) {
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	// 后台同步自身也要可取消：退出时 syncRoot 被取消，这里立刻返回，
+	// 关闭流程才等得到门闩——否则它要等这一整轮（最长 45 秒）跑完。
+	if err := a.lockSync(a.rootContext()); err != nil {
+		return false, err
+	}
+	defer a.unlockSync()
 	return a.applySync()
 }
 
@@ -122,8 +126,10 @@ func (a *App) syncWithData(data *clientInfoData, seq uint64) (changed bool, err 
 	ctx, cancel := a.newSyncContext()
 	defer cancel()
 
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return false, err
+	}
+	defer a.unlockSync()
 	return a.syncWithDataLocked(ctx, data, seq)
 }
 

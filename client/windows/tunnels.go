@@ -44,8 +44,10 @@ func (a *App) CreateTunnel(name, tunnelType, localIP string, localPort, remotePo
 	// 进程已停，这一发请求仍会用旧凭据把隧道建到旧账号上；紧接着的对账又可能把
 	// 刚被停止的进程重新拉起（凭据却已不在）。全程持 syncMu 后，Logout 与 Connect
 	// 都会等这一笔完成，凭据在请求期间保持稳定——与 DeleteTunnel/StartTunnel 同一语义。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return a.GetState(), err
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
@@ -110,8 +112,10 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 
 	// 读凭据 → 发创建请求 → 对账必须与退出登录、重新接入互斥，
 	// 否则会用失效凭据把隧道建到旧账号，或在退出后重新拉起进程。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return BatchResult{}, a.GetState(), err
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
@@ -159,8 +163,10 @@ func (a *App) DeleteTunnel(id uint) (State, error) {
 
 	// 与后台同步互斥：否则同步可能刚按旧清单把这条隧道的进程拉起来，
 	// 而我们紧接着删掉了它的配置文件——进程还在，配置没了。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return a.GetState(), err
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
@@ -217,8 +223,10 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	// 不互斥的话有一个很难复现的竞态：后台同步先读到「这条隧道已停用」
 	// 的清单，用户此刻点了开启，同步随后拿着那份旧清单把刚起来的进程
 	// 停掉——用户看到的就是「点了开启，一闪又断了」。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return a.GetState(), describeManualErr(err)
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
@@ -262,10 +270,13 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	state := a.GetState()
 	a.emitState()
 	go func() {
-		// syncMu 此刻还被本函数持有（defer 解锁），所以这个协程会先等一下，
+		// 门闩此刻还被本函数持有（defer 释放），所以这个协程会先等一下，
 		// 等 StartTunnel 返回后再同步——不会与它重叠。
-		a.syncMu.Lock()
-		defer a.syncMu.Unlock()
+		// 用可取消的等待：应用正在退出时这一轮不必再跑。
+		if err := a.lockSync(a.rootContext()); err != nil {
+			return
+		}
+		defer a.unlockSync()
 		a.syncAndState()
 	}()
 	return state, nil
@@ -290,8 +301,10 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	defer cancel()
 
 	// 必须和后台同步互斥，否则会被旧清单重新拉起来。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return a.GetState(), describeManualErr(err)
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
@@ -324,8 +337,10 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	state := a.GetState()
 	a.emitState()
 	go func() {
-		a.syncMu.Lock()
-		defer a.syncMu.Unlock()
+		if err := a.lockSync(a.rootContext()); err != nil {
+			return
+		}
+		defer a.unlockSync()
 		a.syncAndState()
 	}()
 	return state, nil
@@ -438,8 +453,10 @@ func (a *App) Redeem(code string) (string, State, error) {
 
 	// 读凭据 → 发兑换请求 → 对账必须与退出登录、重新接入互斥，
 	// 否则会用失效凭据兑换，或把配额/分组写到错误的账号视角。
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
+	if err := a.lockSync(ctx); err != nil {
+		return "", a.GetState(), err
+	}
+	defer a.unlockSync()
 
 	base, apiKey, err := a.currentCredential()
 	if err != nil {

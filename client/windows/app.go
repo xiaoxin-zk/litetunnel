@@ -174,10 +174,18 @@ type App struct {
 	// 与 applied 一样由 a.mu 保护。
 	cfgRev map[uint]string
 
-	// syncMu 串行化同步操作。后台定时同步与用户的开关操作可能同时发生，
+	// syncGate 串行化同步操作。后台定时同步与用户的开关操作可能同时发生，
 	// 两者都会写配置文件、起停进程；重叠执行会让同一时刻出现
 	// 「刚停掉又被拉起来」的反复闪断。
-	syncMu sync.Mutex
+	//
+	// 用容量 1 的 channel 而不是 sync.Mutex：等待必须是**可取消**的。
+	// 自动同步可能占着它几十秒（逐条拉配置），用户在此期间点创建/删除/
+	// 退出登录；不可取消的 Mutex 只能干等到同步结束——预算提前开始计时
+	// 也没有意义，因为请求根本还没发出去。
+	//
+	// 取用一律走 lockSync / unlockSync，不要在别处直接读写。
+	syncGate chan struct{}
+	gateOnce sync.Once
 
 	// authMu 串行化「凭据的写盘与发布」：接入（Connect）与退出（Logout）
 	// 都会改 a.cfg 并写配置文件，交错执行会出现「界面已登录、磁盘上没有
@@ -508,6 +516,44 @@ func (a *App) startOnce(ctx context.Context) {
 // 等于让用户盯着一个关不掉的窗口。
 const shutdownSyncWait = 3 * time.Second
 
+// syncGateChan 返回同步门闩，必要时惰性初始化。
+//
+// 惰性化是为了测试：测试直接构造 App 而没有走 NewApp，字段是零值。
+func (a *App) syncGateChan() chan struct{} {
+	a.gateOnce.Do(func() {
+		if a.syncGate == nil {
+			a.syncGate = make(chan struct{}, 1)
+		}
+	})
+	return a.syncGate
+}
+
+// lockSync 取得同步门闩；ctx 结束则放弃等待并返回其错误。
+//
+// 取不到时调用方必须**直接返回**，不能继续往下走：后续的 unlockSync
+// 会从空 channel 上接收，把自己挂在解锁那一步。
+func (a *App) lockSync(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case a.syncGateChan() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// lockSyncBlocking 是不可取消的等待，只给关闭流程用（见 shutdown）。
+func (a *App) lockSyncBlocking() {
+	a.syncGateChan() <- struct{}{}
+}
+
+// unlockSync 释放同步门闩。
+func (a *App) unlockSync() {
+	<-a.syncGateChan()
+}
+
 // shutdown 在客户端退出前被调用，确保所有 frpc 子进程一并结束。
 //
 // 顺序有讲究：**取消同步 → 等这一轮退出 → 关闸并停全部进程**。
@@ -533,8 +579,10 @@ func (a *App) shutdown(ctx context.Context) {
 		// 下面 Manager.Close 关掉的那个闸门仍然挡得住迟到的启动。
 		done := make(chan struct{})
 		go func() {
-			a.syncMu.Lock()
-			a.syncMu.Unlock()
+			// 这里刻意用不可取消的等待：关闭流程要确认的就是「那一轮同步
+			// 真的收工了」，超时放弃会让它失去意义（下面另有总超时兜底）。
+			a.lockSyncBlocking()
+			a.unlockSync()
 			close(done)
 		}()
 		select {

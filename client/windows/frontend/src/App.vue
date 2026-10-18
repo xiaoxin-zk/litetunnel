@@ -218,6 +218,14 @@ onUnmounted(() => {
       // 注销失败不该影响卸载；下一次挂载会重新订阅。
     }
   }
+
+  // 合并缓冲的定时器也要停：200ms 后的回调闭包仍持有本组件的 ref，
+  // 热重载或重复挂载后它会往一个已经没人看的实例里写日志。
+  if (logTimer) {
+    clearTimeout(logTimer)
+    logTimer = null
+  }
+  pendingLogs.length = 0
 })
 </script>
 

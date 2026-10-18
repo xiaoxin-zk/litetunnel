@@ -61,8 +61,7 @@ func TestCreateTunnelHoldsSyncMuThroughRequest(t *testing.T) {
 			postSeen.Store(true)
 			if app == nil {
 				t.Error("发出创建请求前应用对象应已就绪")
-			} else if app.syncMu.TryLock() {
-				app.syncMu.Unlock()
+			} else if !syncGateHeld(app) {
 				t.Error("创建隧道发出请求期间 syncMu 应被持有")
 			}
 			w.Header().Set("Content-Type", "application/json")

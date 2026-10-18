@@ -164,7 +164,9 @@ async function submit() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
   } finally {
-    loading.value = false
+    // 只有当前这一次能改按钮状态：过期请求若把 loading 关掉，正在等
+    // 的新请求就会失去「加载中」的表象，按钮又能被点第二次。
+    if (seq === attempt) loading.value = false
   }
 }
 
@@ -183,6 +185,15 @@ const countdown = ref(0)
 const mailEnabled = ref(false)
 const notice = ref('')
 const reset = reactive({ account: '', emailCode: '', oldPassword: '', password: '', confirm: '' })
+
+// 表单内容变了也算「另一次尝试」：旧请求回来时不能把结果写进新表单。
+// 只盯服务器地址与模式是不够的——用户改了账号再点发送验证码，前一次
+// 请求的结果仍可能落在新表单上（提示串号、倒计时为另一个账号而走）。
+watch(
+  () => [form.apiKey, reset.account, reset.emailCode, reset.oldPassword, reset.password, reset.confirm],
+  () => { attempt++ },
+  { flush: 'sync' }
+)
 
 // 倒计时定时器必须能在「重新发送」与「组件卸载」时被清掉：
 // 反复进入找回密码页会各起一个 setInterval，旧定时器在组件卸载后仍在修改
@@ -237,7 +248,7 @@ async function sendCode() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '验证码发送失败'
   } finally {
-    sending.value = false
+    if (seq === attempt) sending.value = false
   }
 }
 
@@ -278,6 +289,9 @@ async function submitReset() {
     )
     // 期间换了服务器或退了模式：这次成功属于另一套上下文，不再提示。
     if (seq !== attempt) return
+    // 先关掉加载态：下面清字段会把 attempt 推进（表单 watch），
+    // finally 里就判不出「我还是当前这次」了。
+    loading.value = false
     // 清掉敏感字段，避免残留在界面上
     reset.oldPassword = ''
     reset.emailCode = ''
@@ -289,7 +303,7 @@ async function submitReset() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '重置失败，请检查填写的信息'
   } finally {
-    loading.value = false
+    if (seq === attempt) loading.value = false
   }
 }
 

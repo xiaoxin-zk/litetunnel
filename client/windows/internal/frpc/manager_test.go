@@ -303,6 +303,45 @@ func TestLogMergesRepeatedLines(t *testing.T) {
 	}
 }
 
+// TestLogCallbackSeesMonotonicSeq 覆盖并发输出时的乱序投递。
+//
+// 回调原先在解锁之后执行：两条隧道同时输出时，序号大的可能先被投递，
+// 调用方按序号去重就会把随后迟到的较小序号当成重复丢掉。
+func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
+	m := testManager(t)
+
+	var mu sync.Mutex
+	var seqs []uint64
+	m.SetCallbacks(func(_ uint, _ string, seq uint64, _ string) {
+		mu.Lock()
+		seqs = append(seqs, seq)
+		mu.Unlock()
+	}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				m.appendLog(uint(id), fmt.Sprintf("t%d", id), fmt.Sprintf("line-%d-%d", id, j))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seqs) != 400 {
+		t.Fatalf("应投递 400 行，实际 %d", len(seqs))
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] <= seqs[i-1] {
+			t.Fatalf("投递顺序必须与序号一致，第 %d 项 %d <= 前一项 %d", i, seqs[i], seqs[i-1])
+		}
+	}
+}
+
 // TestAppendRawSharesHistoryAndSeq 覆盖「客户端自身日志不进历史」。
 //
 // 两条来源必须落进同一份缓冲、共用同一个序号：否则重新加载日志时

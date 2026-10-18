@@ -63,6 +63,13 @@ async function loadLogs() {
     logEpoch.value = snap.epoch || 0
     lastSeq.value = maxSeq
     logs.value = snap.lines
+    // 快照已经包含这些行：把待合并队列里的同序号项剔掉，否则 200ms 后
+    // 计时器会把它们再追加一遍（快照与事件重叠的重复来源）。
+    for (let i = pendingLogs.length - 1; i >= 0; i--) {
+      if (pendingLogs[i].seq !== 0 && pendingLogs[i].seq <= maxSeq) {
+        pendingLogs.splice(i, 1)
+      }
+    }
     return
   }
   // 兼容旧版主进程：直接返回字符串数组。
@@ -80,6 +87,8 @@ async function loadLogs() {
 // 注意这一层**不减少事件数量**：主进程那侧已经按 120 毫秒成批推送（事件
 // 「logs」带数组），这里还会再合并一次，是因为多个批次可能在同一个渲染
 // 周期内到达——两边各管一段：主进程管跨进程调用的次数，这里管 DOM 更新次数。
+// 待合并队列里的每一项都带序号：快照返回时要把已经被快照覆盖的行剔掉，
+// 只留字符串的话分不清哪一行已经在快照里了。
 const pendingLogs = []
 // 缓冲上限：200 毫秒内涌入的极端量（例如日志被反复重试刷屏）也不至于把
 // 内存撑起来。界面本来就只保留最近 500 行，丢掉更早的那部分没有损失。
@@ -104,10 +113,10 @@ function pushLog(payload) {
       // seq 为 0 的是客户端合成行（如「已丢弃 N 行」），始终显示。
       if (seq !== 0 && seq <= lastSeq.value) continue
       if (seq > lastSeq.value) lastSeq.value = seq
-      pendingLogs.push(batch[i])
+      pendingLogs.push({ seq, text: batch[i] })
     }
   } else if (batch) {
-    pendingLogs.push(batch)
+    pendingLogs.push({ seq: 0, text: batch })
   }
   if (pendingLogs.length > maxPendingLogs) {
     pendingLogs.splice(0, pendingLogs.length - maxPendingLogs)
@@ -117,7 +126,7 @@ function pushLog(payload) {
     logTimer = null
     const batch = pendingLogs.splice(0, pendingLogs.length)
     if (!batch.length) return
-    logs.value = [...logs.value, ...batch].slice(-500)
+    logs.value = [...logs.value, ...batch.map((item) => item.text)].slice(-500)
   }, 200)
 }
 

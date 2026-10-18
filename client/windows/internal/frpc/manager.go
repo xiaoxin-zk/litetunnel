@@ -538,12 +538,9 @@ func (m *Manager) AppendRaw(line string) {
 
 	m.mu.Lock()
 	e := logEntry{seq: m.recordTextLocked(line), text: line}
-	cb := m.onLog
+	// 与 appendLog 同理：锁内投递，保证调用方看到的顺序与序号一致。
+	emitLogs(m.onLog, []logEntry{e})
 	m.mu.Unlock()
-
-	if cb != nil {
-		cb(0, "", e.seq, e.text)
-	}
 }
 
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
@@ -567,18 +564,18 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	if key == m.repeatKey && now.Sub(m.repeatAt) < logRepeatWindow {
 		m.repeatCount++
 		m.repeatAt = now
-		cb := m.onLog
+		emitLogs(m.onLog, out)
 		m.mu.Unlock()
-		emitLogs(cb, out)
 		return
 	}
 	m.repeatKey, m.repeatAt = key, now
 	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
 	out = append(out, m.recordLocked(tunnelID, tunnelName, line, now))
-	cb := m.onLog
+	// 回调在锁内执行：序号分配与投递必须是同一个原子步骤。
+	// 放到锁外的话，两条隧道并发输出时较大的序号可能先到，调用方按序号
+	// 去重就会把随后迟到的较小序号当成重复丢掉。
+	emitLogs(m.onLog, out)
 	m.mu.Unlock()
-
-	emitLogs(cb, out)
 }
 
 func emitLogs(cb func(uint, string, uint64, string), entries []logEntry) {

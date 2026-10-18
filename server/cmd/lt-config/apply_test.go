@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -117,7 +118,7 @@ func TestEnvFileSetRejectsLineBreaks(t *testing.T) {
 func TestRenderAndApplyRejectsControlCharsInVars(t *testing.T) {
 	s, p := newRenderOnlyService(t)
 
-	_, err := s.renderAndApply(tlscfg.RenderRequest{
+	_, err := s.renderAndApply(context.Background(), tlscfg.RenderRequest{
 		Vars: map[string]string{
 			tlscfg.VarUserPublicURL: "https://panel.example.com",
 			tlscfg.VarDNSProvider:   "cloudflare",
@@ -147,7 +148,7 @@ func TestRenderAndApplyRejectsCaddyImageMismatch(t *testing.T) {
 	// .env 里是 ghcr.io/example/caddy-dns:latest，这里故意换一个。
 	s.caddyImage = "caddy:2-alpine"
 
-	_, err := s.renderAndApply(tlscfg.RenderRequest{
+	_, err := s.renderAndApply(context.Background(), tlscfg.RenderRequest{
 		Vars: map[string]string{
 			tlscfg.VarUserPublicURL: "https://panel.example.com",
 			tlscfg.VarDNSProvider:   "cloudflare",

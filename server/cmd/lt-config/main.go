@@ -40,6 +40,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -49,10 +50,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -110,14 +113,32 @@ func main() {
 	mux.HandleFunc("/dns/check", srv.handleDNSCheck)
 	mux.HandleFunc("/certs", srv.handleCerts)
 
+	// 进程级根上下文：收到 SIGINT/SIGTERM 时取消。所有请求的 context 都由它
+	// 派生（见 BaseContext），于是停服务时在途的 docker 校验/重建也会一并被打断，
+	// 而不是让 docker 子进程在容器重建到一半时被父进程带着硬停。
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	httpSrv := &http.Server{
 		Addr:    *addr,
 		Handler: srv.auth(mux),
+		// 请求 context 从根上下文派生：停服务时取消在途的 docker 操作。
+		BaseContext: func(net.Listener) context.Context { return rootCtx },
 		// 渲染要等 docker 校验，读超时给足；写超时同理。
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      4 * time.Minute,
 	}
+
+	// 收到退出信号后优雅关闭：先停接收新连接，再等已取消的在途请求收尾。
+	go func() {
+		<-rootCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[lt-config] 关闭时出错: %v", err)
+		}
+	}()
 
 	log.Printf("[lt-config] 部署目录 %s", p.deployDir)
 	log.Printf("[lt-config] 监听 %s（重建容器：%v，frps 校验：%v）", *addr, *allowApply, *validateFrps)

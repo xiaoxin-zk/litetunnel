@@ -28,8 +28,8 @@ var composeServices = []string{"caddy", "frps"}
 // 用 up -d 而不是 restart：DNS 凭据等环境变量来自 .env 的插值，
 // 只有重建容器才会带上新值；而 restart 只是把旧容器的进程重启一遍。
 // 不变的服务（panel）通过 --no-deps 与显式服务名排除在外。
-func (s *service) composeUp() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+func (s *service) composeUp(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, dockerTimeout)
 	defer cancel()
 
 	args := []string{

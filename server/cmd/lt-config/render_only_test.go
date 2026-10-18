@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,7 +78,7 @@ func newRenderOnlyService(t *testing.T) (*service, paths) {
 func TestRenderOnlyDoesNotTouchActiveFiles(t *testing.T) {
 	s, p := newRenderOnlyService(t)
 
-	res, err := s.renderAndApply(tlscfg.RenderRequest{
+	res, err := s.renderAndApply(context.Background(), tlscfg.RenderRequest{
 		Vars: map[string]string{
 			tlscfg.VarUserPublicURL: "https://panel.example.com",
 			tlscfg.VarTunnelDomain:  "tunnel.example.com",
@@ -143,7 +144,7 @@ func TestRenderOnlyReportsNoChangeWhenIdentical(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := s.renderAndApply(tlscfg.RenderRequest{
+	res, err := s.renderAndApply(context.Background(), tlscfg.RenderRequest{
 		Vars: map[string]string{
 			tlscfg.VarUserPublicURL: "https://panel.example.com",
 			tlscfg.VarTunnelDomain:  "tunnel.example.com",

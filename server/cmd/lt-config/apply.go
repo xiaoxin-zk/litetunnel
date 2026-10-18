@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -26,7 +27,7 @@ import (
 // 顺序不可调换：写盘必须在校验之后。先写盘再校验的话，一次笔误就能让
 // 磁盘上留下一份 Caddy 拒绝加载的配置——重启 caddy 时才爆炸，
 // 而那时管理员已经离开这个页面了。
-func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult, error) {
+func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) (tlscfg.RenderResult, error) {
 	var res tlscfg.RenderResult
 
 	// 全程串行。两个并发的 /render 会交错读 .env、写三个文件并各自触发一次
@@ -107,7 +108,7 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	// 5) 校验：用将要上线的那个镜像（已在上一步确认与 Compose 一致）。
 	//    官方镜像没有 dns 插件，拿它校验「带 DNS Challenge 的自建镜像配置」
 	//    会误报 unrecognized directive: dns。
-	validateOut, err := s.validateContainers(caddyText, caddyImage, frpsText, vars)
+	validateOut, err := s.validateContainers(ctx, caddyText, caddyImage, frpsText, vars)
 	if err != nil {
 		return res, err
 	}
@@ -170,7 +171,7 @@ func (s *service) renderAndApply(req tlscfg.RenderRequest) (tlscfg.RenderResult,
 	//
 	// 文件都没有变化时仍然重建：.env 里的 DNS 凭据可能变了，
 	// 而 compose 只有在重建容器时才会把新的环境变量带进容器。
-	out, err := s.composeUp()
+	out, err := s.composeUp(ctx)
 	if err != nil {
 		return res, err
 	}

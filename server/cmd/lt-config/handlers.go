@@ -80,7 +80,7 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.renderAndApply(req)
+	res, err := s.renderAndApply(r.Context(), req)
 	if err != nil {
 		// 校验失败属于「配置本身不对」，用 422 与「helper 挂了」（502）区分开，
 		// 界面据此决定是提示管理员改配置还是去查服务。
@@ -113,7 +113,7 @@ func (s *service) handleApply(w http.ResponseWriter, r *http.Request) {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
-	out, err := s.composeUp()
+	out, err := s.composeUp(r.Context())
 	if err != nil {
 		failJSON(w, http.StatusBadGateway, err)
 		return

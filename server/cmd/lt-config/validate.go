@@ -125,7 +125,7 @@ func isOfficialCaddyImage(image string) bool {
 //
 // 校验器与运行时镜像必须一致：两者的指令集不同（DNS 插件是编译期决定的），
 // 换一个镜像校验就只剩下自我安慰的作用。
-func (s *service) validateCaddy(text, image string, vars map[string]string) (string, error) {
+func (s *service) validateCaddy(ctx context.Context, text, image string, vars map[string]string) (string, error) {
 	dir, err := s.tempDir("lt-config-caddy-")
 	if err != nil {
 		return "", err
@@ -137,7 +137,7 @@ func (s *service) validateCaddy(text, image string, vars map[string]string) (str
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dockerTimeout)
 	defer cancel()
 
 	args := []string{
@@ -174,18 +174,18 @@ func (s *service) validateCaddy(text, image string, vars map[string]string) (str
 //
 // 两层分工：validateVars 看变量本身（能指出是哪个字段的问题），这里看这份
 // 渲染结果在那个镜像里能不能起来。两者都不通过就不该写盘。
-func (s *service) validateContainers(caddyText, caddyImage, frpsText string, vars map[string]string) (string, error) {
+func (s *service) validateContainers(ctx context.Context, caddyText, caddyImage, frpsText string, vars map[string]string) (string, error) {
 	if s.validateFn != nil {
 		return s.validateFn(caddyText, caddyImage, frpsText, vars)
 	}
-	out, err := s.validateCaddy(caddyText, caddyImage, vars)
+	out, err := s.validateCaddy(ctx, caddyText, caddyImage, vars)
 	if err != nil {
 		return "", err
 	}
 	if !s.validateFrps {
 		return out, nil
 	}
-	frpsOut, err := s.validateFrpsConfig(frpsText)
+	frpsOut, err := s.validateFrpsConfig(ctx, frpsText)
 	if err != nil {
 		return "", err
 	}
@@ -193,7 +193,7 @@ func (s *service) validateContainers(caddyText, caddyImage, frpsText string, var
 }
 
 // validateFrpsConfig 用 frps 自带的 verify 子命令校验。
-func (s *service) validateFrpsConfig(text string) (string, error) {
+func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, error) {
 	dir, err := s.tempDir("lt-config-frps-")
 	if err != nil {
 		return "", err
@@ -205,7 +205,7 @@ func (s *service) validateFrpsConfig(text string) (string, error) {
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	ctx, cancel := context.WithTimeout(ctx, dockerTimeout)
 	defer cancel()
 
 	args := []string{

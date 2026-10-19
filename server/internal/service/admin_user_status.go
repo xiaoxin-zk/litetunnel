@@ -271,6 +271,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 代次的话，实例 B 上的重新启用不会被实例 A 的断流看到。
 	var gen uint64
 	var drainIntent string
+	var drainNotAfter time.Time
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.User{}).Where("id = ?", id).
 			Updates(map[string]any{
@@ -315,10 +316,12 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		if status != model.UserStatusActive {
 			// 断流意图与禁用状态必须在同一事务提交：进程若在提交后、
 			// CloseUserProxies 前退出，后台仍能靠这条记录继续断流。
+			drainNotAfter = time.Now()
 			drainIntent = s.recordProxyDrainPendingDB(tx, proxyDrainRequest{
-				userID: id,
-				prefix: FrpUserOf(id) + ".",
-				gen:    gen,
+				userID:   id,
+				prefix:   FrpUserOf(id) + ".",
+				gen:      gen,
+				notAfter: drainNotAfter,
 			})
 			if drainIntent == "" {
 				return errors.New("记录账号禁用断流意图失败")
@@ -337,7 +340,10 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	if status != model.UserStatusActive {
 		// 时间点必须取在事务提交成功之后：锁等待期间可能已经有代理启动，
 		// 不能把它们误判成「禁用后启动」而跳过断流。
-		disabledAt := time.Now()
+		disabledAt := drainNotAfter
+		if disabledAt.IsZero() {
+			disabledAt = time.Now()
+		}
 		// 禁用/封禁走独立的标记，而不是借用超额标记。
 		//
 		// 借用的写法有个致命后果：超额标记会被每轮流量采集按配额重算，

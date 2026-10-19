@@ -265,6 +265,18 @@ type LoginLog struct {
 
 func (LoginLog) TableName() string { return "lt_login_logs" }
 
+// MailTemplate 是可自定义的邮件模板；没有行记录时使用代码内置默认模板。
+type MailTemplate struct {
+	ID      uint   `gorm:"primarykey" json:"id"`
+	Event   string `gorm:"size:64;uniqueIndex;not null" json:"event"`
+	Subject string `gorm:"size:255;not null" json:"subject"`
+	Body    string `gorm:"type:text;not null" json:"body"`
+
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (MailTemplate) TableName() string { return "lt_mail_templates" }
+
 type EmailCode struct {
 	ID        uint       `gorm:"primarykey" json:"id"`
 	Email     string     `gorm:"size:128;index;not null" json:"-"`

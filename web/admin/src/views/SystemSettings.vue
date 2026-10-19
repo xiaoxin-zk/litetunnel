@@ -23,6 +23,42 @@
           <el-form-item label="站点名称">
             <el-input v-model="form['site.name']" placeholder="显示在控制台与邮件标题中" />
           </el-form-item>
+          <el-form-item label="站点副标题">
+            <el-input v-model="form['site.subtitle']" placeholder="显示在登录页站点名下方，留空则不显示" />
+          </el-form-item>
+          <el-form-item label="站点 Logo">
+            <div style="display: flex; align-items: center; gap: 12px">
+              <img
+                v-if="form['site.logo']"
+                :src="form['site.logo']"
+                alt="logo"
+                style="height: 40px; border-radius: 6px"
+              />
+              <el-upload
+                :auto-upload="false"
+                :show-file-list="false"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                :on-change="onLogoChange"
+              >
+                <el-button>选择图片</el-button>
+              </el-upload>
+              <el-button v-if="form['site.logo']" link type="danger" @click="form['site.logo'] = ''">
+                移除
+              </el-button>
+            </div>
+            <span class="hint">
+              PNG / JPEG / WebP / GIF，256KB 以内。图片以 data URL 存在设置表里，不依赖对象存储；
+              不接受外链与 SVG（SVG 可携带脚本）
+            </span>
+          </el-form-item>
+          <el-form-item label="首页说明">
+            <el-input
+              v-model="form['site.home_content']"
+              type="textarea"
+              :rows="4"
+              placeholder="登录页公告下方展示，留空则不显示；按纯文本渲染，换行会保留"
+            />
+          </el-form-item>
           <el-form-item label="站点公告">
             <el-input v-model="form['site.announcement']" type="textarea" :rows="2" placeholder="登录页顶部展示，留空则不显示" />
           </el-form-item>
@@ -348,6 +384,51 @@
           </el-form-item>
         </el-form>
       </el-tab-pane>
+
+      <el-tab-pane label="邮件模板" name="mail">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 16px"
+          title="模板存数据库，恢复默认后使用代码内置模板"
+          description="只做双花括号占位符的纯文本替换，不执行模板表达式；填入未知变量会被拒绝保存。自定义模板渲染失败时自动回退内置模板，验证码类邮件不会因为模板写错而发不出。"
+        />
+        <el-form label-width="120px" style="max-width: 900px">
+          <el-form-item label="邮件类型">
+            <el-select v-model="mailEvent" style="width: 260px" @change="selectMailEvent">
+              <el-option
+                v-for="t in mailTemplates"
+                :key="t.event"
+                :label="t.name + (t.custom ? '（已自定义）' : '（内置默认）')"
+                :value="t.event"
+              />
+            </el-select>
+            <el-button style="margin-left: 12px" :loading="mailPreviewing" @click="previewMail">
+              预览
+            </el-button>
+            <el-button type="primary" :loading="mailSaving" @click="saveMail">保存模板</el-button>
+            <el-button :disabled="!currentMail || !currentMail.custom" @click="resetMail">
+              恢复默认
+            </el-button>
+          </el-form-item>
+          <el-form-item label="邮件标题">
+            <el-input v-model="mailForm.subject" />
+          </el-form-item>
+          <el-form-item label="正文 HTML">
+            <el-input v-model="mailForm.body" type="textarea" :rows="16" />
+            <span class="hint">可用变量：{{ mailVarHint }}</span>
+          </el-form-item>
+        </el-form>
+        <div v-if="mailPreview" style="max-width: 900px">
+          <el-divider content-position="left">预览（示例数据）</el-divider>
+          <div class="hint" style="margin: 0 0 8px">标题：{{ mailPreview.subject }}</div>
+          <iframe
+            :srcdoc="mailPreview.body"
+            style="width: 100%; height: 460px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff"
+          />
+        </div>
+      </el-tab-pane>
     </el-tabs>
   </div>
 </template>
@@ -356,7 +437,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { settingsApi } from '../api'
+import { mailTemplateApi, settingsApi } from '../api'
 
 const SECRET_MASK = '__UNCHANGED__'
 
@@ -477,7 +558,93 @@ async function testMail() {
   }
 }
 
-onMounted(load)
+const LOGO_MAX_BYTES = 256 * 1024
+
+function onLogoChange(file) {
+  const raw = file && file.raw
+  if (!raw) return
+  if (raw.size > LOGO_MAX_BYTES) {
+    ElMessage.warning('图片不能超过 256KB，请压缩后再上传')
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    form['site.logo'] = String(reader.result || '')
+  }
+  reader.onerror = () => ElMessage.error('读取图片失败')
+  reader.readAsDataURL(raw)
+}
+
+const mailTemplates = ref([])
+const mailEvent = ref('email_code')
+const mailForm = reactive({ subject: '', body: '' })
+const mailPreview = ref(null)
+const mailSaving = ref(false)
+const mailPreviewing = ref(false)
+
+const currentMail = computed(() => mailTemplates.value.find((t) => t.event === mailEvent.value))
+const mailVarHint = computed(() =>
+  (currentMail.value ? currentMail.value.vars : []).map((v) => `{{${v}}}`).join('  ')
+)
+
+function fillMailForm() {
+  const t = currentMail.value
+  mailForm.subject = t ? t.subject : ''
+  mailForm.body = t ? t.body : ''
+  mailPreview.value = null
+}
+
+async function loadMailTemplates() {
+  mailTemplates.value = await mailTemplateApi.list()
+  if (!mailTemplates.value.some((t) => t.event === mailEvent.value)) {
+    mailEvent.value = mailTemplates.value.length ? mailTemplates.value[0].event : ''
+  }
+  fillMailForm()
+}
+
+function selectMailEvent() {
+  fillMailForm()
+}
+
+async function saveMail() {
+  if (!mailEvent.value) return
+  mailSaving.value = true
+  try {
+    await mailTemplateApi.save(mailEvent.value, {
+      subject: mailForm.subject,
+      body: mailForm.body
+    })
+    ElMessage.success('模板已保存，下一次发信生效')
+    await loadMailTemplates()
+  } finally {
+    mailSaving.value = false
+  }
+}
+
+async function resetMail() {
+  if (!mailEvent.value) return
+  await mailTemplateApi.reset(mailEvent.value)
+  ElMessage.success('已恢复内置默认模板')
+  await loadMailTemplates()
+}
+
+async function previewMail() {
+  if (!mailEvent.value) return
+  mailPreviewing.value = true
+  try {
+    mailPreview.value = await mailTemplateApi.preview(mailEvent.value, {
+      subject: mailForm.subject,
+      body: mailForm.body
+    })
+  } finally {
+    mailPreviewing.value = false
+  }
+}
+
+onMounted(() => {
+  load()
+  loadMailTemplates()
+})
 </script>
 
 <style scoped>

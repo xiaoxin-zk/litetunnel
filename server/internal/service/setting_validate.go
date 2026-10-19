@@ -123,6 +123,10 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 操作日志保留天数需为 0-3650 的整数（0 表示永久保留，仅可手动清理）", ErrInvalidParam)
 	}
 
+	if err := validateSiteBrand(view); err != nil {
+		return err
+	}
+
 	if h := strings.TrimSpace(view(KeyGatewayHost)); h != "" {
 		if strings.ContainsAny(h, " \t\r\n/\\:@") {
 			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)
@@ -157,6 +161,47 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 	}
 	if needsReconcile && (s.Settings.Bool(KeyFirewallEnabled) || !firewallWasOn) {
 		s.KickFirewall()
+	}
+	return nil
+}
+
+const (
+	siteLogoDataURLMax = 360000 // 约 256KB 图片（base64 后膨胀 4/3）
+	siteSubtitleMax    = 120
+	siteHomeContentMax = 20000
+)
+
+var siteLogoPrefixes = []string{
+	"data:image/png;base64,",
+	"data:image/jpeg;base64,",
+	"data:image/webp;base64,",
+	"data:image/gif;base64,",
+}
+
+// validateSiteBrand 校验站点品牌字段。Logo 直接以 data URL 存设置表，
+// 不依赖对象存储，因此必须限制类型与体积，避免把设置行写爆。
+func validateSiteBrand(view func(SettingKey) string) error {
+	if logo := strings.TrimSpace(view(KeySiteLogo)); logo != "" {
+		ok := false
+		for _, p := range siteLogoPrefixes {
+			if strings.HasPrefix(logo, p) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return fmt.Errorf("%w: 站点 Logo 只支持 png/jpeg/webp/gif 的 data URL（形如 data:image/png;base64,...），"+
+				"不接受外链与 SVG（SVG 可携带脚本）", ErrInvalidParam)
+		}
+		if len(logo) > siteLogoDataURLMax {
+			return fmt.Errorf("%w: 站点 Logo 体积超限，压缩到 256KB 以内再上传", ErrInvalidParam)
+		}
+	}
+	if n := len([]rune(view(KeySiteSubtitle))); n > siteSubtitleMax {
+		return fmt.Errorf("%w: 站点副标题不能超过 %d 字", ErrInvalidParam, siteSubtitleMax)
+	}
+	if n := len(view(KeySiteHomeContent)); n > siteHomeContentMax {
+		return fmt.Errorf("%w: 首页内容不能超过 %d 字节", ErrInvalidParam, siteHomeContentMax)
 	}
 	return nil
 }

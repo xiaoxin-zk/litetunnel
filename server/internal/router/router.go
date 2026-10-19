@@ -171,6 +171,7 @@ func New(
 		adminRead.GET("/login-logs", adminH.ListLoginLogs)
 		adminRead.GET("/admins", adminH.ListAdmins)
 		adminRead.GET("/settings", adminH.GetSettings)
+		adminRead.GET("/mail-templates", adminH.ListMailTemplates)
 		adminRead.GET("/domain/status", adminH.DomainStatus)
 	}
 
@@ -214,6 +215,9 @@ func New(
 
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
+		adminSuper.PUT("/mail-templates/:event", adminH.SaveMailTemplate)
+		adminSuper.POST("/mail-templates/:event/preview", adminH.PreviewMailTemplate)
+		adminSuper.DELETE("/mail-templates/:event", adminH.ResetMailTemplate)
 
 		adminSuper.GET("/firewall/status", adminH.FirewallStatus)
 		adminSuper.POST("/firewall/rescan", adminH.FirewallRescan)

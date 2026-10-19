@@ -6,9 +6,9 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"log"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,10 +120,14 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 	if siteName == "" {
 		siteName = "LiteTunnel"
 	}
-	subject := fmt.Sprintf("【%s】邮箱验证码", siteName)
+	subject, body := s.renderMail(MailEventEmailCode, map[string]string{
+		"site_name": siteName,
+		"code":      code,
+		"minutes":   strconv.Itoa(int(emailCodeTTL.Minutes())),
+		"email":     email,
+	})
 
-	_, err = s.enqueueMail(email, subject,
-		emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())),
+	_, err = s.enqueueMail(email, subject, body,
 		kind, emailCodePayload{
 			Email:        email,
 			Scene:        scene,
@@ -245,29 +249,4 @@ func newNumericCode(n int) (string, error) {
 		sb.WriteByte(byte('0' + v.Int64()))
 	}
 	return sb.String(), nil
-}
-
-func emailCodeMailBody(siteName, code string, ttlMinutes int) string {
-	return fmt.Sprintf(`<!doctype html>
-<html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
-  <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;">
-    <h2 style="margin:0 0 8px;font-size:18px;color:#1f2937;">邮箱验证码</h2>
-    <p style="color:#4b5563;line-height:1.8;margin:0 0 20px;">
-      你正在使用 %s。请在页面中填写下面的验证码：
-    </p>
-    <p style="margin:0 0 20px;">
-      <span style="display:inline-block;background:#f3f4f6;border-radius:10px;
-        padding:14px 26px;font-size:30px;letter-spacing:8px;font-weight:600;
-        color:#111827;font-family:ui-monospace,Menlo,Consolas,monospace;">%s</span>
-    </p>
-    <p style="color:#6b7280;font-size:13px;line-height:1.8;margin:0 0 18px;">
-      验证码 %d 分钟内有效，且只能使用一次。
-    </p>
-    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
-    <p style="color:#9ca3af;font-size:12px;line-height:1.8;margin:0;">
-      如果这不是你本人的操作，请忽略本邮件。<br>
-      请勿把验证码告诉任何人，包括自称客服的人。
-    </p>
-  </div>
-</body></html>`, siteName, code, ttlMinutes)
 }

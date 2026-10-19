@@ -2,10 +2,11 @@
   <div class="page">
     <div class="panel lt-card">
       <div class="brand">
-        <div class="logo">LT</div>
+        <img v-if="site.site_logo" class="logo-img" :src="site.site_logo" alt="logo" />
+        <div v-else class="logo">LT</div>
         <div>
           <h1>{{ site.site_name || 'LiteTunnel' }}</h1>
-          <p>登录后管理你的隧道、客户端与账号</p>
+          <p>{{ site.site_subtitle || '登录后管理你的隧道、客户端与账号' }}</p>
         </div>
       </div>
 
@@ -17,6 +18,8 @@
         style="margin-bottom: 16px"
         :title="site.announcement"
       />
+
+      <div v-if="site.home_content" class="home-content">{{ site.home_content }}</div>
 
       <el-tabs v-model="tab" class="tabs">
         <el-tab-pane label="登录" name="login">
@@ -372,6 +375,26 @@ onMounted(async () => {
   gap: 13px;
   align-items: center;
   margin-bottom: 18px;
+}
+
+.logo-img {
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+  object-fit: contain;
+  background: #fff;
+  flex-shrink: 0;
+}
+
+.home-content {
+  white-space: pre-wrap;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #4b5563;
+  font-size: 13px;
+  line-height: 1.8;
 }
 
 .logo {

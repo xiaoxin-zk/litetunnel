@@ -145,6 +145,9 @@ func (h *Handler) PublicSettings(c *gin.Context) {
 	s := h.svc.Settings
 	httpx.OK(c, gin.H{
 		"site_name":              s.Get(service.KeySiteName),
+		"site_subtitle":          s.Get(service.KeySiteSubtitle),
+		"site_logo":              s.Get(service.KeySiteLogo),
+		"home_content":           s.Get(service.KeySiteHomeContent),
 		"announcement":           s.Get(service.KeySiteAnnouncement),
 		"icp":                    s.Get(service.KeySiteICP),
 		"register_enabled":       s.Bool(service.KeyRegisterEnabled),

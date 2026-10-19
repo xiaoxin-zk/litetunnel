@@ -84,6 +84,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.ClientSession{},
 		&model.TrafficDaily{},
 		&model.LoginLog{},
+		&model.MailTemplate{},
 		&model.PasswordResetToken{},
 		&model.EmailCode{},
 		&model.Setting{},

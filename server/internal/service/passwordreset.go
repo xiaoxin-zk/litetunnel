@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,8 +78,13 @@ func (s *Services) requestPasswordReset(account, ip, baseURL string) error {
 		siteName = "LiteTunnel"
 	}
 	link := strings.TrimRight(baseURL, "/") + "/reset-password?token=" + plain
-	subject := fmt.Sprintf("【%s】重置登录密码", siteName)
-	body := resetMailBody(siteName, u.Username, link, int(resetTokenTTL.Minutes()))
+	subject, body := s.renderMail(MailEventPasswordReset, map[string]string{
+		"site_name": siteName,
+		"username":  u.Username,
+		"link":      link,
+		"minutes":   strconv.Itoa(int(resetTokenTTL.Minutes())),
+		"email":     u.Email,
+	})
 
 	tokenVersion := u.TokenVersion
 	if _, err := s.enqueueMail(u.Email, subject, body, model.MailKindResetLink, resetLinkPayload{
@@ -381,30 +387,4 @@ func newResetToken() (plain, hash string, err error) {
 	plain = hex.EncodeToString(buf)
 	sum := sha256.Sum256([]byte(plain))
 	return plain, hex.EncodeToString(sum[:]), nil
-}
-
-func resetMailBody(siteName, username, link string, ttlMinutes int) string {
-	return fmt.Sprintf(`<!doctype html>
-<html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
-  <div style="max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;">
-    <h2 style="margin:0 0 8px;font-size:18px;color:#1f2937;">重置登录密码</h2>
-    <p style="color:#4b5563;line-height:1.8;margin:0 0 18px;">
-      你好 %s，我们收到了 %s 的密码重置请求。<br>
-      点击下面的按钮设置新密码，链接 %d 分钟内有效。
-    </p>
-    <p style="margin:0 0 22px;">
-      <a href="%s" style="display:inline-block;background:#2563eb;color:#fff;text-decoration:none;
-         padding:11px 22px;border-radius:9px;font-weight:500;">设置新密码</a>
-    </p>
-    <p style="color:#6b7280;font-size:13px;line-height:1.8;margin:0 0 14px;">
-      按钮无法点击时，请复制下面的链接到浏览器打开：
-    </p>
-    <p style="word-break:break-all;color:#2563eb;font-size:13px;margin:0 0 18px;">%s</p>
-    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
-    <p style="color:#9ca3af;font-size:12px;line-height:1.8;margin:0;">
-      如果这不是你本人的操作，请忽略本邮件，你的密码不会发生变化。<br>
-      为保障账号安全，重置成功后所有已登录设备都将下线。
-    </p>
-  </div>
-</body></html>`, username, siteName, ttlMinutes, link, link)
 }

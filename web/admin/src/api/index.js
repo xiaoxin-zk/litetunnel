@@ -131,6 +131,13 @@ export const settingsApi = {
   testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
+export const mailTemplateApi = {
+  list: () => http.get('/mail-templates'),
+  save: (event, data) => http.put(`/mail-templates/${event}`, data),
+  reset: (event) => http.delete(`/mail-templates/${event}`),
+  preview: (event, data) => http.post(`/mail-templates/${event}/preview`, data)
+}
+
 export const domainApi = {
   status: () => http.get('/domain/status'),
   apply: (apply = true) => http.post('/domain/apply', { apply }),

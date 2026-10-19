@@ -67,6 +67,9 @@ const (
 	KeyFirewallHelperToken SettingKey = "firewall.helper_token"
 
 	KeySiteName              SettingKey = "site.name"
+	KeySiteSubtitle          SettingKey = "site.subtitle"
+	KeySiteLogo              SettingKey = "site.logo"
+	KeySiteHomeContent       SettingKey = "site.home_content"
 	KeySiteAnnouncement      SettingKey = "site.announcement"
 	KeySiteICP               SettingKey = "site.icp"
 	KeySiteClientDownloadURL SettingKey = "site.client_download_url"
@@ -164,6 +167,9 @@ var settingSpecs = []settingSpec{
 	}},
 
 	{Key: KeySiteName, Default: func(c *config.Config) string { return c.SMTP.SiteName }},
+	{Key: KeySiteSubtitle, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeySiteLogo, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeySiteHomeContent, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteAnnouncement, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteICP, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteClientDownloadURL, Default: func(*config.Config) string { return "" }},

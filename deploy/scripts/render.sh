@@ -20,10 +20,33 @@ FRPS_OUT="${ROOT}/deploy/frps/frps.toml"
 CADDY_TPL="${ROOT}/deploy/caddy/Caddyfile.template"
 CADDY_OUT="${ROOT}/deploy/caddy/Caddyfile"
 
-[[ -f "${ENV_FILE}" ]] || {
-  echo "未找到 ${ENV_FILE}，请先复制 .env.example 为 .env 并填写真实值。" >&2
+# 输入文件统一走这里：只接受普通文件（符号链接允许，但必须解析到普通文件），
+# 并限制大小。没有上限时，一个被替换成 /dev/zero 的 .env 会让脚本读死；
+# 而 FIFO 之类会让 read 永久阻塞——两者都表现为「渲染卡住」，却查不出原因。
+MAX_INPUT_BYTES=$((1024 * 1024))
+require_input_file() {
+  local p="$1" what="$2" size
+  if [[ ! -e "${p}" ]]; then
+    echo "未找到 ${what}：${p}" >&2
+    return 1
+  fi
+  if [[ ! -f "${p}" ]]; then
+    echo "${what} ${p} 不是普通文件：拒绝读取（请换成真实文件，或修正符号链接指向）" >&2
+    return 1
+  fi
+  size=$(wc -c < "${p}" 2>/dev/null || echo 0)
+  if (( size > MAX_INPUT_BYTES )); then
+    echo "${what} ${p} 大小为 ${size} 字节，超过 ${MAX_INPUT_BYTES} 字节上限：拒绝读取（文件可能已损坏或被替换）" >&2
+    return 1
+  fi
+}
+
+require_input_file "${ENV_FILE}" ".env" || {
+  echo "请先复制 .env.example 为 .env 并填写真实值。" >&2
   exit 1
 }
+require_input_file "${FRPS_TPL}" "frps 模板" || exit 1
+require_input_file "${CADDY_TPL}" "Caddyfile 模板" || exit 1
 
 # ---- 解析 .env（不使用 source，避免执行到非预期的内容）----
 #
@@ -354,11 +377,82 @@ trap cleanup_tmp EXIT
 render "${FRPS_TPL}" "${FRPS_OUT}"
 render "${CADDY_TPL}" "${CADDY_OUT}"
 
-# 两份都渲染并校验通过后才作为一次事务提交。
-for ((i=0; i<${#PENDING_TMP[@]}; i++)); do
-  mv -f "${PENDING_TMP[i]}" "${PENDING_OUT[i]}"
-  chmod 600 "${PENDING_OUT[i]}"
-  echo "已生成 ${PENDING_OUT[i]}"
+# ---- 提交：两个文件要么一起换新，要么一起回滚 ----
+#
+# 只把「写临时文件 + rename」做到位还不够：rename 本身是原子的，但**两次**
+# rename 不是一次事务。第二次 mv 失败（磁盘满、目标被占用、目录权限变了）
+# 时，第一次已经生效——现场是「frps 新 / Caddy 旧」，而脚本退出码非零，
+# 运维多半只看最后一行错误就重跑了，这份混合配置会一直留在磁盘上。
+#
+# 所以提交前先把现有目标备份下来，任一文件提交失败就把已提交的全部还原。
+# 备份与目标同目录，还原同样是原子 rename。
+BACKUP_TMP=()
+BACKUP_OUT=()
+
+backup_targets() {
+  local i out bak
+  for ((i=0; i<${#PENDING_OUT[@]}; i++)); do
+    out="${PENDING_OUT[i]}"
+    if [[ -e "${out}" ]]; then
+      bak="$(dirname "${out}")/.$(basename "${out}").bak.$$"
+      if ! cp -p "${out}" "${bak}"; then
+        echo "备份 ${out} 失败，未做任何修改" >&2
+        return 1
+      fi
+      BACKUP_TMP+=("${bak}")
+    else
+      # 首次运行：没有旧文件可备份，回滚时直接删除新文件。
+      BACKUP_TMP+=("")
+    fi
+    BACKUP_OUT+=("${out}")
+  done
+  return 0
+}
+
+rollback_commit() {
+  local i out bak
+  for ((i=0; i<${#BACKUP_OUT[@]}; i++)); do
+    out="${BACKUP_OUT[i]}"
+    bak="${BACKUP_TMP[i]}"
+    if [[ -n "${bak}" && -e "${bak}" ]]; then
+      if ! mv -f "${bak}" "${out}"; then
+        # 还原也失败时绝不能删备份：那是唯一还能恢复现场的东西。
+        echo "回滚 ${out} 失败：原内容已保留在 ${bak}，请手工恢复" >&2
+      fi
+    elif [[ -z "${bak}" ]]; then
+      rm -f "${out}"
+    fi
+  done
+}
+
+commit_all() {
+  local i out
+  for ((i=0; i<${#PENDING_OUT[@]}; i++)); do
+    out="${PENDING_OUT[i]}"
+    # 先落权限再 rename：目标一旦出现就应该是 0600，而不是先 0644 再收紧
+    # （中间那一刻同机其他用户可以读到 token）。
+    if ! mv -f "${PENDING_TMP[i]}" "${out}"; then
+      echo "写入 ${out} 失败，回滚已提交的配置" >&2
+      rollback_commit
+      return 1
+    fi
+    if ! chmod 600 "${out}"; then
+      echo "设置 ${out} 权限失败，回滚已提交的配置" >&2
+      rollback_commit
+      return 1
+    fi
+    echo "已生成 ${out}"
+  done
+  return 0
+}
+
+backup_targets || exit 1
+commit_all || exit 1
+
+# 成功提交后才丢弃备份：失败路径上的备份要么已经用于还原，要么是手工
+# 恢复的唯一线索。
+for bak in "${BACKUP_TMP[@]}"; do
+  [[ -n "${bak}" ]] && rm -f "${bak}"
 done
 
 cat <<'EOF'

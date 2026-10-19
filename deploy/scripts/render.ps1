@@ -20,9 +20,29 @@ $frpsOut  = Join-Path $root 'deploy/frps/frps.toml'
 $caddyTpl = Join-Path $root 'deploy/caddy/Caddyfile.template'
 $caddyOut = Join-Path $root 'deploy/caddy/Caddyfile'
 
-if (-not (Test-Path $envFile)) {
-    throw "Missing $envFile. Copy .env.example to .env and fill in real values first."
+# Input policy, identical to render.sh: only regular files (a symlink is fine as
+# long as it resolves to one), and a hard size cap. Without the cap a .env that
+# was replaced by a huge or endless file would be read into memory until the
+# process dies; a FIFO would block the script forever. Both look like "the
+# renderer hangs" and leave no clue.
+$maxInputBytes = 1MB
+
+function Assert-InputFile([string]$path, [string]$what) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "Missing ${what}: $path"
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.PSIsContainer) {
+        throw "$what $path is a directory: refusing to read it."
+    }
+    if ($item.Length -gt $maxInputBytes) {
+        throw "$what $path is $($item.Length) bytes, over the $maxInputBytes limit: refusing to read it (the file may be damaged or replaced)."
+    }
 }
+
+Assert-InputFile $envFile  '.env'
+Assert-InputFile $frpsTpl  'frps template'
+Assert-InputFile $caddyTpl 'Caddyfile template'
 
 # ---- Parse .env ----
 # Values must be decoded with the same semantics the panel helper uses when
@@ -267,9 +287,23 @@ function Set-OwnerOnly([string]$path) {
         if ($LASTEXITCODE -ne 0) { throw "chmod 600 $path failed" }
         return
     }
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    & icacls.exe $path /inheritance:r /grant:r "${me}:(F)" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls failed to restrict $path to $me" }
+    # Get-Acl/Set-Acl instead of just "icacls /inheritance:r": turning off
+    # inheritance does NOT remove explicit ACEs already present on the file
+    # (e.g. a Users:Read somebody added earlier). Those survive and the file
+    # stays readable - the tightening would only half happen.
+    $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $acl = Get-Acl -LiteralPath $path
+    # $true  = stop inheriting, $false = drop the inherited entries.
+    $acl.SetAccessRuleProtection($true, $false)
+    # Copy first: the collection is live and cannot be modified while iterating.
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRule($rule)
+    }
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $me, [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $path -AclObject $acl
+    if (-not (Test-Path -LiteralPath $path)) { throw "Set-Acl lost $path" }
 }
 
 # Render into a hidden temp file next to the target and commit only once every
@@ -278,6 +312,9 @@ function Set-OwnerOnly([string]$path) {
 # pair looks exactly like a successful run.
 $pendingTmp = New-Object System.Collections.Generic.List[string]
 $pendingOut = New-Object System.Collections.Generic.List[string]
+# Backups taken before the commit phase, one entry per output ('' when the
+# output did not exist yet and a rollback should delete it instead of restoring).
+$pendingBak = New-Object System.Collections.Generic.List[string]
 
 function Render([string]$template, [string]$output, [hashtable]$values) {
     $raw      = Get-Content -LiteralPath $template -Raw -Encoding UTF8
@@ -320,18 +357,70 @@ function Commit-Rendered([string]$tmp, [string]$output) {
     Write-Host "Generated $output"
 }
 
+# Two atomic renames are still not one transaction: if the second Replace fails
+# (disk full, file locked, ACL changed) the first output is already new and the
+# deployment is left with "frps new / Caddy old" - exactly the mixed state that
+# looks like a successful run. So back both outputs up first and restore them
+# when any commit step fails.
+function Backup-Targets {
+    foreach ($output in $pendingOut) {
+        if (Test-Path -LiteralPath $output) {
+            $bak = Join-Path (Split-Path -Parent $output) ('.' + (Split-Path -Leaf $output) + '.bak.' + $PID)
+            # Copy-Item carries the source ACL over, so the backup is exactly as
+            # (un)readable as the file it replaces.
+            Copy-Item -LiteralPath $output -Destination $bak -Force
+            $pendingBak.Add($bak)
+        } else {
+            $pendingBak.Add('')
+        }
+    }
+}
+
+function Restore-Targets {
+    for ($i = 0; $i -lt $pendingBak.Count; $i++) {
+        $out = $pendingOut[$i]
+        $bak = $pendingBak[$i]
+        if ($bak) {
+            if (Test-Path -LiteralPath $bak) {
+                try {
+                    [IO.File]::Copy($bak, $out, $true)
+                } catch {
+                    # Never delete the backup when the restore itself failed: it
+                    # is the only remaining copy of the previous config.
+                    Write-Warning "Rollback of $out failed; previous content is kept at $bak"
+                }
+            }
+        } else {
+            Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+$committed = $false
 try {
     Render $frpsTpl  $frpsOut  $vars
     Render $caddyTpl $caddyOut $vars
+    Backup-Targets
     for ($i = 0; $i -lt $pendingTmp.Count; $i++) {
         Commit-Rendered $pendingTmp[$i] $pendingOut[$i]
     }
+    $committed = $true
+} catch {
+    Restore-Targets
+    throw
 } finally {
     # $ErrorActionPreference = 'Stop' unwinds through here on any failure: no
     # half-written file may survive in the deployment directory.
     foreach ($t in $pendingTmp) {
         if (Test-Path -LiteralPath $t) {
             Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # Backups are dropped only after a clean commit; on the failure path they
+    # were either consumed by the restore or are the manual recovery copy.
+    if ($committed) {
+        foreach ($b in $pendingBak) {
+            if ($b) { Remove-Item -LiteralPath $b -Force -ErrorAction SilentlyContinue }
         }
     }
 }

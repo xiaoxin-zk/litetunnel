@@ -107,11 +107,13 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	}
 
 	// 4) 渲染
-	caddyTpl, err := os.ReadFile(s.paths.caddyTpl)
+	// 模板同样走统一读取策略（大小上限 + 只接受普通文件）：模板损坏时
+	// 应当是一条明确的错误，而不是渲染出一份半截配置再让 Caddy 拒绝加载。
+	caddyTpl, err := readConfigInput(s.paths.caddyTpl)
 	if err != nil {
 		return res, internalError(fmt.Errorf("读取 Caddyfile 模板失败: %w", err))
 	}
-	frpsTpl, err := os.ReadFile(s.paths.frpsTpl)
+	frpsTpl, err := readConfigInput(s.paths.frpsTpl)
 	if err != nil {
 		return res, internalError(fmt.Errorf("读取 frps.toml 模板失败: %w", err))
 	}

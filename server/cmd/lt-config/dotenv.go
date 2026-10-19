@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 )
 
@@ -47,8 +46,11 @@ type envFile struct {
 // 还原——双引号包裹的值先处理转义（\\ \" 等），单引号包裹的值按字面保留，
 // 两种引号之外再统一把 Compose 的转义插值 $$ 还原成 $。老文件里没转义的
 // 裸值不含这些序列，解码后原样不变。
+// 读取走 readConfigInput：.env 是运维可置换的输入，必须受统一的大小上限与
+// 文件类型策略约束（见 safeio.go）。没有上限时，一个被替换成 /dev/zero
+// 的 .env 会直接把这个进程读死。
 func readEnvFile(path string) (*envFile, map[string]string, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := readConfigInput(path)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -825,6 +825,42 @@ jobs:
           retention-days: 7
 
   # ============================================================
+  #  部署渲染脚本
+  #
+  #  这两个脚本在 CI 里原本没有任何执行点：它们只在运维机器上跑，改坏了
+  #  要等到下一次部署才发现（而那时现场是「frps 连不上」或「两份配置一
+  #  新一旧」）。夹具覆盖 CRLF/LF、未替换占位符、第二个文件提交失败回滚、
+  #  以及输入文件的大小与类型策略。
+  # ============================================================
+  deploy-scripts:
+    name: Deploy scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n deploy/scripts/render.sh
+          bash -n scripts/test-render.sh
+          bash -n scripts/check-pins.sh
+
+      - name: ShellCheck
+        # 只报 error 级别：warning 里有大量「引号可以省略」这类噪音，
+        # 让它挡住合并会把规则变成噪音而不是保障。
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S error deploy/scripts/render.sh
+          else
+            echo "shellcheck 不可用，跳过（镜像是干净的 ubuntu-latest）"
+          fi
+
+      - name: render.sh fixtures
+        run: bash scripts/test-render.sh
+
+      - name: frp version pins
+        run: bash scripts/check-pins.sh
+
+  # ============================================================
   #  Windows 客户端（Wails）
   # ============================================================
   client:
@@ -859,9 +895,21 @@ jobs:
       # 只测子包，不测 main：main 依赖 //go:embed frontend/dist，
       # 没构建前端就跑不了。而这里最容易坏掉的是解析逻辑
       # （netstat / tasklist 的输出格式），它全在子包里。
+      # vet 与 test 一起跑：vet 能抓到的（格式化串、锁值复制、不可达代码）
+      # 多半不会让测试失败，但会在运行期变成难查的 bug。
+      - name: Vet
+        working-directory: client/windows
+        run: go vet ./...
+
       - name: Unit tests
         working-directory: client/windows
         run: go test ./internal/...
+
+      # PowerShell 版渲染脚本同样没有别的执行点。夹具在 Windows runner 上
+      # 校验权限收紧（只留当前用户）、未替换占位符时不动旧文件、无临时残留。
+      - name: Deploy script (PowerShell) fixtures
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-render.ps1
 
       - name: Build
         working-directory: client/windows

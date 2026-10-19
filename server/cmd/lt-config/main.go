@@ -116,7 +116,7 @@ func main() {
 	if *validateFrps {
 		if img, err := composeServiceImage(p.composeFile, "frps"); err != nil {
 			log.Fatalf("[lt-config] 无法从 Compose 读取 frps 镜像，无法确认校验镜像与实际运行镜像一致: %v", err)
-		} else if resolved, ok := resolveComposeImage(img, os.Getenv); !ok {
+		} else if resolved, ok := resolveComposeImage(img, composeEnvLookup(p.envFile)); !ok {
 			log.Fatalf("[lt-config] Compose 的 frps 镜像 %q 含无法解析的变量，无法确认校验镜像与实际运行镜像一致", img)
 		} else if *frpsImage != resolved {
 			log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
@@ -205,6 +205,33 @@ func main() {
 	if errors.Is(err, http.ErrServerClosed) {
 		// 只有收到退出信号时才有这个错误；等收尾完成再返回。
 		<-shutdownDone
+	}
+}
+
+// composeEnvLookup 返回按 Compose 语义查插值变量的函数。
+//
+// Compose 做 ${VAR} 插值时，来源优先级是「进程环境变量 > --env-file 指定的
+// .env 文件」。这里原先直接用 os.Getenv：变量只写在 .env 里时（本仓库推荐的
+// 做法——值留在部署目录、由 --env-file 传进去）取不到值，于是镜像被判成
+// 「无法解析」或「与校验镜像不一致」并**阻断启动**。那条错误与实际部署毫无
+// 关系，排查时只能看到「镜像名对不上」，很难想到是解析来源不同。
+//
+// 读失败不在这里 fatal：变量全在进程环境里的部署（例如由 systemd
+// Environment= 提供）仍然可用；真解析不出来时上层会给出「无法解析」的错误。
+func composeEnvLookup(envPath string) func(string) string {
+	vars := map[string]string{}
+	if _, parsed, err := readEnvFile(envPath); err != nil {
+		log.Printf("[lt-config] 读取 %s 失败，Compose 镜像里的变量只能来自进程环境: %v", envPath, err)
+	} else {
+		vars = parsed
+	}
+	return func(name string) string {
+		// 进程环境优先：与 Compose 的优先级一致，也保证「同一个变量在两处
+		// 都设了值」时，本程序与 Compose 得出同一个结论。
+		if v, ok := os.LookupEnv(name); ok && strings.TrimSpace(v) != "" {
+			return v
+		}
+		return vars[name]
 	}
 }
 

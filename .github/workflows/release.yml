@@ -14,9 +14,10 @@ permissions:
   contents: write
   packages: write
 
-env:
-  # 与 server 侧 frps 镜像保持一致，升级时两处需同步修改
-  FRP_VERSION: '0.71.0'
+# frp 版本不再写在这里：它由仓库根目录的 frp-version.txt 提供（compose、
+# lt-config 默认镜像、systemd 示例都从同一个值校验，见 scripts/check-pins.sh）。
+# 发布流程自己再写死一份，就会有「tag 发出去才发现内嵌 frpc 与镜像版本不一致」
+# 这种只能靠人工记住的同步点。
 
 jobs:
   # ============================================================
@@ -31,6 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 手工发布（workflow_dispatch）必须构建**输入版本号对应的源码**。
+          # 不指定 ref 时 checkout 的是默认分支 HEAD，于是可以用今天的 main
+          # 打出一个 v0.1.0 的包——版本号与实际内容毫无关系。tag 推送时
+          # 显式锁到触发的那次提交，避免推送与检出之间 tag 被移动。
+          ref: ${{ github.event.inputs.version || github.sha }}
 
       - uses: actions/setup-go@v5
         with:
@@ -41,9 +48,19 @@ jobs:
         working-directory: server
         run: go mod download
 
+      - name: Vet
+        working-directory: server
+        run: go vet ./...
+
       - name: Test
         working-directory: server
         run: go test ./...
+
+      # frp 版本同时出现在 compose、systemd 示例与 lt-config 默认镜像里。
+      # 三者不一致不会让构建失败，只会让「校验通过的配置」在运行时被 frps
+      # 拒绝——所以放在发布门禁里，而不是留给运维去发现。
+      - name: frp version pins
+        run: bash scripts/check-pins.sh
 
   # ============================================================
   #  容器镜像推送到 GitHub Container Registry
@@ -61,6 +78,9 @@ jobs:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 见 test job 的说明：手工发布要锁到输入版本对应的源码。
+          ref: ${{ github.event.inputs.version || github.sha }}
 
       - name: Validate version
         run: |
@@ -111,6 +131,9 @@ jobs:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 见 test job 的说明：手工发布要锁到输入版本对应的源码。
+          ref: ${{ github.event.inputs.version || github.sha }}
 
       - name: Validate version
         shell: pwsh
@@ -118,6 +141,17 @@ jobs:
           if ($env:VERSION -notmatch '^v\d+\.\d+\.\d+$') {
             throw "版本必须形如 v1.2.3，当前为 '$env:VERSION'"
           }
+
+      # 内嵌 frpc 的版本来自仓库里的唯一来源文件，不再由本工作流写死。
+      - name: Load frp version
+        shell: pwsh
+        run: |
+          $v = (Get-Content -LiteralPath frp-version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') {
+            throw "frp-version.txt 内容不是 x.y.z：'$v'"
+          }
+          "FRP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "frp $v"
 
       - uses: actions/setup-go@v5
         with:
@@ -142,6 +176,10 @@ jobs:
       - name: Resolve dependencies
         working-directory: client/windows
         run: go mod download
+
+      - name: Vet
+        working-directory: client/windows
+        run: go vet ./...
 
       # 发布前先测后打：这里复制 CI 的客户端测试，保证 tag 发布与日常 CI
       # 至少跑同一套用例。构建失败可以重来，发布出去的 bug 没法回收。
@@ -200,6 +238,13 @@ jobs:
           # 用户报障时能直接说出自己在跑哪个版本。
           wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=$env:VERSION"
 
+      # -tags embedfrpc 只在发布路径上启用，日常 CI 走不到：内嵌文件是空文件、
+      # 是错误页、或下载后被截断，编译与打包都不会报错，只有用户双击后才发现
+      # 内置客户端释放不出来。这里在构建前直接检查字节（PE 头 + 体积下限）。
+      - name: Embedded frpc smoke test
+        working-directory: client/windows
+        run: go test -tags embedfrpc -run TestEmbeddedFrpc .
+
       - name: Assemble package
         shell: pwsh
         run: |
@@ -228,11 +273,25 @@ jobs:
           Set-Content -Path "$bin/README-client.txt" -Value $readme -Encoding UTF8
           Compress-Archive -Path "$bin/*" -DestinationPath LiteTunnel-windows-amd64.zip -Force
 
+      # 校验和随产物一起发布：用户拿到 zip 后能自己确认「下载没被中间层改过」，
+      # 这是我们在下载端唯一还能提供的完整性证据。
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath LiteTunnel-windows-amd64.zip -Algorithm SHA256).Hash.ToLower()
+          $line = "$hash  LiteTunnel-windows-amd64.zip`n"
+          [IO.File]::WriteAllText(
+            (Join-Path (Get-Location) 'LiteTunnel-windows-amd64.zip.sha256'),
+            $line,
+            (New-Object System.Text.UTF8Encoding($false)))
+
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: LiteTunnel-windows-amd64
-          path: LiteTunnel-windows-amd64.zip
+          path: |
+            LiteTunnel-windows-amd64.zip
+            LiteTunnel-windows-amd64.zip.sha256
 
   # ============================================================
   #  服务端部署包（不含任何真实地址，全部为模板）
@@ -243,6 +302,8 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.sha }}
 
       - name: Assemble
         run: |
@@ -261,13 +322,23 @@ jobs:
           # 后台「域名与证书」依赖后者，包里没有就得回仓库里翻。
           cp deploy/systemd/* bundle/deploy/systemd/
           cp .env.example README.md bundle/
+          # 渲染脚本的回归夹具也进包：用户/运维改了脚本之后可以在本地先跑一遍，
+          # 不需要等仓库 CI。它不依赖仓库里的其他文件（只用 .env.example 与模板）。
+          mkdir -p bundle/scripts
+          cp scripts/test-render.sh scripts/check-pins.sh bundle/scripts/
+          cp frp-version.txt bundle/
           cd bundle && zip -r ../litetunnel-deploy.zip .
+
+      - name: Generate checksum
+        run: sha256sum litetunnel-deploy.zip > litetunnel-deploy.zip.sha256
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
           name: litetunnel-deploy
-          path: litetunnel-deploy.zip
+          path: |
+            litetunnel-deploy.zip
+            litetunnel-deploy.zip.sha256
 
   # ============================================================
   #  创建 Release 并挂载产物
@@ -275,9 +346,14 @@ jobs:
   publish:
     name: Publish release
     runs-on: ubuntu-latest
-    needs: [client, deploy-bundle]
+    # docker 必须在列：Release 正文会写出 ghcr.io/...:<version> 这个镜像地址。
+    # 不依赖它时，镜像构建失败而 Release 照发——用户照着正文 pull 得到
+    # manifest unknown，而 Release 页面看起来一切正常。
+    needs: [test, client, deploy-bundle, docker]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.sha }}
 
       - name: Resolve version
         id: ver
@@ -298,6 +374,17 @@ jobs:
           name: litetunnel-deploy
           path: assets
 
+      # 挂上去之前先自查一遍：产物缺失或校验和与产物不匹配时，宁可让发布
+      # 失败，也不要发出一个「sha256 对不上」的版本——那比没有校验和更糟，
+      # 用户会以为下载被篡改了。
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          for f in assets/LiteTunnel-windows-amd64.zip assets/litetunnel-deploy.zip; do
+            [[ -f "$f" ]] || { echo "::error::缺少产物 $f"; exit 1; }
+          done
+          ( cd assets && sha256sum -c LiteTunnel-windows-amd64.zip.sha256 litetunnel-deploy.zip.sha256 )
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -312,8 +399,16 @@ jobs:
             |---|---|
             | `LiteTunnel-windows-amd64.zip` | Windows 客户端，已内置 frpc.exe，解压即用 |
             | `litetunnel-deploy.zip` | 服务端部署包（compose / frps 模板 / Caddy 模板 / .env 模板） |
+            | `*.zip.sha256` | 产物的 SHA-256 校验和，下载后可核对 |
 
             容器镜像：`ghcr.io/${{ github.repository_owner }}/litetunnel-panel:${{ steps.ver.outputs.version }}`
+
+            ## 校验下载
+            ```bash
+            sha256sum -c LiteTunnel-windows-amd64.zip.sha256   # Linux
+            shasum -a 256 -c LiteTunnel-windows-amd64.zip.sha256  # macOS
+            # Windows: Get-FileHash LiteTunnel-windows-amd64.zip -Algorithm SHA256
+            ```
 
             ## 服务端部署
 
@@ -329,4 +424,6 @@ jobs:
             ```
           files: |
             assets/LiteTunnel-windows-amd64.zip
+            assets/LiteTunnel-windows-amd64.zip.sha256
             assets/litetunnel-deploy.zip
+            assets/litetunnel-deploy.zip.sha256

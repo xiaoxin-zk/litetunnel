@@ -20,6 +20,30 @@ func validateManifestForRecovery(dir string, m batchManifest) error {
 	if len(m.Files) == 0 {
 		return fmt.Errorf("manifest files 为空")
 	}
+	// 以**解析符号链接之后**的部署根为边界。
+	//
+	// 只比较字面路径不够：部署目录本身可能是一个符号链接（/opt/lt →
+	// /data/lt），此时 manifest 里写的是 /opt/lt/...，而真实文件在
+	// /data/lt 下；反过来，一个指向目录树之外的父目录链接也能让字面
+	// 路径通过检查，实际删除却发生在部署根之外。
+	root, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("无法解析部署目录的真实路径（%s）: %w", dir, err)
+	}
+
+	withinRoot := func(p string) bool {
+		return p == root || strings.HasPrefix(p, root+string(os.PathSeparator))
+	}
+
+	// resolveParent 返回目标文件父目录的真实路径。
+	resolveParent := func(p string) (string, error) {
+		real, err := filepath.EvalSymlinks(filepath.Dir(p))
+		if err != nil {
+			return "", fmt.Errorf("无法解析 %s 的父目录（可能不存在或是悬空链接）: %w", p, err)
+		}
+		return real, nil
+	}
+
 	seen := make(map[string]struct{}, len(m.Files))
 	for _, f := range m.Files {
 		if f.Name == "" || f.Path == "" {
@@ -29,8 +53,12 @@ func validateManifestForRecovery(dir string, m batchManifest) error {
 		if err != nil || filepath.Dir(path) == "." {
 			return fmt.Errorf("manifest 路径非法: %q", f.Path)
 		}
-		if filepath.Dir(path) != filepath.Dir(dir) && !strings.HasPrefix(path, filepath.Clean(dir)+string(os.PathSeparator)) {
-			return fmt.Errorf("manifest 文件越出部署目录: %s", f.Path)
+		parent, err := resolveParent(path)
+		if err != nil {
+			return err
+		}
+		if !withinRoot(parent) {
+			return fmt.Errorf("manifest 文件越出部署目录（真实路径 %s）: %s", parent, f.Path)
 		}
 		base := strings.ToLower(filepath.Base(path))
 		if base == batchManifestName || strings.HasSuffix(base, backupSuffix) || strings.HasPrefix(base, ".lt-config-tmp-") {
@@ -42,8 +70,15 @@ func validateManifestForRecovery(dir string, m batchManifest) error {
 		seen[path] = struct{}{}
 		if f.Tmp != "" {
 			tmp, err := filepath.Abs(filepath.Clean(f.Tmp))
-			if err != nil || !strings.HasPrefix(tmp, filepath.Clean(dir)+string(os.PathSeparator)) {
-				return fmt.Errorf("manifest 临时文件越出部署目录: %s", f.Tmp)
+			if err != nil {
+				return fmt.Errorf("manifest 临时文件路径非法: %s", f.Tmp)
+			}
+			tmpParent, err := resolveParent(tmp)
+			if err != nil {
+				return err
+			}
+			if !withinRoot(tmpParent) {
+				return fmt.Errorf("manifest 临时文件越出部署目录（真实路径 %s）: %s", tmpParent, f.Tmp)
 			}
 		}
 		if info, err := os.Lstat(path); err == nil {

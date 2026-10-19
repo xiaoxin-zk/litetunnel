@@ -84,8 +84,12 @@ func (b *writeBatch) finalize() error {
 // 用于「文件已经换好，但容器重建失败」：此时磁盘是新配置、容器还是旧的，
 // 不做这一步就留下一个跨版本的半成品。
 func (b *writeBatch) revert() error {
+	// 权限也属于「提交前的那份磁盘状态」，必须先恢复。
+	// 只回滚内容会让磁盘停在「旧内容 + 新权限」的混合态，而权限收紧
+	// 多半与凭据文件有关，留着错误的权限本身就是安全问题。
+	modeErr := b.restoreModeFixes()
 	if len(b.staged) == 0 {
-		return nil
+		return modeErr
 	}
 	if err := b.rollbackCommitted(); err != nil {
 		// 恢复失败：记录与备份必须留着，它们是下次启动唯一能依的现场。
@@ -105,6 +109,11 @@ func (b *writeBatch) revert() error {
 	b.discard()
 	for _, st := range b.staged {
 		st.cleanupBackup()
+	}
+	if modeErr != nil {
+		// 内容已是旧配置，权限却没回去：如实上报，让管理员知道还有一处
+		// 与「提交前」不一致，而不是把它当成一次干净的回滚。
+		return fmt.Errorf("配置已回滚为旧内容，但文件权限未能恢复: %w", modeErr)
 	}
 	return nil
 }

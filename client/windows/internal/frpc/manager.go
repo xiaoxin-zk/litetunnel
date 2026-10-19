@@ -336,6 +336,19 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		return fmt.Errorf("启动 frpc 失败: %w", err)
 	}
 
+	// 把子进程绑到「随本进程终止而终止」的 Job Object。
+	//
+	// 必须在**登记进 procs 之前**完成，且失败即失败：Job Object 是异常退出时
+	// 唯一可靠的孤儿进程兜底。以前绑定失败只记一行日志继续跑，Start 返回
+	// nil，调用方以为隧道起来了；客户端崩溃后 frpc 仍在后台转发、占着端口，
+	// 而界面上什么都看不出来。
+	if err := attachToJob(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait() // 回收句柄，避免留下僵尸进程
+		m.mu.Unlock()
+		return fmt.Errorf("无法绑定 frpc 进程生命周期，已终止该进程: %w", err)
+	}
+
 	exitCh := make(chan struct{})
 	m.genSeq++
 	gen := m.genSeq
@@ -346,21 +359,6 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	m.mu.Unlock()
 
 	m.appendLog(tunnelID, tunnelName, fmt.Sprintf("已启动 frpc（PID %d）", cmd.Process.Pid))
-
-	// 把子进程绑到一个「随本进程终止而终止」的 Job Object。
-	//
-	// Windows 上父进程退出不会自动结束子进程，不绑的话用户关掉客户端后
-	// frpc 会继续在后台跑。放在解锁之后调用：它会做几次系统调用，
-	// 没必要占着锁。
-	//
-	// 失败不致命（会退化为「仅在正常关闭时清理」），所以只记一行日志。
-	if err := attachToJob(cmd); err != nil {
-		// Job Object 是异常退出时唯一可靠的孤儿进程兜底。绑定失败后继续
-		// 运行会让客户端“看似启动成功”，但崩溃时 frpc 仍可留在后台转发。
-		// 终止当前进程并走统一 Wait/退出回调路径，避免留下未受管控的 frpc。
-		m.appendLog(tunnelID, tunnelName, "无法绑定进程生命周期，已终止 frpc："+err.Error())
-		_ = cmd.Process.Kill()
-	}
 
 	var pumps sync.WaitGroup
 	pumps.Add(2)
@@ -406,6 +404,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		case <-drained:
 		case <-time.After(2 * time.Second):
 			m.appendLog(tunnelID, tunnelName, "日志管道未在 2 秒内读取完毕，可能仍有输出未被记录")
+			// 主动关掉读端：可能有孙进程继承了写端导致 EOF 迟迟不来，
+			// 不关的话两个读取协程会永久挂在 Read 上（协程泄漏，且每次
+			// 重启多两个）。关闭后 Read 立即返回，管道随之收敛。
+			_ = stdout.Close()
+			_ = stderr.Close()
 		}
 
 		err := cmd.Wait()
@@ -515,39 +518,77 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	return nil
 }
 
-// Stop 停止某条隧道的 frpc 进程。
-func (m *Manager) Stop(tunnelID uint) error {
-	m.mu.Lock()
-	p := m.procs[tunnelID]
-	if p != nil {
-		// 先标记再 Kill：Wait 的协程可能在任何时刻读到它。
-		p.stopping = true
-	}
-	m.mu.Unlock()
-	if p == nil || p.cmd == nil || p.cmd.Process == nil {
-		return nil
-	}
-	m.appendLog(tunnelID, p.name, "正在停止 frpc…")
-	// 进程可能在我们拿到锁之前就自己退出了（frpc 启动失败就是这种情况），
-	// 此时 Kill 返回 ErrProcessDone——那不是错误，目标已经达成。
-	if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("停止 frpc 失败: %w", err)
-	}
+// stopAttempts 是 Stop 允许「再停一次」的轮数。
+//
+// 取 5 只是给并发误用设一个上界：正常情况下第一轮就结束。
+const stopAttempts = 5
 
-	// 等进程真正退出再返回。
-	//
-	// 不等的话，紧接着调用 Start 会撞上 ErrAlreadyRunning——
-	// 因为进程记录是在 Wait 的协程里才被删除的。
-	if p.exitCh != nil {
-		select {
-		case <-p.exitCh:
-		case <-time.After(5 * time.Second):
-			// 极端情况：Kill 之后进程仍未退出。
-			// 不无限等待，让上层能给出提示，而不是把界面卡死。
-			return errors.New("等待 frpc 退出超时")
+// Stop 停止某条隧道的 frpc 进程。
+//
+// 必须循环复查：拿到进程指针后就会释放锁，而这段时间里并发的 Start 可以
+// 登记一个新进程。只处理手里那个旧进程就返回，会让调用方以为「隧道已停」，
+// 实际上新进程正在转发——StopTunnel 之后隧道自己又活了。
+func (m *Manager) Stop(tunnelID uint) error {
+	for attempt := 0; ; attempt++ {
+		m.mu.Lock()
+		p := m.procs[tunnelID]
+		if p != nil {
+			// 先标记再 Kill：Wait 的协程可能在任何时刻读到它。
+			p.stopping = true
+		}
+		m.mu.Unlock()
+		if p == nil {
+			return nil
+		}
+		if p.cmd == nil || p.cmd.Process == nil {
+			// 没有可终止的句柄（极少见）：仍然等它从表里消失。
+			if !m.waitExit(p, tunnelID) {
+				return errors.New("等待 frpc 退出超时")
+			}
+		} else {
+			m.appendLog(tunnelID, p.name, "正在停止 frpc…")
+			// 进程可能在我们拿到锁之前就自己退出了（frpc 启动失败就是这种
+			// 情况），此时 Kill 返回 ErrProcessDone——那不是错误，目标已达成。
+			if err := p.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				return fmt.Errorf("停止 frpc 失败: %w", err)
+			}
+			// 等进程真正退出再返回。
+			//
+			// 不等的话，紧接着调用 Start 会撞上 ErrAlreadyRunning——
+			// 因为进程记录是在 Wait 的协程里才被删除的。
+			if !m.waitExit(p, tunnelID) {
+				// 极端情况：Kill 之后进程仍未退出。
+				// 不无限等待，让上层能给出提示，而不是把界面卡死。
+				return errors.New("等待 frpc 退出超时")
+			}
+		}
+
+		m.mu.Lock()
+		stillThere := m.procs[tunnelID] != nil
+		m.mu.Unlock()
+		if !stillThere {
+			return nil
+		}
+		if attempt+1 >= stopAttempts {
+			// 每次停完都有人立刻拉起新进程：继续循环只会无限占用调用方，
+			// 如实报错让对方决定是重试还是先同步。
+			return errors.New("隧道在停止过程中被反复重新启动，请稍后重试")
 		}
 	}
-	return nil
+}
+
+// waitExit 等待某个进程真正退出，返回是否在超时前等到。
+func (m *Manager) waitExit(p *process, tunnelID uint) bool {
+	if p.exitCh == nil {
+		return true
+	}
+	select {
+	case <-p.exitCh:
+		return true
+	case <-time.After(5 * time.Second):
+		m.appendLog(tunnelID, p.name, "等待 frpc 退出超时，可能仍有残留进程")
+		return false
+	}
 }
 
 // StopAll 停止全部隧道的 frpc 进程，返回第一个错误。

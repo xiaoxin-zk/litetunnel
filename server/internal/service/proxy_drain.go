@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
 // CloseUserProxies 关闭某用户在 frps 侧的所有已建立代理，实现「立即断流」。
@@ -124,6 +126,13 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 		userID:  userID,
 		prefix:  FrpUserOf(userID) + ".",
 		deleted: true,
+		// 复用删除事务里已经写好的那条待办。
+		//
+		// 不传的话 drainProxies 会重新登记一次：此刻 users 行已经不存在，
+		// 新登记的 incarnation 是空的，会把事务内记下的标识覆盖掉——
+		// UI 上看不出区别，但 ID 被复用时旧待办就再也识别不出「这是
+		// 另一个账号」了。
+		intent: s.deletedDrainFence(userID),
 	})
 	switch {
 	case out.unknown:
@@ -141,6 +150,23 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 // 失败绝不影响删除结果：账号必须已经删掉，这里只是尽力收回已经建立的流量。
 // 删除接口的返回值不变（仍然只反映数据库侧是否删成功），否则管理员会重试，
 // 而重试只会得到「账号不存在」。
+// deletedDrainFence 返回删号事务留下的那条待办的围栏令牌。
+//
+// 读不到（没有待办 / 数据库不可用）时返回空串：调用方会按「新意图」重新
+// 登记，与以前的行为一致——宁可多写一条，也不能因为读失败就完全不登记。
+func (s *Services) deletedDrainFence(userID uint) string {
+	if s.DB == nil {
+		return ""
+	}
+	var row model.ProxyDrainPending
+	if err := s.DB.Select("fence").
+		Where("user_id = ? AND deleted = ?", userID, true).
+		First(&row).Error; err != nil {
+		return ""
+	}
+	return row.Fence
+}
+
 func (s *Services) closeUserProxiesAfterDelete(userID uint) {
 	ctx, cancel := context.WithTimeout(context.Background(), closeProxiesTimeout)
 	defer cancel()

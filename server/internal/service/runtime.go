@@ -185,6 +185,13 @@ const identityTTL = 10 * time.Second
 // 值，迟到的解析必然对不上，只会放弃回填。
 const identityGenGrace = 5 * time.Minute
 
+// identityControlTimeout 是共享控制面（Redis）读写的单次上限。
+//
+// 认证路径上不能出现「没有上界的外部调用」：Redis 故障/网络黑洞时，
+// context.Background 会让每个缓存未命中的请求都挂到 TCP 超时。
+// 宁可读到空版本（退回本地代次 + 数据库），也不能把登录拖住。
+const identityControlTimeout = 800 * time.Millisecond
+
 type identityKey struct {
 	kind uint8
 	id   uint
@@ -248,7 +255,11 @@ func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool, version in
 // 最多 identityTTL），也不该直接返回给这次请求。
 func (r *Runtime) IdentityGen(kind uint8, id uint) uint64 {
 	if r.control != nil && r.control.Enabled() {
-		if version, err := r.control.GetInt(context.Background(), fmt.Sprintf("identity:%d:%d", kind, id)); err == nil && version > 0 {
+		// 必须带超时：这条路径在每次「缓存未命中」的认证请求上，Redis
+		// 卡住时用 Background 会把延迟直接叠加到登录/鉴权上，而且没有上界。
+		ctx, cancel := context.WithTimeout(context.Background(), identityControlTimeout)
+		defer cancel()
+		if version, err := r.control.GetInt(ctx, fmt.Sprintf("identity:%d:%d", kind, id)); err == nil && version > 0 {
 			r.ObserveIdentityVersion(kind, id, uint64(version))
 		}
 	}
@@ -291,7 +302,15 @@ func (r *Runtime) SetCachedIdentityIfGen(kind uint8, id uint, active bool, versi
 func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
 	key := identityKey{kind: kind, id: id}
 	if r.control != nil && r.control.Enabled() {
-		if _, err := r.control.BumpVersion(context.Background(), fmt.Sprintf("identity:%d:%d", kind, id)); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), identityControlTimeout)
+		err := func() error {
+			defer cancel()
+			_, err := r.control.BumpVersion(ctx, fmt.Sprintf("identity:%d:%d", kind, id))
+			return err
+		}()
+		if err != nil {
+			// 共享版本写不进去只影响「别的实例多快看到失效」，本地代次与
+			// 数据库状态仍然生效；记日志而不是阻塞禁用/改密请求。
 			log.Printf("[runtime] 共享身份失效版本更新失败（kind=%d id=%d）: %v", kind, id, err)
 		}
 	}

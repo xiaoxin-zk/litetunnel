@@ -25,8 +25,22 @@ jobs:
   docker:
     name: Publish image
     runs-on: ubuntu-latest
+    env:
+      # 手工发布与 tag 发布统一到同一个版本变量。
+      #
+      # 只用 type=ref,event=tag 的话，workflow_dispatch 产生的镜像只有
+      # latest 一个 tag，而 Release 正文引用的是输入里那个版本——用户
+      # 照着文档 pull 指定版本会得到 manifest unknown。
+      VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate version
+        run: |
+          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本必须形如 v1.2.3，当前为 '${VERSION}'"
+            exit 1
+          fi
 
       - uses: docker/setup-buildx-action@v3
 
@@ -43,7 +57,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/litetunnel-panel
           tags: |
-            type=ref,event=tag
+            type=raw,value=${{ env.VERSION }}
             type=raw,value=latest
 
       - name: Build and push
@@ -54,7 +68,7 @@ jobs:
           push: true
           # 把 tag 注入二进制，部署后可通过 /healthz 确认版本
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ env.VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -66,8 +80,17 @@ jobs:
   client:
     name: Package Windows client
     runs-on: windows-latest
+    env:
+      VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          if ($env:VERSION -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "版本必须形如 v1.2.3，当前为 '$env:VERSION'"
+          }
 
       - uses: actions/setup-go@v5
         with:
@@ -80,7 +103,15 @@ jobs:
           node-version: '22'
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        working-directory: client/windows
+        shell: pwsh
+        run: |
+          # 版本跟随 go.mod，而不是 @latest：latest 会在两次发布之间漂移，
+          # 同一份源码重发可能产出不同的客户端（构建器行为与生成代码都会变）。
+          $v = go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2
+          if (-not $v) { throw '无法从 go.mod 解析 wails 版本' }
+          Write-Host "Installing wails $v"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@$v"
 
       - name: Resolve dependencies
         working-directory: client/windows
@@ -95,6 +126,17 @@ jobs:
           $url = "https://github.com/fatedier/frp/releases/download/v$ver/frp_${ver}_windows_amd64.zip"
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile frp.zip
+          # 校验下载内容：仅固定版本号不能证明拿到的是官方那一份（镜像劫持、
+          # 代理缓存污染都可能换掉字节）。官方 release 附带 checksums.txt。
+          $sumsUrl = "https://github.com/fatedier/frp/releases/download/v$ver/frp_${ver}_checksums.txt"
+          Invoke-WebRequest -Uri $sumsUrl -OutFile checksums.txt
+          $line = Get-Content checksums.txt | Where-Object { $_ -match "frp_${ver}_windows_amd64\.zip$" } | Select-Object -First 1
+          if (-not $line) { throw "checksums.txt 中没有 windows_amd64 的条目" }
+          $want = ($line -split '\s+')[0].ToLower()
+          $got = (Get-FileHash frp.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) {
+            throw "frp 压缩包校验失败：期望 $want，实际 $got"
+          }
           Expand-Archive -Path frp.zip -DestinationPath frp -Force
           $exe = Get-ChildItem -Path frp -Recurse -Filter frpc.exe | Select-Object -First 1
           if (-not $exe) { throw 'frpc.exe not found in frp release archive' }
@@ -120,7 +162,7 @@ jobs:
           # 用户最终只拿到**一个 exe**。
           # 同时注入平台地址与版本号，版本号会显示在客户端界面上，
           # 用户报障时能直接说出自己在跑哪个版本。
-          wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=${{ github.ref_name }}"
+          wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=$env:VERSION"
 
       - name: Assemble package
         shell: pwsh

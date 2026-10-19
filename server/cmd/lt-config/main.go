@@ -116,6 +116,14 @@ func main() {
 		log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
 			"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
 	}
+	// 路径策略必须**在清理之前**跑完：清理会按配置的目录去读、删临时文件与
+	// 备份。若路径配错（两个输出指向同一文件、指向符号链接、用了事务保留名），
+	// 先清理就等于在一个语义未定义的目标上动手——错删的文件不会因为后面
+	// 的校验失败而回来。
+	if err := validateManagedPaths(p); err != nil {
+		log.Fatalf("[lt-config] %v", err)
+	}
+
 	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
 	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。
 	//
@@ -162,13 +170,19 @@ func main() {
 		// 渲染要等 docker 校验，读超时给足；写超时同理。
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      4 * time.Minute,
+		WriteTimeout:      writeTimeout,
 	}
 
 	// 收到退出信号后优雅关闭：先停接收新连接，再等已取消的在途请求收尾。
+	//
+	// 进程必须**等到 Shutdown 返回**再退出：在途请求可能正在做回滚（用独立的
+	// 3 分钟预算，不受根上下文取消影响）。ListenAndServe 一返回就结束进程的话，
+	// 文件可能停在「内容已换新、容器仍是旧版」的中间态——而这正是回滚要避免的。
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-rootCtx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("[lt-config] 关闭时出错: %v", err)
@@ -177,9 +191,50 @@ func main() {
 
 	log.Printf("[lt-config] 部署目录 %s", p.deployDir)
 	log.Printf("[lt-config] 监听 %s（重建容器：%v，frps 校验：%v）", *addr, *allowApply, *validateFrps)
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err := httpSrv.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("[lt-config] 服务退出: %v", err)
 	}
+	if errors.Is(err, http.ErrServerClosed) {
+		// 只有收到退出信号时才有这个错误；等收尾完成再返回。
+		<-shutdownDone
+	}
+}
+
+const (
+	// writeTimeout 必须覆盖「镜像校验 → 写盘 → compose 重建 → 稳定检查 →
+	// 失败回滚重建」的最坏链路。
+	//
+	// 服务端在到达 WriteTimeout 时会断开连接，但**不会**停止正在跑的处理：
+	// 前端看到超时后重试，就会叠加出第二个事务——而第一个仍在改盘。4 分钟
+	// 覆盖不了「回滚重建」的 3 分钟预算，所以这里放宽到 10 分钟，并配合
+	// applyMu 的 TryLock（并发请求直接 409，而不是排队）。
+	writeTimeout = 10 * time.Minute
+
+	// shutdownTimeout 是优雅关闭等待在途请求的上限。
+	//
+	// 必须大于 rollbackTimeout：关闭信号到达时，某个请求可能正在用独立预算
+	// 做回滚重建。提前退出进程会把它截断在「磁盘新、容器旧」的中间态。
+	shutdownTimeout = 4 * time.Minute
+)
+
+// addWarn 记一条要随本次响应返回给面板的警告。
+func (s *service) addWarn(msg string) {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	s.pendingWarns = append(s.pendingWarns, msg)
+}
+
+// takeWarns 取走并清空待回传警告。
+func (s *service) takeWarns() []string {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	if len(s.pendingWarns) == 0 {
+		return nil
+	}
+	out := s.pendingWarns
+	s.pendingWarns = nil
+	return out
 }
 
 // paths 是全部会被本服务读写的路径，启动时统一解析与校验。
@@ -314,6 +369,14 @@ type service struct {
 	//
 	// 面板通常只有一个页面在调它，但接口的安全性不该建立在调用方克制上。
 	applyMu sync.Mutex
+
+	// warnMu 保护 pendingWarns：校验阶段产生、但要随本次响应返回给面板的
+	// 非致命问题（主要是临时目录清理失败）。
+	//
+	// 只写日志是不够的：那些目录里可能有 DNS 凭据，管理员在界面上看到
+	// 「应用成功」就不会再关注日志，而残留的凭据目录会一直躺在部署根下。
+	warnMu       sync.Mutex
+	pendingWarns []string
 
 	caddyImage   string
 	frpsImage    string

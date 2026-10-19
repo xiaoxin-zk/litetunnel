@@ -286,8 +286,18 @@ func cleanupLeftovers(p paths) []string {
 		blocked = append(blocked, dir)
 	}
 	seen := map[string]bool{}
-	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {
+	// 部署根目录必须显式纳入：校验临时目录（.lt-config-caddy-* /
+	// .lt-config-frps-*，里面有挂进容器的凭据）创建在部署根下，而三个
+	// 输出文件通常在它的子目录里。只按输出文件的父目录遍历的话，这些
+	// 目录永远扫不到，异常退出后会一直留着。
+	for _, f := range []string{p.deployDir, p.caddyOut, p.frpsOut, p.envFile} {
+		if strings.TrimSpace(f) == "" {
+			continue
+		}
 		dir := filepath.Dir(f)
+		if f == p.deployDir {
+			dir = filepath.Clean(f)
+		}
 		if seen[dir] {
 			continue
 		}

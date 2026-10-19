@@ -155,12 +155,12 @@ func writeManifestFile(m batchManifest) error {
 // 摘要只有在每个文件真正完成备份之后才算得出来，而记录必须在第一次替换
 // **之前**就落盘（否则崩溃时没有记录可依）。所以这里多写一次。
 //
-// 补写失败不影响本批的推进：记录里少一层校验，恢复退回「备份是否存在」
-// 的老判据，与升级前的行为一致。真正危险的是「记录写着摘要、备份却不是
-// 那份内容」，那是恢复时的校验负责挡住的事。
-func (b *writeBatch) refreshBackupSums() {
+// 补写失败**不能**被忽略：记录里没有摘要时，恢复只能退回「备份文件存在
+// 就当它是旧内容」，一份被截断/覆盖的备份会被原样写回成"旧配置"。所以这里
+// 返回错误，由 commit 整批回滚。
+func (b *writeBatch) refreshBackupSums() error {
 	if b.manifest.Dir == "" || len(b.manifest.Files) == 0 {
-		return
+		return nil
 	}
 	for i := range b.manifest.Files {
 		if i < len(b.staged) {
@@ -168,8 +168,9 @@ func (b *writeBatch) refreshBackupSums() {
 		}
 	}
 	if err := writeManifestFile(b.manifest); err != nil {
-		log.Printf("[lt-config] 补写备份摘要失败（恢复时退回备份存在性判断）: %v", err)
+		return fmt.Errorf("补写备份摘要失败: %w", err)
 	}
+	return nil
 }
 
 // removeManifest 在整批文件已经确定落定（新配置生效或已完整回滚）后撤掉记录。

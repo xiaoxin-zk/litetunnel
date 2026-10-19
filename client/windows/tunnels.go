@@ -269,6 +269,10 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	// 后台同步照常执行（拿最新的隧道清单与状态），只是不再挡着返回。
 	state := a.GetState()
 	a.emitState()
+	// 记下本次操作所属的账号代次：等到协程真正拿到同步锁时，用户可能已经
+	// 退出登录或换了账号。那种情况下这一轮同步必须整段放弃——它拿的是旧
+	// 凭据、改的是旧清单，落到新账号上就是「用别人的隧道覆盖我的状态」。
+	gen := a.currentAuthGen()
 	go func() {
 		// 门闩此刻还被本函数持有（defer 释放），所以这个协程会先等一下，
 		// 等 StartTunnel 返回后再同步——不会与它重叠。
@@ -277,6 +281,9 @@ func (a *App) StartTunnel(id uint) (State, error) {
 			return
 		}
 		defer a.unlockSync()
+		if !a.authGenCurrent(gen) {
+			return
+		}
 		a.syncAndState()
 	}()
 	return state, nil
@@ -336,11 +343,17 @@ func (a *App) StopTunnel(id uint) (State, error) {
 	// syncMu 仍由本函数持有（defer 解锁），因此这个协程会在返回之后才开始同步。
 	state := a.GetState()
 	a.emitState()
+	gen := a.currentAuthGen()
 	go func() {
 		if err := a.lockSync(a.rootContext()); err != nil {
 			return
 		}
 		defer a.unlockSync()
+		// 同 StartTunnel：停止操作返回后账号可能已经切换，旧同步不得
+		// 在新的账号下按旧凭据改状态。
+		if !a.authGenCurrent(gen) {
+			return
+		}
 		a.syncAndState()
 	}()
 	return state, nil
@@ -486,6 +499,8 @@ func (a *App) Redeem(code string) (string, State, error) {
 	if err := json.Unmarshal(raw, &out); err != nil || out.Message == "" {
 		out.Message = "兑换成功"
 	}
+	// 与服务端错误同样限长：这段文案会直接进 Wails 响应与界面提示。
+	out.Message = clampStatusText(out.Message)
 
 	// 兑换可能改变配额或分组，同步一次让界面立刻反映最新状态。
 	// 用 syncAndState 而不是 Refresh：本函数已持有 syncMu。

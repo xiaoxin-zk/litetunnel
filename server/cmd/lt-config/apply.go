@@ -35,8 +35,17 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	// 全程串行。两个并发的 /render 会交错读 .env、写三个文件并各自触发一次
 	// 容器重建，结果是磁盘上的配置可能来自两次请求的混合，而容器重建了两轮。
 	// 面板通常只有一个页面在调它，但接口的安全性不该建立在「调用方克制」上。
-	s.applyMu.Lock()
+	// TryLock 而不是 Lock：一次应用可能跑十几分钟（镜像校验 + 重建 +
+	// 稳定检查），排队会让第二个请求在前端超时之后才开始改盘，形成「第一个
+	// 还在写、第二个已经重试」的叠加。忙就明确拒绝，由调用方稍后重试。
+	if !s.applyMu.TryLock() {
+		return res, errApplyBusy
+	}
 	defer s.applyMu.Unlock()
+
+	// 丢掉上一次请求遗留的警告：它们已经随那次响应返回过（或那次请求
+	// 根本没走到校验阶段），不能在这一次的响应里重复出现。
+	_ = s.takeWarns()
 
 	// 启动时就有目录没能自动收敛：那里的批次记录与备份是唯一还能修复磁盘的
 	// 东西，继续写盘会把它们覆盖掉。拒绝执行，由管理员先确认现场（见
@@ -123,6 +132,9 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 		return res, err
 	}
 	res.Validate = validateOut
+	// 校验阶段的非致命问题（例如临时目录清理失败，其中可能含凭据）
+	// 必须随本次响应回到面板，而不是只留在日志里。
+	res.Warnings = append(res.Warnings, s.takeWarns()...)
 
 	// 6) 组装待写产物。走到这里为止，磁盘上的文件一个都没动。
 	writes := []pendingWrite{
@@ -255,6 +267,12 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 
 // partialApplyError 表示配置没有停在「全部生效」或「全部回滚」上。
 //
+// errApplyBusy 表示另一个配置应用还没结束。
+//
+// 单独一个哨兵而不是复用通用错误：调用方要据此返回 409（等等再试），
+// 而不是 422/500（改配置/查服务）。
+var errApplyBusy = errors.New("另一个配置应用正在进行，请等待它结束后重试")
+
 // 单独一个类型是为了让 HTTP 层能给出结构化结果（partial + 各容器状态），
 // 而不是把「现在到底是哪一版在跑」埋进一段错误文本里。
 type partialApplyError struct {

@@ -191,12 +191,29 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 	}
 	res := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"incarnation", "prefix", "status_gen", "not_after", "deleted", "intent_at", "targets",
+		DoUpdates: clause.Assignments(map[string]any{
+			// incarnation 只在新值非空时覆盖。
+			//
+			// 删号路径的即时断流与后台重试都发生在 users 行删除**之后**，
+			// 此刻读不到账号标识。若无条件写回，事务内记下的那个标识会被
+			// 空值抹掉，ID 被复用时这条旧待办就失去了唯一可核验的依据。
+			"incarnation": gorm.Expr(`CASE WHEN excluded.incarnation <> ''
+				THEN excluded.incarnation ELSE lt_proxy_drain_pending.incarnation END`),
+			"prefix":     gorm.Expr("excluded.prefix"),
+			"status_gen": gorm.Expr("excluded.status_gen"),
+			"not_after":  gorm.Expr("excluded.not_after"),
+			"deleted":    gorm.Expr("excluded.deleted"),
+			"intent_at":  gorm.Expr("excluded.intent_at"),
+			"targets":    gorm.Expr("excluded.targets"),
 			// exhausted 与 attempts 一起重置：新的意图该有自己完整的一轮预算。
 			// 沿用旧的「已耗尽」会让这次断流第一次失败就再被判为终态，等于
 			// 永久拒绝为这个账号做补偿。
-			"attempts", "exhausted", "next_at", "fence", "last_err", "updated_at",
+			"attempts":   gorm.Expr("excluded.attempts"),
+			"exhausted":  gorm.Expr("excluded.exhausted"),
+			"next_at":    gorm.Expr("excluded.next_at"),
+			"fence":      gorm.Expr("excluded.fence"),
+			"last_err":   gorm.Expr("excluded.last_err"),
+			"updated_at": time.Now(),
 		}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			// 条件写分两层，理由见函数注释。刻意用布尔列本身做判断而不写

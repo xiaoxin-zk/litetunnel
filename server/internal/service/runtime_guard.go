@@ -318,6 +318,14 @@ func (s *Services) refreshGuardDue() {
 	if ids := append(periodDue, groupDue...); len(ids) > 0 {
 		if err := s.refreshQuotaFlagsFor(ids); err != nil {
 			log.Printf("[quota] 刷新到期用户标记失败: %v", err)
+			// 这批用户刚刚被迁回默认分组，下一轮不会再出现在「已到期」集合里。
+			// 本轮刷新失败若不补偿，旧的内存准入标记会一直留在原处——插件
+			// 热路径只看内存，用户按旧分组配额被拒绝或放行，而数据库里
+			// 一切正常，没有任何地方会再纠正它。
+			//
+			// 把全量校准的时点清零：下一轮用一次全量扫描把这些人收回来。
+			// 代价是一次额外的全表读，且只在真实失败时发生。
+			s.guardFullAt.Store(0)
 		}
 	}
 

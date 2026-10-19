@@ -90,9 +90,16 @@ func ParseNetstat(out string) []Service {
 			pid, _ = strconv.Atoi(f[3])
 		}
 
-		// 同一个端口常同时出现在 0.0.0.0 与 :: 两行上，只保留一条；
-		// 否则列表里会出现两份一模一样的条目。
-		key := proto + "|" + strconv.Itoa(port)
+		// 去重键必须带上绑定地址与 PID。
+		//
+		// 只按「协议 + 端口」去重会把**真实存在**的不同绑定合并掉：同一个
+		// 端口可能同时被两个进程监听在不同地址上（例如 127.0.0.1:8080 是
+		// 用户的开发服务器、192.168.x.x:8080 是另一份实例），只留一条会让
+		// 用户看不到自己想映射的那个。
+		//
+		// 但 0.0.0.0 与 :: 是同一份「监听所有地址」在 v4/v6 下的两种写法，
+		// 必须归一成同一类，否则又是两份一模一样的条目。
+		key := proto + "|" + strconv.Itoa(port) + "|" + strconv.Itoa(pid) + "|" + addrClass(host)
 		if seen[key] {
 			continue
 		}
@@ -107,6 +114,18 @@ func ParseNetstat(out string) []Service {
 		})
 	}
 	return list
+}
+
+// addrClass 把绑定地址归一成去重用的类别。
+//
+// 空串（netstat 的 0.0.0.0）、0.0.0.0、:: 都是「全部地址」，归为 any；
+// 其余保留原值，从而区分回环、具体网卡地址等真实不同的绑定。
+func addrClass(host string) string {
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return "any"
+	}
+	return host
 }
 
 // LooksUserService 猜测这个端口是不是用户自己跑的服务。

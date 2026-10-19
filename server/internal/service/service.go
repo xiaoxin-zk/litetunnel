@@ -351,7 +351,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
-		loginFails:       newLoginFailureCounterWithControl(db, control),
+		loginFails:       newLoginFailureCounter(db),
 		mailWake:         make(chan struct{}, 1),
 		recoveryCh:       make(chan recoveryRequest, recoveryBuffer),
 		recoveryCounters: &recoveryCounters{},

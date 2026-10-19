@@ -125,7 +125,9 @@ func (a *App) do(ctx context.Context, method, endpoint, token string, payload []
 		if msg == "" {
 			msg = fmt.Sprintf("请求失败（状态码 %d）", resp.StatusCode)
 		}
-		return nil, errors.New(msg)
+		// 服务端文案会原样进入 Wails 事件、日志和界面提示。异常响应可能
+		// 带上整段 HTML 或堆栈，不截断就会在每次状态事件里重复传输。
+		return nil, errors.New(clampStatusText(msg))
 	}
 	return env.Data, nil
 }

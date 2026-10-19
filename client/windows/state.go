@@ -133,6 +133,24 @@ func (a *App) recordTunnelErr(id uint, line string) bool {
 	return a.recordTunnelErrMsg(id, frpc.StripLogPrefix(line))
 }
 
+// currentAuthGen 读取当前账号代次。
+//
+// 异步任务（启动后的后台同步、退出回调、手动操作后的补充同步）在开始前
+// 记下它，执行前再比对：期间发生登出/重新接入时，旧任务必须整段放弃，
+// 否则它会把上一个账号的结论写进新账号的状态。
+func (a *App) currentAuthGen() uint64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.authGeneration
+}
+
+// authGenCurrent 报告给定账号代次是否仍是当前代次。
+func (a *App) authGenCurrent(gen uint64) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.authGeneration == gen
+}
+
 // setTunnelRegistered 标记某条隧道的代理是否已注册成功。
 func (a *App) setTunnelRegistered(id uint, up bool) {
 	a.setTunnelRegisteredGen(id, 0, up)

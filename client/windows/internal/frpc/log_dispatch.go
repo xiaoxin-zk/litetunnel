@@ -186,6 +186,12 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 }
 
 func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, line string) {
+	// gen 非零表示这行来自某个具体进程。进程已经不是当前进程时直接丢弃：
+	// 退出登录会清空历史日志，而旧进程的管道可能仍在吐字——没有这道过滤，
+	// 它们会在清空之后重新落进缓冲，用户换账号后看到的仍是上一段的输出。
+	if gen != 0 && !m.stillCurrent(tunnelID, gen) {
+		return
+	}
 	line = strings.TrimRight(line, "\r\n")
 	line = clipLogLine(line, maxLogLineBytes)
 	if line == "" {

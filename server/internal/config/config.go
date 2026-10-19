@@ -212,8 +212,74 @@ func validateEnvInts() error {
 	return nil
 }
 
+// numericEnvKeys 是所有按整数解析的环境变量。
+//
+// 单独列出来做一次显式解析，是因为 envInt 在解析失败时只能返回默认值：
+// 那意味着 LT_PORT_RANGE_END=abc 会被当成「没配」，服务带着 30000 起来，
+// 而管理员以为自己限定了端口范围。这类错误必须在启动时暴露。
+var numericEnvKeys = []string{
+	"LT_GATEWAY_PORT", "LT_KCP_PORT", "LT_VHOST_HTTP_PORT", "LT_VHOST_HTTPS_PORT",
+	"LT_USER_PORT", "LT_FRPS_API_PORT",
+	"LT_PORT_RANGE_START", "LT_PORT_RANGE_END", "LT_MAX_PORTS_PER_USER",
+	"LT_REDIS_DB",
+}
+
+// portEnvKeys 是其中的「合法端口」子集：必须在 1..65535 之间。
+var portEnvKeys = map[string]bool{
+	"LT_GATEWAY_PORT": true, "LT_KCP_PORT": true, "LT_VHOST_HTTP_PORT": true,
+	"LT_VHOST_HTTPS_PORT": true, "LT_USER_PORT": true, "LT_FRPS_API_PORT": true,
+	"LT_PORT_RANGE_START": true, "LT_PORT_RANGE_END": true,
+}
+
+// validateNumericEnvs 在装载前拒绝「设了但解析不出来」的整数变量。
+func validateNumericEnvs() error {
+	for _, key := range numericEnvKeys {
+		raw, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("%s=%q 不是合法的整数", key, raw)
+		}
+		if portEnvKeys[key] && (n < 1 || n > 65535) {
+			return fmt.Errorf("%s=%d 不在 1-65535 范围内", key, n)
+		}
+		if key == "LT_REDIS_DB" && n < 0 {
+			return fmt.Errorf("LT_REDIS_DB=%d 不能为负数", n)
+		}
+		if key == "LT_MAX_PORTS_PER_USER" && n < 1 {
+			return fmt.Errorf("LT_MAX_PORTS_PER_USER=%d 必须大于 0", n)
+		}
+	}
+	// 监听地址里的端口同样要校验：'host:abc' 会让 net.Listen 在启动末尾
+	// 才失败，而那时代码已经做过一轮数据库迁移。
+	for _, key := range []string{"LT_USER_ADDR", "LT_FRPS_API_ADDR"} {
+		raw, ok := os.LookupEnv(key)
+		if !ok || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		_, portStr, err := net.SplitHostPort(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("%s=%q 不是合法的 host:port：%w", key, raw, err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("%s 的端口 %q 不在 1-65535 范围内", key, portStr)
+		}
+	}
+	return nil
+}
+
 // Load 从环境变量装载配置并做必要校验。
 func Load() (*Config, error) {
+	if err := validateNumericEnvs(); err != nil {
+		return nil, err
+	}
 	if err := validateEnvInts(); err != nil {
 		return nil, err
 	}

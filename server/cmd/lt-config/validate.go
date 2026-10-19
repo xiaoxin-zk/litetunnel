@@ -233,6 +233,9 @@ func (s *service) validateCaddy(ctx context.Context, text, image string, vars ma
 		if err := os.RemoveAll(dir); err != nil {
 			log.Printf("[lt-config] 清理 Caddy 校验目录失败（%s），请人工处理: %v", dir, err)
 			s.registerDirtyScene()
+			// 目录里有挂进容器的 DNS 凭据，必须让本次响应明确提示，
+			// 而不是只留一行日志——日志会被滚掉，凭据不会自己消失。
+			s.addWarn(fmt.Sprintf("Caddy 校验临时目录未能清理（%s）：%v；其中可能含 DNS 凭据，请人工删除", dir, err))
 		}
 	}()
 
@@ -309,6 +312,7 @@ func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, 
 		if err := os.RemoveAll(dir); err != nil {
 			log.Printf("[lt-config] 清理 frps 校验目录失败（%s），请人工处理: %v", dir, err)
 			s.registerDirtyScene()
+			s.addWarn(fmt.Sprintf("frps 校验临时目录未能清理（%s）：%v；请人工删除", dir, err))
 		}
 	}()
 

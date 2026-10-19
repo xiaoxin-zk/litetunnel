@@ -41,6 +41,7 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h := tlscfg.Health{DeployDir: s.paths.deployDir, Available: true, BlockedDirs: s.blockedDirsSnapshot()}
+	var envErr error
 	if _, vars, err := readEnvFile(s.paths.envFile); err == nil {
 		h.Ports = tlscfg.Ports{
 			Gateway:    atoiOr(vars["LT_GATEWAY_PORT"], 0),
@@ -48,6 +49,10 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 			VhostHTTP:  atoiOr(vars["LT_VHOST_HTTP_PORT"], 0),
 			VhostHTTPS: atoiOr(vars["LT_VHOST_HTTPS_PORT"], 0),
 		}
+	} else {
+		// .env 读不出来时不能报告可用：端口显示为空、而面板照样允许点保存，
+		// 真正的原因（权限/挂载）会被埋在应用失败的错误里。
+		envErr = err
 	}
 	// docker 分两层报告：Docker 只说明命令在 PATH 里，DockerReady 才说明
 	// 宿主机现在真的能起容器。二者分开是为了让面板能给出准确的下一步——
@@ -76,6 +81,12 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+	}
+	// .env 读不出来时覆盖前两步的结论：缺 docker 可以装，缺模板可以补，
+	// 而「配置源本身读不到」会让后续每一次保存都在同一个地方失败。
+	if envErr != nil {
+		h.Available = false
+		h.Reason = fmt.Sprintf("无法读取 %s（%v）：请检查部署目录的权限与挂载", s.paths.envFile, envErr)
 	}
 	// 现场未收敛放在最后判断：它是「必须人工介入」的状态，比缺 docker、
 	// 缺文件更该先处理，Reason 也以它为准——否则界面显示「缺少某个文件」，
@@ -119,6 +130,12 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, res)
 			return
 		}
+		// 另一个应用还在跑：409，让前端提示「等它结束」。绝不能排队——
+		// 排队会让第二个事务在第一个超时之后才开始改盘。
+		if errors.Is(err, errApplyBusy) {
+			failJSON(w, http.StatusConflict, err)
+			return
+		}
 		// 按错误类别区分状态码：配置错 422（原地改配置）、宿主机错 502（去查
 		// docker）、读盘/写盘错 500（看本服务日志）。返回前先脱敏：校验输出里
 		// 可能带回服务商插件打印的凭据片段。
@@ -154,7 +171,12 @@ func (s *service) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	// 与 /render 共用同一把锁：否则容器可能重建在「文件替换到一半」的瞬间，
 	// 起出来的进程读到的就是一份新旧混合的配置。
-	s.applyMu.Lock()
+	//
+	// 同样用 TryLock：重建容器的耗时不可控，排队只会把请求堆到超时之后。
+	if !s.applyMu.TryLock() {
+		failJSON(w, http.StatusConflict, errApplyBusy)
+		return
+	}
 	defer s.applyMu.Unlock()
 
 	// 现场未收敛时同样拒绝：磁盘可能是新旧混合，按它重建容器等于把混合

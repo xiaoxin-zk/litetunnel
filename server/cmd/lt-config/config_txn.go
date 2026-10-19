@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -52,6 +53,8 @@ type writeBatch struct {
 	// 替换失败会走回滚，内容回到旧版本，权限却停在新的（且可能是放宽的）
 	// 值上——一份回滚不完整的配置比不纠正权限更糟。
 	modeFix []pendingModeFix
+	// modeFixed 表示至少有一次权限纠正真的生效了，供 revert 决定要不要恢复。
+	modeFixed bool
 }
 
 // pendingModeFix 一个待纠正的权限。
@@ -59,6 +62,12 @@ type pendingModeFix struct {
 	name string
 	path string
 	mode os.FileMode
+	// original 是修改之前的权限，供 revert 恢复。
+	//
+	// 没有它的话，「内容回滚成功、权限却停在收紧后的值」会留下一个
+	// 与旧配置不匹配的混合状态：备份文件里的内容是旧的，而目标文件的
+	// 权限是新的（可能已经放宽）。
+	original os.FileMode
 }
 
 // pendingChanges 列出「如果应用，会变化哪些文件」，全程不碰磁盘。
@@ -110,7 +119,13 @@ func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 			// 这里只检查「当前权限是否已经是期望值」，读不出来同样按需要纠正
 			// 处理——那与 ensureMode 内部 Stat 失败的处理一致。
 			if fi, err := os.Stat(w.path); err != nil || fi.Mode().Perm() != w.mode.Perm() {
-				b.modeFix = append(b.modeFix, pendingModeFix{name: w.name, path: w.path, mode: w.mode})
+				var orig os.FileMode
+				if err == nil {
+					orig = fi.Mode().Perm()
+				}
+				b.modeFix = append(b.modeFix, pendingModeFix{
+					name: w.name, path: w.path, mode: w.mode, original: orig,
+				})
 			}
 			continue
 		}
@@ -137,9 +152,33 @@ func (b *writeBatch) applyModeFixes() {
 				fmt.Sprintf("%s 的内容没变，但权限纠正失败（期望 %#o）: %v", fix.name, fix.mode.Perm(), err))
 			continue
 		}
+		b.modeFixed = true
 		b.warn = append(b.warn,
 			fmt.Sprintf("%s 的内容没变，权限已收紧为 %#o", fix.name, fix.mode.Perm()))
 	}
+}
+
+// restoreModeFixes 把已经改过的权限恢复成原值。
+//
+// 用于「内容已提交、容器重建失败、整批回滚」这条路径：内容能回滚，权限
+// 却留在新值上，磁盘就不再是「提交前的那一份」。只在确实改过时才动手。
+func (b *writeBatch) restoreModeFixes() error {
+	if !b.modeFixed {
+		return nil
+	}
+	var failures []string
+	for _, fix := range b.modeFix {
+		if fix.original == 0 {
+			continue
+		}
+		if err := os.Chmod(fix.path, fix.original); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", fix.name, err))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("恢复文件权限失败: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // commit 逐个替换目标文件，失败时整体回滚。
@@ -187,7 +226,18 @@ func (b *writeBatch) commit() error {
 	}
 	// 每个文件的备份摘要此刻才齐全，补写进记录：崩溃恢复时要靠它确认
 	// 「这份备份确实是当时的旧文件」，而不是一份写了一半的东西。
-	b.refreshBackupSums()
+	//
+	// 补写失败必须整批回滚，而不是「记一行日志继续」：记录里没有摘要时，
+	// 恢复只能退化成「备份文件存在就当它是旧内容」。若那份备份恰好是被
+	// 覆盖/截断的残片，恢复会把半份内容当成原始配置写回去——一个安静的
+	// 数据损坏，比这次应用失败严重得多。
+	if err := b.refreshBackupSums(); err != nil {
+		rbErr := b.rollbackCommitted()
+		if rbErr != nil {
+			return fmt.Errorf("补写备份摘要失败，且回滚未完成（已保留批次记录，重启后按批次恢复）: %v；回滚错误: %w", err, rbErr)
+		}
+		return b.rollbackFailedCommit(m, "备份摘要", err)
+	}
 
 	// 内容全部替换成功之后才纠正权限（见 applyModeFixes）。
 	b.applyModeFixes()

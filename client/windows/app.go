@@ -473,11 +473,14 @@ func (a *App) startup(ctx context.Context) {
 		// 日志回调在 Manager 内排队，旧进程的行可能晚于新进程到达。
 		// 只有当前 generation 才能修改注册、退避和错误状态；旧日志仍保留
 		// 用于诊断，但不再污染当前隧道运行态。
-		current := a.mgr.Current(id, gen)
-		a.appendLogLine(seq, line)
-		if !current {
+		// 先判代次再落日志：旧账号进程迟到的行不属于当前账号，既不能改
+		// 状态也不能进日志缓冲——否则用户换了账号，界面上会先冒出上一段
+		// 会话的输出。Manager 已在入队前做过一次同样的过滤，这里是回调
+		// 排队期间又发生切换时的第二道。
+		if !a.mgr.Current(id, gen) {
 			return
 		}
+		a.appendLogLine(seq, line)
 		switch {
 		case strings.Contains(line, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。

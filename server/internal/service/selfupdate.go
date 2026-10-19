@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -160,6 +161,12 @@ func (s *Services) ApplyPanelUpdate(ctx context.Context) (string, error) {
 	if err := os.Rename(exe, backup); err != nil {
 		return "", fmt.Errorf("备份当前版本失败（目录不可写？）: %w", err)
 	}
+	// 写「更新待确认」标记：新进程稳定运行 30 秒后才删除；启动脚本据此判断
+	// 上一次启动是否失败并回滚到 .old。
+	if err := s.writeUpdatePending(status.Latest, backup); err != nil {
+		log.Printf("[selfupdate] 写入更新标记失败（不影响本次更新）: %v", err)
+	}
+
 	if err := os.Rename(newPath, exe); err != nil {
 		// 换不回去就等于服务没了，立刻还原备份。
 		_ = os.Rename(backup, exe)
@@ -175,6 +182,53 @@ func (s *Services) RestartPanel() {
 		time.Sleep(400 * time.Millisecond)
 		if err := reExecSelf(); err != nil {
 			log.Printf("[selfupdate] 重启失败，请手动重启服务: %v", err)
+		}
+	}()
+}
+
+type updatePending struct {
+	Version string    `json:"version"`
+	Backup  string    `json:"backup"`
+	Exe     string    `json:"exe"`
+	At      time.Time `json:"at"`
+}
+
+func (s *Services) dataDir() string {
+	if v := strings.TrimSpace(os.Getenv("LT_DATA_DIR")); v != "" {
+		return v
+	}
+	if s.Cfg.DBDriver == "sqlite" {
+		if d := filepath.Dir(s.Cfg.DBDSN); d != "" && d != "." {
+			return d
+		}
+	}
+	return filepath.Join(".", "data")
+}
+
+func (s *Services) updatePendingPath() string {
+	return filepath.Join(s.dataDir(), "update-pending.json")
+}
+
+func (s *Services) writeUpdatePending(version, backup string) error {
+	if err := os.MkdirAll(s.dataDir(), 0o750); err != nil {
+		return err
+	}
+	exe, _ := os.Executable()
+	data, err := json.Marshal(updatePending{Version: version, Backup: backup, Exe: exe, At: time.Now()})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.updatePendingPath(), data, 0o644)
+}
+
+// ConfirmStartup 由 main 在服务起来后调用：稳定运行 30 秒即删除「更新待确认」标记。
+// 若新版本反复崩溃，标记会一直留着，启动脚本据此把 .old 换回来。
+func (s *Services) ConfirmStartup() {
+	path := s.updatePendingPath()
+	go func() {
+		time.Sleep(30 * time.Second)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("[selfupdate] 清除更新标记失败: %v", err)
 		}
 	}()
 }

@@ -80,6 +80,8 @@ func main() {
 		frpsplugin.New(svc, cfg.FrpsPluginAllowCIDRs))
 
 	srv := newServer(cfg.UserAddr, engine)
+	// 稳定运行 30 秒后清除「更新待确认」标记，供启动脚本判断是否需要回滚。
+	svc.ConfirmStartup()
 
 	go func() {
 		log.Printf("LiteTunnel %s 启动中（环境 %s）", config.Version, cfg.Env)

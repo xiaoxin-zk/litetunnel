@@ -37,6 +37,8 @@ const (
 
 	KeyAuditRetentionDays SettingKey = "audit.retention_days"
 	KeyStepUpEnabled      SettingKey = "security.step_up_enabled"
+	KeyBackupAuto         SettingKey = "backup.auto_enabled"
+	KeyBackupRetention    SettingKey = "backup.retention"
 
 	KeyOAuthGitHubEnabled      SettingKey = "oauth.github_enabled"
 	KeyOAuthGitHubClientID     SettingKey = "oauth.github_client_id"
@@ -138,6 +140,8 @@ var settingSpecs = []settingSpec{
 
 	{Key: KeyAuditRetentionDays, Default: func(*config.Config) string { return "180" }},
 	{Key: KeyStepUpEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyBackupAuto, Default: func(*config.Config) string { return "true" }},
+	{Key: KeyBackupRetention, SingleLine: true, Default: func(*config.Config) string { return "7" }},
 
 	{Key: KeyOAuthGitHubEnabled, Default: func(*config.Config) string { return "false" }},
 	{Key: KeyOAuthGitHubClientID, SingleLine: true, Default: func(*config.Config) string { return "" }},

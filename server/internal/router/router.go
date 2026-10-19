@@ -182,6 +182,7 @@ func New(
 		adminRead.GET("/mail-templates", adminH.ListMailTemplates)
 		adminRead.GET("/domain/status", adminH.DomainStatus)
 		adminRead.GET("/admin-api-keys", adminH.ListAdminAPIKeys)
+		adminRead.GET("/backups", adminH.ListBackups)
 	}
 
 	adminWrite := r.Group("/api/admin")
@@ -224,6 +225,11 @@ func New(
 		adminSuper.DELETE("/admins/:id", adminH.DeleteAdmin)
 		adminSuper.POST("/admins/:id/password", adminH.SetAdminPassword)
 		adminSuper.POST("/admins/:id/totp-reset", adminH.ClearAdminTOTP)
+
+		adminSuper.POST("/backups", adminH.CreateBackup)
+		adminSuper.GET("/backups/:name/download", adminH.DownloadBackup)
+		adminSuper.DELETE("/backups/:name", adminH.DeleteBackup)
+		adminSuper.POST("/backups/:name/restore", adminH.RestoreBackup)
 
 		adminSuper.POST("/system/update/apply", adminH.ApplyUpdate)
 		adminSuper.POST("/system/update/restart", adminH.RestartPanel)

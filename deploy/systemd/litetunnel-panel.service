@@ -14,6 +14,8 @@ Environment=LT_DATA_DIR=/var/lib/litetunnel
 # 允许面板「立即更新」：下载新二进制、校验后原地替换并 exec 自身。
 # 容器部署不要设置这一项（容器内替换会在重启后失效）。
 Environment=LT_SELF_UPDATE=1
+# 启动前检查上次更新是否失败，失败则自动还原 .old。
+ExecStartPre=/opt/litetunnel/selfupdate-guard.sh
 ExecStart=/opt/litetunnel/litetunnel-panel
 Restart=always
 RestartSec=3

@@ -288,7 +288,7 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 				c.Redirect(http.StatusFound, adminPath+"/")
 				return
 			}
-			serveIndexHTML(c, adminIndex, cfg.Version)
+			serveIndexHTML(c, adminIndex, config.Version)
 			return
 		}
 
@@ -296,7 +296,7 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 			httpx.NotFound(c, "前端资源未构建")
 			return
 		}
-		serveIndexHTML(c, userIndex, cfg.Version)
+		serveIndexHTML(c, userIndex, config.Version)
 	})
 }
 

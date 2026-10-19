@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 )
 
 const (
@@ -177,7 +179,7 @@ func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error
 	}
 
 	latest := strings.TrimPrefix(rel.TagName, "v")
-	current := s.Cfg.Version
+	current := config.Version
 	hasUpdate, comparable := versionLess(current, latest)
 
 	status := &UpdateStatus{

@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/handler/shared"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
@@ -29,7 +30,7 @@ func (h *Handler) Profile(c *gin.Context) {
 		"totp_verified_at": a.TOTPVerifiedAt,
 		"last_login_at":    a.LastLoginAt,
 		"last_login_ip":    a.LastLoginIP,
-		"version":          h.svc.Cfg.Version,
+		"version":          config.Version,
 	})
 }
 

@@ -125,6 +125,23 @@ func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 	return b, nil
 }
 
+// applyModeFixes 纠正「内容没变、权限不符」的文件。
+//
+// 只在内容替换全部成功之后调用（或整批没有内容变化时）。失败只记 warn：
+// 文件内容已经是新的，报错会让调用方按「应用失败」回滚内容，权限问题反而
+// 被掩盖成一次配置回滚。
+func (b *writeBatch) applyModeFixes() {
+	for _, fix := range b.modeFix {
+		if err := os.Chmod(fix.path, fix.mode.Perm()); err != nil {
+			b.warn = append(b.warn,
+				fmt.Sprintf("%s 的内容没变，但权限纠正失败（期望 %#o）: %v", fix.name, fix.mode.Perm(), err))
+			continue
+		}
+		b.warn = append(b.warn,
+			fmt.Sprintf("%s 的内容没变，权限已收紧为 %#o", fix.name, fix.mode.Perm()))
+	}
+}
+
 // commit 逐个替换目标文件，失败时整体回滚。
 //
 // 三个文件互相引用（Caddyfile 的域名要与 frps.toml 的 subDomainHost 一致，
@@ -133,6 +150,13 @@ func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 // 才以错误形式爆炸。所以每个文件替换前先备份旧内容（见 stagedFile.commit），
 // 失败时把已替换的文件恢复，最终磁盘回到「全部旧配置」。
 func (b *writeBatch) commit() error {
+	// 没有任何文件需要替换时只剩权限纠正：没有内容变化就没有可恢复的现场，
+	// 不能写一份 Files 为空的批次记录——下次启动的严格 schema 校验会把它
+	// 判成不可信，从而把整个目录永久阻断。
+	if len(b.staged) == 0 {
+		b.applyModeFixes()
+		return nil
+	}
 	// 先把整批文件的身份落盘，再动第一个目标文件。进程内回滚只覆盖「本进程
 	// 还活着」的失败；强杀或断电时，磁盘可能停在第一个文件已换新、第二个
 	// 还没换的中间态，而启动清理单看某个文件的备份无法判断整批是否提交完整。
@@ -165,18 +189,8 @@ func (b *writeBatch) commit() error {
 	// 「这份备份确实是当时的旧文件」，而不是一份写了一半的东西。
 	b.refreshBackupSums()
 
-	// 内容全部替换成功之后才纠正权限。失败只记 warn：文件内容已经是新的，
-	// 此时报错会让调用方按「应用失败」回滚，而它回滚的是内容——权限问题
-	// 反而被掩盖成一次配置回滚。
-	for _, fix := range b.modeFix {
-		if err := os.Chmod(fix.path, fix.mode.Perm()); err != nil {
-			b.warn = append(b.warn,
-				fmt.Sprintf("%s 的内容没变，但权限纠正失败（期望 %#o）: %v", fix.name, fix.mode.Perm(), err))
-			continue
-		}
-		b.warn = append(b.warn,
-			fmt.Sprintf("%s 的内容没变，权限已收紧为 %#o", fix.name, fix.mode.Perm()))
-	}
+	// 内容全部替换成功之后才纠正权限（见 applyModeFixes）。
+	b.applyModeFixes()
 
 	// 全部成功，但**不在这里**撤记录、清备份。
 	//

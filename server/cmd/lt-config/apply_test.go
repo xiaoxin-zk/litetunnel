@@ -191,10 +191,24 @@ func TestPrepareWritesFixesLoosePermissions(t *testing.T) {
 	if len(batch.changed) != 0 {
 		t.Errorf("内容没变时不该报「文件已变化」，得到 %v", batch.changed)
 	}
+	// 准备阶段**不许**碰磁盘：这一批后面还可能因为另一个文件准备失败而整体
+	// 放弃，此时权限若已经被改过就回不去了。
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("准备阶段不应修改权限，实际 %v", info.Mode().Perm())
+	}
+
+	// 提交成功之后才纠正权限，并留下提示。
+	if err := batch.commit(); err != nil {
+		t.Fatal(err)
+	}
 	if len(batch.warn) == 0 {
 		t.Error("权限被收紧应当留下提示，否则管理员不会知道磁盘上曾经是 0644")
 	}
-	info, err := os.Stat(path)
+	info, err = os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}

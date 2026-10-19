@@ -839,12 +839,31 @@ func (a *App) shutdown(ctx context.Context) {
 	// 关信号必须在等退出之前：不关的话 logWg.Wait 会永远等不到。
 	if a.logStop != nil {
 		a.logStopOnce.Do(func() { close(a.logStop) })
-		a.logWg.Wait()
+		// 等待必须带超时：flusher 与 stateLoop 最终都会调 Wails 的
+		// EventsEmit，而它是同步的——窗口正在销毁时那次调用可能迟迟不返回。
+		// 没有超时的话，用户点关闭后进程会挂在退出流程里（任务管理器里
+		// 留一个「未响应」的客户端），比丢最后几行日志严重得多。
+		done := make(chan struct{})
+		go func() {
+			a.logWg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(shutdownDrainTimeout):
+			log.Printf("[client] 退出时仍有日志/状态推送未完成（UI 可能已销毁），不再等待")
+		}
 	}
 	// 把队列里剩下的日志推出去：停止进程会产出「隧道已断开」「frpc 已退出」
 	// 这类收尾日志，攒在队列里不发，用户下次打开客户端时日志就断在退出前。
 	a.flushLogs()
 }
+
+// shutdownDrainTimeout 是退出时等待日志/状态推送协程收敛的上限。
+//
+// 2 秒足够推完积压的几批日志（每批 ≤200 行，EventsEmit 正常情况下毫秒级），
+// 又短到用户感知不到「点了关闭却没反应」。
+const shutdownDrainTimeout = 2 * time.Second
 
 // OpenDataDir 在资源管理器中打开数据目录。
 func (a *App) OpenDataDir() (string, error) {

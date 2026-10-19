@@ -241,7 +241,17 @@ func (s *Services) loadPendingFirewall() {
 	if s.fwPending == nil {
 		s.fwPending = map[int]pendingFW{}
 	}
+	loaded := 0
 	for _, r := range recs {
+		// 恢复也要受容量上限约束：库里的历史待办可能远超内存上限（异常期间
+		// 累积、或多实例共用一个库），全量装入等于绕过 pendingFWLimit——
+		// 内存涨上去，重试一轮扫的端口也变多，周期被拉长。
+		//
+		// 超出部分不静默丢：留一条日志说明「还有 N 条没有恢复」，运维可以在
+		// 端口管理页按端口自查，而不是以为队列已经空了。
+		if len(s.fwPending) >= pendingFWLimit && !hasPendingLocked(s.fwPending, r.Port) {
+			continue
+		}
 		// 加载不是无条件覆盖：协调器是延迟 3 秒才起来读库的，这段时间 HTTP
 		// 服务已经在跑，新建/停用隧道会先往内存里写意图。无条件覆盖会把
 		// 它们换成库里的旧记录——那条新意图既不执行、也不再被展示。
@@ -253,10 +263,22 @@ func (s *Services) loadPendingFirewall() {
 			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
 			exhausted: r.Exhausted, gen: r.Generation,
 		}
+		loaded++
 	}
 	n := len(s.fwPending)
 	s.fwMu.Unlock()
+	if loaded < len(recs) {
+		log.Printf("[firewall] 从数据库恢复了 %d 条待处理的端口操作（共 %d 条，其余 %d 条超出队列上限 %d，未恢复，需人工核对）",
+			n, len(recs), len(recs)-loaded, pendingFWLimit)
+		return
+	}
 	log.Printf("[firewall] 从数据库恢复了 %d 条待处理的端口操作，将继续重试", n)
+}
+
+// hasPendingLocked 报告该端口是否已在待办表里（调用方须持有 fwMu）。
+func hasPendingLocked(m map[int]pendingFW, port int) bool {
+	_, ok := m[port]
+	return ok
 }
 
 // applyPortIntent 执行一次端口操作；失败时记入待重试队列。

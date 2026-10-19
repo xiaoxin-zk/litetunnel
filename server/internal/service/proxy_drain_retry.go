@@ -253,6 +253,15 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 			// 永久拒绝为这个账号做补偿。
 			"attempts":   gorm.Expr("excluded.attempts"),
 			"exhausted":  gorm.Expr("excluded.exhausted"),
+			// 新意图登记时把「人工待办」标记清掉。
+			//
+			// 不清的话，同一行会同时是「exhausted=false（重试器照常自动执行）」
+			// 和「manual_review=true（指标把它算作已停止、等人工）」——管理端
+			// 的人工待办数只增不减，运维去核对一批其实正在自动重试的代理，
+			// 真正需要人看的「疑似误关」被噪声淹没。全仓库只有 reschedule 会
+			// 置 true，没有别的路径能置回 false。
+			"manual_review": false,
+			"suspects":      "",
 			"next_at":    gorm.Expr("excluded.next_at"),
 			"fence":      gorm.Expr("excluded.fence"),
 			"last_err":   gorm.Expr("excluded.last_err"),

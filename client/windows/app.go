@@ -591,7 +591,10 @@ func (a *App) startup(ctx context.Context) {
 			// 但只在错误原文**变化**时刷新，并对同一隧道限频：一次连接失败
 			// 可能瞬间刷出上千行同样的错误，逐行推状态纯属浪费（每推一次都
 			// 要序列化整个状态），而重复的错误对用户没有新信息。
-			if a.recordTunnelErrMsgAcct(id, epoch, gen, line) && a.epochCurrent(epoch) {
+			// 传原始行：line 已被 Manager 拼过 `HH:MM:SS  Tunnel/<名字>  ` 前缀，
+			// 原样存进 last_error 会让界面显示成「14:22:01 Tunnel/x [E] ... · 14:22:01」，
+			// 时间戳重复、内部前缀混进给用户看的文案，还白吃掉截断预算。
+			if a.recordTunnelErrMsgAcct(id, epoch, gen, frpc.StripLogPrefix(line)) && a.epochCurrent(epoch) {
 				// 合并式推送自带限频（stateEmitMinInterval），不需要再按隧道
 				// 各限一次；这里同样不能阻塞日志投递协程。
 				a.requestState()

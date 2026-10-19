@@ -145,7 +145,22 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return err
 	}
 
-	if _, changed := in[KeyFirewallEnabled]; changed && !firewallWasOn && s.Settings.Bool(KeyFirewallEnabled) {
+	// 任何「影响能否真正放行/收回」的开关变化都要唤醒协调器，而不只是总开关
+	// 由关变开那一次。
+	//
+	// 反例（真实缺陷）：auto_open 关闭期间建的隧道，FirewallOpenPort 直接
+	// return nil（不报错、也不入队），于是那些端口既没规则、也没有待办；
+	// 管理员随后把 auto_open 打开时若没人唤醒协调器，aligned 仍是 true，
+	// ReconcileFirewall 不会重跑——端口永久没放行，而界面一片绿。
+	needsReconcile := false
+	for _, k := range []SettingKey{KeyFirewallEnabled, KeyFirewallAutoOpen, KeyFirewallAutoClose} {
+		if _, changed := in[k]; changed {
+			needsReconcile = true
+		}
+	}
+	if needsReconcile && (s.Settings.Bool(KeyFirewallEnabled) || !firewallWasOn) {
+		// 总开关刚被关掉时也唤醒一次：让协调器把 aligned 重置，下次打开时
+		// 才会重新对齐，而不是沿用关闭前的「已对齐」。
 		s.KickFirewall()
 	}
 	return nil

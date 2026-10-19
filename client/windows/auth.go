@@ -25,6 +25,19 @@ type groupLimit struct {
 	AllowProtocols    string `json:"allow_protocols"`
 	AllowCustomDomain bool   `json:"allow_custom_domain"`
 	BandwidthLimitStr string `json:"bandwidth_limit_str"`
+	// 下面三个字段服务端一直在下发，但客户端结构体里没有对应字段，
+	// encoding/json 会把它们**静默丢掉**，于是界面拿不到判断依据：
+	//
+	//   - https_tunnel_enabled：edge 模式下服务端会拒绝 https 隧道，
+	//     而表单照样提供该选项，用户填完整张表才被 ErrNoHTTPSProxyEntry 拒；
+	//   - https_entry：账户信息里的「HTTPS 隧道入口」永远不显示；
+	//   - max_ports：端口配额对用户不可见，建到超限才报错。
+	//
+	// 用指针是为了区分「服务端没说」（nil）与「服务端说关闭」（false）：
+	// 老服务端不下发该键时，前端应保持现有行为，而不是把 https 藏起来。
+	HTTPSTunnelEnabled *bool  `json:"https_tunnel_enabled"`
+	HTTPSEntry         string `json:"https_entry"`
+	MaxPorts           int    `json:"max_ports"`
 }
 
 type clientInfoData struct {

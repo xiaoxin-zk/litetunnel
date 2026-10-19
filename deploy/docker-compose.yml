@@ -80,7 +80,13 @@ services:
     environment:
       # 覆盖为回环监听：公网流量统一由 Caddy 进入
       # 用户控制台与管理后台共用该端口，通过 /admin 路径区分
-      LT_USER_ADDR: "127.0.0.1:7848"
+      # 端口必须跟随 .env 的 LT_USER_PORT：Compose 的 environment **优先于**
+      # env_file，写死 7848 时用户改了 LT_USER_PORT，模板（Caddyfile 的
+      # reverse_proxy、frps 的插件回调）都指向新端口，而面板仍在 7848 监听。
+      # 结果是「配置已应用、容器都 running」，但控制台 502、所有客户端
+      # 登录回调打到没人监听的端口。lt-config 的校验也只看 LT_USER_PORT
+      # 自身，不会发现这处矛盾。
+      LT_USER_ADDR: "127.0.0.1:${LT_USER_PORT:-7848}"
       LT_DB_DRIVER: "sqlite"
       LT_DB_DSN: "/data/litetunnel.db"
       LT_USER_WEB_DIR: "/app/web/user"

@@ -337,7 +337,7 @@ func (s *Services) raiseAlert(kind, level, message string, value, threshold floa
 		case last.Status == model.AlertStatusFiring:
 			// 只有两个通道都没成功时才重试；邮件已入队时重复投递只会多收一封。
 			if !last.Delivered && !last.MailQueued {
-				s.deliverAlert(last)
+				s.deliverAlert(last, false)
 				return
 			}
 			// 同一事件每 30 分钟提醒一次：长期故障不会只在开头响一声，
@@ -347,7 +347,8 @@ func (s *Services) raiseAlert(kind, level, message string, value, threshold floa
 				last.Value = value
 				last.Threshold = threshold
 				s.refreshAlert(&last)
-				s.deliverAlert(last)
+				// 提醒必须重新推一次 Webhook，不能因为「之前送达过」就跳过。
+				s.deliverAlert(last, true)
 			}
 			return
 		case last.ResolvedAt != nil && time.Since(*last.ResolvedAt) < alertCooldown:
@@ -372,14 +373,14 @@ func (s *Services) raiseAlert(kind, level, message string, value, threshold floa
 			kind, s.nodeID, model.AlertStatusFiring).
 			Order("id DESC").First(&open).Error; e == nil {
 			if !open.Delivered && !open.MailQueued {
-				s.deliverAlert(open)
+				s.deliverAlert(open, false)
 			}
 			return
 		}
 		log.Printf("[alert] 记录告警失败: %v", err)
 		return
 	}
-	s.deliverAlert(ev)
+	s.deliverAlert(ev, false)
 }
 
 // reopenAlert 把刚恢复的事件重新打开。条件在冷却窗口内复发时当作同一次抖动，
@@ -472,11 +473,12 @@ func (s *Services) refreshAlert(ev *model.AlertEvent) {
 
 // deliverAlert 推送并回写送达状态。Webhook 与邮件是两条独立通道，
 // 任一成功就算「已通知」；都失败时只记日志，下一轮采样重试同一条。
-func (s *Services) deliverAlert(ev model.AlertEvent) {
+// force=true 用于 30 分钟提醒：即使之前送达过也要再推一次 Webhook。
+func (s *Services) deliverAlert(ev model.AlertEvent, force bool) {
 	cfg := s.AlertConfig()
 	updates := map[string]any{}
 
-	webhookOK := ev.Delivered
+	webhookOK := ev.Delivered && !force
 	if cfg.WebhookURL != "" && !webhookOK {
 		if err := s.postWebhook(ev); err != nil {
 			// 地址里通常带 token，日志只记出站策略能安全展示的部分。
@@ -494,6 +496,12 @@ func (s *Services) deliverAlert(ev model.AlertEvent) {
 	}
 
 	if len(updates) == 0 {
+		// 提醒尝试过但两个通道都没成功：仍然推进提醒时间，
+		// 避免每 5 分钟重试一次把日志和接收端刷爆。
+		if force {
+			s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).
+				Update("last_notified_at", time.Now())
+		}
 		return
 	}
 	updates["last_notified_at"] = time.Now()

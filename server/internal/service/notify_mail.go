@@ -171,7 +171,7 @@ func (s *Services) sendAlertEmail(ev model.AlertEvent, resolved bool) bool {
 	for _, to := range recipients {
 		// 带上事件 ID：发件箱最终失败时可以回写这条告警，页面才不会谎报「已通知」。
 		payload := map[string]any{"alert_event_id": ev.ID}
-		if err := s.enqueueMail(to, subject, body, kind, payload, mailQuota{}); err != nil {
+		if _, err := s.enqueueMail(to, subject, body, kind, payload, mailQuota{}); err != nil {
 			log.Printf("[alert] 告警邮件入队失败（收件人 %s）: %v", maskEmail(to), err)
 			continue
 		}
@@ -405,14 +405,14 @@ func (s *Services) enqueueSummaryReport(cfg ReportConfig, kind string, start, en
 
 	queued := 0
 	for _, to := range cfg.Recipients {
-		if err := s.enqueueMail(to, subject, body, model.MailKindReportSummary, nil, mailQuota{}); err != nil {
+		if _, err := s.enqueueMail(to, subject, body, model.MailKindReportSummary, nil, mailQuota{}); err != nil {
 			log.Printf("[report] 摘要邮件入队失败（收件人 %s）: %v", maskEmail(to), err)
 			continue
 		}
 		queued++
 	}
 	if queued > 0 {
-		log.Printf("[report] 摘要邮件已入队（%s，%d 封）", reportName, queued)
+		log.Printf("[report] 摘要邮件已入队（%s，%d 封）", reportName(kind), queued)
 	}
 	return queued
 }

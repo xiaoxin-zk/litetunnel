@@ -72,11 +72,18 @@ import (
 // proxy_drain_retry.go），本轮没关干净的代理由后台重试器按退避继续关，
 // 直到关完才删待办。关闭失败依然不中断主流程：能关一个是一个。
 func (s *Services) CloseUserProxies(ctx context.Context, userID uint, gen uint64, notAfter time.Time) {
+	s.closeUserProxiesWithIntent(ctx, userID, gen, notAfter, "")
+}
+
+// closeUserProxiesWithIntent 执行已登记的断流意图；intent 非空时不会再次
+// 创建待办，从而保持「状态事务 + 断流意图」的同一提交点。
+func (s *Services) closeUserProxiesWithIntent(ctx context.Context, userID uint, gen uint64, notAfter time.Time, intent string) {
 	s.drainProxies(ctx, proxyDrainRequest{
 		userID:   userID,
 		prefix:   FrpUserOf(userID) + ".",
 		gen:      gen,
 		notAfter: notAfter,
+		intent:   intent,
 	})
 }
 
@@ -213,7 +220,9 @@ func (s *Services) drainProxies(ctx context.Context, req proxyDrainRequest) prox
 		req.prefix = FrpUserOf(req.userID) + "."
 	}
 
-	req.intent = s.recordProxyDrainPending(req)
+	if req.intent == "" {
+		req.intent = s.recordProxyDrainPending(req)
+	}
 	if req.intent == "" {
 		// 落库失败（数据库整体不可用）。这时仍要继续断流——能关一个是一个，
 		// 但「本次没关干净」将没有任何持久化补偿。
@@ -511,11 +520,21 @@ func (s *Services) closeDrainedProxy(ctx context.Context, req proxyDrainRequest,
 		// 而那台实例写下的状态版本，这里只能查库才看得到。
 		// 查不到账号（已删除）或数据库暂时不可用时不据此中止：禁用本身
 		// 已经生效，新连接会被拒，漏关的代理影响远小于误判。
-		if dbGen, err := s.userStateVersionFromDB(req.userID); err == nil && dbGen != req.gen {
-			log.Printf("[user] 用户 %d 的状态在其他实例上已变更（版本 %d ≠ %d），停止关闭剩余代理",
-				req.userID, dbGen, req.gen)
-			return drainStepAbandoned, ""
+		dbGen, err := s.userStateVersionFromDB(req.userID)
+		if err == nil {
+			if dbGen != req.gen {
+				log.Printf("[user] 用户 %d 的状态在其他实例上已变更（版本 %d ≠ %d），停止关闭剩余代理",
+					req.userID, dbGen, req.gen)
+				return drainStepAbandoned, ""
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			// 状态无法确认时绝不能按旧版本继续 CloseProxy：另一实例可能
+			// 已经重新启用并注册同名代理。保留待办，交给下一轮重试。
+			log.Printf("[user] 用户 %d 的状态版本读取失败，跳过关闭并保留待办: %v", req.userID, err)
+			return drainStepResidual, err.Error()
 		}
+		// ErrRecordNotFound 表示账号已删除，删除路径没有可比版本，
+		// 继续依靠代理实例身份快照处理。
 	}
 
 	// 列表快照可能已经过时：同名代理在这里被重新注册后，直接按名称

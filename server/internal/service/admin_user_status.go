@@ -270,6 +270,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 	// 状态与状态版本必须一起落库：断流任务跨锁、跨实例执行，只靠进程内
 	// 代次的话，实例 B 上的重新启用不会被实例 A 的断流看到。
 	var gen uint64
+	var drainIntent string
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.User{}).Where("id = ?", id).
 			Updates(map[string]any{
@@ -311,6 +312,18 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 			return err
 		}
 		gen = u.StateVersion
+		if status != model.UserStatusActive {
+			// 断流意图与禁用状态必须在同一事务提交：进程若在提交后、
+			// CloseUserProxies 前退出，后台仍能靠这条记录继续断流。
+			drainIntent = s.recordProxyDrainPendingDB(tx, proxyDrainRequest{
+				userID: id,
+				prefix: FrpUserOf(id) + ".",
+				gen:    gen,
+			})
+			if drainIntent == "" {
+				return errors.New("记录账号禁用断流意图失败")
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -349,7 +362,7 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 继续关。所以这里不需要（也不能）等它成功——禁用必须立刻生效，
 		// 而「关流量」是个可以慢慢补偿的外部动作。
 		closeCtx, cancel := context.WithTimeout(context.Background(), closeProxiesTimeout)
-		s.CloseUserProxies(closeCtx, id, gen, disabledAt)
+		s.closeUserProxiesWithIntent(closeCtx, id, gen, disabledAt, drainIntent)
 		cancel()
 		return nil
 	}

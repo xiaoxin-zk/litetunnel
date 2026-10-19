@@ -106,9 +106,18 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 			return err
 		}
 		if len(missing) > 0 {
-			return hostError(fmt.Errorf(
-				"容器重建后未保持运行: %s（多半是新配置未被接受，请查看 docker compose logs）",
-				strings.Join(missing, ", ")))
+			// 容器刚创建时可能短暂处于 created/starting，不能把一次
+			// 尚未完成的启动直接当成配置失败。继续轮询，直到稳定窗口
+			// 成功或总超时；最终错误会带出未运行的服务名。
+			streak = 0
+			select {
+			case <-probeCtx.Done():
+				return hostError(fmt.Errorf(
+					"容器重建后在稳定检查窗口内仍未运行: %s（请查看 docker compose logs）",
+					strings.Join(missing, ", ")))
+			case <-time.After(containerStableInterval):
+				continue
+			}
 		}
 		streak++
 		if streak >= containerStableChecks {

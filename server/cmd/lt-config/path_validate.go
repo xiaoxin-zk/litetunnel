@@ -12,12 +12,16 @@ import (
 // 额外解析软链接，避免两个逻辑路径最终指向同一个文件。
 func validateManagedPaths(p paths) error {
 	managed := []struct {
-		name string
-		path string
+		name   string
+		path   string
+		output bool
 	}{
-		{"Caddyfile", p.caddyOut},
-		{"frps.toml", p.frpsOut},
-		{".env", p.envFile},
+		{"Caddyfile", p.caddyOut, true},
+		{"frps.toml", p.frpsOut, true},
+		{".env", p.envFile, true},
+		{"Caddyfile 模板", p.caddyTpl, false},
+		{"frps.toml 模板", p.frpsTpl, false},
+		{"Compose 文件", p.composeFile, false},
 	}
 	canonical := make(map[string]string, len(managed))
 	for _, item := range managed {
@@ -26,13 +30,13 @@ func validateManagedPaths(p paths) error {
 			return fmt.Errorf("%s 输出路径为空", item.name)
 		}
 		base := strings.ToLower(filepath.Base(path))
-		if base == batchManifestName || strings.HasSuffix(base, backupSuffix) ||
-			strings.HasPrefix(base, ".lt-config-tmp-") {
+		if item.output && (base == batchManifestName || strings.HasSuffix(base, backupSuffix) ||
+			strings.HasPrefix(base, ".lt-config-tmp-")) {
 			return fmt.Errorf("%s 输出路径使用了配置事务保留文件名：%s", item.name, path)
 		}
 		key := strings.ToLower(path)
 		if prev, ok := canonical[key]; ok {
-			return fmt.Errorf("%s 与 %s 使用了相同输出路径：%s", item.name, prev, path)
+			return fmt.Errorf("%s 与 %s 指向同一路径：%s", item.name, prev, path)
 		}
 		canonical[key] = item.name
 

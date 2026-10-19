@@ -148,6 +148,11 @@ func (s *stagedFile) commit() error {
 // 而不是把它当成「已经回滚好了」。
 func (s *stagedFile) restore() error {
 	if s.backup != "" {
+		// Windows 不允许 Rename 到已存在的目标。先删除新文件，再把备份
+		// 放回原位；删除失败时保留现场并返回错误，不能假装已经回滚。
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		if err := os.Rename(s.backup, s.path); err != nil {
 			return err
 		}

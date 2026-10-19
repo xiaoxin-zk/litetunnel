@@ -148,7 +148,13 @@ func decodeProxyDrainTargets(raw string) []proxyDrainTarget {
 // 数字字面量比较布尔列——SQLite 存 0/1、Postgres 是真 boolean，
 // `deleted = 1` 在 Postgres 上会直接类型错误。
 func (s *Services) recordProxyDrainPending(req proxyDrainRequest) string {
-	if s.DB == nil {
+	return s.recordProxyDrainPendingDB(s.DB, req)
+}
+
+// recordProxyDrainPendingDB 在给定数据库句柄上登记断流意图。
+// 事务内调用时传入事务句柄，使「账号禁用」与「断流意图」在同一个提交点落地。
+func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest) string {
+	if db == nil {
 		return ""
 	}
 	fence, err := randomHex(16)
@@ -168,7 +174,7 @@ func (s *Services) recordProxyDrainPending(req proxyDrainRequest) string {
 		NextAt:    time.Now().Add(proxyDrainBaseDelay),
 		Fence:     fence,
 	}
-	res := s.DB.Clauses(clause.OnConflict{
+	res := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"prefix", "status_gen", "not_after", "deleted", "intent_at", "targets",
@@ -196,7 +202,7 @@ func (s *Services) recordProxyDrainPending(req proxyDrainRequest) string {
 	// 并不一致，据此认领会把「被更强意图拒绝」误判成「我登记成功」，随后
 	// 拿错误的围栏令牌去收尾别人的待办（把那条真正该执行的断流删掉）。
 	var mine int64
-	if err := s.DB.Model(&model.ProxyDrainPending{}).
+	if err := db.Model(&model.ProxyDrainPending{}).
 		Where("user_id = ? AND fence = ?", req.userID, fence).Count(&mine).Error; err != nil {
 		log.Printf("[proxy-drain] 读回用户 %d 的断流待办失败: %v", req.userID, err)
 		return ""

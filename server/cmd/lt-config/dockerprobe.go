@@ -161,6 +161,12 @@ func composeAfterDocker(res dockerProbeResult, probeCompose func() composeProbeR
 	cres := probeCompose()
 	res.ComposeReady = cres.Ready
 	res.ComposeReason = cres.Reason
+	if cres.Ready {
+		s.composeMu.Lock()
+		s.composeBin = cres.Bin
+		s.composeV2 = cres.V2
+		s.composeMu.Unlock()
+	}
 	return res
 }
 
@@ -228,19 +234,11 @@ func probeComposeHost() composeProbeResult {
 		return composeProbeResult{Ready: true}
 	}
 
-	// 退回 V1 的独立二进制。LookPath 失败说明它也没装，不必再起进程。
-	if path, err := exec.LookPath("docker-compose"); err == nil && path != "" {
-		if _, err := runVersionProbe(path, "version"); err == nil {
-			return composeProbeResult{Ready: true}
-		}
-	}
-
 	detail := pluginOut
 	if detail == "" {
 		detail = pluginErr.Error()
 	}
-	return composeProbeResult{Reason: "docker compose 不可用（插件与独立 docker-compose 都没能跑起来）：" +
-		"校验与重建容器都要用它，请安装 compose 插件（docker-compose-plugin）或 docker-compose；" +
+	return composeProbeResult{Reason: "docker compose V2 不可用：校验与重建容器统一使用 docker compose，请安装 docker-compose-plugin；" +
 		"docker compose version 的输出：" + truncateRunes(detail, 200)}
 }
 

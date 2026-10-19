@@ -112,7 +112,7 @@ func (a *App) baseReason() string {
 func (a *App) isLoggedIn() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.username != "" || (a.cfg != nil && a.cfg.APIKey != "")
+	return a.username != ""
 }
 
 func (a *App) Connect(apiKey, serverURL string) (State, error) {

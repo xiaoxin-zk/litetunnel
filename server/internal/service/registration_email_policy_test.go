@@ -56,8 +56,9 @@ func TestEmailDomainRuleMatch(t *testing.T) {
 	if !wildcard.Match("s.qq.com") || !wildcard.Match("a.mail.qq.com") {
 		t.Error("*.qq.com 应匹配子域")
 	}
-	if wildcard.Match("qq.com") {
-		t.Error("*.qq.com 不该匹配 qq.com 本身")
+	// 与 sub2api 一致：*.domain 连本域一起覆盖。
+	if !wildcard.Match("qq.com") {
+		t.Error("*.qq.com 应同时匹配 qq.com 本身")
 	}
 }
 
@@ -125,8 +126,8 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 	if err := domainReject(svc, "a@s.qq.com"); err != nil {
 		t.Fatalf("*.qq.com 应放行子域: %v", err)
 	}
-	if err := domainReject(svc, "a@qq.com"); !errors.Is(err, ErrDomainNotTrusted) {
-		t.Fatalf("*.qq.com 不该放行 qq.com 本身，实际 %v", err)
+	if err := domainReject(svc, "a@qq.com"); err != nil {
+		t.Fatalf("*.qq.com 应同时放行 qq.com 本身: %v", err)
 	}
 
 	// 黑名单优先级更高：即使关掉白名单模式，命中黑名单也必须拒绝。

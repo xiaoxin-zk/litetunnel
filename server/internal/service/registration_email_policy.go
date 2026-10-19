@@ -14,7 +14,7 @@ import (
 // 结构对齐 sub2api 的 registrationEmailPolicy：列表项在**解析时**就规范化
 //
 //	@domain   精确匹配该域本身，不含子域
-//	*.domain  只匹配子域，不含本域
+//	*.domain  匹配该域及其全部子域（与 sub2api 的 wildcard 语义一致）
 //
 // 并且把无法识别的项**报出来**，而不是静默丢掉。静默丢弃的代价最隐蔽：
 // 少打一个字符的结果是「界面上看着保存了、实际永远不生效」，而且没有任何
@@ -41,16 +41,18 @@ func (r EmailDomainRule) String() string {
 
 // Match 判断邮箱域名是否命中本规则。
 //
-// 两条规则的边界很硬：@qq.com 只认 qq.com，*.qq.com 只认子域。子域不会被
-// 自动放行——白名单一旦自动包含子域，管理员写下的「只允许 qq.com」实际会变成
-// 「允许 qq.com 及任何 s.qq.com」，与他的意图相反。
+// @qq.com 只认 qq.com：子域不会被自动放行，否则管理员写下的「只允许 qq.com」
+// 实际会变成「允许 qq.com 及任何 s.qq.com」，与他的意图相反。要放行子域就
+// 显式写 *.qq.com，它同时覆盖 qq.com 本身（sub2api 的 wildcard 也是这个口径）。
 func (r EmailDomainRule) Match(domain string) bool {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if domain == "" || r.Suffix == "" {
 		return false
 	}
 	if r.Wildcard {
-		return strings.HasSuffix(domain, "."+r.Suffix)
+		// 与 sub2api 的 registrationEmailDomainMatchesWildcard 一致：
+		// *.edu.cn 同时匹配 edu.cn 本身与其子域。
+		return domain == r.Suffix || strings.HasSuffix(domain, "."+r.Suffix)
 	}
 	// 精确匹配，**不含子域**。
 	//

@@ -103,7 +103,7 @@
             />
             <span class="hint">
               写 <code>@qq.com</code> 或 <code>qq.com</code> 等价，只放行该域名本身（<code>s.qq.com</code> 不放行）；
-              要放行子域请显式写 <code>*.your-domain.com</code>（不含本域）。
+              要连子域一起放行请写 <code>*.your-domain.com</code>（<code>*.edu.cn</code> 匹配 edu.cn 及其子域）。
               典型用法：企业自有域名列入白名单供员工自由注册；其余公共邮箱仍可注册但受下方限制。
               填错会被拒绝保存，不会静默失效
             </span>

@@ -120,7 +120,17 @@ func (s *proxySnapshot) discoveryTargets(userID uint, prefix string, notAfter ti
 			continue
 		}
 		if p.Status.LastStartAt > 0 && !notAfter.IsZero() {
-			if startedAt := time.Unix(p.Status.LastStartAt, 0); startedAt.After(notAfter) {
+			// 留 1 秒余量再判「是否晚于水位」。
+		//
+		// notAfter 落库走 unixOrZero（截断到整秒，且向上取整到秒），frps 的
+		// lastStartAt 也只有整秒。用户刚禁用就在**同一秒**重连时，
+		// startedAt == notAfter，严格的 After 判定认为「不比水位新」，
+		// 于是刚连上的代理被当成禁用前的老连接关掉——表现是「刚上线又掉线」，
+		// 而且因为时间戳相等，重试多少轮结论都一样。
+		//
+		// 宁可放过这一秒内新注册的代理：下一轮重试会用新的快照重新判定，
+		// 而误关一条刚连上的隧道是用户可见的故障。
+		if startedAt := time.Unix(p.Status.LastStartAt, 0); !startedAt.Before(notAfter.Add(-time.Second)) {
 				log.Printf("[user] 用户 %d 的代理 %q 在禁用之后才启动（%s），跳过关闭",
 					userID, p.Name, startedAt.Format(time.RFC3339))
 				continue

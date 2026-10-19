@@ -60,6 +60,39 @@ if grep -qE '^\s*FRP_VERSION:' .github/workflows/release.yml; then
   FAILS=$((FAILS + 1))
 fi
 
+# ---- 端口池三方一致 ----
+#
+# 端口池同时出现在三处，而且**三处都必须是同一个范围**：
+#   - .env.example             —— 运维照着填的值
+#   - config.Default()         —— 没配环境变量时面板自己用的值
+#   - lt-fw.env.example        —— 宿主机 helper 允许放行的范围（安全边界）
+#
+# 不一致的症状不是报错，而是「隧道建起来了但端口打不开」：面板分配了
+# helper 不允许的端口，防火墙规则永远下不去。这类问题极难归因，因为两个
+# 组件各自都认为自己是对的。
+pool_value() {
+  grep -oE "$2" "$1" 2>/dev/null | head -n1 | grep -oE '[0-9]+$'
+}
+panel_start="$(pool_value .env.example '^LT_PORT_RANGE_START=[0-9]+')"
+panel_end="$(pool_value .env.example '^LT_PORT_RANGE_END=[0-9]+')"
+code_start="$(grep -oE 'PortRangeStart: +envInt\("LT_PORT_RANGE_START", [0-9]+\)' server/internal/config/config.go | grep -oE '[0-9]+\)$' | tr -d ')')"
+code_end="$(grep -oE 'PortRangeEnd: +envInt\("LT_PORT_RANGE_END", [0-9]+\)' server/internal/config/config.go | grep -oE '[0-9]+\)$' | tr -d ')')"
+fw_start="$(pool_value deploy/systemd/lt-fw.env.example '^LT_FW_POOL_START=[0-9]+')"
+fw_end="$(pool_value deploy/systemd/lt-fw.env.example '^LT_FW_POOL_END=[0-9]+')"
+
+for pair in "start:${panel_start}:${code_start}:${fw_start}" "end:${panel_end}:${code_end}:${fw_end}"; do
+  IFS=':' read -r which a b c <<< "${pair}"
+  if [[ -z "${a}" || -z "${b}" || -z "${c}" ]]; then
+    echo "FAIL 端口池: 取不到 ${which} 的三个来源（.env.example=${a:-?} config=${b:-?} lt-fw=${c:-?}）" >&2
+    FAILS=$((FAILS + 1))
+    continue
+  fi
+  if [[ "${a}" != "${b}" || "${a}" != "${c}" ]]; then
+    echo "FAIL 端口池 ${which}: .env.example=${a} / config 默认=${b} / lt-fw=${c} 不一致" >&2
+    FAILS=$((FAILS + 1))
+  fi
+done
+
 if (( FAILS > 0 )); then
   echo >&2
   echo "frp 版本不一致：改版本请先改 frp-version.txt，再同步上面这些引用。" >&2

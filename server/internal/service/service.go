@@ -127,6 +127,9 @@ type Services struct {
 	guardFullAt atomic.Int64
 
 	auditCounters *auditCounters
+
+	updateMu    sync.Mutex
+	updateCache *UpdateStatus
 }
 
 const portLockShards = 64

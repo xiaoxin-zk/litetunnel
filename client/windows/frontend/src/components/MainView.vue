@@ -296,10 +296,46 @@
       </div>
     </div>
 
+    <div v-if="updateOpen" class="modal" @click.self="updateOpen = false">
+      <div class="modal-card">
+        <div class="modal-title">版本更新</div>
+
+        <div v-if="updateInfo" class="update-box">
+          <div class="update-line">
+            <span>当前版本 <b class="mono">{{ updateInfo.current || state.version }}</b></span>
+            <span v-if="updateInfo.latest">最新版本 <b class="mono">{{ updateInfo.latest }}</b></span>
+          </div>
+
+          <div v-if="updateInfo.error" class="error">{{ updateInfo.error }}</div>
+          <template v-else-if="updateInfo.has_update">
+            <p class="muted">
+              下载后会自动保存到「下载」目录并定位文件。请先退出客户端，再解压覆盖旧版本，然后重新打开。
+            </p>
+            <pre v-if="updateInfo.notes" class="notes">{{ updateInfo.notes }}</pre>
+            <div v-if="updateLocalPath" class="ok">已下载到：{{ updateLocalPath }}</div>
+          </template>
+          <p v-else class="muted">当前已是最新版本。</p>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn-ghost" @click="updateOpen = false">关闭</button>
+          <button
+            v-if="updateInfo?.has_update"
+            class="btn-primary"
+            :disabled="updateBusy"
+            @click="downloadUpdate"
+          >
+            {{ updateBusy ? '下载中…' : '下载新版本' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <footer class="footer">
       <div class="footer-right">
         <span class="muted mono" v-if="state.version">{{ state.version }}</span>
         <span class="muted mono" v-if="state.config_path">{{ state.config_path }}</span>
+        <button class="btn-ghost mini" @click="checkUpdate">检查更新</button>
         <button class="btn-ghost mini" @click="handleOpenDataDir">打开数据目录</button>
       </div>
     </footer>
@@ -323,6 +359,38 @@ const busy = ref(false)
 const message = ref('')
 const messageType = ref('ok')
 const logBox = ref()
+
+const updateOpen = ref(false)
+const updateBusy = ref(false)
+const updateInfo = ref(null)
+const updateLocalPath = ref('')
+
+async function checkUpdate() {
+  updateOpen.value = true
+  updateInfo.value = null
+  updateLocalPath.value = ''
+  try {
+    updateInfo.value = await api.checkUpdate()
+  } catch (e) {
+    updateInfo.value = { current: props.state.version, error: String(e?.message || e) }
+  }
+}
+
+async function downloadUpdate() {
+  updateBusy.value = true
+  try {
+    const res = await api.downloadUpdate()
+    updateInfo.value = res || updateInfo.value
+    updateLocalPath.value = res?.local_path || ''
+  } catch (e) {
+    updateInfo.value = {
+      ...(updateInfo.value || {}),
+      error: String(e?.message || e)
+    }
+  } finally {
+    updateBusy.value = false
+  }
+}
 
 const createOpen = ref(false)
 const showAdvanced = ref(false)
@@ -1214,6 +1282,37 @@ watch(
   justify-content: flex-end;
   gap: 8px;
   margin-top: 18px;
+}
+
+.update-box {
+  font-size: 13px;
+  color: #334155;
+}
+
+.update-line {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 10px;
+  color: #4b5563;
+}
+
+.update-box .notes {
+  max-height: 200px;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.update-box .ok {
+  margin-top: 8px;
+  color: #15803d;
+  font-size: 12.5px;
+  word-break: break-all;
 }
 
 .field {

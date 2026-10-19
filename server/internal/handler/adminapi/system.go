@@ -3,6 +3,7 @@ package adminapi
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,16 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/monitor"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
+
+// CheckUpdate 查询最新发布版本，force=1 时绕过缓存。
+func (h *Handler) CheckUpdate(c *gin.Context) {
+	status, err := h.svc.CheckUpdate(c.Request.Context(), c.Query("force") == "1")
+	if err != nil {
+		httpx.Fail(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	httpx.OK(c, status)
+}
 
 func (h *Handler) StatsOverview(c *gin.Context) {
 	var (

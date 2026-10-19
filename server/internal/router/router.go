@@ -108,6 +108,7 @@ func New(
 	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
 	{
 		cli.GET("/info", userH.ClientInfo)
+		cli.GET("/version", userH.ClientVersion)
 		cli.GET("/config", userH.ClientConfig)
 
 		dl := cli.Group("")
@@ -198,6 +199,7 @@ func New(
 		adminWrite.POST("/users/:id/password", middleware.StepUp(svc), adminH.ResetUserPassword)
 		adminWrite.POST("/users/:id/reset-secret", middleware.StepUp(svc), adminH.ResetUserSecret)
 		adminWrite.POST("/step-up", adminH.StepUpVerify)
+		adminWrite.GET("/system/update", adminH.CheckUpdate)
 
 		adminWrite.POST("/groups", adminH.CreateGroup)
 		adminWrite.PUT("/groups/:id", adminH.UpdateGroup)
@@ -286,7 +288,7 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 				c.Redirect(http.StatusFound, adminPath+"/")
 				return
 			}
-			c.File(adminIndex)
+			serveIndexHTML(c, adminIndex, cfg.Version)
 			return
 		}
 
@@ -294,8 +296,22 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 			httpx.NotFound(c, "前端资源未构建")
 			return
 		}
-		c.File(userIndex)
+		serveIndexHTML(c, userIndex, cfg.Version)
 	})
+}
+
+// serveIndexHTML 把构建版本注入 index.html。
+// 前端据此判断「加载的静态资源」与「后端版本」是否一致：容器升级后
+// 仍停在旧页面的浏览器会提示刷新，避免新旧前端混用同一个后端。
+func serveIndexHTML(c *gin.Context, file, version string) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		c.File(file)
+		return
+	}
+	html := strings.ReplaceAll(string(data), "__LT_VERSION__", version)
+	c.Header("Cache-Control", "no-cache")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(html))
 }
 
 func indexPath(dir string) (string, bool) {

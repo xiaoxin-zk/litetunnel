@@ -92,7 +92,18 @@ const mock = {
   CreateTunnel: async () => mockConnectedState,
   CreateTunnelsBatch: async () => [{ message: '[mock] 已创建 3 条隧道', failures: [] }, mockConnectedState],
   DeleteTunnel: async () => mockConnectedState,
-  Redeem: async () => ['[mock] 兑换成功', mockConnectedState]
+  Redeem: async () => ['[mock] 兑换成功', mockConnectedState],
+  CheckUpdate: async () => ({
+    current: 'dev',
+    latest: '',
+    has_update: false,
+    error: '浏览器预览模式不支持检查更新'
+  }),
+  DownloadClientUpdate: async () => ({
+    current: 'dev',
+    has_update: false,
+    error: '浏览器预览模式不支持下载更新'
+  })
 }
 
 const go = isWails ? window.go.main.App : mock
@@ -117,7 +128,9 @@ export const api = {
   deleteTunnel: (id) => go.DeleteTunnel(id),
   startTunnel: (id) => go.StartTunnel(id),
   stopTunnel: (id) => go.StopTunnel(id),
-  redeem: (code) => go.Redeem(code)
+  redeem: (code) => go.Redeem(code),
+  checkUpdate: () => go.CheckUpdate(),
+  downloadUpdate: () => go.DownloadClientUpdate()
 }
 
 export function onEvent(name, handler) {

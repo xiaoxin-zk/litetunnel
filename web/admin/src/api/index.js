@@ -153,6 +153,10 @@ export const clientPkgApi = {
   remove: (name) => http.delete(`/client-packages/${encodeURIComponent(name)}`)
 }
 
+export const systemApi = {
+  update: (force) => http.get('/system/update', { params: force ? { force: 1 } : {} })
+}
+
 export const monitorApi = {
   system: (limit) => http.get('/system/metrics', { params: limit ? { limit } : {} })
 }

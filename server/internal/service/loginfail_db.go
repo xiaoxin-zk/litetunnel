@@ -11,6 +11,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/controlplane"
+
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -80,6 +82,7 @@ var errLoginFailCounterDegraded = errors.New("账号级失败计数已降级：�
 // dbLoginFailureCounter 是落库版计数。
 type dbLoginFailureCounter struct {
 	db *gorm.DB
+	control *controlplane.Client
 
 	// missed 记录「写库失败、只记在本实例」的失败次数。
 	//
@@ -118,10 +121,14 @@ type dbLoginFailureCounter struct {
 // db 为 nil 时退化为纯进程内实现：只有不接数据库的构造路径（例如后台
 // 协程里那个只带部分字段的 Services）才会走到这里。
 func newLoginFailureCounter(db *gorm.DB) loginFailCounter {
+	return newLoginFailureCounterWithControl(db, nil)
+}
+
+func newLoginFailureCounterWithControl(db *gorm.DB, control *controlplane.Client) loginFailCounter {
 	if db == nil {
 		return newMemoryLoginFailureCounter()
 	}
-	return &dbLoginFailureCounter{db: db, missed: newMemoryLoginFailureCounter()}
+	return &dbLoginFailureCounter{db: db, control: control, missed: newMemoryLoginFailureCounter()}
 }
 
 // record 记一次失败：先落库，落库失败再补记到进程内。
@@ -129,6 +136,11 @@ func (c *dbLoginFailureCounter) record(account string, now time.Time) {
 	account = normalizeAccount(account)
 	if account == "" {
 		return
+	}
+	if c.control != nil && c.control.Enabled() {
+		if _, err := c.control.IncrementWindow(context.Background(), "loginfail:"+account, loginFailWindow); err == nil {
+			return
+		}
 	}
 	if err := c.bump(account, now); err != nil {
 		// 落库失败也要算这一次：否则「数据库写不进去」就等于「防线关掉」。
@@ -212,6 +224,13 @@ func (c *dbLoginFailureCounter) count(account string, now time.Time) (int, bool)
 	account = normalizeAccount(account)
 	if account == "" {
 		return 0, true
+	}
+	if c.control != nil && c.control.Enabled() {
+		ctx, cancel := context.WithTimeout(context.Background(), loginFailDBTimeout)
+		defer cancel()
+		if n, err := c.control.GetInt(ctx, "loginfail:"+account); err == nil {
+			return int(n), true
+		}
 	}
 	// 补记表是进程内的，它的 count 永远可信（第二个返回值恒为 true），
 	// 这里显式丢弃：本函数自己的可信度只取决于**读库**是否成功。

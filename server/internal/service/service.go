@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/controlplane"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/mailer"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
@@ -114,6 +115,7 @@ type Services struct {
 	DB      *gorm.DB
 	Cfg     *config.Config
 	Frps    *FrpsClient
+	Control *controlplane.Client
 	Runtime *Runtime
 
 	// Settings 是管理端可随时调整的运行期配置（SMTP、注册开关、支付、端口策略）。
@@ -336,6 +338,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		DB:         db,
 		Cfg:        cfg,
 		Frps:       NewFrpsClient(cfg),
+		Control:    mustControlPlane(cfg),
 		Runtime:    NewRuntime(),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
@@ -347,7 +350,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
-		loginFails:       newLoginFailureCounter(db),
+		loginFails:       newLoginFailureCounterWithControl(db, mustControlPlane(cfg)),
 		mailWake:         make(chan struct{}, 1),
 		recoveryCh:       make(chan recoveryRequest, recoveryBuffer),
 		recoveryCounters: &recoveryCounters{},

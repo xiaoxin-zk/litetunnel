@@ -39,6 +39,12 @@ type Config struct {
 	DBDriver string // sqlite | postgres
 	DBDSN    string
 
+	// Redis 控制面：多实例部署必须配置，用于共享登录失败窗口、撤销版本和分布式租约。
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+	RedisPrefix   string
+
 	// 监听地址：单一入口，用户控制台与管理后台共用同一端口，
 	// 通过路径前缀区分（管理后台挂在 AdminPath 下）。
 	UserAddr      string
@@ -176,8 +182,12 @@ func Load() (*Config, error) {
 		Env:      env("LT_ENV", "development"),
 		LogLevel: env("LT_LOG_LEVEL", "info"),
 
-		DBDriver: env("LT_DB_DRIVER", "sqlite"),
-		DBDSN:    env("LT_DB_DSN", "./data/litetunnel.db"),
+		DBDriver:     env("LT_DB_DRIVER", "sqlite"),
+		DBDSN:        env("LT_DB_DSN", "./data/litetunnel.db"),
+		RedisAddr:    env("LT_REDIS_ADDR", ""),
+		RedisPassword: env("LT_REDIS_PASSWORD", ""),
+		RedisDB:      envInt("LT_REDIS_DB", 0),
+		RedisPrefix:  env("LT_REDIS_PREFIX", "litetunnel:"),
 
 		UserAddr:        env("LT_USER_ADDR", "0.0.0.0:7848"),
 		UserPublicURL:   strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),

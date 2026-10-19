@@ -1,0 +1,17 @@
+# 换行符策略。
+#
+# 仓库里所有文本在索引中都是 LF（`git ls-files --eol` 可查）。但 Windows 上
+# core.autocrlf=true 会让**检出**变成 CRLF——Go 与 PowerShell 都能忍，bash 不能：
+# 带 CRLF 的脚本会报 `$'\r': command not found`，而这类问题只在「Windows 检出、
+# Linux 运行」的组合里出现，本地测不出来。
+#
+# 部署脚本尤其危险：它们跑在生产机上，出错时运维看到的是「渲染脚本莫名失败」。
+*.sh text eol=lf
+
+# PowerShell 脚本同样固定 LF：两种换行 PowerShell 都能读，固定一种是为了让
+# 不同平台检出后 git status 不抖动。
+*.ps1 text eol=lf
+
+# 工作流由 GitHub 解析，但它内部的 heredoc / shell 片段与本机脚本同源，
+# 统一成 LF 可以避免复制粘贴时带入 CRLF。
+*.yml text eol=lf

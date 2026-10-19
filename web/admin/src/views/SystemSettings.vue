@@ -255,6 +255,16 @@
             <el-input-number v-model="numForm['api.rate_limit_burst']" :min="1" :max="10000" />
             <span class="hint">允许的瞬时峰值，默认 60；调低可防刷，但页面并发加载多时易误伤</span>
           </el-form-item>
+
+          <el-divider content-position="left">审计日志</el-divider>
+
+          <el-form-item label="操作日志保留天数">
+            <el-input-number v-model="numForm['audit.retention_days']" :min="0" :max="3650" />
+            <span class="hint">
+              每小时维护任务分批清理超期记录，单轮有 5 秒预算，量大会跨轮清完；
+              0 表示永久保留，只能手动清理。登录日志固定保留 180 天
+            </span>
+          </el-form-item>
         </el-form>
 
         <el-divider />
@@ -264,7 +274,7 @@
           · 账号级指数退避锁定（合并登录入口：3 次失败锁 30 分钟起，上限 24 小时）<br />
           · 管理员双因素认证（TOTP）<br />
           · 改密即全端下线（令牌版本号）<br />
-          · 全部登录尝试写入审计日志，保留 180 天
+          · 全部登录尝试写入审计日志，操作日志保留天数可在上方调整
         </div>
       </el-tab-pane>
 
@@ -373,7 +383,8 @@ const NUM_KEYS = [
   'login.captcha_after_failures',
   'login.max_per_minute',
   'api.rate_limit_per_minute',
-  'api.rate_limit_burst'
+  'api.rate_limit_burst',
+  'audit.retention_days'
 ]
 
 const SECRET_KEYS = ['smtp.password', 'payment.secret']

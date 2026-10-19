@@ -119,6 +119,10 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 白名单外域名注册名额需为 0-100000 的整数（0 表示直接拒绝）", ErrInvalidParam)
 	}
 
+	if n, err := strconv.Atoi(view(KeyAuditRetentionDays)); err != nil || n < 0 || n > 3650 {
+		return fmt.Errorf("%w: 操作日志保留天数需为 0-3650 的整数（0 表示永久保留，仅可手动清理）", ErrInvalidParam)
+	}
+
 	if h := strings.TrimSpace(view(KeyGatewayHost)); h != "" {
 		if strings.ContainsAny(h, " \t\r\n/\\:@") {
 			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)

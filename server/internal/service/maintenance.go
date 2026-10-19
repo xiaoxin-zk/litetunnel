@@ -67,6 +67,13 @@ func (s *Services) runMaintenance(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	if days := s.Settings.Int(KeyAuditRetentionDays); days > 0 {
+		s.pruneTable(ctx, deadline, "过期审计日志", &model.AuditLog{},
+			"created_at < ?", now.AddDate(0, 0, -days))
+		if ctx.Err() != nil {
+			return
+		}
+	}
 	s.PurgeExpiredLoginFails(now.Add(-loginFailWindow), deadline)
 
 	middleware.SweepIdleLimiters()

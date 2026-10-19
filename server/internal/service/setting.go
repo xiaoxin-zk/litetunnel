@@ -35,6 +35,8 @@ const (
 	KeyLoginCaptchaAfter SettingKey = "login.captcha_after_failures"
 	KeyLoginMaxPerMinute SettingKey = "login.max_per_minute"
 
+	KeyAuditRetentionDays SettingKey = "audit.retention_days"
+
 	KeyAPIRatePerMinute SettingKey = "api.rate_limit_per_minute"
 	KeyAPIRateBurst     SettingKey = "api.rate_limit_burst"
 
@@ -121,6 +123,8 @@ var settingSpecs = []settingSpec{
 
 	{Key: KeyLoginCaptchaAfter, Default: func(*config.Config) string { return "3" }},
 	{Key: KeyLoginMaxPerMinute, Default: func(*config.Config) string { return "10" }},
+
+	{Key: KeyAuditRetentionDays, Default: func(*config.Config) string { return "180" }},
 
 	{Key: KeyAPIRatePerMinute, Default: func(*config.Config) string { return "120" }},
 	{Key: KeyAPIRateBurst, Default: func(*config.Config) string { return "60" }},

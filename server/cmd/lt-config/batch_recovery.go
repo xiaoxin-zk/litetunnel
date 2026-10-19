@@ -305,10 +305,10 @@ func cleanupLeftovers(p paths) []string {
 
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			// 读不出目录内容就无法判断有没有遗留备份。**什么都不做**是这里
-			// 最安全的选择：一个文件都不会被删（不是删一半），只是这次清理
-			// 没发生。留一条日志，否则「为什么备份还在」没有任何线索。
-			log.Printf("[lt-config] 读取部署目录失败，跳过本次残留清理（%s）: %v", dir, err)
+			// 读不出目录内容就无法判断有没有遗留备份。必须进入 blockedDirs，
+			// 否则当前进程仍可能继续写盘，覆盖未检查的 manifest/备份现场。
+			log.Printf("[lt-config] 读取部署目录失败，阻断后续写盘（%s）: %v", dir, err)
+			blockDir(dir)
 			continue
 		}
 		for _, e := range entries {

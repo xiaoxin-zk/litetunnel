@@ -213,10 +213,14 @@ type proxyDrainOutcome struct {
 func (s *Services) drainProxies(ctx context.Context, req proxyDrainRequest) proxyDrainOutcome {
 	var out proxyDrainOutcome
 	if s.Frps == nil {
-		// 未配置 frps 管理接口时无从断流。不 panic 也不上抛错误：此刻账号已经
-		// 删掉/禁用掉了，一个可选依赖缺失不该让主流程失败。也不落待办：
-		// 没有 frps 客户端，重试一万次也不会成功。
-		log.Printf("[service] 未配置 frps 管理接口，无法关闭用户 %d 的已建立代理", req.userID)
+		// 没有客户端也不代表代理已经关闭：保留待办，等待配置/依赖恢复后
+		// 由 Worker 重试。否则上层会把空结果当成成功并删除唯一补偿线索。
+		if req.intent == "" {
+			req.intent = s.recordProxyDrainPending(req)
+		}
+		out.unknown = true
+		out.lastErr = "frps 管理客户端未初始化，断流结果未知"
+		log.Printf("[service] 未配置 frps 管理接口，用户 %d 的断流结果未知，已保留待办", req.userID)
 		return out
 	}
 	if req.prefix == "" {
@@ -385,11 +389,15 @@ func (s *Services) verifyClosedProxies(ctx context.Context, req proxyDrainReques
 	fresh := newProxySnapshotCache(s)
 	snap, err := fresh.current(ctx)
 	if err != nil {
-		// 复查失败不影响「关闭请求已成功」这个事实，但必须留痕：这次关闭
-		// 是否误伤无法确认。不记残留——那会让待办因为一个可观测性动作而
-		// 永远清不掉。
-		log.Printf("[user] 用户 %d 关闭 %d 个代理后无法复查实例身份（列表拉取失败），本次关闭是否误伤无法确认: %v",
+		// 关闭后复查失败时，关闭结果不完整可验证。保留原目标并标记
+		// unknown/residual，避免上层清理待办后失去下一轮补偿线索。
+		log.Printf("[user] 用户 %d 关闭 %d 个代理后无法复查实例身份（列表拉取失败），保留待办等待重试: %v",
 			req.userID, len(out.closedTargets), err)
+		out.unknown = true
+		out.residual = append(out.residual, out.closedTargets...)
+		if out.lastErr == "" {
+			out.lastErr = err.Error()
+		}
 		return out
 	}
 

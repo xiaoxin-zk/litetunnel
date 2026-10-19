@@ -1,13 +1,16 @@
 package service
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	"gorm.io/gorm"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/controlplane"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -43,6 +46,7 @@ type sessionInfo struct {
 // 这条高频路径上不允许出现数据库查询。
 type Runtime struct {
 	mu sync.RWMutex
+	control *controlplane.Client
 
 	sessions map[string]sessionInfo // runID -> 会话
 	exceeded map[uint]bool          // userID -> 是否超额
@@ -195,7 +199,12 @@ type identityState struct {
 
 // NewRuntime 构造内存态。
 func NewRuntime() *Runtime {
+	return newRuntime(nil)
+}
+
+func newRuntime(control *controlplane.Client) *Runtime {
 	return &Runtime{
+		control:       control,
 		sessions:      make(map[string]sessionInfo),
 		exceeded:      make(map[uint]bool),
 		blocked:       make(map[uint]bool),
@@ -238,10 +247,27 @@ func (r *Runtime) SetCachedIdentity(kind uint8, id uint, active bool, version in
 // 读到的是旧状态——那份结果既不能写进缓存（否则旧的有效状态会再存活
 // 最多 identityTTL），也不该直接返回给这次请求。
 func (r *Runtime) IdentityGen(kind uint8, id uint) uint64 {
+	if r.control != nil && r.control.Enabled() {
+		if version, err := r.control.GetInt(context.Background(), fmt.Sprintf("identity:%d:%d", kind, id)); err == nil && version > 0 {
+			r.ObserveIdentityVersion(kind, id, uint64(version))
+		}
+	}
 	key := identityKey{kind: kind, id: id}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.identityGen[key]
+}
+
+// ObserveIdentityVersion 将跨实例失效版本同步到本地，不产生新的共享版本。
+func (r *Runtime) ObserveIdentityVersion(kind uint8, id uint, version uint64) {
+	key := identityKey{kind: kind, id: id}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if version > r.identityGen[key] {
+		r.identityGen[key] = version
+		r.identityGenAt[key] = time.Now()
+		delete(r.identities, key)
+	}
 }
 
 // SetCachedIdentityIfGen 按代次条件回填缓存：代次一致才写入。
@@ -264,6 +290,11 @@ func (r *Runtime) SetCachedIdentityIfGen(kind uint8, id uint, active bool, versi
 // 回填时会被 SetCachedIdentityIfGen 拒绝，旧状态不会重新住进缓存。
 func (r *Runtime) InvalidateIdentity(kind uint8, id uint) {
 	key := identityKey{kind: kind, id: id}
+	if r.control != nil && r.control.Enabled() {
+		if _, err := r.control.BumpVersion(context.Background(), fmt.Sprintf("identity:%d:%d", kind, id)); err != nil {
+			log.Printf("[runtime] 共享身份失效版本更新失败（kind=%d id=%d）: %v", kind, id, err)
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.identityGen == nil {

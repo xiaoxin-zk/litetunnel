@@ -340,7 +340,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		Cfg:        cfg,
 		Frps:       NewFrpsClient(cfg),
 		Control:    control,
-		Runtime:    NewRuntime(),
+		Runtime:    newRuntime(control),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
 		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),

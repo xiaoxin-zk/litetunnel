@@ -346,11 +346,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	pumps.Add(2)
 	go func() {
 		defer pumps.Done()
-		m.pump(tunnelID, tunnelName, gen, stdout)
+		m.pumpGen(tunnelID, tunnelName, gen, stdout)
 	}()
 	go func() {
 		defer pumps.Done()
-		m.pump(tunnelID, tunnelName, gen, stderr)
+		m.pumpGen(tunnelID, tunnelName, gen, stderr)
 	}()
 
 	go func() {

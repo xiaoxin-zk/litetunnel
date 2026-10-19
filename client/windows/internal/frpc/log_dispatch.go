@@ -79,7 +79,11 @@ func (m *Manager) ClearLogs() uint64 {
 // 不返回，界面上那条隧道会一直是「运行中」。
 const pumpLineLimit = 1024 * 1024
 
-func (m *Manager) pump(tunnelID uint, tunnelName string, gen uint64, r io.Reader) {
+func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
+	m.pumpGen(tunnelID, tunnelName, 0, r)
+}
+
+func (m *Manager) pumpGen(tunnelID uint, tunnelName string, gen uint64, r io.Reader) {
 	// 用 ReadSlice 而不是 bufio.Scanner：Scanner 遇到超过上限的行会返回
 	// ErrTooLong 并**停止读取**，剩下的输出没人消费，子进程就卡在写管道上。
 	// 这里超限只截断日志内容，读取照常继续到换行、继续跟进后面的行。

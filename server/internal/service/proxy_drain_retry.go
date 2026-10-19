@@ -203,8 +203,14 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 	// 新账号会拿到不同标识，这条旧待办据此作废，而不是按相同前缀关掉
 	// 新账号刚建立的代理。读不到账号时留空，空的待办在重试时按「不可核验」
 	// 处理，不会退化成不校验。
-	var incarnation string
-	{
+	incarnation := req.incarnation
+	if incarnation == "" {
+		// 只有「当场登记」的路径（禁用/删号的即时断流）才需要读库：此刻请求
+		// 与用户行是同一个时间点，读到的就是意图所属的账号。
+		//
+		// 从补偿队列 flush 回来时必须用请求里带的原标识，绝不能在这里再读：
+		// 那读到的是「现在占用这个 ID 的账号」，而 flush 可能发生在几分钟
+		// 甚至一次重启之后。
 		var u model.User
 		if err := db.Select("id", "incarnation").First(&u, req.userID).Error; err != nil {
 			log.Printf("[proxy-drain] 读取用户 %d 的账号标识失败（待办仍会登记，重试时按不可核验处理）: %v",
@@ -302,6 +308,19 @@ func (s *Services) clearProxyDrainPending(userID uint, fence string) {
 // rescheduleProxyDrain 把未关干净的残留重新登记：累计次数、退避下一次时间、
 // 更新实例身份快照；到上限则转终态并保留记录。
 func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOutcome) {
+	if req.noRegister {
+		// 这次断流明确「不许登记待办」（升级前删号、找不到原意图）。
+		//
+		// 那就连补偿队列也不能进：fallback 的 flush 是**后来**执行的，它会
+		// 重新读一次「那个 ID 现在的用户身份」去登记待办。ID 一旦被复用，
+		// 旧删号的残留就会以新账号的 incarnation 落库，再按相同前缀把新账号
+		// 的代理关掉——比最初那次误关更难发现，因为它发生在重启之后。
+		// 只留一条带前缀与数量的告警，交给人工按清单核对。
+		log.Printf("[proxy-drain][ALERT] 用户 %d 的断流没有可依据的待办（noRegister），残留 %d 个代理不做持久化补偿，"+
+			"也不会进入补偿队列：请人工核对 frps 中 %s* 下的代理",
+			req.userID, len(out.residual), FrpUserOf(req.userID)+".")
+		return
+	}
 	if s.DB == nil {
 		return
 	}
@@ -405,14 +424,15 @@ func timeFromUnix(sec int64) time.Time {
 // 否则「重试」就变成了另一种更宽松的关闭逻辑——那正是「按名字盲关」的来源。
 func requestFromPending(row model.ProxyDrainPending) proxyDrainRequest {
 	req := proxyDrainRequest{
-		userID:   row.UserID,
-		prefix:   row.Prefix,
-		gen:      row.StatusGen,
-		notAfter: timeFromUnix(row.NotAfter),
-		deleted:  row.Deleted,
-		attempts: row.Attempts,
-		intent:   row.Fence,
-		known:    decodeProxyDrainTargets(row.Targets),
+		userID:      row.UserID,
+		prefix:      row.Prefix,
+		gen:         row.StatusGen,
+		notAfter:    timeFromUnix(row.NotAfter),
+		deleted:     row.Deleted,
+		attempts:    row.Attempts,
+		intent:      row.Fence,
+		known:       decodeProxyDrainTargets(row.Targets),
+		incarnation: row.Incarnation,
 	}
 	if req.prefix == "" {
 		req.prefix = FrpUserOf(req.userID) + "."
@@ -515,28 +535,35 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 				row.UserID, err)
 			return proxyDrainIntentUnverifiable, false
 		}
-		if exists && inc != "" {
+		// 只要这个 ID 上还有账号就转人工——注意**不能**再要求「新账号有标识」。
+		//
+		// 原来的条件是 exists && inc != ""：当现存账号的标识恰好为空（导入、
+		// 手工插入、绕过钩子的迁移）时，条件不成立，于是继续按前缀关代理。
+		// 而「标识为空」恰恰是无法自证身份的那一类，最该转人工。
+		if exists {
+			log.Printf("[proxy-drain] 用户 %d 的待办缺少账号标识且该 ID 上仍有账号，跳过自动断流，转人工确认",
+				row.UserID)
 			return proxyDrainIntentManual, false
 		}
 	}
 	if row.Deleted {
-		// 账号已删：没有「重新启用」这回事，按删号语义继续——
-		// 但必须先排除「这个 ID 已经被另一个账号占用」。导入/恢复流程复用
-		// 自增 ID 时，旧删号待办的前缀与新账号完全相同，照着关就会打掉
-		// 新账号刚建立的代理。此刻用户行存在即说明 ID 已被复用，旧意图作废。
-		if row.Incarnation != "" {
-			_, inc, err := s.userStateVersionAndIncarnation(row.UserID)
-			if err == nil && inc != row.Incarnation {
-				log.Printf("[proxy-drain] 已删账号 %d 的 ID 已被新账号占用（%s ≠ %s），旧删号意图作废",
-					row.UserID, row.Incarnation, inc)
-				return proxyDrainIntentAbandoned, false
-			}
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				// 读取失败（不是「账号不存在」）：无法排除 ID 复用，不能动手。
-				log.Printf("[proxy-drain] 已删账号 %d 的标识读取失败，本轮不动手（保留待办继续重试）: %v",
-					row.UserID, err)
-				return proxyDrainIntentUnverifiable, false
-			}
+		// 账号已删：没有「重新启用」这回事，按删号语义继续——但前提是
+		// **用户行确实已经不存在**。
+		//
+		// 只比较 incarnation 不够：备份恢复、手工导入、迁移回放都可能把
+		// 同一个 incarnation 原样带回来（model 的钩子对显式赋值保持原值）。
+		// 那样 inc == row.Incarnation，旧删号意图会被判为有效，然后把现存
+		// 账号的 lt_u<ID>.* 代理全部关掉。判据换成「行是否存在」之后，
+		// 只要账号还在，这类意图一律转人工，不再动手。
+		_, exists, err := s.currentIncarnation(row.UserID)
+		if err != nil {
+			log.Printf("[proxy-drain] 已删账号 %d 的账号状态读取失败，本轮不动手（保留待办继续重试）: %v",
+				row.UserID, err)
+			return proxyDrainIntentUnverifiable, false
+		}
+		if exists {
+			log.Printf("[proxy-drain] 用户 %d 的删号意图登记后该 ID 上重新出现了账号，跳过自动断流，转人工确认", row.UserID)
+			return proxyDrainIntentManual, false
 		}
 		return proxyDrainIntentActive, true
 	}

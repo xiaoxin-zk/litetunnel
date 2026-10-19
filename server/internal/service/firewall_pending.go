@@ -187,6 +187,26 @@ func (s *Services) dropPending(port int, gen int64) {
 	}
 }
 
+// setPendingIfCurrent 把重试结果写回内存，只在「端口上仍是同一代意图」时。
+//
+// 重试循环虽然在自己的端口锁内完成动作，但**登记**并不都走那把锁：
+// tunnel_batch 的批量建隧道只登记待办并唤醒协调器（注释里明确说明不取端口
+// 锁）。于是旧代次的重试结果可能晚于新代次登记落进 map，把「放行」顶成
+// 「收回」——内存里错一份，重启后还会从库里读回来继续执行。
+//
+// 返回 false 表示写入被丢弃（端口上已经是别的代次，或那条意图已经被清掉），
+// 调用方无需做额外处理：该做的事已经由新意图负责。
+func (s *Services) setPendingIfCurrent(port int, item pendingFW) bool {
+	s.fwMu.Lock()
+	defer s.fwMu.Unlock()
+	cur, ok := s.fwPending[port]
+	if !ok || cur.gen != item.gen {
+		return false
+	}
+	s.fwPending[port] = item
+	return true
+}
+
 // loadPendingFirewall 把落库的待办读回内存。启动时调用一次。
 //
 // 读回来的意图仍然要经过 portIntentValid 校验才会执行——重启期间端口可能
@@ -206,6 +226,13 @@ func (s *Services) loadPendingFirewall() {
 		s.fwPending = map[int]pendingFW{}
 	}
 	for _, r := range recs {
+		// 加载不是无条件覆盖：协调器是延迟 3 秒才起来读库的，这段时间 HTTP
+		// 服务已经在跑，新建/停用隧道会先往内存里写意图。无条件覆盖会把
+		// 它们换成库里的旧记录——那条新意图既不执行、也不再被展示。
+		// 只接受代次不低于内存现值的记录（代次单调，等价于「不许倒退」）。
+		if cur, ok := s.fwPending[r.Port]; ok && cur.gen > r.Generation {
+			continue
+		}
 		s.fwPending[r.Port] = pendingFW{
 			open: r.Open, proto: r.Proto, attempts: r.Attempts, lastErr: r.LastErr,
 			exhausted: r.Exhausted, gen: r.Generation,

@@ -122,7 +122,7 @@ const closeProxiesTimeout = 15 * time.Second
 // 关不掉的那部分会留在落库待办里由后台继续重试（见 proxy_drain_retry.go）：
 // 账号已删除，删除事务本身不可能因为这次失败而回滚，补偿只能放在这条路径上。
 func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
-	fence, incarnation, found, err := s.deletedDrainIntent(userID)
+	row, found, err := s.deletedDrainIntent(userID)
 	if err != nil {
 		// 读不出待办时**不能**当成「没有待办」重新登记：此刻 users 行已删，
 		// 新登记的 incarnation 是空的，会把事务里记下的现场覆盖掉。原待办
@@ -130,52 +130,47 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 		log.Printf("[proxy-drain] 读取已删账号 %d 的断流待办失败，保留原现场并跳过本次断流: %v", userID, err)
 		return
 	}
-	if found && incarnation == "" {
-		// 升级前遗留的待办没有账号标识。只有当该 ID 上确实存在一个已登记
-		// 标识的账号时才可能误伤（删号后 ID 被复用）；此时交给人工确认。
-		inc, exists, err := s.currentIncarnation(userID)
-		if err != nil {
-			// 读不出来不能当成「没有账号」继续按前缀断流：ID 可能已被复用，
-			// 误关新账号的代理是不可见的故障。保留原待办，交给后台重试器
-			// 下一轮再判。
-			log.Printf("[proxy-drain] 读取已删账号 %d 的标识失败，保留原现场并跳过本次断流: %v", userID, err)
+	if found {
+		// 与后台重试**同一套判定**，一条不少：
+		//
+		//   - 身份（incarnation）：ID 被复用时旧意图作废，绝不按前缀盲关；
+		//   - 状态版本 / 账号行是否存在：删号意图只承认「用户行确实已不存在」；
+		//   - 无标识的升级前待办：只要该 ID 上还有账号，就转人工。
+		//
+		// 即时路径以前自己抄了一份判断，只覆盖了 incarnation，于是「删号后 ID
+		// 被复用」和「待办里标识为空」两条在即时路径上仍然会误关；抄一份判据
+		// 就一定会漂移，所以这里直接调用同一个函数。
+		switch state, _ := s.proxyDrainIntentState(row); state {
+		case proxyDrainIntentUnverifiable:
+			log.Printf("[proxy-drain] 已删账号 %d 的身份读取失败，跳过即时断流，保留待办由后台重试", userID)
 			return
-		}
-		if exists && inc != "" {
-			log.Printf("[proxy-drain] 账号 %d 的断流待办缺少账号标识且该 ID 已被新账号占用，跳过自动断流，需人工确认", userID)
+		case proxyDrainIntentAbandoned:
+			log.Printf("[proxy-drain] 已删账号 %d 的断流意图已作废（账号行仍存在或标识已变），跳过即时断流", userID)
 			return
-		}
-	}
-	if found && incarnation != "" {
-		// 与后台重试路径（proxyDrainIntentState）同一套身份判断：待办里已经
-		// 带着旧标识时，仍要核对当前 ID 上是不是同一个账号。导入/恢复流程
-		// 复用自增 ID 时，新账号的前缀与旧账号完全相同，照着关会打掉新账号
-		// 刚建立的代理。即时路径以前只保护了「空标识」的升级前待办，反而
-		// 漏掉了更常见的「有标识」路径。
-		_, inc, err := s.userStateVersionAndIncarnation(userID)
-		switch {
-		case err == nil && inc != incarnation:
-			log.Printf("[proxy-drain] 已删账号 %d 的 ID 已被新账号占用（%s ≠ %s），跳过即时断流，旧意图作废",
-				userID, incarnation, inc)
-			return
-		case err != nil && !errors.Is(err, gorm.ErrRecordNotFound):
-			// 读不出来就无法排除 ID 复用：保留待办交给后台重试，绝不动手。
-			log.Printf("[proxy-drain] 已删账号 %d 的标识读取失败，跳过即时断流，保留待办由后台重试: %v", userID, err)
+		case proxyDrainIntentManual:
+			log.Printf("[proxy-drain] 已删账号 %d 的断流待办无法自动核验身份，跳过自动断流，转人工确认", userID)
 			return
 		}
 	}
 
-	req := proxyDrainRequest{
-		userID:  userID,
-		prefix:  FrpUserOf(userID) + ".",
-		deleted: true,
-		// 复用删除事务里已经写好的那条待办。
-		intent: fence,
-	}
-	if !found {
+	var req proxyDrainRequest
+	if found {
+		// 用落库待办重建请求：这样即时断流也带上**登记时刻的时间水位与
+		// 实例快照**（targets）。只按前缀扫一遍全表的话，账号检查到
+		// ListProxies 之间注册的同名新实例会被当成残留关掉——即 TOCTOU。
+		// 有快照时只关当初看到的那批实例，新实例不在名单里。
+		req = requestFromPending(row)
+	} else {
 		// 没有待办（例如升级前删掉的账号）：只做一次尽力而为的即时断流，
-		// 不为它新登记一条空标识的待办。
-		req.noRegister = true
+		// 既不为它新登记一条空标识的待办，也不把它放进补偿队列——
+		// 队列 flush 时会按「当时的用户身份」重建意图，ID 一旦被复用，
+		// 旧删号的残留就会绑定到新账号上（见 rescheduleProxyDrain）。
+		req = proxyDrainRequest{
+			userID:     userID,
+			prefix:     FrpUserOf(userID) + ".",
+			deleted:    true,
+			noRegister: true,
+		}
 	}
 	out := s.drainProxies(ctx, req)
 	switch {
@@ -203,20 +198,21 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 //     ——此刻 users 行已删，新登记的 incarnation 是空的，会覆盖事务现场；
 //   - found=true 且 incarnation 为空：升级前的遗留待办，无法核验身份，
 //     交给人工确认。
-func (s *Services) deletedDrainIntent(userID uint) (fence, incarnation string, found bool, err error) {
-	if s.DB == nil {
-		return "", "", false, errors.New("数据库未初始化")
-	}
+func (s *Services) deletedDrainIntent(userID uint) (model.ProxyDrainPending, bool, error) {
 	var row model.ProxyDrainPending
-	if qerr := s.DB.Select("fence", "incarnation").
-		Where("user_id = ? AND deleted = ?", userID, true).
-		First(&row).Error; qerr != nil {
-		if errors.Is(qerr, gorm.ErrRecordNotFound) {
-			return "", "", false, nil
-		}
-		return "", "", false, qerr
+	if s.DB == nil {
+		return row, false, errors.New("数据库未初始化")
 	}
-	return row.Fence, row.Incarnation, true, nil
+	// 整行读出来（而不是只挑 fence/incarnation）：即时断流要按与后台重试
+	// 相同的判据重建请求，缺了 not_after / intent_at / targets 就只能退化成
+	// 「按前缀全表扫」——那正是 TOCTOU 误关的来源。
+	if err := s.DB.Where("user_id = ? AND deleted = ?", userID, true).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return row, false, nil
+		}
+		return row, false, err
+	}
+	return row, true, nil
 }
 
 func (s *Services) closeUserProxiesAfterDelete(userID uint) {
@@ -256,7 +252,15 @@ type proxyDrainRequest struct {
 	//
 	// 用于已经确认没有待办的删号路径（升级前遗留）：users 行已删，此时新登记
 	// 的 incarnation 必然为空，而空标识的待办无法在 ID 复用时自证身份。
+	// 它同样禁止进入补偿队列：队列的 flush 在**之后**执行，会重新读一次
+	// 「那个 ID 现在的用户身份」，等于把空标识的缺陷挪到重启之后才发作。
 	noRegister bool
+	// incarnation 是**意图登记时**的账号标识。
+	//
+	// 补偿队列的 flush 可能发生在几分钟甚至重启之后：那时再读一次 users 行，
+	// 读到的可能是复用了同一自增 ID 的新账号。把登记时的标识随请求带下去，
+	// flush 才会按原身份落库；只有字段为空（禁用的即时路径）才回落到读库。
+	incarnation string
 }
 
 // proxyDrainOutcome 是一轮断流的结果。

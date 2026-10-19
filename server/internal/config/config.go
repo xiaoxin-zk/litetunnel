@@ -21,6 +21,33 @@ import (
 
 const placeholderPrefix = "CHANGE_ME"
 
+// localPortRange 读取内核分配给**出站连接**的本地源端口范围
+// （net.ipv4.ip_local_port_range）。
+//
+// 为什么要读真值而不是写死 32768：这个值在容器基础镜像、云厂商镜像上经常被
+// 调过（10240-65000 之类），照默认值判断会让「与临时端口段重叠」这条检查在
+// 最需要它的机器上失效——表现是随机的「隧道建不起来」，日志里只有一次
+// EADDRINUSE。
+//
+// 读不到不是错误路径的失败：Windows/macOS 没有这个文件，容器里也可能没有
+// /proc。返回错误时调用方跳过检查。
+func localPortRange() (lo, hi int, err error) {
+	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(raw)))
+	if len(fields) < 2 {
+		return 0, 0, fmt.Errorf("无法解析 ip_local_port_range: %q", strings.TrimSpace(string(raw)))
+	}
+	nlo, err1 := strconv.Atoi(fields[0])
+	nhi, err2 := strconv.Atoi(fields[1])
+	if err1 != nil || err2 != nil || nlo <= 0 || nhi <= nlo {
+		return 0, 0, fmt.Errorf("ip_local_port_range 取值异常: %q", strings.TrimSpace(string(raw)))
+	}
+	return nlo, nhi, nil
+}
+
 // Version 是构建时注入的版本号，用于确认线上跑的是哪个版本。
 //
 // 通过 -ldflags 注入，例如：
@@ -492,9 +519,17 @@ func (c *Config) validate() error {
 		return fmt.Errorf("LT_MAX_PORTS_PER_USER=%d 必须大于 0", c.MaxPortsPerUser)
 	}
 	// 端口池上限必须低于内核临时端口段：与之重叠会让 frps 偶发绑定失败，
-	// 表现为随机的「隧道建不起来」。32768 是 Linux 默认的起始值。
-	if c.PortRangeEnd > 65535 {
-		return fmt.Errorf("LT_PORT_RANGE_END=%d 超过 65535", c.PortRangeEnd)
+	// 表现为随机的「隧道建不起来」。
+	//
+	// 这里必须**真的**读一次内核值，而不是照着「32768 是默认值」写死：
+	// ip_local_port_range 在不少机器上被调成 10240-65000 之类（容器基础镜像、
+	// 云厂商镜像都改过），写死的判据在这些机器上等于没有。读不到（非 Linux、
+	// 或 /proc 未挂载）时只记一条提示，不阻断启动——那是开发机与 Windows
+	// 部署的正常情况。
+	if lo, hi, err := localPortRange(); err == nil && c.PortRangeEnd >= lo && c.PortRangeStart <= hi {
+		return fmt.Errorf("端口池 %d-%d 与内核临时端口段 %d-%d 重叠：监听端口撞上出站连接的源端口会导致偶发绑定失败"+
+			"（请把 LT_PORT_RANGE_END 压到 %d 以下）",
+			c.PortRangeStart, c.PortRangeEnd, lo, hi, lo-1)
 	}
 
 	// 转发头信任范围必须显式收窄，否则客户端可伪造来源 IP 绕过限流与白名单。

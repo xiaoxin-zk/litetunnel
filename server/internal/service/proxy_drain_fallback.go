@@ -181,7 +181,13 @@ type proxyDrainWALRecord struct {
 	// 上一版只写淘汰项、没有这个字段（空值）：读到时按 dropped 处理，
 	// 与旧文件语义一致。
 	Kind       string             `json:"kind,omitempty"`
-	UserID     uint               `json:"user_id"`
+	UserID uint `json:"user_id"`
+	// Incarnation 是意图登记时的账号标识，随记录一起落盘。
+	//
+	// 补偿队列的 flush 可能在重启之后：那时再从 users 表读一次「这个 ID 现在
+	// 是谁」，读到的可能是复用该 ID 的新账号。用落盘的原始标识，才能保证
+	// 补写出来的待办描述的是**当初那个账号**的生命周期。
+	Incarnation string             `json:"incarnation,omitempty"`
 	Prefix     string             `json:"prefix"`
 	Gen        uint64             `json:"gen,omitempty"`
 	NotAfter   time.Time          `json:"not_after,omitempty"`
@@ -195,20 +201,22 @@ type proxyDrainWALRecord struct {
 
 func (r proxyDrainWALRecord) request() proxyDrainRequest {
 	return proxyDrainRequest{
-		userID:     r.UserID,
-		prefix:     r.Prefix,
-		gen:        r.Gen,
-		notAfter:   r.NotAfter,
-		deleted:    r.Deleted,
-		attempts:   r.Attempts,
-		known:      r.Known,
-		intent:     r.Intent,
-		noRegister: r.NoRegister,
+		userID:      r.UserID,
+		prefix:      r.Prefix,
+		gen:         r.Gen,
+		notAfter:    r.NotAfter,
+		deleted:     r.Deleted,
+		attempts:    r.Attempts,
+		known:       r.Known,
+		intent:      r.Intent,
+		noRegister:  r.NoRegister,
+		incarnation: r.Incarnation,
 	}
 }
 
 func walRecordOf(it proxyDrainFallback) proxyDrainWALRecord {
 	return proxyDrainWALRecord{
+		Incarnation: it.req.incarnation,
 		UserID:     it.req.userID,
 		Prefix:     it.req.prefix,
 		Gen:        it.req.gen,

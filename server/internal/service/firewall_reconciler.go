@@ -98,9 +98,9 @@ func (s *Services) retryPendingFirewall() int {
 				// 不能直接删：删了之后这条「本该收回却一直开着」的端口
 				// 就再也不会出现在任何界面上，只剩一行迟早被滚动掉的日志。
 				item.exhausted = true
-				s.fwMu.Lock()
-				s.fwPending[port] = item
-				s.fwMu.Unlock()
+				// 按代次条件写回：这期间 tunnel_batch 可能已经登记了更新的
+				// 意图（它不取端口锁），无条件覆盖会把那条新意图抹掉。
+				s.setPendingIfCurrent(port, item)
 				if perr := s.persistPending(port, item); perr != nil {
 					log.Printf("[firewall] 端口 %d 的终态未能落库（重启后仍会重试一轮）: %v", port, perr)
 				}
@@ -109,9 +109,7 @@ func (s *Services) retryPendingFirewall() int {
 					port, item.attempts, err)
 				continue
 			}
-			s.fwMu.Lock()
-			s.fwPending[port] = item
-			s.fwMu.Unlock()
+			s.setPendingIfCurrent(port, item)
 			// 重试次数也要落库：否则重启后计数归零，永久失败的端口
 			// 会重新走满一轮上限，日志反复出现。
 			if perr := s.persistPending(port, item); perr != nil {

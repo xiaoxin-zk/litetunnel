@@ -469,8 +469,15 @@ func (a *App) startup(ctx context.Context) {
 	// 日志出的第一行就进批量队列：只要开始产生日志，推送到前端的节奏就
 	// 由推送协程决定，而不是「一行一次 Wails 调用」。
 	a.startLogFlusher()
-	a.mgr.SetCallbacks(func(id uint, name string, seq uint64, line string) {
+	a.mgr.SetGenerationCallbacks(func(id uint, name string, gen uint64, seq uint64, line string) {
+		// 日志回调在 Manager 内排队，旧进程的行可能晚于新进程到达。
+		// 只有当前 generation 才能修改注册、退避和错误状态；旧日志仍保留
+		// 用于诊断，但不再污染当前隧道运行态。
+		current := a.mgr.Current(id, gen)
 		a.appendLogLine(seq, line)
+		if !current {
+			return
+		}
 		switch {
 		case strings.Contains(line, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
@@ -499,7 +506,12 @@ func (a *App) startup(ctx context.Context) {
 				a.emitStateThrottled(id)
 			}
 		}
-	}, a.onTunnelExit)
+	}, func(id uint, name string, gen uint64, err error, requested bool) {
+		if !a.mgr.Current(id, gen) {
+			return
+		}
+		a.onTunnelExit(id, name, err, requested)
+	})
 }
 
 // onTunnelExit 处理「某条隧道的 frpc 进程退出」。

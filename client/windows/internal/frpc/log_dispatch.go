@@ -79,7 +79,7 @@ func (m *Manager) ClearLogs() uint64 {
 // 不返回，界面上那条隧道会一直是「运行中」。
 const pumpLineLimit = 1024 * 1024
 
-func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
+func (m *Manager) pump(tunnelID uint, tunnelName string, gen uint64, r io.Reader) {
 	// 用 ReadSlice 而不是 bufio.Scanner：Scanner 遇到超过上限的行会返回
 	// ErrTooLong 并**停止读取**，剩下的输出没人消费，子进程就卡在写管道上。
 	// 这里超限只截断日志内容，读取照常继续到换行、继续跟进后面的行。
@@ -96,7 +96,7 @@ func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 		if truncated {
 			text += "（本行超过 1 MiB，其余内容已截断）"
 		}
-		m.appendLog(tunnelID, tunnelName, text)
+		m.appendLogGen(tunnelID, tunnelName, gen, text)
 		line = line[:0]
 		truncated = false
 	}
@@ -137,7 +137,7 @@ func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 			// 以前这里什么都不做：日志会凭空停在某一行，看起来像「frpc 不再
 			// 输出了」，而真实原因是我们的读取端坏了（管道错误、卷被卸载）。
 			// 这类现象最容易被归因到 frpc 或服务端，实际上问题在客户端自己。
-			m.appendLog(tunnelID, tunnelName, "日志读取中断："+err.Error())
+			m.appendLogGen(tunnelID, tunnelName, gen, "日志读取中断："+err.Error())
 			return
 		}
 	}
@@ -153,6 +153,7 @@ const logRepeatWindow = 5 * time.Second
 type logEntry struct {
 	id   uint
 	name string
+	gen  uint64
 	seq  uint64
 	text string
 }
@@ -177,6 +178,10 @@ func (m *Manager) AppendRaw(line string) {
 }
 
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
+	m.appendLogGen(tunnelID, tunnelName, 0, line)
+}
+
+func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, line string) {
 	line = strings.TrimRight(line, "\r\n")
 	line = clipLogLine(line, maxLogLineBytes)
 	if line == "" {
@@ -190,7 +195,7 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	var out []logEntry
 	// 重复窗口结束、或换了一条不同的日志：先把累计的重复次数交代掉。
 	if m.repeatCount > 0 && (key != m.repeatKey || now.Sub(m.repeatAt) >= logRepeatWindow) {
-		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName,
+		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName, gen,
 			fmt.Sprintf("（上一条重复 %d 次，已合并）", m.repeatCount), now))
 		m.repeatCount = 0
 	}
@@ -203,7 +208,7 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	}
 	m.repeatKey, m.repeatAt = key, now
 	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
-	out = append(out, m.recordLocked(tunnelID, tunnelName, line, now))
+	out = append(out, m.recordLocked(tunnelID, tunnelName, gen, line, now))
 	// 加锁入队、解锁后投递：既保证调用方按序号收到，又允许回调重入 Manager。
 	m.enqueueEmitLocked(out)
 	m.mu.Unlock()
@@ -264,6 +269,7 @@ func (m *Manager) emitPending() {
 		if dropped > 0 {
 			// seq=0：合成记录不参与去重，前端总是显示。
 			batch = append([]logEntry{{
+				gen:  0,
 				text: fmt.Sprintf("%s  [客户端] 日志过多，已丢弃 %d 条较早的记录",
 					time.Now().Format("15:04:05"), dropped),
 			}}, batch...)
@@ -272,6 +278,14 @@ func (m *Manager) emitPending() {
 		if cb != nil {
 			for _, e := range batch {
 				cb(e.id, e.name, e.seq, e.text)
+			}
+		}
+		m.mu.Lock()
+		cbGen := m.onLogGen
+		m.mu.Unlock()
+		if cbGen != nil {
+			for _, e := range batch {
+				cbGen(e.id, e.name, e.gen, e.seq, e.text)
 			}
 		}
 
@@ -285,9 +299,9 @@ func (m *Manager) emitPending() {
 }
 
 // recordLocked 在已持有锁的前提下写入一行日志，返回可推送的副本。
-func (m *Manager) recordLocked(tunnelID uint, tunnelName, line string, now time.Time) logEntry {
+func (m *Manager) recordLocked(tunnelID uint, tunnelName string, gen uint64, line string, now time.Time) logEntry {
 	stamped := fmt.Sprintf("%s  %s  %s", now.Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
-	return logEntry{id: tunnelID, name: tunnelName, seq: m.recordTextLocked(stamped), text: stamped}
+	return logEntry{id: tunnelID, name: tunnelName, gen: gen, seq: m.recordTextLocked(stamped), text: stamped}
 }
 
 // recordTextLocked 写入一行已经格式化好的文本，并返回它分配的序号。

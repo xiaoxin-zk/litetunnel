@@ -45,6 +45,11 @@ func (m *Manager) stillCurrent(tunnelID uint, gen uint64) bool {
 	return m.gens[tunnelID] == gen && !m.closed
 }
 
+// Current 用于上层在产生状态副作用前再次确认进程代次。
+func (m *Manager) Current(tunnelID uint, gen uint64) bool {
+	return m.stillCurrent(tunnelID, gen)
+}
+
 // exitLock 返回某条隧道的退出回调锁。
 func (m *Manager) exitLock(tunnelID uint) *sync.Mutex {
 	return &m.exitMu[tunnelID%exitLockShards]
@@ -150,6 +155,7 @@ type Manager struct {
 
 	// onLog 收到的行已经带好前缀；seq 是该行的单调序号。
 	onLog func(tunnelID uint, tunnelName string, seq uint64, line string)
+	onLogGen func(tunnelID uint, tunnelName string, gen uint64, seq uint64, line string)
 	// onExit 在某个隧道的进程退出时调用。
 	//
 	// requested 为 true 表示这次退出是 Stop 主动请求的（用户关掉开关、
@@ -157,6 +163,7 @@ type Manager struct {
 	// 要不要进入退避重试。判错的后果很直观：用户关掉一条隧道，
 	// 界面却开始报「启动失败，30 秒后重试」。
 	onExit func(tunnelID uint, tunnelName string, err error, requested bool)
+	onExitGen func(tunnelID uint, tunnelName string, gen uint64, err error, requested bool)
 }
 
 // New 创建管理器。exePath 为空时自动在应用目录与 PATH 中查找 frpc。
@@ -185,6 +192,22 @@ func (m *Manager) SetCallbacks(
 	defer m.mu.Unlock()
 	m.onLog = onLog
 	m.onExit = onExit
+	m.onLogGen = nil
+	m.onExitGen = nil
+}
+
+// SetGenerationCallbacks 注册携带进程 generation 的回调。
+// 旧 SetCallbacks 保留给现有调用方和测试；生产 App 使用本接口。
+func (m *Manager) SetGenerationCallbacks(
+	onLog func(tunnelID uint, tunnelName string, gen uint64, seq uint64, line string),
+	onExit func(tunnelID uint, tunnelName string, gen uint64, err error, requested bool),
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onLogGen = onLog
+	m.onExitGen = onExit
+	m.onLog = nil
+	m.onExit = nil
 }
 
 // ExePath 返回解析到的 frpc 路径。
@@ -303,6 +326,7 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	m.gens[tunnelID] = gen
 	m.procs[tunnelID] = &process{name: tunnelName, cmd: cmd, exitCh: exitCh, gen: gen}
 	onExit := m.onExit
+	onExitGen := m.onExitGen
 	m.mu.Unlock()
 
 	m.appendLog(tunnelID, tunnelName, fmt.Sprintf("已启动 frpc（PID %d）", cmd.Process.Pid))
@@ -322,11 +346,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	pumps.Add(2)
 	go func() {
 		defer pumps.Done()
-		m.pump(tunnelID, tunnelName, stdout)
+		m.pump(tunnelID, tunnelName, gen, stdout)
 	}()
 	go func() {
 		defer pumps.Done()
-		m.pump(tunnelID, tunnelName, stderr)
+		m.pump(tunnelID, tunnelName, gen, stderr)
 	}()
 
 	go func() {
@@ -381,7 +405,7 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		// 必须在 mu 内登记：Close 先置 closed 再 Wait，两条路径只可能是先后
 		// 关系——这里读到 false 并 Add 之后才会有人置 true，而那时 Add 已经
 		// 完成，Wait 一定能等到。
-		dispatch := current && !stale && !closing && onExit != nil
+		dispatch := current && !stale && !closing && (onExit != nil || onExitGen != nil)
 		if dispatch {
 			m.callbackWG.Add(1)
 		}
@@ -445,7 +469,13 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 			m.callbackWG.Done()
 			return
 		}
-		onExit(tunnelID, tunnelName, err, requested)
+		// 在最终代次检查之后立即串行派发 generation 回调；App 仍会在入口
+		// 再核验一次，防止回调排队期间 Start/Stop 发生变化。
+		if onExitGen != nil {
+			onExitGen(tunnelID, tunnelName, gen, err, requested)
+		} else if onExit != nil {
+			onExit(tunnelID, tunnelName, err, requested)
+		}
 		m.callbackWG.Done()
 	}()
 

@@ -334,11 +334,12 @@ func (s *Services) userLock(userID uint) *sync.Mutex {
 
 // New 构造服务集合。
 func New(db *gorm.DB, cfg *config.Config) *Services {
+	control := mustControlPlane(cfg)
 	return &Services{
 		DB:         db,
 		Cfg:        cfg,
 		Frps:       NewFrpsClient(cfg),
-		Control:    mustControlPlane(cfg),
+		Control:    control,
 		Runtime:    NewRuntime(),
 		Settings:   NewSettingStore(db, cfg),
 		Captchas:   NewCaptchaStore(),
@@ -350,7 +351,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
-		loginFails:       newLoginFailureCounterWithControl(db, mustControlPlane(cfg)),
+		loginFails:       newLoginFailureCounterWithControl(db, control),
 		mailWake:         make(chan struct{}, 1),
 		recoveryCh:       make(chan recoveryRequest, recoveryBuffer),
 		recoveryCounters: &recoveryCounters{},

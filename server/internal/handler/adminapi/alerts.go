@@ -35,23 +35,38 @@ func (h *Handler) GetAlertSettings(c *gin.Context) {
 	if !cfg.SilenceUntil.IsZero() {
 		silenceUntil = cfg.SilenceUntil.Format(time.RFC3339)
 	}
+	report := h.svc.ReportConfig()
 	httpx.OK(c, gin.H{
-		"enabled":            cfg.Enabled,
-		"webhook_url":        webhook,
-		"webhook_configured": configured,
-		"webhook_host":       host,
-		"error_rate_pct":     cfg.ErrorRatePct,
-		"disk_pct":           cfg.DiskPct,
-		"backup_stale_hours": cfg.BackupStaleHr,
-		"sustained_windows":  cfg.SustainedWindows,
-		"silence_until":      silenceUntil,
-		"silence_reason":     cfg.SilenceReason,
-		"silenced":           cfg.Silenced(time.Now()),
-		"min_requests":       service.AlertMinRequests,
-		"interval_minutes":   service.AlertIntervalMinutes,
-		"cooldown_minutes":   service.AlertCooldownMinutes,
-		"sample_keep_days":   service.AlertSampleKeepDays,
-		"event_keep_days":    service.AlertEventKeepDays,
+		"enabled":                cfg.Enabled,
+		"webhook_url":            webhook,
+		"webhook_configured":     configured,
+		"webhook_host":           host,
+		"error_rate_pct":         cfg.ErrorRatePct,
+		"disk_pct":               cfg.DiskPct,
+		"backup_stale_hours":     cfg.BackupStaleHr,
+		"sustained_windows":      cfg.SustainedWindows,
+		"silence_until":          silenceUntil,
+		"silence_reason":         cfg.SilenceReason,
+		"silenced":               cfg.Silenced(time.Now()),
+		"email_enabled":          cfg.EmailEnabled,
+		"email_recipients":       strings.Join(cfg.EmailRecipients, ", "),
+		"email_min_level":        cfg.EmailMinLevel,
+		"email_hourly_limit":     cfg.EmailHourlyLimit,
+		"email_include_recovery": cfg.EmailIncludeRecovery,
+		"mail_ready":             h.svc.MailEnabled(),
+
+		"report_enabled":        report.Enabled,
+		"report_daily_enabled":  report.DailyEnabled,
+		"report_daily_hour":     report.DailyHour,
+		"report_weekly_enabled": report.WeeklyEnabled,
+		"report_weekly_weekday": report.WeeklyWeekday,
+		"report_weekly_hour":    report.WeeklyHour,
+
+		"min_requests":     service.AlertMinRequests,
+		"interval_minutes": service.AlertIntervalMinutes,
+		"cooldown_minutes": service.AlertCooldownMinutes,
+		"sample_keep_days": service.AlertSampleKeepDays,
+		"event_keep_days":  service.AlertEventKeepDays,
 	})
 }
 
@@ -66,6 +81,19 @@ type alertSettingsReq struct {
 	SustainedWindows *int     `json:"sustained_windows"`
 	SilenceUntil     *string  `json:"silence_until"`
 	SilenceReason    *string  `json:"silence_reason"`
+
+	EmailEnabled         *bool   `json:"email_enabled"`
+	EmailRecipients      *string `json:"email_recipients"`
+	EmailMinLevel        *string `json:"email_min_level"`
+	EmailHourlyLimit     *int    `json:"email_hourly_limit"`
+	EmailIncludeRecovery *bool   `json:"email_include_recovery"`
+
+	ReportEnabled       *bool `json:"report_enabled"`
+	ReportDailyEnabled  *bool `json:"report_daily_enabled"`
+	ReportDailyHour     *int  `json:"report_daily_hour"`
+	ReportWeeklyEnabled *bool `json:"report_weekly_enabled"`
+	ReportWeeklyWeekday *int  `json:"report_weekly_weekday"`
+	ReportWeeklyHour    *int  `json:"report_weekly_hour"`
 }
 
 func (h *Handler) UpdateAlertSettings(c *gin.Context) {
@@ -115,6 +143,46 @@ func (h *Handler) UpdateAlertSettings(c *gin.Context) {
 	if req.SilenceReason != nil {
 		in[service.KeyAlertSilenceReason] = strings.TrimSpace(*req.SilenceReason)
 	}
+	if req.EmailEnabled != nil {
+		in[service.KeyAlertEmailEnabled] = strconv.FormatBool(*req.EmailEnabled)
+	}
+	if req.EmailRecipients != nil {
+		raw := strings.TrimSpace(*req.EmailRecipients)
+		valid, invalid := service.ParseMailRecipients(raw)
+		if len(invalid) > 0 {
+			// 保留原样交给校验报错，不要悄悄丢掉写错的地址。
+			in[service.KeyAlertEmailTo] = raw
+		} else {
+			in[service.KeyAlertEmailTo] = strings.Join(valid, ",")
+		}
+	}
+	if req.EmailMinLevel != nil {
+		in[service.KeyAlertEmailMinLevel] = strings.ToLower(strings.TrimSpace(*req.EmailMinLevel))
+	}
+	if req.EmailHourlyLimit != nil {
+		in[service.KeyAlertEmailHourlyMax] = strconv.Itoa(*req.EmailHourlyLimit)
+	}
+	if req.EmailIncludeRecovery != nil {
+		in[service.KeyAlertEmailRecovery] = strconv.FormatBool(*req.EmailIncludeRecovery)
+	}
+	if req.ReportEnabled != nil {
+		in[service.KeyReportEnabled] = strconv.FormatBool(*req.ReportEnabled)
+	}
+	if req.ReportDailyEnabled != nil {
+		in[service.KeyReportDailyEnabled] = strconv.FormatBool(*req.ReportDailyEnabled)
+	}
+	if req.ReportDailyHour != nil {
+		in[service.KeyReportDailyHour] = strconv.Itoa(*req.ReportDailyHour)
+	}
+	if req.ReportWeeklyEnabled != nil {
+		in[service.KeyReportWeeklyEnabled] = strconv.FormatBool(*req.ReportWeeklyEnabled)
+	}
+	if req.ReportWeeklyWeekday != nil {
+		in[service.KeyReportWeeklyWeekday] = strconv.Itoa(*req.ReportWeeklyWeekday)
+	}
+	if req.ReportWeeklyHour != nil {
+		in[service.KeyReportWeeklyHour] = strconv.Itoa(*req.ReportWeeklyHour)
+	}
 	if len(in) == 0 {
 		httpx.BadRequest(c, "没有需要更新的字段")
 		return
@@ -133,8 +201,9 @@ func (h *Handler) UpdateAlertSettings(c *gin.Context) {
 		}
 	}
 	h.audit(c, "alert.settings.update", "alert", "",
-		fmt.Sprintf("更新告警设置（启用=%v，错误率阈值=%.0f%%，磁盘阈值=%.0f%%，备份超时=%d 小时，持续=%d 窗口，%s）",
-			cfg.Enabled, cfg.ErrorRatePct, cfg.DiskPct, cfg.BackupStaleHr, cfg.SustainedWindows, silence))
+		fmt.Sprintf("更新告警设置（启用=%v，错误率阈值=%.0f%%，磁盘阈值=%.0f%%，备份超时=%d 小时，持续=%d 窗口，邮件=%v，报告=%v，%s）",
+			cfg.Enabled, cfg.ErrorRatePct, cfg.DiskPct, cfg.BackupStaleHr,
+			cfg.SustainedWindows, cfg.EmailEnabled, h.svc.ReportConfig().Enabled, silence))
 	httpx.OK(c, gin.H{"message": "已保存，配置即时生效"})
 }
 
@@ -153,6 +222,16 @@ func (h *Handler) TestAlertWebhook(c *gin.Context) {
 	}
 	h.audit(c, "alert.settings.test", "alert", "", "发送告警 Webhook 测试消息")
 	httpx.OK(c, gin.H{"message": "测试消息已推送，请检查接收端"})
+}
+
+// SendTestReport 立即投递一份最近 24 小时的摘要，用于验证 SMTP 与模板。
+func (h *Handler) SendTestReport(c *gin.Context) {
+	if err := h.svc.SendTestReport(time.Now()); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "alert.report.test", "alert", "", "发送测试摘要邮件")
+	httpx.OK(c, gin.H{"message": "测试摘要已入队，请查收邮箱"})
 }
 
 func (h *Handler) ListAlertEvents(c *gin.Context) {

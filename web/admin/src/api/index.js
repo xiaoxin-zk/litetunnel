@@ -163,6 +163,10 @@ export const monitorApi = {
   system: (limit) => http.get('/system/metrics', { params: limit ? { limit } : {} })
 }
 
+export const healthApi = {
+  get: () => http.get('/health')
+}
+
 export const firewallApi = {
   status: () => http.get('/firewall/status'),
   rescan: () => http.post('/firewall/rescan'),
@@ -207,6 +211,7 @@ export const alertApi = {
   settings: () => http.get('/alerts/settings'),
   saveSettings: (data) => http.put('/alerts/settings', data),
   test: () => http.post('/alerts/settings/test'),
+  testReport: () => http.post('/alerts/reports/test'),
   events: (limit) => http.get('/alerts/events', { params: limit ? { limit } : {} }),
   resolve: (id) => http.post(`/alerts/events/${id}/resolve`),
   metrics: (limit) => http.get('/alerts/metrics', { params: limit ? { limit } : {} })

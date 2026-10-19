@@ -171,6 +171,7 @@ func New(
 		adminRead.POST("/profile/totp/disable", adminH.TOTPDisable)
 		adminRead.GET("/stats/overview", adminH.StatsOverview)
 		adminRead.GET("/system/metrics", adminH.SystemMetrics)
+		adminRead.GET("/health", adminH.HealthReport)
 
 		adminRead.GET("/users", adminH.ListUsers)
 		adminRead.GET("/groups", adminH.ListGroups)
@@ -246,6 +247,7 @@ func New(
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
 		adminSuper.PUT("/alerts/settings", adminH.UpdateAlertSettings)
 		adminSuper.POST("/alerts/settings/test", adminH.TestAlertWebhook)
+		adminSuper.POST("/alerts/reports/test", adminH.SendTestReport)
 		adminSuper.POST("/admin-api-keys", adminH.CreateAdminAPIKey)
 		adminSuper.DELETE("/admin-api-keys/:id", adminH.RevokeAdminAPIKey)
 

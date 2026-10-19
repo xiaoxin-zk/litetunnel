@@ -44,6 +44,18 @@ func (s *Services) applyMailAction(row model.MailOutbox, token string) error {
 	}
 }
 
+// mailKindHasAction 表示这类邮件送达后还需要在库里激活某个凭据。
+// 告警与报告只是通知，送达即终态。
+func mailKindHasAction(kind string) bool {
+	switch kind {
+	case model.MailKindEmailCodeRegister, model.MailKindEmailCodeReset,
+		model.MailKindEmailCodeChange, model.MailKindResetLink:
+		return true
+	default:
+		return false
+	}
+}
+
 func stillClaimed(tx *gorm.DB, rowID uint, token string) error {
 	var n int64
 	if err := tx.Model(&model.MailOutbox{}).

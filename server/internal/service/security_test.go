@@ -109,6 +109,7 @@ func enableTestMail(t *testing.T, svc *Services) {
 		KeySMTPUser:     "noreply@example.com",
 		KeySMTPPassword: "secret",
 		KeySMTPFrom:     "noreply@example.com",
+		KeySMTPTLS:      "none",
 	}); err != nil {
 		t.Fatalf("设置邮件配置失败: %v", err)
 	}

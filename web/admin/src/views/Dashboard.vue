@@ -1,6 +1,54 @@
 <template>
   <div v-loading="loading && !hasData">
-    <div class="lt-card">
+    <div class="lt-card" v-loading="healthLoading && !health">
+      <div class="lt-card-title">
+        <span>健康检查</span>
+        <span class="lt-muted" style="font-size: 12.5px; font-weight: 400">
+          {{ health?.generated_at ? '更新于 ' + new Date(health.generated_at).toLocaleTimeString() : '' }}
+        </span>
+      </div>
+
+      <el-row :gutter="16">
+        <el-col :xs="24" :md="6">
+          <div class="health-score">
+            <div class="health-num" :style="{ color: gradeColor }">{{ health ? health.score : '—' }}</div>
+            <div class="health-grade">{{ health?.grade || '未知' }}</div>
+            <div class="lt-muted" style="font-size: 12px">算不出的分项不参与加权</div>
+          </div>
+        </el-col>
+        <el-col :xs="24" :md="18">
+          <div v-for="c in health?.components || []" :key="c.key" class="health-comp">
+            <div class="health-comp-head">
+              <span class="health-comp-name">{{ c.name }}</span>
+              <span class="lt-muted health-comp-detail">{{ c.detail }}</span>
+              <span :style="{ color: compColor(c.status) }">
+                {{ c.status === 'unknown' ? '—' : c.score }}
+              </span>
+            </div>
+            <el-progress
+              :percentage="c.status === 'unknown' ? 0 : c.score"
+              :show-text="false"
+              :stroke-width="5"
+              :color="compColor(c.status)"
+            />
+          </div>
+        </el-col>
+      </el-row>
+
+      <div v-if="health?.todos?.length" class="health-todos">
+        <div v-for="t in health.todos" :key="t.key" class="health-todo">
+          <el-tag size="small" :type="todoTag(t.level)">{{ todoLabel(t.level) }}</el-tag>
+          <b>{{ t.title }}</b>
+          <span class="lt-muted health-todo-detail">{{ t.detail }}</span>
+          <el-button v-if="t.link" link type="primary" @click="$router.push(t.link)">去处理</el-button>
+        </div>
+      </div>
+      <div v-else-if="health" class="lt-muted" style="margin-top: 10px">
+        没有需要处理的项。
+      </div>
+    </div>
+
+    <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>服务器实时状态</span>
         <span class="lt-muted" style="font-size: 12.5px; font-weight: 400">
@@ -168,12 +216,62 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
-import { monitorApi, statsApi } from '../api'
+import { healthApi, monitorApi, statsApi } from '../api'
 import { formatBytes } from '../utils/format'
 
 const loading = ref(false)
 const stats = ref({})
 const metrics = ref({})
+
+const health = ref(null)
+const healthLoading = ref(false)
+let healthTimer = null
+
+const gradeColor = computed(() => {
+  const s = health.value?.score ?? 0
+  if (s >= 90) return '#059669'
+  if (s >= 75) return '#2563eb'
+  if (s >= 60) return '#d97706'
+  return '#dc2626'
+})
+
+function compColor(status) {
+  switch (status) {
+    case 'critical':
+      return '#dc2626'
+    case 'warn':
+      return '#d97706'
+    case 'ok':
+      return '#059669'
+    default:
+      return '#cbd5e1'
+  }
+}
+
+function todoTag(level) {
+  if (level === 'critical') return 'danger'
+  if (level === 'warning') return 'warning'
+  return 'info'
+}
+
+function todoLabel(level) {
+  if (level === 'critical') return '严重'
+  if (level === 'warning') return '警告'
+  return '提示'
+}
+
+// 健康分要读证书状态（可能走宿主机 helper），因此单独 60 秒刷新一次，
+// 不跟着 5 秒一次的实时指标一起轮询。
+async function loadHealth() {
+  healthLoading.value = true
+  try {
+    health.value = await healthApi.get()
+  } catch {
+    // 辅助信息，失败不影响其他卡片
+  } finally {
+    healthLoading.value = false
+  }
+}
 
 const cpuRef = ref()
 const memRef = ref()
@@ -412,14 +510,16 @@ async function load() {
 }
 
 onMounted(async () => {
-  await load()
+  await Promise.all([load(), loadHealth()])
   window.addEventListener('resize', resizeCharts)
   const iv = (metrics.value.sample_interval || 5) * 1000
   timer = setInterval(load, iv)
+  healthTimer = setInterval(loadHealth, 60 * 1000)
 })
 
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
+  if (healthTimer) clearInterval(healthTimer)
   window.removeEventListener('resize', resizeCharts)
   Object.values(charts).forEach((c) => c && c.dispose())
 })
@@ -468,5 +568,67 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.health-score {
+  padding: 6px 0 14px;
+}
+
+.health-num {
+  font-size: 40px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.health-grade {
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 4px;
+}
+
+.health-comp {
+  margin-bottom: 10px;
+}
+
+.health-comp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  margin-bottom: 4px;
+}
+
+.health-comp-name {
+  width: 42px;
+  color: #374151;
+  flex: none;
+}
+
+.health-comp-detail {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health-todos {
+  margin-top: 14px;
+  border-top: 1px solid #eef1f6;
+  padding-top: 10px;
+}
+
+.health-todo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+
+.health-todo-detail {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

@@ -302,11 +302,9 @@ func validateAlertSettings(view func(SettingKey) string) error {
 			return fmt.Errorf("%w: 告警 Webhook %v", ErrInvalidParam, err)
 		}
 	}
-	if upstream == "" {
-		switch strings.ToLower(strings.TrimSpace(view(KeyAlertEnabled))) {
-		case "true", "1", "yes", "on":
-			return fmt.Errorf("%w: 启用告警前请先填写 Webhook 地址，否则告警无处可发", ErrInvalidParam)
-		}
+	emailOn := truthySetting(view, KeyAlertEmailEnabled)
+	if truthySetting(view, KeyAlertEnabled) && upstream == "" && !emailOn {
+		return fmt.Errorf("%w: 启用告警前请至少配置一个通知通道（Webhook 或邮件）", ErrInvalidParam)
 	}
 	for _, item := range []struct {
 		key  SettingKey
@@ -338,7 +336,61 @@ func validateAlertSettings(view func(SettingKey) string) error {
 	if n := len([]rune(strings.TrimSpace(view(KeyAlertSilenceReason)))); n > 200 {
 		return fmt.Errorf("%w: 静默原因不能超过 200 字", ErrInvalidParam)
 	}
+
+	recipients, badRecipients := ParseMailRecipients(view(KeyAlertEmailTo))
+	if len(badRecipients) > 0 {
+		return fmt.Errorf("%w: 通知邮箱里有无法识别的地址：%s", ErrInvalidParam,
+			strings.Join(badRecipients, "、"))
+	}
+	if len(recipients) > maxNotifyRecipients {
+		return fmt.Errorf("%w: 通知邮箱最多 %d 个", ErrInvalidParam, maxNotifyRecipients)
+	}
+	switch strings.ToLower(strings.TrimSpace(view(KeyAlertEmailMinLevel))) {
+	case "warning", "critical":
+	default:
+		return fmt.Errorf("%w: 邮件最低级别只能是 warning 或 critical", ErrInvalidParam)
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyAlertEmailHourlyMax))); err != nil || n < 0 || n > 100 {
+		return fmt.Errorf("%w: 邮件每小时上限需为 0-100 的整数（0 表示不限）", ErrInvalidParam)
+	}
+	// 不在这里强制要求 SMTP 已就绪：系统设置页会一次性提交所有键，
+	// 在这里拦截会让「关闭 SMTP」这种合法操作被一条不相干的告警配置挡住。
+	// 通道没就绪的事实由页面提示与健康检查的待办来暴露。
+	if emailOn && len(recipients) == 0 {
+		return fmt.Errorf("%w: 启用邮件通知前请先填写收件人", ErrInvalidParam)
+	}
+
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyReportDailyHour))); err != nil || n < 0 || n > 23 {
+		return fmt.Errorf("%w: 日报发送时间需为 0-23 点", ErrInvalidParam)
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyReportWeeklyWeekday))); err != nil || n < 1 || n > 7 {
+		return fmt.Errorf("%w: 周报发送日需为 1-7（1 表示周一）", ErrInvalidParam)
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyReportWeeklyHour))); err != nil || n < 0 || n > 23 {
+		return fmt.Errorf("%w: 周报发送时间需为 0-23 点", ErrInvalidParam)
+	}
+	reportOn := truthySetting(view, KeyReportEnabled)
+	dailyOn := truthySetting(view, KeyReportDailyEnabled)
+	weeklyOn := truthySetting(view, KeyReportWeeklyEnabled)
+	if (dailyOn || weeklyOn) && !reportOn {
+		return fmt.Errorf("%w: 已选择日报/周报，请同时打开「定时报告」总开关", ErrInvalidParam)
+	}
+	if reportOn && !dailyOn && !weeklyOn {
+		return fmt.Errorf("%w: 定时报告至少要选择日报或周报中的一种", ErrInvalidParam)
+	}
+	if reportOn && len(recipients) == 0 {
+		return fmt.Errorf("%w: 启用定时报告前请先填写收件人", ErrInvalidParam)
+	}
 	return nil
+}
+
+// truthySetting 与 SettingStore.Bool 的判定保持一致，用于保存前的校验。
+func truthySetting(view func(SettingKey) string, key SettingKey) bool {
+	switch strings.ToLower(strings.TrimSpace(view(key))) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func validateOAuthSettings(view func(SettingKey) string, truthy func(SettingKey) bool) error {

@@ -102,6 +102,63 @@
             清空时间并保存即取消静默
           </span>
         </el-form-item>
+
+        <el-form-item label="邮件通知">
+          <div class="stack">
+            <div class="row">
+              <el-switch v-model="form.email_enabled" />
+              <span class="hint" style="margin-top: 0">
+                与 Webhook 相互独立，任一通道可用即可收到告警
+              </span>
+              <el-tag v-if="!mailReady" size="small" type="warning">SMTP 未启用</el-tag>
+            </div>
+            <el-input
+              v-model="form.email_recipients"
+              placeholder="收件人，多个用逗号分隔，最多 10 个"
+            />
+            <div class="row">
+              <span class="hint" style="margin-top: 0">最低级别</span>
+              <el-select v-model="form.email_min_level" style="width: 130px">
+                <el-option label="警告及以上" value="warning" />
+                <el-option label="仅严重" value="critical" />
+              </el-select>
+              <span class="hint" style="margin-top: 0">每小时上限</span>
+              <el-input-number v-model="form.email_hourly_limit" :min="0" :max="100" :step="1" />
+              <el-checkbox v-model="form.email_include_recovery">恢复时也发邮件</el-checkbox>
+            </div>
+            <span class="hint" style="margin-top: 0">
+              上限按「封数」计（多个收件人算多封），0 表示不限；达到上限的那一轮只跳过邮件，Webhook 照常
+            </span>
+          </div>
+        </el-form-item>
+
+        <el-form-item label="定时报告">
+          <div class="stack">
+            <div class="row">
+              <el-switch v-model="form.report_enabled" @change="onReportToggle" />
+              <span class="hint" style="margin-top: 0">收件人沿用上面的通知邮箱；需要先启用 SMTP</span>
+              <el-button link type="primary" :loading="testingReport" @click="sendTestReport">
+                发送测试摘要
+              </el-button>
+            </div>
+            <div class="row">
+              <el-checkbox v-model="form.report_daily_enabled">日报</el-checkbox>
+              <el-select v-model="form.report_daily_hour" style="width: 100px">
+                <el-option v-for="h in 24" :key="h - 1" :label="`${h - 1}:00`" :value="h - 1" />
+              </el-select>
+              <el-checkbox v-model="form.report_weekly_enabled">周报</el-checkbox>
+              <el-select v-model="form.report_weekly_weekday" style="width: 100px">
+                <el-option v-for="d in weekdays" :key="d.value" :label="d.label" :value="d.value" />
+              </el-select>
+              <el-select v-model="form.report_weekly_hour" style="width: 100px">
+                <el-option v-for="h in 24" :key="h - 1" :label="`${h - 1}:00`" :value="h - 1" />
+              </el-select>
+            </div>
+            <span class="hint" style="margin-top: 0">
+              摘要含用户/隧道/流量、平均错误率、磁盘、最近备份与本期告警摘要；发送时间按服务器本地时区
+            </span>
+          </div>
+        </el-form-item>
       </el-form>
     </div>
 
@@ -210,8 +267,31 @@ const form = ref({
   sustained_windows: 1,
   silence_until: null,
   silence_reason: '',
+  email_enabled: false,
+  email_recipients: '',
+  email_min_level: 'warning',
+  email_hourly_limit: 10,
+  email_include_recovery: true,
+  report_enabled: false,
+  report_daily_enabled: false,
+  report_daily_hour: 9,
+  report_weekly_enabled: false,
+  report_weekly_weekday: 1,
+  report_weekly_hour: 9,
   min_requests: 50
 })
+
+const mailReady = ref(true)
+const testingReport = ref(false)
+const weekdays = [
+  { value: 1, label: '周一' },
+  { value: 2, label: '周二' },
+  { value: 3, label: '周三' },
+  { value: 4, label: '周四' },
+  { value: 5, label: '周五' },
+  { value: 6, label: '周六' },
+  { value: 7, label: '周日' }
+]
 
 const silenced = computed(() => {
   const until = form.value.silence_until
@@ -323,6 +403,7 @@ async function loadConfig() {
     sampleKeepDays.value = Number(res.sample_keep_days ?? 14)
     eventKeepDays.value = Number(res.event_keep_days ?? 90)
     const until = res.silence_until ? new Date(res.silence_until) : null
+    mailReady.value = res.mail_ready !== false
     form.value = {
       enabled: !!res.enabled,
       webhook_url: '',
@@ -332,6 +413,17 @@ async function loadConfig() {
       sustained_windows: Number(res.sustained_windows ?? 1),
       silence_until: until && !Number.isNaN(until.getTime()) ? until : null,
       silence_reason: res.silence_reason || '',
+      email_enabled: !!res.email_enabled,
+      email_recipients: res.email_recipients || '',
+      email_min_level: res.email_min_level || 'warning',
+      email_hourly_limit: Number(res.email_hourly_limit ?? 10),
+      email_include_recovery: res.email_include_recovery !== false,
+      report_enabled: !!res.report_enabled,
+      report_daily_enabled: !!res.report_daily_enabled,
+      report_daily_hour: Number(res.report_daily_hour ?? 9),
+      report_weekly_enabled: !!res.report_weekly_enabled,
+      report_weekly_weekday: Number(res.report_weekly_weekday ?? 1),
+      report_weekly_hour: Number(res.report_weekly_hour ?? 9),
       min_requests: Number(res.min_requests ?? 50)
     }
   } finally {
@@ -353,12 +445,41 @@ async function save() {
       backup_stale_hours: form.value.backup_stale_hours,
       sustained_windows: form.value.sustained_windows,
       silence_until: form.value.silence_until ? new Date(form.value.silence_until).toISOString() : '',
-      silence_reason: form.value.silence_reason || ''
+      silence_reason: form.value.silence_reason || '',
+      email_enabled: form.value.email_enabled,
+      email_recipients: form.value.email_recipients || '',
+      email_min_level: form.value.email_min_level,
+      email_hourly_limit: form.value.email_hourly_limit,
+      email_include_recovery: form.value.email_include_recovery,
+      report_enabled: form.value.report_enabled,
+      report_daily_enabled: form.value.report_daily_enabled,
+      report_daily_hour: form.value.report_daily_hour,
+      report_weekly_enabled: form.value.report_weekly_enabled,
+      report_weekly_weekday: form.value.report_weekly_weekday,
+      report_weekly_hour: form.value.report_weekly_hour
     })
     ElMessage.success('已保存，配置即时生效')
     await loadConfig()
   } finally {
     saving.value = false
+  }
+}
+
+// 打开总开关时至少勾一种报告，否则保存会被校验拒绝。
+function onReportToggle(v) {
+  if (v && !form.value.report_daily_enabled && !form.value.report_weekly_enabled) {
+    form.value.report_daily_enabled = true
+  }
+}
+
+// 测试摘要用的是「已保存」的收件人与模板，改完记得先保存。
+async function sendTestReport() {
+  testingReport.value = true
+  try {
+    const res = await alertApi.testReport()
+    ElMessage.success(res?.message || '测试摘要已入队，请查收邮箱')
+  } finally {
+    testingReport.value = false
   }
 }
 
@@ -494,6 +615,13 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
 }
 
 .hint {

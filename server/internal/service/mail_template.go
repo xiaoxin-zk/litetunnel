@@ -15,6 +15,9 @@ import (
 const (
 	MailEventEmailCode     = "email_code"
 	MailEventPasswordReset = "password_reset"
+	MailEventAlertFiring   = "alert_firing"
+	MailEventAlertResolved = "alert_resolved"
+	MailEventReportSummary = "report_summary"
 )
 
 const (
@@ -91,6 +94,58 @@ const passwordResetMailTemplate = `<!doctype html>
   </div>
 </body></html>`
 
+const alertFiringMailTemplate = `<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;">
+    <h2 style="margin:0 0 8px;font-size:18px;color:#b91c1c;">{{level_label}}：{{kind_label}}</h2>
+    <p style="color:#4b5563;line-height:1.8;margin:0 0 16px;">{{message}}</p>
+    <p style="color:#6b7280;font-size:13px;line-height:1.8;margin:0 0 16px;">
+      当前值 <b>{{value}}</b>，阈值 <b>{{threshold}}</b>；首次触发 {{fired_at}}。
+    </p>
+    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
+    <p style="color:#9ca3af;font-size:12px;line-height:1.8;margin:0;">
+      来自 {{site_name}} 的告警通知。问题恢复后会再发一封「已恢复」；<br>
+      同一事件每 30 分钟提醒一次，可在管理端「告警与监控」中处理或静默。
+    </p>
+  </div>
+</body></html>`
+
+const alertResolvedMailTemplate = `<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;">
+    <h2 style="margin:0 0 8px;font-size:18px;color:#15803d;">已恢复：{{kind_label}}</h2>
+    <p style="color:#4b5563;line-height:1.8;margin:0 0 16px;">{{message}}</p>
+    <p style="color:#6b7280;font-size:13px;line-height:1.8;margin:0 0 16px;">
+      触发于 {{fired_at}}，恢复于 {{resolved_at}}，持续 {{duration}}。
+    </p>
+    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
+    <p style="color:#9ca3af;font-size:12px;line-height:1.8;margin:0;">来自 {{site_name}} 的告警恢复通知。</p>
+  </div>
+</body></html>`
+
+const reportSummaryMailTemplate = `<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">
+  <div style="max-width:600px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;">
+    <h2 style="margin:0 0 6px;font-size:18px;color:#1f2937;">{{report_name}}</h2>
+    <p style="color:#9ca3af;font-size:12px;margin:0 0 18px;">统计区间 {{period}} · 生成于 {{generated_at}}</p>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;color:#374151;">
+      <tr><td style="padding:6px 0;">用户</td><td style="padding:6px 0;text-align:right;">{{users_total}}（新增 {{users_new}}）</td></tr>
+      <tr><td style="padding:6px 0;">隧道</td><td style="padding:6px 0;text-align:right;">{{tunnels_total}}（在线 {{tunnels_online}}）</td></tr>
+      <tr><td style="padding:6px 0;">流量</td><td style="padding:6px 0;text-align:right;">{{traffic}}</td></tr>
+      <tr><td style="padding:6px 0;">平均错误率</td><td style="padding:6px 0;text-align:right;">{{error_rate}}%</td></tr>
+      <tr><td style="padding:6px 0;">磁盘使用率</td><td style="padding:6px 0;text-align:right;">{{disk}}%</td></tr>
+      <tr><td style="padding:6px 0;">最近备份</td><td style="padding:6px 0;text-align:right;">{{last_backup}}</td></tr>
+    </table>
+    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
+    <p style="color:#374151;font-size:13px;margin:0 0 10px;">
+      本期新增告警 {{alerts_firing}} 条，恢复 {{alerts_resolved}} 条。
+    </p>
+    <ul style="margin:0;padding-left:18px;color:#4b5563;font-size:13px;line-height:1.9;">{{alert_lines}}</ul>
+    <hr style="border:none;border-top:1px solid #eef1f6;margin:18px 0;">
+    <p style="color:#9ca3af;font-size:12px;line-height:1.8;margin:0;">来自 {{site_name}} 的运维摘要。可在管理端「告警与监控」中调整发送频率。</p>
+  </div>
+</body></html>`
+
 var mailEvents = []MailEvent{
 	{
 		Event:          MailEventEmailCode,
@@ -105,6 +160,32 @@ var mailEvents = []MailEvent{
 		Vars:           []string{"site_name", "username", "link", "minutes", "email"},
 		DefaultSubject: "【{{site_name}}】重置登录密码",
 		DefaultBody:    passwordResetMailTemplate,
+	},
+	{
+		Event:          MailEventAlertFiring,
+		Name:           "告警通知",
+		Vars:           []string{"site_name", "kind_label", "level_label", "message", "value", "threshold", "fired_at"},
+		DefaultSubject: "【{{site_name}}】{{level_label}}：{{kind_label}}",
+		DefaultBody:    alertFiringMailTemplate,
+	},
+	{
+		Event:          MailEventAlertResolved,
+		Name:           "告警恢复通知",
+		Vars:           []string{"site_name", "kind_label", "message", "fired_at", "resolved_at", "duration"},
+		DefaultSubject: "【{{site_name}}】已恢复：{{kind_label}}",
+		DefaultBody:    alertResolvedMailTemplate,
+	},
+	{
+		Event: MailEventReportSummary,
+		Name:  "运维摘要（日报/周报）",
+		Vars: []string{
+			"site_name", "report_name", "period", "generated_at",
+			"users_total", "users_new", "tunnels_total", "tunnels_online",
+			"traffic", "error_rate", "disk", "last_backup",
+			"alerts_firing", "alerts_resolved", "alert_lines",
+		},
+		DefaultSubject: "【{{site_name}}】{{report_name}}（{{period}}）",
+		DefaultBody:    reportSummaryMailTemplate,
 	},
 }
 
@@ -267,5 +348,29 @@ func sampleMailVars() map[string]string {
 		"username":  "demo",
 		"link":      "https://panel.example.com/reset-password?token=example",
 		"email":     "demo@example.com",
+
+		"kind_label":  "磁盘水位",
+		"level_label": "严重",
+		"message":     "磁盘使用率 95.0%（阈值 90%）",
+		"value":       "95.0",
+		"threshold":   "90",
+		"fired_at":    "2026-10-20 10:00:00",
+		"resolved_at": "2026-10-20 12:15:00",
+		"duration":    "2 小时 15 分",
+
+		"report_name":     "日报",
+		"period":          "2026-10-19 09:00 ~ 2026-10-20 09:00",
+		"generated_at":    "2026-10-20 09:00:05",
+		"users_total":     "12",
+		"users_new":       "1",
+		"tunnels_total":   "8",
+		"tunnels_online":  "6",
+		"traffic":         "3.2 GB",
+		"error_rate":      "0.4",
+		"disk":            "62.5",
+		"last_backup":     "6 小时前",
+		"alerts_firing":   "1",
+		"alerts_resolved": "2",
+		"alert_lines":     "<li>严重 · 磁盘水位：磁盘使用率 95.0%</li>",
 	}
 }

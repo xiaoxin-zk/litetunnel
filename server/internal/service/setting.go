@@ -119,6 +119,21 @@ const (
 	KeyAlertSustained     SettingKey = "alert.sustained_windows"
 	KeyAlertSilenceUntil  SettingKey = "alert.silence_until"
 	KeyAlertSilenceReason SettingKey = "alert.silence_reason"
+
+	KeyAlertEmailEnabled   SettingKey = "alert.email_enabled"
+	KeyAlertEmailTo        SettingKey = "alert.email_recipients"
+	KeyAlertEmailMinLevel  SettingKey = "alert.email_min_level"
+	KeyAlertEmailHourlyMax SettingKey = "alert.email_hourly_limit"
+	KeyAlertEmailRecovery  SettingKey = "alert.email_include_recovery"
+
+	KeyReportEnabled       SettingKey = "report.enabled"
+	KeyReportDailyEnabled  SettingKey = "report.daily_enabled"
+	KeyReportDailyHour     SettingKey = "report.daily_hour"
+	KeyReportWeeklyEnabled SettingKey = "report.weekly_enabled"
+	KeyReportWeeklyWeekday SettingKey = "report.weekly_weekday"
+	KeyReportWeeklyHour    SettingKey = "report.weekly_hour"
+	KeyReportDailyLastAt   SettingKey = "report.daily_last_at"
+	KeyReportWeeklyLastAt  SettingKey = "report.weekly_last_at"
 )
 
 const SecretMask = "__UNCHANGED__"
@@ -249,6 +264,23 @@ var settingSpecs = []settingSpec{
 	{Key: KeyAlertSustained, Default: func(*config.Config) string { return "1" }},
 	{Key: KeyAlertSilenceUntil, Default: func(*config.Config) string { return "" }},
 	{Key: KeyAlertSilenceReason, SingleLine: true, Default: func(*config.Config) string { return "" }},
+
+	{Key: KeyAlertEmailEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyAlertEmailTo, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyAlertEmailMinLevel, Default: func(*config.Config) string { return "warning" }},
+	{Key: KeyAlertEmailHourlyMax, Default: func(*config.Config) string { return "10" }},
+	{Key: KeyAlertEmailRecovery, Default: func(*config.Config) string { return "true" }},
+
+	{Key: KeyReportEnabled, Default: func(*config.Config) string { return "false" }},
+	// 默认关闭：总开关关着却把日报勾上是自相矛盾的组合，校验会拒绝，
+	// 那会让「默认状态」本身就保存不过去。
+	{Key: KeyReportDailyEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyReportDailyHour, Default: func(*config.Config) string { return "9" }},
+	{Key: KeyReportWeeklyEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyReportWeeklyWeekday, Default: func(*config.Config) string { return "1" }},
+	{Key: KeyReportWeeklyHour, Default: func(*config.Config) string { return "9" }},
+	{Key: KeyReportDailyLastAt, Internal: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyReportWeeklyLastAt, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 var settingByKey = func() map[SettingKey]settingSpec {

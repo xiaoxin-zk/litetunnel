@@ -44,6 +44,13 @@ type AlertConfig struct {
 	SustainedWindows int       `json:"sustained_windows"`
 	SilenceUntil     time.Time `json:"silence_until"`
 	SilenceReason    string    `json:"silence_reason"`
+
+	// 邮件通道与 Webhook 相互独立：任何一条通道配好就能收到告警。
+	EmailEnabled         bool     `json:"email_enabled"`
+	EmailRecipients      []string `json:"email_recipients"`
+	EmailMinLevel        string   `json:"email_min_level"`
+	EmailHourlyLimit     int      `json:"email_hourly_limit"`
+	EmailIncludeRecovery bool     `json:"email_include_recovery"`
 }
 
 // Silenced 报告 now 是否处于静默窗口内。静默只影响推送，不影响状态维护。
@@ -56,15 +63,25 @@ func (s *Services) AlertConfig() AlertConfig {
 	if sustained < 1 {
 		sustained = 1
 	}
+	recipients, _ := ParseMailRecipients(s.Settings.Get(KeyAlertEmailTo))
+	minLevel := strings.ToLower(strings.TrimSpace(s.Settings.Get(KeyAlertEmailMinLevel)))
+	if minLevel != "critical" {
+		minLevel = "warning"
+	}
 	return AlertConfig{
-		Enabled:          s.Settings.Bool(KeyAlertEnabled),
-		WebhookURL:       strings.TrimSpace(s.Settings.Get(KeyAlertWebhook)),
-		ErrorRatePct:     float64(s.Settings.Int(KeyAlertErrorRate)),
-		DiskPct:          float64(s.Settings.Int(KeyAlertDisk)),
-		BackupStaleHr:    s.Settings.Int(KeyAlertBackupHours),
-		SustainedWindows: sustained,
-		SilenceUntil:     parseSilenceUntil(s.Settings.Get(KeyAlertSilenceUntil)),
-		SilenceReason:    strings.TrimSpace(s.Settings.Get(KeyAlertSilenceReason)),
+		Enabled:              s.Settings.Bool(KeyAlertEnabled),
+		WebhookURL:           strings.TrimSpace(s.Settings.Get(KeyAlertWebhook)),
+		ErrorRatePct:         float64(s.Settings.Int(KeyAlertErrorRate)),
+		DiskPct:              float64(s.Settings.Int(KeyAlertDisk)),
+		BackupStaleHr:        s.Settings.Int(KeyAlertBackupHours),
+		SustainedWindows:     sustained,
+		SilenceUntil:         parseSilenceUntil(s.Settings.Get(KeyAlertSilenceUntil)),
+		SilenceReason:        strings.TrimSpace(s.Settings.Get(KeyAlertSilenceReason)),
+		EmailEnabled:         s.Settings.Bool(KeyAlertEmailEnabled),
+		EmailRecipients:      recipients,
+		EmailMinLevel:        minLevel,
+		EmailHourlyLimit:     s.Settings.Int(KeyAlertEmailHourlyMax),
+		EmailIncludeRecovery: s.Settings.Bool(KeyAlertEmailRecovery),
 	}
 }
 
@@ -135,7 +152,8 @@ func (s *Services) runAlertCycle(now time.Time) {
 	cfg := s.AlertConfig()
 	// 静默与关闭告警的区别：静默只是不打扰（不新建事件、不推送），状态仍然维护；
 	// 关闭告警则连评估都不做推送，但已有事件照样会按条件恢复。
-	notify := cfg.Enabled && cfg.WebhookURL != "" && !cfg.Silenced(now)
+	// 只要 Webhook 或邮件任一通道可用就算「能通知」。
+	notify := cfg.Enabled && (cfg.WebhookURL != "" || cfg.EmailEnabled) && !cfg.Silenced(now)
 
 	checks := s.evaluateAlerts(cfg, sample, stats, diskKnown, now)
 	evaluated := make(map[string]struct{}, len(checks))
@@ -246,20 +264,33 @@ func (s *Services) evaluateAlerts(
 }
 
 func (s *Services) backupStaleHours(now time.Time) (float64, bool) {
-	if !s.BackupSupported() {
+	hours, exists, ok := s.latestBackupAge(now)
+	if !ok {
 		return 0, false
+	}
+	if !exists {
+		return 1 << 20, true // 一个都没有：视为早已过期的极值
+	}
+	return hours, true
+}
+
+// latestBackupAge 返回最近一次「非恢复前快照」备份的年龄。
+// exists=false 表示一份都没有；ok=false 表示当前环境不支持或目录读不出来。
+func (s *Services) latestBackupAge(now time.Time) (hours float64, exists bool, ok bool) {
+	if !s.BackupSupported() {
+		return 0, false, false
 	}
 	list, err := s.ListBackups()
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	for _, f := range list {
 		if f.PreRestore {
 			continue
 		}
-		return now.Sub(f.CreatedAt).Hours(), true
+		return now.Sub(f.CreatedAt).Hours(), true, true
 	}
-	return 1 << 20, true // 一个都没有：视为早已过期的极值
+	return 0, false, true
 }
 
 // sustained 判断最近 n 个采样窗口（含当前窗口）是否都满足条件。
@@ -428,12 +459,23 @@ func (s *Services) refreshAlert(ev *model.AlertEvent) {
 	}
 }
 
-// deliverAlert 推送并回写送达状态。失败只记日志：告警记录本身已经落库，
-// 下一轮采样会重试同一条。
+// deliverAlert 推送并回写送达状态。Webhook 与邮件是两条独立通道，
+// 任一成功就算「已通知」；都失败时只记日志，下一轮采样重试同一条。
 func (s *Services) deliverAlert(ev model.AlertEvent) {
-	if err := s.postWebhook(ev); err != nil {
-		// 地址里通常带 token，日志只记出站策略能安全展示的部分。
-		log.Printf("[alert] Webhook 推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
+	cfg := s.AlertConfig()
+	delivered := false
+	if cfg.WebhookURL != "" {
+		if err := s.postWebhook(ev); err != nil {
+			// 地址里通常带 token，日志只记出站策略能安全展示的部分。
+			log.Printf("[alert] Webhook 推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
+		} else {
+			delivered = true
+		}
+	}
+	if s.sendAlertEmail(ev, false) {
+		delivered = true
+	}
+	if !delivered {
 		return
 	}
 	s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).
@@ -444,7 +486,7 @@ func (s *Services) deliverAlert(ev model.AlertEvent) {
 // 接收端没看到「炸了」，再来一条「好了」只会让人困惑。
 func (s *Services) deliverResolved(ev model.AlertEvent, message string) {
 	cfg := s.AlertConfig()
-	if !cfg.Enabled || cfg.WebhookURL == "" {
+	if !cfg.Enabled || (cfg.WebhookURL == "" && !cfg.EmailEnabled) {
 		return
 	}
 	if cfg.Silenced(time.Now()) {
@@ -462,11 +504,21 @@ func (s *Services) deliverResolved(ev model.AlertEvent, message string) {
 	out.Status = model.AlertStatusResolved
 	out.Level = "info"
 	out.Message = message
-	if err := s.postWebhook(out); err != nil {
-		log.Printf("[alert] 恢复通知推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
-		return
+
+	delivered := false
+	if cfg.WebhookURL != "" {
+		if err := s.postWebhook(out); err != nil {
+			log.Printf("[alert] 恢复通知推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
+		} else {
+			delivered = true
+		}
 	}
-	s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
+	if s.sendAlertEmail(out, true) {
+		delivered = true
+	}
+	if delivered {
+		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
+	}
 }
 
 // postWebhook 推送一条告警。at 是推送时间，fired_at 是事件发生时间，

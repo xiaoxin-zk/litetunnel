@@ -272,6 +272,18 @@ func (s *Services) deliverMail(ctx context.Context, row model.MailOutbox, token 
 	log.Printf("[mail] 已送达（收件人 %s，类型 %s，第 %d 次尝试）",
 		maskEmail(row.To), row.Kind, row.Attempts+1)
 
+	// 通知类邮件（告警、报告）没有凭据动作，送达即终态；
+	// 走原来的「已送达 → 激活」流程只会多一次状态写入和一条误导性的日志。
+	if !mailKindHasAction(row.Kind) {
+		s.finishMail(row.ID, token, mailFinish{
+			status:         model.MailSent,
+			attempts:       row.Attempts + 1,
+			actionAttempts: row.ActionAttempts,
+			clearSensitive: true,
+		})
+		return
+	}
+
 	updates := map[string]any{
 		"status":      model.MailDelivered,
 		"attempts":    row.Attempts + 1,

@@ -412,6 +412,11 @@ const (
 	MailKindEmailCodeReset    = "email_code_reset"
 	MailKindEmailCodeChange   = "email_code_change"
 	MailKindResetLink         = "reset_link"
+
+	// 以下三类是通知邮件：送达即完成，没有需要回写的凭据动作。
+	MailKindAlertFiring   = "alert_firing"
+	MailKindAlertResolved = "alert_resolved"
+	MailKindReportSummary = "report_summary"
 )
 
 type MailOutbox struct {

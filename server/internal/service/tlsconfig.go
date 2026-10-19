@@ -583,9 +583,20 @@ func checkDomain(d string) error {
 	if len(labels) < 2 {
 		return fmt.Errorf("不是完整域名（至少需要两段，如 panel.example.com）")
 	}
+	if len(d) > 253 {
+		return fmt.Errorf("域名总长度不能超过 253 个字符（当前 %d）", len(d))
+	}
 	for _, l := range labels {
 		if l == "" {
 			return fmt.Errorf("存在空的域名段")
+		}
+		// 单个标签最长 63：超过之后 DNS 与证书签发都会失败，
+		// 而失败发生在申请证书阶段，错误信息与「域名太长」毫无关联。
+		if len(l) > 63 {
+			return fmt.Errorf("域名段 %q 超过 63 个字符", l)
+		}
+		if strings.HasPrefix(l, "-") || strings.HasSuffix(l, "-") {
+			return fmt.Errorf("域名段 %q 不能以 - 开头或结尾", l)
 		}
 		for _, r := range l {
 			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {

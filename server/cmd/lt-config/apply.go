@@ -240,8 +240,9 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 			}
 			return res, &partialApplyError{
 				msg:      fmt.Sprintf("配置与容器均已生效，但批次现场无法落定：重启可能把磁盘回滚到旧配置，需人工处理\n%v", err),
-				services: states,
-				cause:    err,
+				services:    states,
+				servicesErr: stateErr,
+				cause:       err,
 			}
 		}
 		res.Warnings = append(res.Warnings, err.Error())
@@ -259,6 +260,9 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 type partialApplyError struct {
 	msg      string
 	services []tlscfg.ServiceState
+	// servicesErr 是「各容器实际状态」读取失败的原因。必须与「读到空列表」
+	// 区分：读取失败时不能让人以为容器都不存在。
+	servicesErr error
 	// cause 保留原始错误链。
 	//
 	// 这个类型是给 HTTP 层用的「结构化结果」，不是普通的包装错误：它自己
@@ -307,12 +311,13 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 	cleanupPending := errors.Is(rbErr, errBatchCleanupPending)
 	if rbErr != nil && !cleanupPending {
 		s.registerDirtyScene()
-		states, _ := s.serviceStates(rollbackCtx)
+		states, stateErr := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
 				"\n重建错误: %v\n回滚错误: %v%s", upErr, rbErr, detail),
-			services: states,
-			cause:    rbErr,
+			services:    states,
+			servicesErr: stateErr,
+			cause:       rbErr,
 		}
 	}
 	note := ""
@@ -331,12 +336,13 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置%s，可修改后重试）%s", upErr, note, detail)
 	} else {
 		s.registerDirtyScene()
-		states, _ := s.serviceStates(rollbackCtx)
+		states, stateErr := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("新配置重建失败，磁盘已回滚为旧配置，但按旧配置重建也失败：容器当前版本未知"+
 				"\n新配置重建错误: %v\n回滚重建错误: %v%s", upErr, reErr, detail),
-			services: states,
-			cause:    reErr,
+			services:    states,
+			servicesErr: stateErr,
+			cause:       reErr,
 		}
 	}
 }

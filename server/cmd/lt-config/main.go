@@ -104,6 +104,18 @@ func main() {
 	}
 
 	p := newPaths(*deployDir, *envFile, *composeFile, *caddyTpl, *caddyOut, *frpsTpl, *frpsOut, *caddyData)
+
+	// 校验用的 frps 镜像必须与 Compose 实际启动的一致。两边各自可配，
+	// 只改一边时「校验通过」就只对另一个镜像成立——镜像里有没有 verify
+	// 子命令、支持哪些字段都可能不同，这种校验比没有更误导人。
+	if img, err := composeServiceImage(p.composeFile, "frps"); err != nil {
+		log.Printf("[lt-config] 警告：无法从 Compose 读取 frps 镜像，校验镜像沿用 %q: %v", *frpsImage, err)
+	} else if resolved, ok := resolveComposeImage(img, os.Getenv); !ok {
+		log.Printf("[lt-config] 警告：Compose 的 frps 镜像 %q 含无法解析的变量，跳过一致性检查", img)
+	} else if *frpsImage != resolved {
+		log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
+			"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
+	}
 	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
 	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。
 	//

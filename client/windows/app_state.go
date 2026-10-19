@@ -74,8 +74,12 @@ func (a *App) getStateLocked(logEpoch uint64) State {
 	// 而 GetState 会被日志回调高频调用。
 	tunnels := make([]TunnelVO, len(a.tunnels))
 	copy(tunnels, a.tunnels)
+	// 一次取运行集合：逐条 Running 会在隧道很多时放大成 O(N) 次加锁，
+	// 而状态快照会被每次状态事件（含高频日志）调用。
+	running := a.mgr.RunningSet()
 	for i := range tunnels {
-		tunnels[i].Running = a.mgr.Running(tunnels[i].ID)
+		_, isRunning := running[tunnels[i].ID]
+		tunnels[i].Running = isRunning
 		tunnels[i].Registered = a.registered[tunnels[i].ID]
 		// 进程在跑但还没注册成功：把已等待时长带出去，界面据此显示
 		// 「连接中 · 42 秒」，而不是一句没有信息量的「连接中」。
@@ -131,7 +135,8 @@ func (a *App) getStateLocked(logEpoch uint64) State {
 		// 的事件」（见 State.AuthGen）。这里已持有读锁，直接读即可。
 		AuthGen: a.authGeneration,
 		// Running 是「有没有任意一条隧道在连」，界面的状态点用它。
-		Running:   a.mgr.AnyRunning(),
+		// 直接用上面那份集合，避免再取一次管理器锁。
+		Running:   len(running) > 0,
 		FrpcFound: a.mgr.Available(),
 		FrpcPath:  a.mgr.ExePath(),
 	}

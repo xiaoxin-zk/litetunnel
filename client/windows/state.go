@@ -10,9 +10,26 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/client/internal/frpc"
 )
 
+// maxStatusTextRunes 是错误/状态文本保留的最大字符数。
+//
+// 这些文本来自服务端响应与 frpc 输出，最终会随每次 GetState 通过 IPC
+// 送给前端。不设上限时，一次异常响应（例如带整段 HTML 的 502 页面）会被
+// 原样保留并在每次状态事件里重复序列化——内存与 IPC 都被一条消息放大。
+// 保留开头而不是结尾：错误的首行通常就说明了原因。
+const maxStatusTextRunes = 400
+
+// clampStatusText 按字符（而不是字节）截断，避免把 UTF-8 字符切成半个。
+func clampStatusText(s string) string {
+	r := []rune(s)
+	if len(r) <= maxStatusTextRunes {
+		return s
+	}
+	return string(r[:maxStatusTextRunes]) + "…（已截断）"
+}
+
 func (a *App) setSyncErr(err error) {
 	a.mu.Lock()
-	a.syncErr = err.Error()
+	a.syncErr = clampStatusText(err.Error())
 	a.mu.Unlock()
 }
 
@@ -323,7 +340,7 @@ func (a *App) recordTunnelErrMsg(id uint, msg string) bool {
 }
 
 func (a *App) recordTunnelErrMsgGen(id uint, gen uint64, msg string) bool {
-	msg = strings.TrimSpace(msg)
+	msg = clampStatusText(strings.TrimSpace(msg))
 	if msg == "" {
 		return false
 	}

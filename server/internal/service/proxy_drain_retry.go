@@ -162,10 +162,25 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 		log.Printf("[proxy-drain] 生成待办围栏令牌失败（用户 %d）: %v", req.userID, err)
 		return ""
 	}
+	// 记录登记那一刻的账号标识：账号被删除后 ID 若被导入/恢复流程复用，
+	// 新账号会拿到不同标识，这条旧待办据此作废，而不是按相同前缀关掉
+	// 新账号刚建立的代理。读不到账号时留空，空的待办在重试时按「不可核验」
+	// 处理，不会退化成不校验。
+	var incarnation string
+	{
+		var u model.User
+		if err := db.Select("id", "incarnation").First(&u, req.userID).Error; err != nil {
+			log.Printf("[proxy-drain] 读取用户 %d 的账号标识失败（待办仍会登记，重试时按不可核验处理）: %v",
+				req.userID, err)
+		} else {
+			incarnation = u.Incarnation
+		}
+	}
 	rec := model.ProxyDrainPending{
-		UserID:    req.userID,
-		Prefix:    req.prefix,
-		StatusGen: req.gen,
+		UserID:      req.userID,
+		Incarnation: incarnation,
+		Prefix:      req.prefix,
+		StatusGen:   req.gen,
 		NotAfter:  unixOrZero(req.notAfter),
 		Deleted:   req.deleted,
 		IntentAt:  time.Now().Unix(),
@@ -177,7 +192,7 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 	res := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
-			"prefix", "status_gen", "not_after", "deleted", "intent_at", "targets",
+			"incarnation", "prefix", "status_gen", "not_after", "deleted", "intent_at", "targets",
 			// exhausted 与 attempts 一起重置：新的意图该有自己完整的一轮预算。
 			// 沿用旧的「已耗尽」会让这次断流第一次失败就再被判为终态，等于
 			// 永久拒绝为这个账号做补偿。
@@ -410,7 +425,7 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 		// 账号已删：没有「重新启用」这回事，按删号语义继续。
 		return proxyDrainIntentActive, true
 	}
-	gen, err := s.userStateVersionFromDB(row.UserID)
+	gen, incarnation, err := s.userStateVersionAndIncarnation(row.UserID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// 禁用之后账号被删了：断流目标没变（还是那批代理），语义换成删号。
 		return proxyDrainIntentActive, true
@@ -420,12 +435,72 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 			row.UserID, err)
 		return proxyDrainIntentUnverifiable, false
 	}
+	if row.Incarnation != "" && incarnation != row.Incarnation {
+		// 同一个自增 ID 已经是另一个账号（导入/恢复/手工重建）。旧待办描述的
+		// 是上一个生命周期，按相同前缀去关只会打掉新账号的代理。
+		log.Printf("[proxy-drain] 用户 %d 的账号标识已变化（%s ≠ %s），旧断流意图作废",
+			row.UserID, row.Incarnation, incarnation)
+		return proxyDrainIntentAbandoned, false
+	}
 	if gen != row.StatusGen {
 		// 账号已被重新启用（也可能是又禁用了一次）：这条意图对应的那次禁用
 		// 已经不是当前状态，手里的代理清单描述的世界已经过去了。
 		return proxyDrainIntentAbandoned, false
 	}
 	return proxyDrainIntentActive, false
+}
+
+// ProxyDrainQueueHealth 是断流待办队列的可观测快照。
+//
+// 为什么单独暴露：frps 管理接口不可用时，重试循环刻意「保留待办但不推进」
+// （见 retryPendingProxyDrains 的 Frps == nil 分支）。这条路径不报错、也不
+// 改 next_at，从日志里只能看到一次启动日志，管理员无从知道「有 N 个账号的
+// 代理其实一直没被关掉」。把队列深度与依赖可用性放到系统指标里，才能让
+// 这种「静默但不危险」的状态被发现。
+type ProxyDrainQueueHealth struct {
+	// Pending 是仍在等待重试的待办数（不含已停止自动重试的终态）。
+	Pending int64 `json:"pending"`
+	// Exhausted 是已停止自动重试、等待人工处理的待办数。
+	Exhausted int64 `json:"exhausted"`
+	// NextAttemptAt 是最早的一条待办的预定重试时刻（nil 表示没有待办）。
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	// FrpsAvailable 表示当前进程有没有可用的 frps 管理客户端。
+	// false 且 Pending > 0 就是「待办永远不会推进」的明确信号。
+	FrpsAvailable bool `json:"frps_available"`
+	// LastErr 是最近一条待办登记的错误摘要，便于判断是网络还是权限问题。
+	LastErr string `json:"last_err,omitempty"`
+}
+
+// ProxyDrainQueueHealth 读取待办队列状态。查询失败时返回零值并记录日志：
+// 这是只读观测接口，不能因为数据库抖动把系统指标整体打挂。
+func (s *Services) ProxyDrainQueueHealth() ProxyDrainQueueHealth {
+	h := ProxyDrainQueueHealth{FrpsAvailable: s != nil && s.Frps != nil}
+	if s == nil || s.DB == nil {
+		return h
+	}
+	if err := s.DB.Model(&model.ProxyDrainPending{}).
+		Where("exhausted = ?", false).Count(&h.Pending).Error; err != nil {
+		log.Printf("[proxy-drain] 统计待办数量失败: %v", err)
+		return h
+	}
+	if err := s.DB.Model(&model.ProxyDrainPending{}).
+		Where("exhausted = ?", true).Count(&h.Exhausted).Error; err != nil {
+		log.Printf("[proxy-drain] 统计终态待办数量失败: %v", err)
+		return h
+	}
+	var next []time.Time
+	if err := s.DB.Model(&model.ProxyDrainPending{}).
+		Where("exhausted = ?", false).Order("next_at asc").Limit(1).
+		Pluck("next_at", &next).Error; err == nil && len(next) > 0 {
+		t := next[0]
+		h.NextAttemptAt = &t
+	}
+	var last model.ProxyDrainPending
+	if err := s.DB.Select("last_err").
+		Where("last_err <> ''").Order("updated_at desc").First(&last).Error; err == nil {
+		h.LastErr = last.LastErr
+	}
+	return h
 }
 
 // retryPendingProxyDrains 重试所有到期的断流待办，返回仍在等待的数量。

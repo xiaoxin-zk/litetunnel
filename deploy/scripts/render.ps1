@@ -101,6 +101,43 @@ $vars['LT_ADMIN_ALLOW_CIDR'] = if ($vars['LT_ADMIN_ALLOW_CIDR']) { $vars['LT_ADM
 $vars['LT_ACME_EMAIL']       = if ($vars['LT_ACME_EMAIL']) { $vars['LT_ACME_EMAIL'] } else { "admin@$userDomain" }
 $vars['LT_TUNNEL_DOMAIN']    = if ($vars['LT_TUNNEL_DOMAIN']) { $vars['LT_TUNNEL_DOMAIN'] } else { '' }
 
+# Domain rules must match the panel's checkDomain (server/internal/service/tlsconfig.go):
+# bare domain only, at least two labels (IPv4 passes), total <= 253, each label
+# 1-63 chars of [a-z0-9-] and not starting/ending with '-'.
+function Assert-Domain([string]$name, [string]$d) {
+    if ([string]::IsNullOrEmpty($d)) { return }
+    if ($d -match '[\s/\\*]') {
+        throw "$name=$d contains illegal characters (bare domain only: no scheme, path or *)."
+    }
+    if ($d.Length -gt 253) {
+        throw "$name=$d is longer than 253 characters."
+    }
+    $labels = $d.Split('.')
+    if ($labels.Count -lt 2) {
+        throw "$name=$d is not a full domain (needs at least two labels, e.g. panel.example.com)."
+    }
+    foreach ($l in $labels) {
+        if ([string]::IsNullOrEmpty($l)) {
+            throw "$name=$d contains an empty label."
+        }
+        if ($l.Length -gt 63) {
+            throw "$name=$d has a label '$l' longer than 63 characters."
+        }
+        if ($l.StartsWith('-') -or $l.EndsWith('-')) {
+            throw "$name=$d has a label '$l' that starts or ends with '-'."
+        }
+        if ($l -notmatch '^[a-z0-9-]+$') {
+            throw "$name=$d has a label '$l' outside [a-z0-9-]."
+        }
+    }
+}
+
+Assert-Domain 'LT_USER_DOMAIN' $userDomain
+Assert-Domain 'LT_TUNNEL_DOMAIN' $vars['LT_TUNNEL_DOMAIN']
+if ($vars['LT_TUNNEL_DOMAIN'] -and $vars['LT_TUNNEL_DOMAIN'] -eq $userDomain) {
+    throw 'LT_TUNNEL_DOMAIN must differ from the panel domain: a wildcard certificate would cover the panel itself.'
+}
+
 # DNS challenge: the only channel a wildcard certificate can be validated over.
 $vars['LT_CADDY_DNS_PROVIDER'] = if ($vars['LT_CADDY_DNS_PROVIDER']) { $vars['LT_CADDY_DNS_PROVIDER'] } else { '' }
 if (-not $vars['LT_CADDY_DNS_ARGS']) {

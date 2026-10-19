@@ -118,6 +118,9 @@ func (h *Handler) SystemMetrics(c *gin.Context) {
 		// 所以跟 recovery/audit 一起下发。
 		"drain_fallback": h.svc.ProxyDrainFallback(),
 		"drain_race":     h.svc.ProxyDrainRaceHealth(),
+		// drain_queue 暴露待办深度与 frps 可用性：frps 不可用时重试循环
+		// 刻意不推进待办，没有这个数字就只能靠翻日志发现「断流一直没做」。
+		"drain_queue": h.svc.ProxyDrainQueueHealth(),
 	})
 }
 

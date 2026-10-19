@@ -46,6 +46,19 @@ type writeBatch struct {
 	// manifest 是这一批的现场记录。commit 成功后仍保留在磁盘上，
 	// 直到 finalize（确认生效）或 revert（撤回）把它撤掉。
 	manifest batchManifest
+	// modeFix 是「内容没变、但权限不符合期望」的文件。
+	//
+	// 推迟到全部文件替换成功之后再改：准备阶段就 chmod 的话，后续某个文件
+	// 替换失败会走回滚，内容回到旧版本，权限却停在新的（且可能是放宽的）
+	// 值上——一份回滚不完整的配置比不纠正权限更糟。
+	modeFix []pendingModeFix
+}
+
+// pendingModeFix 一个待纠正的权限。
+type pendingModeFix struct {
+	name string
+	path string
+	mode os.FileMode
 }
 
 // pendingChanges 列出「如果应用，会变化哪些文件」，全程不碰磁盘。
@@ -76,15 +89,28 @@ func pendingChanges(writes []pendingWrite) []string {
 func prepareWrites(writes []pendingWrite) (*writeBatch, error) {
 	b := &writeBatch{changed: map[string]bool{}}
 	for _, w := range writes {
-		if old, err := os.ReadFile(w.path); err == nil && string(old) == w.content {
-			fixed, err := ensureMode(w.path, w.mode)
-			if err != nil {
+		// 目标必须是普通文件或不存在。符号链接会让「替换」写到链接指向的
+		// 别处（甚至部署目录之外）；目录、设备、命名管道则会让 rename 的
+		// 行为完全不可预期。这些都在动第一个字节之前拒绝。
+		if fi, err := os.Lstat(w.path); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
 				b.discard()
-				return nil, fmt.Errorf("检查 %s 的权限失败: %w", w.name, err)
+				return nil, fmt.Errorf("%s 的目标路径是符号链接，拒绝替换: %s", w.name, w.path)
 			}
-			if fixed {
-				b.warn = append(b.warn,
-					fmt.Sprintf("%s 的内容没变，但权限已收紧为 %#o", w.name, w.mode.Perm()))
+			if !fi.Mode().IsRegular() {
+				b.discard()
+				return nil, fmt.Errorf("%s 的目标路径不是普通文件（%s），拒绝替换: %s", w.name, fi.Mode().Type(), w.path)
+			}
+		} else if !os.IsNotExist(err) {
+			b.discard()
+			return nil, fmt.Errorf("检查 %s 的目标路径失败: %w", w.name, err)
+		}
+		if old, err := os.ReadFile(w.path); err == nil && string(old) == w.content {
+			// 只登记、不修改：真正 chmod 放到 commit 全部成功之后（见 commit）。
+			// 这里只检查「当前权限是否已经是期望值」，读不出来同样按需要纠正
+			// 处理——那与 ensureMode 内部 Stat 失败的处理一致。
+			if fi, err := os.Stat(w.path); err != nil || fi.Mode().Perm() != w.mode.Perm() {
+				b.modeFix = append(b.modeFix, pendingModeFix{name: w.name, path: w.path, mode: w.mode})
 			}
 			continue
 		}
@@ -139,6 +165,19 @@ func (b *writeBatch) commit() error {
 	// 「这份备份确实是当时的旧文件」，而不是一份写了一半的东西。
 	b.refreshBackupSums()
 
+	// 内容全部替换成功之后才纠正权限。失败只记 warn：文件内容已经是新的，
+	// 此时报错会让调用方按「应用失败」回滚，而它回滚的是内容——权限问题
+	// 反而被掩盖成一次配置回滚。
+	for _, fix := range b.modeFix {
+		if err := os.Chmod(fix.path, fix.mode.Perm()); err != nil {
+			b.warn = append(b.warn,
+				fmt.Sprintf("%s 的内容没变，但权限纠正失败（期望 %#o）: %v", fix.name, fix.mode.Perm(), err))
+			continue
+		}
+		b.warn = append(b.warn,
+			fmt.Sprintf("%s 的内容没变，权限已收紧为 %#o", fix.name, fix.mode.Perm()))
+	}
+
 	// 全部成功，但**不在这里**撤记录、清备份。
 	//
 	// 配置是否真的生效要等容器重建完——那一步由调用方做（见 apply 的
@@ -164,13 +203,14 @@ func (s *service) commitFailure(err error) error {
 	s.registerDirtyScene()
 	statesCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	states, _ := s.serviceStates(statesCtx)
+	states, stateErr := s.serviceStates(statesCtx)
 	return &partialApplyError{
 		msg: fmt.Sprintf("本次写盘已回滚（磁盘仍为旧配置），但批次现场未能清理："+
 			"重启后恢复逻辑会按残留记录把整批再回滚一次、覆盖此后的任何修改；"+
 			"在人工清理之前，所有写操作都会被拒绝\n%v", err),
-		services: states,
-		cause:    err,
+		services:    states,
+		servicesErr: stateErr,
+		cause:       err,
 	}
 }
 

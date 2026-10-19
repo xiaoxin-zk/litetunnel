@@ -111,6 +111,9 @@ func (s *service) handleRender(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &partial) {
 			res.Partial = true
 			res.Services = partial.services
+			if partial.servicesErr != nil {
+				res.ServicesError = redactSecret(req.Vars[tlscfg.VarDNSCredential], partial.servicesErr.Error())
+			}
 			res.Applied = false
 			res.Message = redactSecret(req.Vars[tlscfg.VarDNSCredential], partial.msg)
 			writeJSON(w, http.StatusOK, res)

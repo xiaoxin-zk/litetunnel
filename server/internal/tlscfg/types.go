@@ -253,6 +253,12 @@ type RenderResult struct {
 	//
 	// 只有 Partial 为真时才有意义：它是「现在到底跑的是哪一版」的唯一线索。
 	Services []ServiceState `json:"services,omitempty"`
+	// ServicesError 说明容器状态**没能读出来**。
+	//
+	// 与「Services 为空」必须区分：空列表可能真的是没有服务，而读取失败时
+	// 管理员若把空列表当成「容器都不存在」，会往完全错误的方向处理
+	// （比如去重建本来正常的服务）。有这条错误时界面必须显式提示状态未知。
+	ServicesError string `json:"services_error,omitempty"`
 }
 
 // ServiceState 是一个 compose 服务的实际状态。

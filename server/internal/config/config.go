@@ -176,8 +176,47 @@ func (s SMTPConfig) Enabled() bool {
 	return s.Host != "" && s.User != "" && s.Password != ""
 }
 
+// intEnvKeys 是所有按整数解析的环境变量。
+//
+// 集中列出是为了在启动时一次性校验：envInt 在解析失败时会回落到默认值，
+// 而「端口写成了 7O01」这种 typo 回落之后服务仍能起来，只是监听在默认端口
+// 上——管理员看到的是「配置改了却没生效」，日志里一个字都没有。
+var intEnvKeys = []string{
+	"LT_REDIS_DB",
+	"LT_GATEWAY_PORT",
+	"LT_PORT_RANGE_START",
+	"LT_PORT_RANGE_END",
+	"LT_MAX_PORTS_PER_USER",
+	"LT_VHOST_HTTPS_PORT",
+	"LT_SMTP_PORT",
+	"LT_TRAFFIC_POLL_INTERVAL",
+}
+
+// validateEnvInts 拒绝无法解析的整数环境变量，而不是静默回落到默认值。
+func validateEnvInts() error {
+	for _, key := range intEnvKeys {
+		v, ok := os.LookupEnv(key)
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if v == "" {
+			// 空值与未设置等价：容器编排里常见 `LT_X=` 的写法，按默认值处理
+			// 不会掩盖任何真实配置。
+			continue
+		}
+		if _, err := strconv.Atoi(v); err != nil {
+			return fmt.Errorf("%s 必须是整数，当前为 %q: %w", key, v, err)
+		}
+	}
+	return nil
+}
+
 // Load 从环境变量装载配置并做必要校验。
 func Load() (*Config, error) {
+	if err := validateEnvInts(); err != nil {
+		return nil, err
+	}
 	c := &Config{
 		Env:      env("LT_ENV", "development"),
 		LogLevel: env("LT_LOG_LEVEL", "info"),

@@ -191,9 +191,14 @@ func newServer(addr string, handler http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       90 * time.Second,
+		ReadTimeout: 30 * time.Second,
+		// 写超时必须大于配置下发链路的**最坏**耗时：域名/证书下发会调用
+		// lt-config 完成渲染、容器校验、重建与稳定检查，客户端那侧的
+		// renderTimeout 是 3 分钟。以前这里是 60 秒，长于一分钟的合法下发
+		// 会在面板侧被写超时切断，管理员看到的是「请求失败」，而 helper
+		// 其实已经改完配置并重建了容器——这是最难排查的一类不一致。
+		WriteTimeout: 4 * time.Minute,
+		IdleTimeout:  90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 }

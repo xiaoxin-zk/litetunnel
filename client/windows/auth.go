@@ -213,6 +213,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.paymentEnabled = info.PaymentEnabled
 	a.balanceCents = info.BalanceCents
 	a.lastError = ""
+	// 配置已经成功写盘并发布：启动期那次「本地配置读取失败」的原因不复存在，
+	// 继续显示只会让用户以为当前配置仍是坏的。
+	a.cfgErr = ""
 	if a.tunnels == nil {
 		a.tunnels = []TunnelVO{}
 	}
@@ -390,6 +393,8 @@ func (a *App) resetPerAccountState() {
 	// 往下走。清空之后，那个迟到回调查不到自己的记账，就会按「无法证明
 	// 属于当前账号」处理，从而不会去改新账号的运行态。
 	a.startGen = map[uint]uint64{}
+	// 退出时本地配置已经按「清空」重写成功，启动期读取失败的原因不再适用。
+	a.cfgErr = ""
 }
 
 // currentCredential 返回当前接入用的长期凭据。

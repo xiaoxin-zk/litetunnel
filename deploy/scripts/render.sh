@@ -118,6 +118,60 @@ VARS[LT_ADMIN_ALLOW_CIDR]="${VARS[LT_ADMIN_ALLOW_CIDR]:-127.0.0.1/32}"
 VARS[LT_ACME_EMAIL]="${VARS[LT_ACME_EMAIL]:-admin@${USER_DOMAIN}}"
 VARS[LT_TUNNEL_DOMAIN]="${VARS[LT_TUNNEL_DOMAIN]:-}"
 
+# 域名规则必须与面板（server/internal/service/tlsconfig.go 的 checkDomain）
+# 一致，否则会出现「脚本能渲染、面板拒绝保存」或相反的分叉：
+#   - 只填裸域名，不带 scheme、路径或 *；
+#   - 至少两段（IPv4 天然满足）；
+#   - 总长 ≤253，单个标签 1-63 个字符；
+#   - 字符集 [a-z0-9-]，标签不以 - 开头或结尾。
+#
+# 纯 IP 也走这里：四段数字标签同样满足上述规则。
+check_domain() {
+  local name="$1" d="$2"
+  [[ -z "${d}" ]] && return 0
+  if [[ "${d}" == *" "* || "${d}" == *$'\t'* || "${d}" == */* || "${d}" == *\\* || "${d}" == *"*"* ]]; then
+    echo "${name}=${d} 含有非法字符（只填裸域名，不带 scheme、路径或 *）。" >&2
+    exit 1
+  fi
+  if (( ${#d} > 253 )); then
+    echo "${name}=${d} 超过 253 个字符。" >&2
+    exit 1
+  fi
+  local IFS='.'
+  # shellcheck disable=SC2206
+  local labels=(${d})
+  if (( ${#labels[@]} < 2 )); then
+    echo "${name}=${d} 不是完整域名（至少需要两段，如 panel.example.com）。" >&2
+    exit 1
+  fi
+  local l
+  for l in "${labels[@]}"; do
+    if [[ -z "${l}" ]]; then
+      echo "${name}=${d} 存在空的域名段。" >&2
+      exit 1
+    fi
+    if (( ${#l} > 63 )); then
+      echo "${name}=${d} 的域名段 ${l} 超过 63 个字符。" >&2
+      exit 1
+    fi
+    if [[ "${l}" == -* || "${l}" == *- ]]; then
+      echo "${name}=${d} 的域名段 ${l} 不能以 - 开头或结尾。" >&2
+      exit 1
+    fi
+    if [[ ! "${l}" =~ ^[a-z0-9-]+$ ]]; then
+      echo "${name}=${d} 的域名段 ${l} 只能包含小写字母、数字与 -。" >&2
+      exit 1
+    fi
+  done
+}
+
+check_domain LT_USER_DOMAIN "${USER_DOMAIN}"
+check_domain LT_TUNNEL_DOMAIN "${VARS[LT_TUNNEL_DOMAIN]}"
+if [[ -n "${VARS[LT_TUNNEL_DOMAIN]}" && "${VARS[LT_TUNNEL_DOMAIN]}" == "${USER_DOMAIN}" ]]; then
+  echo "LT_TUNNEL_DOMAIN 不能与面板域名相同：泛域名证书会覆盖面板自身的 *.域名。" >&2
+  exit 1
+fi
+
 # DNS Challenge：泛域名证书的唯一签发途径。
 VARS[LT_CADDY_DNS_PROVIDER]="${VARS[LT_CADDY_DNS_PROVIDER]:-}"
 if [[ -z "${VARS[LT_CADDY_DNS_ARGS]:-}" ]]; then

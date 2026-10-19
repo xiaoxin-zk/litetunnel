@@ -57,6 +57,13 @@ type User struct {
 	// 版本落库之后，每次关闭前读一次这一列，任何实例上的状态变更都能被看到。
 	// 与 TrafficResetGen 是同一个思路（见它的注释）。
 	StateVersion uint64 `gorm:"not null;default:0" json:"-"`
+	// Incarnation 是账号生命周期标识：删除后重建、导入或恢复流程即便复用了
+	// 同一个自增 ID，新账号也会拿到新的标识。断流待办据此判断「这条意图还
+	// 是不是当前账号的」——只靠 ID 的话，旧待办会把新账号刚建立的代理关掉。
+	//
+	// 刻意不加唯一索引：历史数据在迁移时是空串，一次性回填之前加唯一约束会
+	// 让启动直接失败。随机 128 位标识的碰撞概率可以忽略，唯一性不依赖索引。
+	Incarnation string `gorm:"size:32;index;not null;default:''" json:"-"`
 
 	GroupID uint   `gorm:"index" json:"group_id"`
 	Group   *Group `gorm:"foreignKey:GroupID" json:"group,omitempty"`
@@ -163,7 +170,14 @@ type Tunnel struct {
 	LocalIP   string `gorm:"size:64;default:'127.0.0.1'" json:"local_ip"`
 	LocalPort int    `json:"local_port"`
 
-	// TCP/UDP 使用固定远程端口；HTTP/HTTPS 使用域名
+	// TCP/UDP 使用固定远程端口；HTTP/HTTPS 使用域名。
+	//
+	// 端口是**全局唯一**的：同一个端口号在同一台宿主机上只能被一条隧道
+	// 占用，不区分协议。数据库的部分唯一索引（remote_port > 0）、端口池
+	// 分配（按 remote_port 全量查已用）、端口锁与防火墙待办都建立在
+	// 这条规则上，改其中任何一处都必须同时改其余三处——只把索引改成
+	// (type, remote_port) 会让「同号 TCP/UDP 共存」在分配阶段看起来成立，
+	// 但防火墙待办仍按数字端口收敛，一条意图会把另一条覆盖掉。
 	RemotePort int    `gorm:"index" json:"remote_port"`
 	Domain     string `gorm:"size:128" json:"domain"`
 	Subdomain  string `gorm:"size:64;index" json:"subdomain"`
@@ -656,7 +670,10 @@ func (FirewallSeq) TableName() string { return "lt_firewall_seq" }
 // 后来的意图覆盖先前的即可（与 FirewallPending 按端口收敛是同一个理由）。
 type ProxyDrainPending struct {
 	// UserID 同时是主键：见上面「一个用户一条待办」的说明。
-	UserID uint `gorm:"primarykey;autoIncrement:false" json:"user_id"`
+	UserID uint `gorm:"primaryKey;autoIncrement:false" json:"user_id"`
+	// Incarnation 是登记断流意图时的账号生命周期标识，防止 ID 恢复/导入复用后
+	// 旧待办误触发新账号代理。
+	Incarnation string `gorm:"size:32;index" json:"incarnation"`
 	// Prefix 是 frp 侧的 user 前缀（"lt_u<ID>."），来自 FrpUserOf。
 	//
 	// 它是从 UserID 现算得了的冗余列，落一份是为了两件事：后台重试器可以

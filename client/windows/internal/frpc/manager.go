@@ -235,6 +235,22 @@ func (m *Manager) Running(tunnelID uint) bool {
 	return ok
 }
 
+// RunningSet 返回「正在运行」的隧道集合。
+//
+// 状态快照需要逐条隧道判断是否在跑。逐条调 Running 会为每条隧道各取一次
+// 管理器锁：隧道上百条时，每次状态事件（日志行也可能触发）都要做上百次
+// 加锁/解锁，且期间进程启停会被反复打断。一次取一份集合，把开销从
+// O(N·lock) 降到 O(N) 的一次锁内遍历。
+func (m *Manager) RunningSet() map[uint]struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[uint]struct{}, len(m.procs))
+	for id := range m.procs {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 // RunningIDs 返回当前正在运行的隧道 ID。
 func (m *Manager) RunningIDs() []uint {
 	m.mu.Lock()
@@ -358,6 +374,19 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	}()
 
 	go func() {
+		// 回收这条隧道的进程代次。只在「表里仍是本次的 gen」时删：Stop 后
+		// 紧接 Start 会写入更大的代次，那个值还要用来判旧回调是否过期。
+		//
+		// 不回收的话，gens 会随「建了又删」的隧道一直增长——删除接口只会
+		// 停进程，不会有人来清这个 map。
+		defer func() {
+			m.mu.Lock()
+			if m.gens[tunnelID] == gen {
+				delete(m.gens, tunnelID)
+			}
+			m.mu.Unlock()
+		}()
+
 		// 等两个读取协程收工，再 Wait。
 		//
 		// os/exec 的文档写得很明确：Wait 会关闭管道，所以「在读完管道之前

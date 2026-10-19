@@ -351,9 +351,22 @@ func (s *Services) migrateExpiredGroups(ids []uint) error {
 		if end > len(ids) {
 			end = len(ids)
 		}
-		if err := s.DB.Model(&model.User{}).
-			Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", ids[start:end], now).
-			Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error; err != nil {
+		// 用户回落与隧道限速快照必须在同一个事务里改完：先迁用户再单独
+		// 刷新隧道，中间的崩溃会留下「用户已按默认分组计费、隧道仍写着旧
+		// 分组的限速」这种没有任何调度会纠正的状态（这批用户已经不满足
+		// 「已到期」条件，不会再被扫出来）。
+		if err := s.DB.Transaction(func(tx *gorm.DB) error {
+			batch := ids[start:end]
+			if err := tx.Model(&model.User{}).
+				Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", batch, now).
+				Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error; err != nil {
+				return err
+			}
+			// 快照同步到生效分组；trigger 会同时推进隧道清单版本，客户端
+			// 下一次同步就能看到新的限速。
+			return tx.Model(&model.Tunnel{}).Where("user_id IN ?", batch).
+				Update("bandwidth_limit", g.BandwidthLimit).Error
+		}); err != nil {
 			return err
 		}
 	}

@@ -69,8 +69,24 @@ func (s *Services) AdminSetUserGroup(id, groupID uint, expiry GroupExpiry) error
 			return ErrNotFound
 		}
 		// 分组变化后刷新该用户所有隧道的限速快照。
+		//
+		// 快照必须按**生效分组**算，而不是按刚写进去的目标分组：给一个已经
+		// 过期（或到期时间就在过去）的账号改派付费分组时，运行期实际回落到
+		// 默认分组，把目标分组的限速写进快照会让「界面显示的限速」与真正
+		// 生效的限速相反，且没有任何后续事件会纠正它——到期调度会先把用户
+		// 迁回默认分组，之后这行快照就再也没人更新了。
+		effective := &g
+		expireAt := u.GroupExpireAt
+		if expiry.Set {
+			expireAt = expiry.Value
+		}
+		if expireAt != nil && !expireAt.After(time.Now()) {
+			if dg := s.defaultGroupTx(tx); dg != nil {
+				effective = dg
+			}
+		}
 		return tx.Model(&model.Tunnel{}).Where("user_id = ?", id).
-			Update("bandwidth_limit", g.BandwidthLimit).Error
+			Update("bandwidth_limit", effective.BandwidthLimit).Error
 	})
 	if err != nil {
 		return err

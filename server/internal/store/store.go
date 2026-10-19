@@ -206,6 +206,12 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		log.Printf("[store] 清理遗留邮件草稿失败（下次启动重试）：%v", err)
 	}
 
+	// 历史账号补上生命周期标识。必须早于任何「按标识判断待办归属」的读取，
+	// 且幂等：只填空值，失败下次启动重试。
+	if err := model.BackfillIncarnations(db); err != nil {
+		return nil, fmt.Errorf("回填账号生命周期标识失败: %w", err)
+	}
+
 	// 隧道清单修订号由触发器维护，见 ensureTunnelListRevTriggers 的说明。
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)

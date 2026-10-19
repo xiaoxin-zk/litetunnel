@@ -18,7 +18,17 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	if seq <= a.appliedSyncSeq {
 		return false, nil
 	}
-	a.appliedSyncSeq = seq
+	// 只有走到「这一轮的结论已经落定」才认领序号。以前在函数开头就写死，
+	// 于是中途因写文件/起停失败提前返回时，这份快照已经被标记为已应用：
+	// 下一轮若沿用同一份缓存的清单，会被 `seq <= appliedSyncSeq` 直接丢弃，
+	// 那条本该重试的变更就一直不生效——表现为「界面上隧道是启用的，本机
+	// 却始终不连」，直到服务端恰好又产生一个新快照。
+	consumed := false
+	defer func() {
+		if consumed {
+			a.appliedSyncSeq = seq
+		}
+	}()
 
 	base := a.serverBase()
 
@@ -359,6 +369,10 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		return changed, roundErr
 	}
 
+	// 整份清单已按当前状态处理完毕：个别隧道失败由各自的退避与错误记录
+	// 继续负责，快照本身可以认领。否则每轮都会重放同一批停/启动作，
+	// 而用户看到的仍然是同一条错误。
+	consumed = true
 	if len(failures) > 0 {
 		// 只列前两条，避免十几条隧道全挂时把这行日志撑成一大段。
 		detail := failures[0]

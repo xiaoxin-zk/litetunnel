@@ -348,8 +348,11 @@
         >
           {{ svc.state || '未知' }}
         </el-descriptions-item>
-        <el-descriptions-item v-if="!(result.services || []).length" label="容器状态">
-          未能读取，请查看 lt-config 与 docker compose 日志
+        <el-descriptions-item v-if="result.services_error" label="容器状态">
+          读取失败：{{ result.services_error }}
+        </el-descriptions-item>
+        <el-descriptions-item v-else-if="!(result.services || []).length" label="容器状态">
+          未返回任何服务状态，请查看 lt-config 与 docker compose 日志
         </el-descriptions-item>
       </el-descriptions>
 

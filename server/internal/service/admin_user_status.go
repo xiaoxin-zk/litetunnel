@@ -202,11 +202,21 @@ func (s *Services) setUserStatusGen(userID uint, gen uint64) {
 // 调用方不应据此放弃断流）。其它错误表示数据库暂时不可用，同样不构成
 // 「状态已变」的证据。
 func (s *Services) userStateVersionFromDB(userID uint) (uint64, error) {
+	gen, _, err := s.userStateVersionAndIncarnation(userID)
+	return gen, err
+}
+
+// userStateVersionAndIncarnation 一次读出状态版本与生命周期标识。
+//
+// 两者必须来自同一次读：分成两次查询的话，中间可能发生「删号 + 新建复用
+// 同一 ID」，于是拿到旧版本配新标识（或反之），断流待办会据此误判。
+func (s *Services) userStateVersionAndIncarnation(userID uint) (uint64, string, error) {
 	var u model.User
-	if err := s.DB.Select("id", "state_version").First(&u, userID).Error; err != nil {
-		return 0, err
+	if err := s.DB.Select("id", "state_version", "incarnation").
+		First(&u, userID).Error; err != nil {
+		return 0, "", err
 	}
-	return u.StateVersion, nil
+	return u.StateVersion, u.Incarnation, nil
 }
 
 // userStatusGen 返回该用户当前的状态代次；从未改过状态时为 0。

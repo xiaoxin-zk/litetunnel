@@ -99,37 +99,46 @@ const maxLogBatchBytes = 128 * 1024
 // 只减少了 DOM 更新，挡不住这层开销，真正被堵住的是这条桥。
 const logFlushInterval = 120 * time.Millisecond
 
-// appendLogLine 把一行日志放进待推送队列。
+// appendLogLine 把一行日志放进待推送队列，返回是否真的入队。
 //
-// 所有往日志区写字的路径都必须走它（frpc 输出、客户端自己的说明），
-// 否则同一段时间里的日志会出现两种先后顺序。
-func (a *App) appendLogLine(seq uint64, line string) {
+// 返回值是「这行仍属于当前账号」的判据：被清空点挡下的行（seq <=
+// logDroppedSeq）来自已经清掉的历史或上一个账号。回调必须用它来决定
+// 是否允许这行**改动运行态**——日志可以丢，状态不能被旧行改写。
+func (a *App) appendLogLine(seq uint64, line string) bool {
 	if a.ctx == nil {
-		return
+		return false
+	}
+	accepted, batchReady := a.pushLog(seq, line)
+	if !accepted {
+		return false
 	}
 	// 攒满一批就立刻推，不等下一个时间片：一味等间隔会让日志洪峰时的
 	// 延迟随着挤压行数一起增长（队列越长，轮到它越晚）。
-	if a.pushLog(seq, line) {
+	if batchReady {
 		select {
 		case a.logKick <- struct{}{}:
 		default:
 			// 推送协程还没处理完上一次通知：它醒来时会取走一批。
 		}
 	}
+	return true
 }
 
-// pushLog 入队一行，返回是否已经攒够一批可以立刻推送。
+// pushLog 入队一行，返回「是否入队」与「是否已经攒够一批可以立刻推送」。
+//
+// 两个返回值必须分开：调用方需要知道这一行是否属于当前账号（据此决定
+// 能否改运行态），而「攒够一批」只是推送时机的提示，不能当作入队与否。
 //
 // 没有 ctx 依赖也不发事件：队列行为本身要能被单测覆盖——「有界」「丢最旧」
 // 「一批不超过 maxLogBatch」这几条一旦坏了，症状只是日志少了几行或内存涨了，
 // 不看队列本身根本发现不了。
-func (a *App) pushLog(seq uint64, line string) bool {
+func (a *App) pushLog(seq uint64, line string) (accepted, batchReady bool) {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 
 	// 清空前产生的行即使晚到也不再入队：它们属于用户已经清掉的那段历史。
 	if seq != 0 && seq <= a.logDroppedSeq {
-		return false
+		return false, false
 	}
 
 	// 队列满了丢掉**最旧**的一批：日志是有时效的，留下最近的才能解释
@@ -155,7 +164,7 @@ func (a *App) pushLog(seq uint64, line string) bool {
 
 	a.logBuf = append(a.logBuf, pendingLog{seq: seq, text: line})
 	a.logBufBytes += len(line)
-	return len(a.logBuf) >= maxLogBatch
+	return true, len(a.logBuf) >= maxLogBatch
 }
 
 // takeLogBatch 取出一批待推送的日志行；没有内容时返回 nil。

@@ -387,13 +387,18 @@ type App struct {
 	// 同样的错误，而问题一点没变，用户还以为客户端在「努力重连」。
 	retries map[uint]*retryState
 
-	// stopIntents 记录「用户刚刚主动停掉了这条隧道」。
+	// stopIntents 记录「用户刚刚主动停掉了这条隧道」，键是隧道 ID，值是
+	// 被停进程对应的 Manager generation。
 	//
 	// 与进程自身的 stopping 标记互补：那个标记只在 mgr.Stop 拿到进程指针时
 	// 才置位；进程恰好在 Stop 之前自己退出时，退出回调看到的是 requested=false，
 	// 会按「异常退出」记一次失败退避，界面上短暂闪出「启动失败」——而用户
 	// 明明点的是「断开」。意图由上层记录，回调消费一次。
-	stopIntents map[uint]bool
+	//
+	// 必须绑定进程代次，不能只记一个 bool：Running 检查与写意图之间进程
+	// 可能自己退出，bool 意图会一直留着，被同 ID 的**下一个**进程退出时
+	// 消费掉，把一次真实失败误判成用户主动停止（跳过退避与自动重连）。
+	stopIntents map[uint]uint64
 
 	// startGen 记录每条隧道的进程是在哪个**账号代次**下启动的
 	// （值取自 a.authGeneration，与它一同由 a.mu 保护）。
@@ -488,19 +493,29 @@ func (a *App) startup(ctx context.Context) {
 		// 日志回调在 Manager 内排队，旧进程的行可能晚于新进程到达。
 		// 只有当前 generation 才能修改注册、退避和错误状态；旧日志仍保留
 		// 用于诊断，但不再污染当前隧道运行态。
-		// 先判代次再落日志：旧账号进程迟到的行不属于当前账号，既不能改
-		// 状态也不能进日志缓冲——否则用户换了账号，界面上会先冒出上一段
-		// 会话的输出。Manager 已在入队前做过一次同样的过滤，这里是回调
-		// 排队期间又发生切换时的第二道。
 		//
-		// 但只对「进程输出」生效：gen=0 是客户端**自己**的说明日志（启动、
-		// 停止、退出诊断），它们不来自任何进程，没有「是不是当前进程」可言。
-		// 用 Current 过滤会把这类行判成无效——于是它们只存在于后续读日志
-		// 快照时，实时推送里却凭空消失，界面表现为「点了启动却没有日志」。
-		if gen != 0 && !a.mgr.Current(id, gen) {
+		// 这里必须先把三类行分开，它们的约束完全不同：
+		//
+		//  1. 进程输出（gen != 0）：受进程代次约束，且只有**真正入队**的行
+		//     才允许改运行态。被清空点挡下的行属于旧账号，它只能说明
+		//     「那一代进程说过这句话」。
+		//  2. 客户端诊断（gen == 0）：没有进程代次，也不代表任何进程状态。
+		//     只进日志，绝不参与 start proxy success / 错误文本解析——
+		//     隧道名与说明文本是用户可填的，恰好带上关键词就会清掉真实
+		//     错误、把隧道误标成已注册。
+		//  3. 账号代次：日志层的隔离由「ClearLogs 清空 Manager 待投递队列」
+		//     加 logDroppedSeq（清空点）共同完成；两者在翻代次之后执行，
+		//     排队期间捕获的旧批次都会被挡下。
+		if gen == 0 {
+			a.appendLogLine(seq, line)
 			return
 		}
-		a.appendLogLine(seq, line)
+		if !a.mgr.Current(id, gen) {
+			return
+		}
+		if !a.appendLogLine(seq, line) {
+			return
+		}
 		switch {
 		case strings.Contains(line, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
@@ -576,7 +591,7 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 	// 用户刚刚主动断开（StopTunnel / 停用同步）：进程恰好在 Stop 之前退出时
 	// 回调拿到的是 requested=false，这里把上层记录的意图合并进来，避免一次
 	// 正常断开被当成启动失败。
-	if a.consumeStopIntent(id) {
+	if a.consumeStopIntent(id, gen) {
 		requested = true
 	}
 	switch {

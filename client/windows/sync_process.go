@@ -218,46 +218,64 @@ func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
 	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
 	a.setTunnelRegistered(t.ID, false)
-	// 没有进程在跑时不要记停止意图：mgr.Stop 会立刻返回 nil，而意图没有任何
-	// 退出回调来消费它。留着它，同 ID 的下一个新进程自然退出时会被误判成
-	// 「用户主动停止」，跳过退避与自动重试——用户看到的是「隧道掉了但一直不重连」。
-	if !a.mgr.Running(t.ID) {
+	// 取「当前进程代次 + 记意图」这两步必须尽量贴近，且意图要记在代次名下：
+	//   - 没有进程时直接返回，不留意图（Stop 会立刻返回 nil，没有退出回调
+	//     来消费它）；
+	//   - 进程若在 Gen 与 markStopIntent 之间自己退出，意图会挂在一个已经
+	//     消失的代次上，下一个进程代次不同，consumeStopIntent 不会认领它。
+	// 这样即使发生竞态，残留意图也不会再误吞下一代的真实失败。
+	gen, ok := a.mgr.Gen(t.ID)
+	if !ok {
 		return nil
 	}
-	// 先记意图再停：进程可能在 mgr.Stop 拿到指针之前就自己退出了，那时
-	// quitting 回调带的是 requested=false。没有这个上限为一次的意图，
-	// 用户点「断开」会看到一闪而过的「启动失败」并多等一轮退避。
-	a.markStopIntent(t.ID)
+	a.markStopIntent(t.ID, gen)
 	err := a.mgr.Stop(t.ID)
 	if err != nil {
 		// 停失败时意图不再成立：留到下一次启动会误吞一次真实的失败。
-		a.clearStopIntent(t.ID)
+		a.clearStopIntentGen(t.ID, gen)
 	}
 	return err
 }
 
-// markStopIntent 记一次主动停止。
-func (a *App) markStopIntent(id uint) {
+// markStopIntent 记一次主动停止，绑定到具体进程代次。
+func (a *App) markStopIntent(id uint, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.stopIntents == nil {
-		a.stopIntents = map[uint]bool{}
+		a.stopIntents = map[uint]uint64{}
 	}
-	a.stopIntents[id] = true
+	a.stopIntents[id] = gen
 }
 
-// clearStopIntent 放弃未消费的停止意图。
+// clearStopIntent 放弃该隧道未消费的停止意图（不区分代次）。
 func (a *App) clearStopIntent(id uint) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.stopIntents, id)
 }
 
-// consumeStopIntent 取走并清除停止意图，返回这次退出是否由用户主动发起。
-func (a *App) consumeStopIntent(id uint) bool {
+// clearStopIntentGen 只放弃属于指定代次的停止意图：
+// 避免停失败清理时误删下一代进程刚记下的意图。
+func (a *App) clearStopIntentGen(id uint, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.stopIntents[id] {
+	if a.stopIntents[id] == gen {
+		delete(a.stopIntents, id)
+	}
+}
+
+// consumeStopIntent 取走并清除属于指定代次的停止意图。
+//
+// 只有代次匹配才算「用户主动停止」：旧代次残留的意图不能被新进程认领。
+// gen == 0 是旧接口/测试路径，没有代次可比，按「有意图就认领」处理。
+func (a *App) consumeStopIntent(id uint, gen uint64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	want, ok := a.stopIntents[id]
+	if !ok {
+		return false
+	}
+	if gen != 0 && want != gen {
 		return false
 	}
 	delete(a.stopIntents, id)

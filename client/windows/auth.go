@@ -390,7 +390,7 @@ func (a *App) resetPerAccountState() {
 	a.cleanupWarned = map[uint]bool{}
 	// 主动停止意图属于上一个账号的操作：不清掉的话，新账号里同一 ID 的
 	// 一次真实启动失败会被旧意图吞掉（而不是进入退避提示）。
-	a.stopIntents = map[uint]bool{}
+	a.stopIntents = map[uint]uint64{}
 	a.cleanupErr = ""
 	// 同步错误与「上次同步时间」同样属于旧账号：残留会让新账号在第一次
 	// 同步完成前显示上一个账号的失败原因与时间戳。

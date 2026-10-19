@@ -234,13 +234,26 @@ func (m *Manager) ExePath() string {
 }
 
 // Available 表示是否找到可用的 frpc。
+//
+// 必须复用 usableExecutable，而不是只做 os.Stat：路径被替换成目录、特殊
+// 文件，或 Unix 上没有执行位时，Stat 照样成功，界面显示「可用」，直到
+// Start 才报 permission denied / is a directory——用户完全看不出是路径错。
 func (m *Manager) Available() bool {
-	p := m.ExePath()
-	if p == "" {
-		return false
+	return usableExecutable(m.ExePath())
+}
+
+// Gen 返回某条隧道当前进程的 generation；没有进程时 ok=false。
+//
+// 上层用它把「主动停止意图」绑定到具体进程：Running 只回答「有没有」，
+// 而意图必须知道「是哪一代」，否则新进程会继承旧进程留下的意图。
+func (m *Manager) Gen(tunnelID uint) (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.procs[tunnelID]
+	if !ok || p == nil {
+		return 0, false
 	}
-	_, err := os.Stat(p)
-	return err == nil
+	return p.gen, true
 }
 
 // Running 返回某条隧道的 frpc 是否正在运行。

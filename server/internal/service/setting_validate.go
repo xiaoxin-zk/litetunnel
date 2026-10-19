@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/outbound"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
@@ -321,6 +322,21 @@ func validateAlertSettings(view func(SettingKey) string) error {
 	}
 	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyAlertBackupHours))); err != nil || n < 0 || n > 8760 {
 		return fmt.Errorf("%w: 备份超时告警需为 0-8760 的整数小时（0 表示关闭该项检查）", ErrInvalidParam)
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyAlertSustained))); err != nil || n < 1 || n > 12 {
+		return fmt.Errorf("%w: 持续判定需为 1-12 个采样窗口（每窗口 5 分钟，1 表示立即触发）", ErrInvalidParam)
+	}
+	if raw := strings.TrimSpace(view(KeyAlertSilenceUntil)); raw != "" {
+		t, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			return fmt.Errorf("%w: 静默截止时间需为 RFC3339 时间（如 2026-10-20T23:00:00+08:00）", ErrInvalidParam)
+		}
+		if t.After(time.Now().AddDate(1, 0, 0)) {
+			return fmt.Errorf("%w: 静默截止时间不要超过一年：长期静默等于把告警关掉却不留痕迹", ErrInvalidParam)
+		}
+	}
+	if n := len([]rune(strings.TrimSpace(view(KeyAlertSilenceReason)))); n > 200 {
+		return fmt.Errorf("%w: 静默原因不能超过 200 字", ErrInvalidParam)
 	}
 	return nil
 }

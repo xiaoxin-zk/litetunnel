@@ -39,16 +39,47 @@ type AlertConfig struct {
 	ErrorRatePct  float64 `json:"error_rate_pct"`
 	DiskPct       float64 `json:"disk_pct"`
 	BackupStaleHr int     `json:"backup_stale_hours"`
+
+	// SustainedWindows 是触发前需要连续超标的采样窗口数（1 表示立即触发）。
+	SustainedWindows int       `json:"sustained_windows"`
+	SilenceUntil     time.Time `json:"silence_until"`
+	SilenceReason    string    `json:"silence_reason"`
+}
+
+// Silenced 报告 now 是否处于静默窗口内。静默只影响推送，不影响状态维护。
+func (c AlertConfig) Silenced(now time.Time) bool {
+	return !c.SilenceUntil.IsZero() && now.Before(c.SilenceUntil)
 }
 
 func (s *Services) AlertConfig() AlertConfig {
-	return AlertConfig{
-		Enabled:       s.Settings.Bool(KeyAlertEnabled),
-		WebhookURL:    strings.TrimSpace(s.Settings.Get(KeyAlertWebhook)),
-		ErrorRatePct:  float64(s.Settings.Int(KeyAlertErrorRate)),
-		DiskPct:       float64(s.Settings.Int(KeyAlertDisk)),
-		BackupStaleHr: s.Settings.Int(KeyAlertBackupHours),
+	sustained := s.Settings.Int(KeyAlertSustained)
+	if sustained < 1 {
+		sustained = 1
 	}
+	return AlertConfig{
+		Enabled:          s.Settings.Bool(KeyAlertEnabled),
+		WebhookURL:       strings.TrimSpace(s.Settings.Get(KeyAlertWebhook)),
+		ErrorRatePct:     float64(s.Settings.Int(KeyAlertErrorRate)),
+		DiskPct:          float64(s.Settings.Int(KeyAlertDisk)),
+		BackupStaleHr:    s.Settings.Int(KeyAlertBackupHours),
+		SustainedWindows: sustained,
+		SilenceUntil:     parseSilenceUntil(s.Settings.Get(KeyAlertSilenceUntil)),
+		SilenceReason:    strings.TrimSpace(s.Settings.Get(KeyAlertSilenceReason)),
+	}
+}
+
+// parseSilenceUntil 解析静默截止时间。非法值当作未静默：
+// 配置损坏时宁可恢复告警，也不要静默地把告警全部吞掉。
+func parseSilenceUntil(raw string) time.Time {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // StartAlertWorker 每 5 分钟采一次样并评估阈值。采样落库，供面板画趋势。
@@ -102,7 +133,9 @@ func (s *Services) runAlertCycle(now time.Time) {
 		Delete(&model.AlertEvent{})
 
 	cfg := s.AlertConfig()
-	notify := cfg.Enabled && cfg.WebhookURL != ""
+	// 静默与关闭告警的区别：静默只是不打扰（不新建事件、不推送），状态仍然维护；
+	// 关闭告警则连评估都不做推送，但已有事件照样会按条件恢复。
+	notify := cfg.Enabled && cfg.WebhookURL != "" && !cfg.Silenced(now)
 
 	checks := s.evaluateAlerts(cfg, sample, stats, diskKnown, now)
 	evaluated := make(map[string]struct{}, len(checks))
@@ -113,13 +146,14 @@ func (s *Services) runAlertCycle(now time.Time) {
 			// 既不算命中也不算恢复，否则会把正在响的告警误标成「已恢复」。
 			continue
 		}
-		if c.breached {
-			if notify {
+		if c.breaching {
+			// 命中但还没达到持续窗口数时不触发，也不恢复（恢复只看当前窗口）。
+			if notify && c.fire {
 				s.raiseAlert(c.kind, c.level, c.message, c.value, c.threshold)
 			}
 			continue
 		}
-		// 没命中也要维护状态：关闭告警期间条件自己好了，事件不能一直挂着 firing。
+		// 当前窗口恢复正常就收尾：恢复不要求持续，避免「降下来又弹回去」时告警长期不消。
 		s.resolveAlert(c.kind, c.recovered)
 	}
 
@@ -133,11 +167,14 @@ func (s *Services) runAlertCycle(now time.Time) {
 	}
 }
 
-// alertCheck 是一轮评估的结果。未命中时也带当前值，恢复通知里要写「回落到多少」。
+// alertCheck 是一轮评估的结果。
+// breaching 表示「当前窗口超标」，fire 表示「满足持续窗口数、可以触发」；
+// 恢复只看 breaching，不看 fire。
 type alertCheck struct {
 	kind      string
 	level     string
-	breached  bool
+	breaching bool
+	fire      bool
 	skip      bool // 数据不足，本窗口不做判定
 	message   string
 	recovered string
@@ -153,12 +190,16 @@ func (s *Services) evaluateAlerts(
 	checks := make([]alertCheck, 0, 3)
 
 	if cfg.ErrorRatePct > 0 {
+		// 请求数不足的窗口不参与判断：几个请求里错一个就是 50%，会变成噪声。
+		breaching := stats.Total >= alertMinRequests && sample.ErrorRate >= cfg.ErrorRatePct
 		checks = append(checks, alertCheck{
-			kind:  "error_rate",
-			level: "warning",
-			// 请求数不足的窗口不参与判断：几个请求里错一个就是 50%，会变成噪声。
-			breached: stats.Total >= alertMinRequests && sample.ErrorRate >= cfg.ErrorRatePct,
-			skip:     stats.Total < alertMinRequests,
+			kind:      "error_rate",
+			level:     "warning",
+			breaching: breaching,
+			skip:      stats.Total < alertMinRequests,
+			fire: breaching && s.sustained(cfg.SustainedWindows, now, func(r model.MetricSample) bool {
+				return r.Requests >= alertMinRequests && r.ErrorRate >= cfg.ErrorRatePct
+			}),
 			message: fmt.Sprintf("接口错误率 %.1f%%（阈值 %.0f%%，样本 %d 次请求）",
 				sample.ErrorRate, cfg.ErrorRatePct, stats.Total),
 			recovered: fmt.Sprintf("接口错误率已回落至 %.1f%%（阈值 %.0f%%）", sample.ErrorRate, cfg.ErrorRatePct),
@@ -167,11 +208,15 @@ func (s *Services) evaluateAlerts(
 		})
 	}
 	if cfg.DiskPct > 0 {
+		breaching := diskKnown && sample.DiskUsedPct >= cfg.DiskPct
 		checks = append(checks, alertCheck{
 			kind:      "disk",
 			level:     "critical",
-			breached:  sample.DiskUsedPct >= cfg.DiskPct,
+			breaching: breaching,
 			skip:      !diskKnown,
+			fire: breaching && s.sustained(cfg.SustainedWindows, now, func(r model.MetricSample) bool {
+				return r.DiskUsedPct >= cfg.DiskPct
+			}),
 			message:   fmt.Sprintf("磁盘使用率 %.1f%%（阈值 %.0f%%）", sample.DiskUsedPct, cfg.DiskPct),
 			recovered: fmt.Sprintf("磁盘使用率已回落至 %.1f%%（阈值 %.0f%%）", sample.DiskUsedPct, cfg.DiskPct),
 			value:     sample.DiskUsedPct,
@@ -180,10 +225,13 @@ func (s *Services) evaluateAlerts(
 	}
 	if cfg.BackupStaleHr > 0 && s.BackupSupported() {
 		if hours, ok := s.backupStaleHours(now); ok {
+			breaching := hours >= float64(cfg.BackupStaleHr)
 			checks = append(checks, alertCheck{
-				kind:      "backup_stale",
+				kind: "backup_stale",
+				// 备份超时本身以小时计，再要求「连续 N 个窗口」只会白白延后提醒。
 				level:     "warning",
-				breached:  hours >= float64(cfg.BackupStaleHr),
+				breaching: breaching,
+				fire:      breaching,
 				message:   fmt.Sprintf("已有 %.0f 小时没有成功备份（阈值 %d 小时）", hours, cfg.BackupStaleHr),
 				recovered: fmt.Sprintf("备份已恢复（最近一次成功备份在 %.0f 小时前）", hours),
 				value:     hours,
@@ -212,6 +260,34 @@ func (s *Services) backupStaleHours(now time.Time) (float64, bool) {
 		return now.Sub(f.CreatedAt).Hours(), true
 	}
 	return 1 << 20, true // 一个都没有：视为早已过期的极值
+}
+
+// sustained 判断最近 n 个采样窗口（含当前窗口）是否都满足条件。
+// 用落库样本回溯而不是进程内计数：进程重启后判断仍然成立，
+// 多实例看到的也是同一份历史。
+func (s *Services) sustained(n int, at time.Time, ok func(model.MetricSample) bool) bool {
+	if n <= 1 {
+		return true
+	}
+	var rows []model.MetricSample
+	if err := s.DB.Where("sampled_at <= ?", at).Order("sampled_at DESC").Limit(n).Find(&rows).Error; err != nil {
+		log.Printf("[alert] 读取指标样本失败，本轮按「未持续」处理: %v", err)
+		return false
+	}
+	if len(rows) < n {
+		return false
+	}
+	// 进程停过一段时间时，库里的「最近 N 条」可能横跨几个小时。
+	// 这种情况不能算「连续」：否则重启后会拿停机前的样本凑数，误报一次。
+	if oldest := rows[len(rows)-1]; at.Sub(oldest.At) > time.Duration(n)*alertInterval*2 {
+		return false
+	}
+	for _, r := range rows {
+		if !ok(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // raiseAlert 维护「同一 kind 同时最多一条 firing」的约束：
@@ -369,6 +445,12 @@ func (s *Services) deliverAlert(ev model.AlertEvent) {
 func (s *Services) deliverResolved(ev model.AlertEvent, message string) {
 	cfg := s.AlertConfig()
 	if !cfg.Enabled || cfg.WebhookURL == "" {
+		return
+	}
+	if cfg.Silenced(time.Now()) {
+		// 静默期间不打扰：状态照常恢复，只是不发消息；标记已处理，
+		// 避免静默结束后再补一条过期的「已恢复」。
+		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
 		return
 	}
 	if !ev.Delivered {

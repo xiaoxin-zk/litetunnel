@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
@@ -446,6 +448,148 @@ func TestRunAlertCycleResolvesWhenConditionClears(t *testing.T) {
 	}
 	if got := sink.count(); got != 2 {
 		t.Errorf("应推送触发 + 恢复两条，实际 %d 条", got)
+	}
+}
+
+// 持续判定：只有连续 N 个窗口都超标才触发；恢复不受影响。
+func TestSustainedRequiresConsecutiveWindows(t *testing.T) {
+	svc := newTestServices(t, nil)
+	now := time.Now()
+	cfg := AlertConfig{ErrorRatePct: 5, SustainedWindows: 2}
+	stats := middleware.HTTPStatsSnapshot{Total: 100, Errors: 20}
+	cur := model.MetricSample{At: now, Requests: 100, Errors: 20, ErrorRate: 20}
+	if err := svc.DB.Create(&cur).Error; err != nil {
+		t.Fatalf("写入当前样本失败: %v", err)
+	}
+
+	checks := svc.evaluateAlerts(cfg, cur, stats, false, now)
+	if len(checks) != 1 {
+		t.Fatalf("应只有一条规则参与评估，实际 %d 条", len(checks))
+	}
+	if !checks[0].breaching {
+		t.Error("当前窗口错误率 20% 应判为超标")
+	}
+	if checks[0].fire {
+		t.Error("只有 1 个窗口超标时不该触发（要求连续 2 个）")
+	}
+
+	prev := model.MetricSample{At: now.Add(-alertInterval), Requests: 100, Errors: 20, ErrorRate: 20}
+	if err := svc.DB.Create(&prev).Error; err != nil {
+		t.Fatalf("写入上一窗口样本失败: %v", err)
+	}
+	checks = svc.evaluateAlerts(cfg, cur, stats, false, now)
+	if !checks[0].fire {
+		t.Error("连续两个窗口都超标后应触发")
+	}
+
+	// 横跨停机时间的样本不能算「连续」，否则重启后会拿停机前的数据凑数。
+	if err := svc.DB.Where("1 = 1").Delete(&model.MetricSample{}).Error; err != nil {
+		t.Fatalf("清理样本失败: %v", err)
+	}
+	stale := model.MetricSample{At: now.Add(-3 * time.Hour), Requests: 100, Errors: 20, ErrorRate: 20}
+	if err := svc.DB.Create(&stale).Error; err != nil {
+		t.Fatalf("写入陈旧样本失败: %v", err)
+	}
+	if err := svc.DB.Create(&model.MetricSample{
+		At: now, Requests: 100, Errors: 20, ErrorRate: 20,
+	}).Error; err != nil {
+		t.Fatalf("写入当前样本失败: %v", err)
+	}
+	checks = svc.evaluateAlerts(cfg, cur, stats, false, now)
+	if checks[0].fire {
+		t.Error("横跨停机的样本不该算连续")
+	}
+}
+
+// 静默期间不新建告警、不推送；结束静默后问题仍在才补一条。
+func TestSilenceSuppressesNewAlerts(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+
+	settings := alertSettingMap(srv.URL, true)
+	settings[KeyAlertDisk] = "0"
+	settings[KeyAlertErrorRate] = "0"
+	settings[KeyAlertBackupHours] = "1"
+	settings[KeyAlertSilenceUntil] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	settings[KeyAlertSilenceReason] = "数据库维护"
+	if err := svc.UpdateSettings(settings); err != nil {
+		t.Fatalf("保存静默设置失败: %v", err)
+	}
+
+	svc.runAlertCycle(time.Now())
+
+	var count int64
+	if err := svc.DB.Model(&model.AlertEvent{}).Count(&count).Error; err != nil {
+		t.Fatalf("统计告警失败: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("静默期间不该新建告警，实际 %d 条", count)
+	}
+	if got := sink.count(); got != 0 {
+		t.Fatalf("静默期间不该推送，实际 %d 条", got)
+	}
+
+	if err := svc.UpdateSettings(map[SettingKey]string{KeyAlertSilenceUntil: ""}); err != nil {
+		t.Fatalf("结束静默失败: %v", err)
+	}
+	svc.runAlertCycle(time.Now())
+
+	if err := svc.DB.Model(&model.AlertEvent{}).Count(&count).Error; err != nil {
+		t.Fatalf("统计告警失败: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("结束静默后应补一条告警，实际 %d 条", count)
+	}
+	if got := sink.count(); got != 1 {
+		t.Errorf("结束静默后应推送一条，实际 %d 条", got)
+	}
+}
+
+func TestAlertSustainedAndSilenceValidation(t *testing.T) {
+	svc := newTestServices(t, nil)
+	base := alertSettingMap("http://127.0.0.1:9/hook", false)
+
+	merge := func(extra map[SettingKey]string) map[SettingKey]string {
+		out := make(map[SettingKey]string, len(base)+len(extra))
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+
+	for _, extra := range []map[SettingKey]string{
+		{KeyAlertSustained: "0"},
+		{KeyAlertSustained: "13"},
+		{KeyAlertSilenceUntil: "tomorrow"},
+		{KeyAlertSilenceUntil: time.Now().AddDate(2, 0, 0).Format(time.RFC3339)},
+		{KeyAlertSilenceReason: strings.Repeat("长", 201)},
+	} {
+		if err := svc.UpdateSettings(merge(extra)); err == nil {
+			t.Errorf("%v 应被拒绝", extra)
+		}
+	}
+
+	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	if err := svc.UpdateSettings(merge(map[SettingKey]string{
+		KeyAlertSustained:     "3",
+		KeyAlertSilenceUntil:  until,
+		KeyAlertSilenceReason: "维护",
+	})); err != nil {
+		t.Fatalf("合法配置不该被拒绝: %v", err)
+	}
+	cfg := svc.AlertConfig()
+	if cfg.SustainedWindows != 3 {
+		t.Errorf("持续窗口 = %d，期望 3", cfg.SustainedWindows)
+	}
+	if !cfg.Silenced(time.Now()) {
+		t.Error("应处于静默窗口内")
+	}
+	if cfg.Silenced(time.Now().Add(2 * time.Hour)) {
+		t.Error("静默时间过后不该仍判定为静默")
 	}
 }
 

@@ -115,6 +115,10 @@ const (
 	KeyAlertErrorRate   SettingKey = "alert.error_rate_pct"
 	KeyAlertDisk        SettingKey = "alert.disk_pct"
 	KeyAlertBackupHours SettingKey = "alert.backup_stale_hours"
+
+	KeyAlertSustained     SettingKey = "alert.sustained_windows"
+	KeyAlertSilenceUntil  SettingKey = "alert.silence_until"
+	KeyAlertSilenceReason SettingKey = "alert.silence_reason"
 )
 
 const SecretMask = "__UNCHANGED__"
@@ -242,6 +246,9 @@ var settingSpecs = []settingSpec{
 	{Key: KeyAlertErrorRate, Default: func(*config.Config) string { return "5" }},
 	{Key: KeyAlertDisk, Default: func(*config.Config) string { return "90" }},
 	{Key: KeyAlertBackupHours, Default: func(*config.Config) string { return "48" }},
+	{Key: KeyAlertSustained, Default: func(*config.Config) string { return "1" }},
+	{Key: KeyAlertSilenceUntil, Default: func(*config.Config) string { return "" }},
+	{Key: KeyAlertSilenceReason, SingleLine: true, Default: func(*config.Config) string { return "" }},
 }
 
 var settingByKey = func() map[SettingKey]settingSpec {

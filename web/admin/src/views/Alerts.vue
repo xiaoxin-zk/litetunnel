@@ -1,5 +1,16 @@
 <template>
   <div>
+    <el-alert
+      v-if="silenced"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 12px"
+      :title="`告警静默中：${fmtTime(form.silence_until)} 之前不推送${form.silence_reason ? '（' + form.silence_reason + '）' : ''}`"
+    >
+      <el-button size="small" @click="stopSilence">结束静默</el-button>
+    </el-alert>
+
     <div class="lt-card" v-loading="loadingConfig">
       <div class="lt-card-title">
         <span>告警设置</span>
@@ -61,6 +72,35 @@
         <el-form-item label="备份超时告警">
           <el-input-number v-model="form.backup_stale_hours" :min="0" :max="8760" :step="1" />
           <span class="hint">小时，距最近一次成功备份超过该值就提醒；0 表示关闭</span>
+        </el-form-item>
+
+        <el-form-item label="持续判定">
+          <el-input-number v-model="form.sustained_windows" :min="1" :max="12" :step="1" />
+          <span class="hint">
+            连续 N 个采样窗口（每窗口 5 分钟）都超标才触发，用来压掉瞬时尖峰；
+            恢复不受影响，第一个正常窗口就会收尾
+          </span>
+        </el-form-item>
+
+        <el-form-item label="临时静默至">
+          <div class="row">
+            <el-date-picker
+              v-model="form.silence_until"
+              type="datetime"
+              placeholder="选择截止时间"
+              style="width: 200px"
+            />
+            <el-input
+              v-model="form.silence_reason"
+              placeholder="原因，如：数据库维护"
+              style="width: 220px"
+            />
+            <el-button v-if="silenced" link type="warning" @click="stopSilence">结束静默</el-button>
+          </div>
+          <span class="hint">
+            静默期间不新建告警、不推送（已有事件仍会随条件自动恢复）；截止后问题仍在会重新开一条。
+            清空时间并保存即取消静默
+          </span>
         </el-form-item>
       </el-form>
     </div>
@@ -167,7 +207,15 @@ const form = ref({
   error_rate_pct: 5,
   disk_pct: 90,
   backup_stale_hours: 48,
+  sustained_windows: 1,
+  silence_until: null,
+  silence_reason: '',
   min_requests: 50
+})
+
+const silenced = computed(() => {
+  const until = form.value.silence_until
+  return !!until && new Date(until).getTime() > Date.now()
 })
 // 已保存的地址不回显：留空即保持原值，只有用户真的改过输入框才覆盖。
 const webhookConfigured = ref(false)
@@ -274,12 +322,16 @@ async function loadConfig() {
     webhookDirty.value = false
     sampleKeepDays.value = Number(res.sample_keep_days ?? 14)
     eventKeepDays.value = Number(res.event_keep_days ?? 90)
+    const until = res.silence_until ? new Date(res.silence_until) : null
     form.value = {
       enabled: !!res.enabled,
       webhook_url: '',
       error_rate_pct: Number(res.error_rate_pct ?? 0),
       disk_pct: Number(res.disk_pct ?? 0),
       backup_stale_hours: Number(res.backup_stale_hours ?? 0),
+      sustained_windows: Number(res.sustained_windows ?? 1),
+      silence_until: until && !Number.isNaN(until.getTime()) ? until : null,
+      silence_reason: res.silence_reason || '',
       min_requests: Number(res.min_requests ?? 50)
     }
   } finally {
@@ -298,9 +350,24 @@ async function save() {
       webhook_url: webhook,
       error_rate_pct: form.value.error_rate_pct,
       disk_pct: form.value.disk_pct,
-      backup_stale_hours: form.value.backup_stale_hours
+      backup_stale_hours: form.value.backup_stale_hours,
+      sustained_windows: form.value.sustained_windows,
+      silence_until: form.value.silence_until ? new Date(form.value.silence_until).toISOString() : '',
+      silence_reason: form.value.silence_reason || ''
     })
     ElMessage.success('已保存，配置即时生效')
+    await loadConfig()
+  } finally {
+    saving.value = false
+  }
+}
+
+// 结束静默只提交静默相关字段：部分更新不会碰到阈值与地址。
+async function stopSilence() {
+  saving.value = true
+  try {
+    await alertApi.saveSettings({ silence_until: '', silence_reason: '' })
+    ElMessage.success('已结束静默，恢复推送')
     await loadConfig()
   } finally {
     saving.value = false

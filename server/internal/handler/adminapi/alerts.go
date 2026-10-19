@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -30,6 +31,10 @@ func (h *Handler) GetAlertSettings(c *gin.Context) {
 		}
 		webhook = service.SecretMask
 	}
+	silenceUntil := ""
+	if !cfg.SilenceUntil.IsZero() {
+		silenceUntil = cfg.SilenceUntil.Format(time.RFC3339)
+	}
 	httpx.OK(c, gin.H{
 		"enabled":            cfg.Enabled,
 		"webhook_url":        webhook,
@@ -38,6 +43,10 @@ func (h *Handler) GetAlertSettings(c *gin.Context) {
 		"error_rate_pct":     cfg.ErrorRatePct,
 		"disk_pct":           cfg.DiskPct,
 		"backup_stale_hours": cfg.BackupStaleHr,
+		"sustained_windows":  cfg.SustainedWindows,
+		"silence_until":      silenceUntil,
+		"silence_reason":     cfg.SilenceReason,
+		"silenced":           cfg.Silenced(time.Now()),
 		"min_requests":       service.AlertMinRequests,
 		"interval_minutes":   service.AlertIntervalMinutes,
 		"cooldown_minutes":   service.AlertCooldownMinutes,
@@ -49,11 +58,14 @@ func (h *Handler) GetAlertSettings(c *gin.Context) {
 // 字段都用指针：只更新请求里真的出现的项。
 // 用零值兜底会让「只想改阈值」的调用顺手把告警关掉。
 type alertSettingsReq struct {
-	Enabled         *bool    `json:"enabled"`
-	WebhookURL      *string  `json:"webhook_url"`
-	ErrorRatePct    *float64 `json:"error_rate_pct"`
-	DiskPct         *float64 `json:"disk_pct"`
-	BackupStaleHour *int     `json:"backup_stale_hours"`
+	Enabled          *bool    `json:"enabled"`
+	WebhookURL       *string  `json:"webhook_url"`
+	ErrorRatePct     *float64 `json:"error_rate_pct"`
+	DiskPct          *float64 `json:"disk_pct"`
+	BackupStaleHour  *int     `json:"backup_stale_hours"`
+	SustainedWindows *int     `json:"sustained_windows"`
+	SilenceUntil     *string  `json:"silence_until"`
+	SilenceReason    *string  `json:"silence_reason"`
 }
 
 func (h *Handler) UpdateAlertSettings(c *gin.Context) {
@@ -83,6 +95,26 @@ func (h *Handler) UpdateAlertSettings(c *gin.Context) {
 	if req.BackupStaleHour != nil {
 		in[service.KeyAlertBackupHours] = strconv.Itoa(*req.BackupStaleHour)
 	}
+	if req.SustainedWindows != nil {
+		in[service.KeyAlertSustained] = strconv.Itoa(*req.SustainedWindows)
+	}
+	if req.SilenceUntil != nil {
+		raw := strings.TrimSpace(*req.SilenceUntil)
+		if raw != "" {
+			// 前端 Date.toISOString() 带毫秒：统一成秒级 UTC 再落库。
+			if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+				raw = t.UTC().Format(time.RFC3339)
+			}
+		}
+		in[service.KeyAlertSilenceUntil] = raw
+		// 结束静默时顺手清掉原因，避免下次静默沿用上一次的说明。
+		if raw == "" && req.SilenceReason == nil {
+			in[service.KeyAlertSilenceReason] = ""
+		}
+	}
+	if req.SilenceReason != nil {
+		in[service.KeyAlertSilenceReason] = strings.TrimSpace(*req.SilenceReason)
+	}
 	if len(in) == 0 {
 		httpx.BadRequest(c, "没有需要更新的字段")
 		return
@@ -93,9 +125,16 @@ func (h *Handler) UpdateAlertSettings(c *gin.Context) {
 		return
 	}
 	cfg := h.svc.AlertConfig()
+	silence := "未静默"
+	if !cfg.SilenceUntil.IsZero() {
+		silence = "静默至 " + cfg.SilenceUntil.Format(time.RFC3339)
+		if cfg.SilenceReason != "" {
+			silence += "（" + cfg.SilenceReason + "）"
+		}
+	}
 	h.audit(c, "alert.settings.update", "alert", "",
-		fmt.Sprintf("更新告警设置（启用=%v，错误率阈值=%.0f%%，磁盘阈值=%.0f%%，备份超时=%d 小时）",
-			cfg.Enabled, cfg.ErrorRatePct, cfg.DiskPct, cfg.BackupStaleHr))
+		fmt.Sprintf("更新告警设置（启用=%v，错误率阈值=%.0f%%，磁盘阈值=%.0f%%，备份超时=%d 小时，持续=%d 窗口，%s）",
+			cfg.Enabled, cfg.ErrorRatePct, cfg.DiskPct, cfg.BackupStaleHr, cfg.SustainedWindows, silence))
 	httpx.OK(c, gin.H{"message": "已保存，配置即时生效"})
 }
 

@@ -564,7 +564,7 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 		if err != nil {
 			reason = "frpc 异常退出：" + err.Error()
 		}
-		a.noteStartFailure(id, name, reason)
+		a.noteStartFailureGen(id, gen, name, reason)
 	}
 	a.emitState()
 }

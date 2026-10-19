@@ -109,6 +109,12 @@ func (a *App) baseReason() string {
 //   - frpc 接入凭据：服务端生成在配置文件里，不需要填。
 //
 // serverURL 仅在构建未注入地址时使用（本地调试构建）。
+func (a *App) isLoggedIn() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.username != "" || (a.cfg != nil && a.cfg.APIKey != "")
+}
+
 func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.mu.RLock()
 	generation := a.authGeneration
@@ -116,6 +122,9 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return a.GetState(), errors.New("请填写 API Key")
+	}
+	if a.isLoggedIn() {
+		return a.GetState(), errors.New("当前账号已接入，请先退出当前账号再重新接入")
 	}
 
 	base, err := a.resolveBase(serverURL)

@@ -222,7 +222,15 @@ func (a *App) retryAllowed(id uint) bool {
 
 // noteStartFailure 记一次失败并安排下次重试时间。
 func (a *App) noteStartFailure(id uint, name, reason string) {
+	a.noteStartFailureGen(id, 0, name, reason)
+}
+
+func (a *App) noteStartFailureGen(id uint, gen uint64, name, reason string) {
 	a.mu.Lock()
+	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		a.mu.Unlock()
+		return
+	}
 	if a.retries == nil {
 		a.retries = map[uint]*retryState{}
 	}

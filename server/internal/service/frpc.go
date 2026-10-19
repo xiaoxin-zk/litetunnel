@@ -183,15 +183,34 @@ type ClientInfo struct {
 	BandwidthUnit string `json:"bandwidth_unit"`
 }
 
+// GatewayEndpoint 返回下发给客户端的隧道网关地址与端口。
+//
+// 从设置读、默认回落 .env：管理员在后台改完就生效，不必登录服务器改 .env
+// 再重启面板。地址只接受主机名或 IPv4——端口是单独一项，写进地址里会让
+// 下发的 frpc 配置变成 serverAddr = "1.2.3.4:7848" 这种非法值。
+func (s *Services) GatewayEndpoint() (string, int) {
+	host := strings.TrimSpace(s.Settings.Get(KeyGatewayHost))
+	port := s.Settings.Int(KeyGatewayPort)
+	if port <= 0 || port > 65535 {
+		port = s.Cfg.GatewayPort
+	}
+	if port <= 0 || port > 65535 {
+		// 与 config.Load 的默认值一致：宁可下发默认端口，也不要写 serverPort = 0。
+		port = 7001
+	}
+	return host, port
+}
+
 // BuildClientInfo 组装客户端接入信息。
 func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 	secret, err := s.EnsureClientSecret(u)
 	if err != nil {
 		return nil, err
 	}
+	gatewayHost, gatewayPort := s.GatewayEndpoint()
 	return &ClientInfo{
-		ServerAddr: s.Cfg.GatewayHost,
-		ServerPort: s.Cfg.GatewayPort,
+		ServerAddr: gatewayHost,
+		ServerPort: gatewayPort,
 		User:       FrpUserOf(u.ID),
 		Token:      secret,
 		FrpsToken:  s.Cfg.FrpsToken,

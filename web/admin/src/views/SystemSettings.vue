@@ -40,6 +40,21 @@
               留空则回退到本地目录（<code>LT_CLIENT_DIST_DIR</code>）分发
             </span>
           </el-form-item>
+          <el-form-item label="隧道网关地址">
+            <el-input
+              v-model="form['gateway.host']"
+              placeholder="panel.example.com 或 203.0.113.10"
+            />
+            <span class="hint">
+              用户端「客户端下载 → 接入信息」显示的服务器地址，也是下发配置里的
+              <code>serverAddr</code>。只填主机名或 IP，不要带协议和端口；留空时回落
+              <code>LT_GATEWAY_HOST</code>
+            </span>
+          </el-form-item>
+          <el-form-item label="隧道网关端口">
+            <el-input-number v-model="numForm['gateway.port']" :min="1" :max="65535" />
+            <span class="hint">客户端连接 frps 的端口，默认 7001；留空回落 <code>LT_GATEWAY_PORT</code></span>
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 
@@ -97,6 +112,13 @@
             <el-switch v-model="boolForm['register.whitelist_only']" />
             <span class="hint">
               开启后非白名单邮箱一律无法注册（填写白名单后才可开启）；发验证码时即拦截
+            </span>
+          </el-form-item>
+          <el-form-item label="白名单外域名名额">
+            <el-input-number v-model="numForm['register.non_whitelist_quota']" :min="0" :max="100000" />
+            <span class="hint">
+              仅「仅白名单可注册」开启且白名单非空时生效：0 = 白名单外直接拒绝；
+              N = 每个白名单外主域（如 qq.com）最多注册 N 个账号，累计不按天重置
             </span>
           </el-form-item>
           <el-form-item label="单域名每日上限">
@@ -354,6 +376,8 @@ const BOOL_KEYS = [
 const NUM_KEYS = [
   'register.max_per_ip_per_day',
   'register.max_per_domain_per_day',
+  'register.non_whitelist_quota',
+  'gateway.port',
   'smtp.port',
   'payment.min_amount',
   'payment.max_amount',

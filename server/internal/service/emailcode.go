@@ -84,8 +84,10 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 	// 告知域名不允许，体验上就像限制没有生效。找回密码不查域名——那条路径对
 	// 任何域名都必须给出同样的结果，否则会变成账号枚举工具。
 	if scene == EmailSceneRegister || scene == EmailSceneChange {
-		if err := s.checkEmailDomainAdmission(email); err != nil {
-			return err
+		// 只判「直接拒绝」；配额是累计账号数，留到注册时再算——发码阶段
+		// 就把人挡掉的话，名额还没用满的用户会莫名收不到信。
+		if v := s.emailDomainVerdictFor(email); v.Reject != nil {
+			return v.Reject
 		}
 	}
 

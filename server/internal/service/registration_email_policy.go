@@ -4,6 +4,9 @@ import (
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
+	"gorm.io/gorm"
+
+	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
 // 邮箱域名准入策略：白名单、黑名单与「单域名限额」计数口径的唯一入口。
@@ -178,23 +181,62 @@ func (s *Services) isTrustedEmailDomain(domain string) bool {
 	return emailDomainIn(domain, s.allowedEmailDomainRules())
 }
 
-// checkEmailDomainAdmission 是注册与换绑共用的域名准入检查。
+// emailDomainVerdict 是域名准入的结论：要么直接拒绝，要么按域名放量。
+type emailDomainVerdict struct {
+	// Reject 非 nil 表示这个邮箱不允许注册。
+	Reject error
+	// Quota 大于 0 表示白名单外域名每个主域最多注册这么多个（累计）。
+	Quota int
+}
+
+// emailDomainVerdictFor 计算域名准入结论。四档语义：
+//
+//	白名单为空              → 不限制（没有白名单就谈不上「白名单外」）
+//	关掉「仅白名单可注册」  → 不限制
+//	开启 + 配额 0           → 白名单外直接拒绝
+//	开启 + 配额 N           → 白名单外每个主域最多 N 个账号
 //
 // 只对「即将落库的邮箱」调用。找回密码**不能**调用：那条路径对任何域名都要
 // 返回同样的结果，否则接口会退化成账号枚举工具。
-//
-// 放在这里而不是只放在 Register 里，是因为发验证码时就能告诉用户
-// 「这个域名不让注册」——等他填完密码再报错，只会让人以为验证码那步是坏的。
-func (s *Services) checkEmailDomainAdmission(email string) error {
+func (s *Services) emailDomainVerdictFor(email string) emailDomainVerdict {
 	domain := emailDomain(email)
 	if domain == "" {
-		return nil
+		return emailDomainVerdict{}
 	}
 	if emailDomainIn(domain, s.blockedEmailDomainRules()) {
-		return ErrEmailNotAllowed
+		return emailDomainVerdict{Reject: ErrEmailNotAllowed}
 	}
-	if s.Settings.Bool(KeyRegisterWhitelistOnly) && !s.isTrustedEmailDomain(domain) {
-		return ErrDomainNotTrusted
+	if !s.Settings.Bool(KeyRegisterWhitelistOnly) {
+		return emailDomainVerdict{}
+	}
+	if len(s.allowedEmailDomainRules()) == 0 {
+		return emailDomainVerdict{}
+	}
+	if s.isTrustedEmailDomain(domain) {
+		return emailDomainVerdict{}
+	}
+	quota := s.Settings.Int(KeyRegisterNonWhitelistQuota)
+	if quota <= 0 {
+		return emailDomainVerdict{Reject: ErrDomainNotTrusted}
+	}
+	return emailDomainVerdict{Quota: quota}
+}
+
+// checkNonWhitelistQuota 限制白名单外域名可注册的账号总数。
+//
+// 与「单域名每日上限」不同，这里是**累计**上限：它的用途是给每个外部域名
+// 留一个体验名额，按天重置等于每天都能再刷一个。
+func (s *Services) checkNonWhitelistQuota(db *gorm.DB, domain string, quota int) error {
+	if domain == "" || quota <= 0 {
+		return nil
+	}
+	var n int64
+	if err := db.Model(&model.User{}).Where("email_domain = ?", domain).Count(&n).Error; err != nil {
+		// 统计失败时放行，理由与其它限额一致：宁可漏拦也不能挡住正常注册。
+		return nil
+	}
+	if n >= int64(quota) {
+		return ErrNonWhitelistQuota
 	}
 	return nil
 }

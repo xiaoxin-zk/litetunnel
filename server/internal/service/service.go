@@ -80,6 +80,8 @@ var (
 	ErrDomainNotTrusted = errors.New("本站当前仅允许白名单内的邮箱域名注册")
 	// ErrDomainRegisterLimited 表示该邮箱域名当日注册量已达上限。
 	ErrDomainRegisterLimited = errors.New("该邮箱域名今日注册数量已达上限，请改用其他邮箱或明日再试")
+	// ErrNonWhitelistQuota 表示白名单外域名的注册名额（累计）已用尽。
+	ErrNonWhitelistQuota     = errors.New("该邮箱域名不在白名单内，且注册名额已用尽")
 	ErrEmailCodeNeeded       = errors.New("请输入邮箱验证码")
 	ErrEmailCodeWrong        = errors.New("邮箱验证码不正确或已过期")
 	// ErrEmailCodeCheckFailed 表示校验本身没法完成（例如失败次数写不进库）。

@@ -138,6 +138,24 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 选择「仅允许白名单域名注册」时必须先填写白名单", ErrInvalidParam)
 	}
 
+	if n, err := strconv.Atoi(view(KeyRegisterNonWhitelistQuota)); err != nil || n < 0 || n > 100000 {
+		return fmt.Errorf("%w: 白名单外域名注册名额需为 0-100000 的整数（0 表示直接拒绝）", ErrInvalidParam)
+	}
+
+	// ---- 接入信息 ----
+	//
+	// 这两个值会被拼进下发给客户端的 frpc 配置（serverAddr / serverPort），
+	// 所以必须在保存时挡住「带协议、带端口、带路径」的写法：地址栏里塞进
+	// :7848 会让 serverAddr 变成 "1.2.3.4:7848"，客户端一个都连不上。
+	if h := strings.TrimSpace(view(KeyGatewayHost)); h != "" {
+		if strings.ContainsAny(h, " \t\r\n/\\:@") {
+			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)
+		}
+	}
+	if n, err := strconv.Atoi(view(KeyGatewayPort)); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("%w: 网关端口需为 1-65535 的整数", ErrInvalidParam)
+	}
+
 	// ---- 接口限流 ----
 	if n, err := strconv.Atoi(view(KeyAPIRatePerMinute)); err != nil || n < 1 || n > 100000 {
 		return fmt.Errorf("%w: 接口每分钟请求上限需为 1-100000 的整数", ErrInvalidParam)

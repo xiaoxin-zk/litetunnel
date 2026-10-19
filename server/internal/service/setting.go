@@ -45,6 +45,12 @@ const (
 	KeyRegisterWhitelistOnly     SettingKey = "register.whitelist_only"
 	KeyRegisterMaxPerDomain      SettingKey = "register.max_per_domain_per_day"
 	KeyRegisterTrustedSkipLimits SettingKey = "register.trusted_domain_skip_limits"
+	// KeyRegisterNonWhitelistQuota 是白名单模式下「白名单外域名」的放量口径。
+	//
+	// 0（默认）= 直接拒绝；N = 每个主域最多注册 N 个账号（累计，不按天重置）。
+	// 白名单为空时该值无效果——没有白名单就谈不上「白名单外」，
+	// 这一点与 sub2api 的「白名单非空时才生效」保持一致。
+	KeyRegisterNonWhitelistQuota SettingKey = "register.non_whitelist_quota"
 
 	// ---- 登录防护 ----
 	//
@@ -117,6 +123,16 @@ const (
 	// 这样做的好处是客户端不再需要人工搬运到服务器、也不会因为
 	// 服务器磁盘被大文件占满而出问题；留空则回退到本地目录分发。
 	KeySiteClientDownloadURL SettingKey = "site.client_download_url"
+
+	// ---- 接入信息（下发给客户端与控制台）----
+	//
+	// 决定用户端「客户端下载 → 接入信息」显示的服务器地址，以及下载到的
+	// frpc 配置里的 serverAddr 与 tls.serverName。
+	//
+	// 默认值回落 .env 的 LT_GATEWAY_HOST / LT_GATEWAY_PORT，老部署升级后行为
+	// 不变；但改它不再需要登录服务器编辑 .env 再重启面板。
+	KeyGatewayHost SettingKey = "gateway.host"
+	KeyGatewayPort SettingKey = "gateway.port"
 
 	// ---- 域名与证书 ----
 	//
@@ -241,6 +257,7 @@ var settingSpecs = []settingSpec{
 	{Key: KeyRegisterWhitelistOnly, Default: func(*config.Config) string { return "false" }},
 	{Key: KeyRegisterMaxPerDomain, Default: func(*config.Config) string { return "5" }},
 	{Key: KeyRegisterTrustedSkipLimits, Default: func(*config.Config) string { return "true" }},
+	{Key: KeyRegisterNonWhitelistQuota, Default: func(*config.Config) string { return "0" }},
 
 	// 登录防护
 	{Key: KeyLoginCaptchaAfter, Default: func(*config.Config) string { return "3" }},
@@ -294,6 +311,18 @@ var settingSpecs = []settingSpec{
 	{Key: KeySiteAnnouncement, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteICP, Default: func(*config.Config) string { return "" }},
 	{Key: KeySiteClientDownloadURL, Default: func(*config.Config) string { return "" }},
+
+	// 接入信息：默认回落 .env，升级后行为不变
+	{Key: KeyGatewayHost, SingleLine: true, Default: func(c *config.Config) string { return c.GatewayHost }},
+	{Key: KeyGatewayPort, Default: func(c *config.Config) string {
+		// 零值兜底 7001：与 config.Load 的默认一致。少了这一层，测试用的空
+		// Config 会让默认值变成 "0"，连「保存任意设置」都会被端口校验拦下。
+		p := c.GatewayPort
+		if p <= 0 {
+			p = 7001
+		}
+		return strconv.Itoa(p)
+	}},
 
 	// 域名与证书。
 	//

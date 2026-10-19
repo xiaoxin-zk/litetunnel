@@ -66,12 +66,13 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, ErrEmailRequired
 	}
 
-	// 4. 邮箱域名准入：黑名单拦住一次性邮箱，白名单模式下非白名单域名一律拒绝。
+	// 4. 邮箱域名准入：黑名单直接拒绝；白名单模式下非白名单域名要么拒绝，
+	// 要么按「每主域 N 个账号」放量（见 emailDomainVerdictFor）。
 	//
-	// 走 checkEmailDomainAdmission 而不是在这里各写一段：发验证码那一步要用
-	// 同一套判断（见 sendEmailCode），两处各写一份迟早会分叉。
-	if err := s.checkEmailDomainAdmission(in.Email); err != nil {
-		return nil, err
+	// 与发验证码共用同一套判断，否则用户要到填完密码才知道域名不允许。
+	verdict := s.emailDomainVerdictFor(in.Email)
+	if verdict.Reject != nil {
+		return nil, verdict.Reject
 	}
 
 	// 限额与额度键统一按公共后缀主域归一：否则换个子域就能绕过「每域名每日上限」。
@@ -87,6 +88,14 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		}
 		// 单邮箱域名每日上限：拦住用同一邮箱服务商批量注册
 		if err := s.checkDomainRate(s.DB, domain, false); err != nil {
+			return nil, err
+		}
+	}
+
+	// 6. 白名单外域名配额：给每个外部域名留固定几个名额，用完即止。
+	// 与「每日上限」无关——它按累计账号数算，否则每天都能再刷一个。
+	if verdict.Quota > 0 {
+		if err := s.checkNonWhitelistQuota(s.DB, domain, verdict.Quota); err != nil {
 			return nil, err
 		}
 	}
@@ -144,6 +153,13 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 				return err
 			}
 			if err := s.checkDomainRate(tx, domain, false); err != nil {
+				return err
+			}
+		}
+		// 白名单外配额同样要在事务内复核：并发注册时前置检查看到的名额
+		// 是同一个「还剩最后一个」，两边各自提交就会超额。
+		if verdict.Quota > 0 {
+			if err := s.checkNonWhitelistQuota(tx, domain, verdict.Quota); err != nil {
 				return err
 			}
 		}

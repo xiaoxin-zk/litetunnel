@@ -12,8 +12,12 @@
         :closable="false"
         show-icon
         title="当前使用 PostgreSQL，面板不做在线备份"
-        description="请用 pg_dump 定期导出，例如：pg_dump -Fc -f litetunnel-$(date +%F).dump \"$LT_DB_DSN\""
-      />
+      >
+        <div>
+          请用 pg_dump 定期导出，例如：
+          <code>pg_dump -Fc -f litetunnel-$(date +%F).dump "$LT_DB_DSN"</code>
+        </div>
+      </el-alert>
 
       <template v-else>
         <div class="strategy">

@@ -69,6 +69,10 @@ func recoverBatch(dir string) bool {
 		log.Printf("[lt-config] 批次记录无法解析（%s），保留现场并阻断后续写盘: %v", path, err)
 		return false
 	}
+	if err := validateManifestForRecovery(dir, m); err != nil {
+		log.Printf("[lt-config] 批次记录 schema 或路径不可信（%s），保留现场并阻断后续写盘: %v", path, err)
+		return false
+	}
 
 	if m.Status == batchStatusCommitted {
 		// 这一批已经生效（文件与容器都按新配置完成），只是记录没删掉。

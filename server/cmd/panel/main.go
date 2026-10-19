@@ -145,14 +145,21 @@ const workerShutdownWait = 5 * time.Second
 
 // waitWorkers 等待所有后台 worker 退出，超过总上限则记录并继续关闭。
 func waitWorkers(workers []<-chan struct{}) {
-	deadline := time.After(workerShutdownWait)
-	for _, done := range workers {
-		select {
-		case <-done:
-		case <-deadline:
-			log.Println("后台 worker 未在 5 秒内退出，继续关闭")
-			return
+	if len(workers) == 0 {
+		return
+	}
+	allDone := make(chan struct{})
+	go func() {
+		for _, done := range workers {
+			<-done
 		}
+		close(allDone)
+	}()
+	select {
+	case <-allDone:
+		return
+	case <-time.After(workerShutdownWait):
+		log.Println("后台 worker 未在 5 秒内全部退出，继续关闭")
 	}
 }
 

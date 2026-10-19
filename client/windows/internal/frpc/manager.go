@@ -339,7 +339,11 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 	//
 	// 失败不致命（会退化为「仅在正常关闭时清理」），所以只记一行日志。
 	if err := attachToJob(cmd); err != nil {
-		m.appendLog(tunnelID, tunnelName, "提示：未能绑定进程生命周期，异常退出时可能残留 frpc 进程")
+		// Job Object 是异常退出时唯一可靠的孤儿进程兜底。绑定失败后继续
+		// 运行会让客户端“看似启动成功”，但崩溃时 frpc 仍可留在后台转发。
+		// 终止当前进程并走统一 Wait/退出回调路径，避免留下未受管控的 frpc。
+		m.appendLog(tunnelID, tunnelName, "无法绑定进程生命周期，已终止 frpc："+err.Error())
+		_ = cmd.Process.Kill()
 	}
 
 	var pumps sync.WaitGroup

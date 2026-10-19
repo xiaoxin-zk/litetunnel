@@ -22,12 +22,16 @@ jobs:
     name: Server (Go)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: server/go.mod
           cache: true
+          # cache-dependency-path 默认取仓库根目录的 go.sum；本仓库的 go.sum
+          # 在 server/ 里，不指定就会「恢复缓存失败：找不到 go.sum」，缓存
+          # 永远存不上（每次都重新下载模块）。
+          cache-dependency-path: server/go.sum
 
       - name: Resolve dependencies
         working-directory: server
@@ -764,7 +768,7 @@ jobs:
           cat /tmp/smoke/panel.log
 
       - name: Upload panel binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: panel-linux-amd64
           path: /tmp/panel
@@ -781,9 +785,9 @@ jobs:
       matrix:
         app: [user, admin]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -818,7 +822,7 @@ jobs:
         run: npm run build
 
       - name: Upload dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: web-${{ matrix.app }}
           path: web/${{ matrix.app }}/dist
@@ -836,7 +840,7 @@ jobs:
     name: Deploy scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Syntax check
         run: |
@@ -867,14 +871,17 @@ jobs:
     name: Client (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: client/windows/go.mod
           cache: true
+          # 同 server 侧：go.sum 在子目录里，不指定就会「找不到 go.sum」而
+          # 恢复缓存失败。go.sum 已入库，因此这里可以放心开缓存。
+          cache-dependency-path: client/windows/go.sum
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -938,7 +945,7 @@ jobs:
         run: go test .
 
       - name: Upload client
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: LiteTunnel-windows-amd64
           path: client/windows/build/bin/LiteTunnel.exe
@@ -961,7 +968,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 

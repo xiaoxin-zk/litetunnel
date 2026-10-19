@@ -31,7 +31,7 @@ jobs:
     name: Server tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # 手工发布（workflow_dispatch）必须构建**输入版本号对应的源码**。
           # 不指定 ref 时 checkout 的是默认分支 HEAD，于是可以用今天的 main
@@ -39,10 +39,13 @@ jobs:
           # 显式锁到触发的那次提交，避免推送与检出之间 tag 被移动。
           ref: ${{ github.event.inputs.version || github.sha }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: server/go.mod
           cache: true
+          # cache-dependency-path 默认取仓库根目录的 go.sum；本仓库的 go.sum
+          # 在 server/ 里，不指定就会「恢复缓存失败：找不到 go.sum」。
+          cache-dependency-path: server/go.sum
 
       - name: Resolve dependencies
         working-directory: server
@@ -77,7 +80,7 @@ jobs:
       # 照着文档 pull 指定版本会得到 manifest unknown。
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # 见 test job 的说明：手工发布要锁到输入版本对应的源码。
           # fetch-depth: 0 是为了让下面的 latest 判断能看到全部 tag。
@@ -152,7 +155,7 @@ jobs:
     env:
       VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # 见 test job 的说明：手工发布要锁到输入版本对应的源码。
           ref: ${{ github.event.inputs.version || github.sha }}
@@ -175,12 +178,14 @@ jobs:
           "FRP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "frp $v"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: client/windows/go.mod
           cache: true
+          # 同 server 侧：go.sum 在子目录里，不指定就会「找不到 go.sum」。
+          cache-dependency-path: client/windows/go.sum
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -323,7 +328,7 @@ jobs:
             (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: LiteTunnel-windows-amd64
           path: |
@@ -338,7 +343,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.version || github.sha }}
 
@@ -370,7 +375,7 @@ jobs:
         run: sha256sum litetunnel-deploy.zip > litetunnel-deploy.zip.sha256
 
       - name: Upload bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: litetunnel-deploy
           path: |
@@ -388,7 +393,7 @@ jobs:
     # manifest unknown，而 Release 页面看起来一切正常。
     needs: [test, client, deploy-bundle, docker]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.version || github.sha }}
 
@@ -401,12 +406,12 @@ jobs:
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: LiteTunnel-windows-amd64
           path: assets
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: litetunnel-deploy
           path: assets

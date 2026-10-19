@@ -51,22 +51,32 @@ func (s *Services) StartMaintenanceWorker(ctx context.Context) <-chan struct{} {
 		defer ticker.Stop()
 
 		// 启动即清一次：重启频繁的部署也能等到清理机会。
-		s.RunMaintenance()
+		//
+		// 传 ctx 而不是 Background：停机可能正好赶上这一轮，而每一轮
+		// 最长可跑 maintenanceBudget。中途检查让关闭阶段不必等满预算，
+		// 剩余的表由下次启动继续清（删除是幂等的）。
+		s.runMaintenance(ctx)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.RunMaintenance()
+				s.runMaintenance(ctx)
 			}
 		}
 	}()
 	return done
 }
 
-// RunMaintenance 执行一轮清理。
-func (s *Services) RunMaintenance() {
+// RunMaintenance 执行一轮清理（不响应停机信号，供测试与一次性调用）。
+func (s *Services) RunMaintenance() { s.runMaintenance(context.Background()) }
+
+// runMaintenance 在给定的上下文中执行一轮清理：每一步开始前检查是否已取消。
+func (s *Services) runMaintenance(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	now := time.Now()
 	// 整个一轮共享一个预算，而不是每张表各算一次：后者在多表同时积压时
 	// 会把一次维护拖成好几倍时长。
@@ -74,11 +84,23 @@ func (s *Services) RunMaintenance() {
 
 	s.pruneTable(deadline, "过期验证码", &model.EmailCode{},
 		"created_at < ?", now.Add(-emailCodeRetention))
+	if ctx.Err() != nil {
+		return
+	}
 	s.pruneTable(deadline, "过期重置令牌", &model.PasswordResetToken{},
 		"created_at < ?", now.Add(-resetTokenRetention))
+	if ctx.Err() != nil {
+		return
+	}
 	s.pruneTable(deadline, "失败邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailFailed, now.Add(-mailFailedRetention))
+	if ctx.Err() != nil {
+		return
+	}
 	s.pruneMailOutbox(deadline)
+	if ctx.Err() != nil {
+		return
+	}
 	// 账号级失败计数（见 loginfail_db.go）：按用户名增长，窗口过后就没用了。
 	// 与上面几张表不同，它只影响「是否要出验证码」的强度，不承担审计，
 	// 所以过期即可删，不必保留观察期。共用同一个 deadline：它的量级取决于

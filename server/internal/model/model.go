@@ -735,7 +735,23 @@ type ProxyDrainPending struct {
 	// 与 MailOutbox.ClaimToken 同一个理由。
 	Fence string `gorm:"size:32" json:"-"`
 	// LastErr 是最后一次失败原因，供排查。
-	LastErr   string    `gorm:"size:255" json:"last_err"`
+	LastErr string `gorm:"size:255" json:"last_err"`
+	// ManualReview 表示这条待办已经**转成人工待办**：自动重试停止，记录保留
+	// 等管理员核对（同时会置 Exhausted，重试器按它跳过）。
+	//
+	// 为什么需要单独一列而不是复用 Exhausted：Exhausted 的含义是「重试次数
+	// 用完」，它说的是**我们试累了**；ManualReview 说的是**再自动关下去有害**
+	// ——关闭请求返回成功后同名代理以另一个实例身份重新出现（frps 只支持按名字
+	// 关闭，无法条件关闭），继续自动重试随时可能打掉客户端刚重连上的新代理。
+	// 两者混在一起，运维就无法区分「需要修 frps」和「需要人工看一眼这条代理」。
+	ManualReview bool `gorm:"not null;default:0;index" json:"manual_review"`
+	// Suspects 是触发人工核对的可疑代理名（JSON 数组，有界）。
+	//
+	// 只留在进程内指标里是不够的：进程一重启，「该核对哪条代理」就没了，
+	// 而这类待办恰恰要跨重启才能等到人来处理。落库之后，管理端与运维的
+	// SQL 都能直接读出名单。
+	Suspects string `gorm:"type:text" json:"suspects,omitempty"`
+	// CreatedAt/UpdatedAt 由 GORM 自动维护。
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

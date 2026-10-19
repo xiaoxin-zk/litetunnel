@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -89,6 +90,42 @@ func proxyDrainRetryDelay(attempts int) time.Duration {
 		}
 	}
 	return d
+}
+
+// proxyDrainSuspectsJSON 把「疑似误关」的代理名序列化进待办。
+//
+// 编码失败时退化成逗号分隔的纯文本：名单是给人看的，宁可格式退化，
+// 也不能因为一次编码失败把「该核对哪条代理」整条丢掉。
+func proxyDrainSuspectsJSON(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(names)
+	if err != nil {
+		return strings.Join(names, ", ")
+	}
+	return string(raw)
+}
+
+// decodeProxyDrainSuspects 还原待办里的可疑代理名。
+//
+// 兼容两种历史格式：JSON 数组（本版本写入）与逗号分隔文本（编码失败时的
+// 退化格式）。解不出来就返回 nil——它只影响展示，不影响断流判定。
+func decodeProxyDrainSuspects(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err == nil {
+		return out
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // proxyDrainTargetsJSON 把发现的实例身份快照序列化进待办。
@@ -295,6 +332,22 @@ func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOut
 		"next_at":  time.Now().Add(delay),
 		"last_err": truncate(out.lastErr, 255),
 	}
+	// 关闭请求返回成功后同名代理以**另一个实例身份**重新出现：这是 frps
+	// 「只按名字关闭」导致的、无法从协议层消除的竞态（见 verifyClosedProxies）。
+	//
+	// 此时继续自动重试是**有害**的：下一轮很可能关掉客户端刚重连上的新代理，
+	// 于是「断流」变成「反复踢人」。所以这里直接把它转成**持久人工待办**：
+	//   - exhausted=true：重试器按它跳过（查询条件里就带了这个谓词）；
+	//   - manual_review=true：与「试累了」区分开，让运维知道该看的是什么；
+	//   - suspects：把名单落库，跨重启仍能读出「该核对哪几条代理」。
+	// 只留进程内计数的做法在重启后什么都不剩，而这类问题恰恰要等人来查。
+	if len(out.suspects) > 0 {
+		updates["manual_review"] = true
+		updates["exhausted"] = true
+		updates["suspects"] = proxyDrainSuspectsJSON(out.suspects)
+		updates["last_err"] = truncate(
+			"疑似误关：关闭后同名代理以另一实例身份重新出现，已转人工核对（"+strings.Join(out.suspects, ", ")+"）", 255)
+	}
 	// 快照只在真的发现了残留时替换：列表拉取失败（unknown）时保留上一次的
 	// 快照，说明白点就是「上次打算关这些，这次连世界长什么样都没看见」。
 	if len(out.residual) > 0 {
@@ -317,6 +370,11 @@ func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOut
 	if res.RowsAffected == 0 {
 		// 期间被更强的意图覆盖了：本次的残留自然由那条意图负责，不能再去动它。
 		return
+	}
+	if len(out.suspects) > 0 {
+		log.Printf("[proxy-drain][ALERT] 用户 %d 的断流已转为人工待办（停止自动重试，记录已保留）：%s。"+
+			"请人工核对 frps 中该前缀下的代理实例，确认后再清理这条待办",
+			req.userID, strings.Join(out.suspects, ", "))
 	}
 	if exhausted {
 		log.Printf("[proxy-drain] 用户 %d 的断流连续 %d 次未能完成，已停止自动重试（待办保留：user_id=%d prefix=%s last_err=%s），"+

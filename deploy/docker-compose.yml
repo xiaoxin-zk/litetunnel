@@ -65,6 +65,11 @@ services:
       # 容量既不等于宿主机根分区也不等于数据盘；/data 才是挂出来的数据卷
       # （宿主机 ./data/panel 所在分区），数据增长真正影响的就是它。
       LT_MONITOR_DISK_PATH: "/data"
+      # 断流兜底队列的落盘镜像。必须显式落在持久卷上：
+      # 容器根文件系统是只读的，os.UserCacheDir 指向的位置既不可写也没挂卷，
+      # 写失败后「数据库抖一下就丢意图」的兜底等于不存在（见
+      # server/internal/service/proxy_drain_fallback.go 的 proxyDrainWALPath）。
+      LT_PROXY_DRAIN_WAL: "/data/proxy-drain-outbox.jsonl"
     volumes:
       - ./data/panel:/data
     read_only: true

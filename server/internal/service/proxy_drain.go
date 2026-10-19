@@ -272,6 +272,10 @@ type proxyDrainOutcome struct {
 	abandoned bool
 	closed    int
 	lastErr   string
+	// suspects 是「关闭请求返回成功后，同名代理以另一个实例身份重新出现」
+	// 的代理名。它同时是**人工待办**的来源：这类结果无法从协议层消除，
+	// 只能停止自动重试并留下名单（见 rescheduleProxyDrain）。
+	suspects []string
 	// closedTargets 是本轮「发出关闭请求并收到成功」的那批代理的**关闭前**身份。
 	//
 	// 单独留下来是为了在整轮结束时统一做一次「关闭后复查」（见
@@ -514,9 +518,10 @@ func (s *Services) verifyClosedProxies(ctx context.Context, req proxyDrainReques
 		// 这是本模块唯一「无法从协议层消除」的竞态，必须留下可被人接手的
 		// 告警：日志前缀加 ALERT，同时把代理名记进 ProxyDrainRaceHealth.Recent，
 		// 让管理端直接看到「该人工核对哪条代理」，而不是只有一个计数。
-		log.Printf("[proxy-drain][ALERT] 用户 %d: %s；已记为残留，请人工核对（代理名已记入 race_health.recent）",
+		log.Printf("[proxy-drain][ALERT] 用户 %d: %s；该代理已转为**人工待办**（不再自动重试），请人工核对",
 			req.userID, msg)
 		s.countProxyDrainRaceSuspect(t.Name)
+		out.suspects = append(out.suspects, t.Name)
 		out.residual = append(out.residual, t)
 		if out.lastErr == "" {
 			out.lastErr = msg
@@ -555,11 +560,20 @@ type ProxyDrainRaceHealth struct {
 	// 非零不等于一定误伤：也可能是我们正确关了旧实例、客户端立刻重新注册。
 	// 但它意味着「有一条关闭动作的结果无法确认」，值得人工看一眼。
 	Suspects uint64 `json:"suspects"`
-	// Recent 是最近几次疑似误伤涉及的代理名（有界）。
+	// Recent 是最近几次疑似误伤涉及的代理名（有界，**进程内**）。
 	//
 	// 只有计数时，管理员知道「发生过 3 次」，却不知道该核对哪条代理；
 	// 保留名字后，这个指标本身就可以直接当作人工待办清单使用。
+	//
+	// 但它会随进程重启清零，所以只是**实时**视角：要跨重启，看下面两个字段。
 	Recent []string `json:"recent,omitempty"`
+	// ManualPending 是已转成人工待办的断流记录数（落库，跨重启保留）。
+	ManualPending int64 `json:"manual_pending"`
+	// ManualSuspects 是这些人工待办涉及的代理名（落库，最多 16 条）。
+	//
+	// 这一项才是运维真正要接手的东西：读到非空就说明「有账号的关闭动作
+	// 结果无法确认，且自动重试已经停下」。
+	ManualSuspects []string `json:"manual_suspects,omitempty"`
 }
 
 // drainRaceRecentMax 是保留的疑似误伤代理名上限。
@@ -591,11 +605,32 @@ func (s *Services) ProxyDrainRaceHealth() ProxyDrainRaceHealth {
 	s.drainRaceMu.Lock()
 	recent := append([]string(nil), s.drainRaceRecent...)
 	s.drainRaceMu.Unlock()
-	return ProxyDrainRaceHealth{
+	h := ProxyDrainRaceHealth{
 		Instance: s.instanceID,
 		Suspects: uint64(s.drainRaceSuspects.Load()),
 		Recent:   recent,
 	}
+	// 进程内的 Recent 会随重启清零，而「该人工核对哪条代理」这件事恰恰要
+	// 跨重启才有机会被人看到。所以再从待办表里把落库的人工待办读出来：
+	// 两者一个实时、一个持久，缺任何一个都会漏。
+	if s.DB == nil {
+		return h
+	}
+	if err := s.DB.Model(&model.ProxyDrainPending{}).
+		Where("manual_review = ?", true).Count(&h.ManualPending).Error; err != nil {
+		log.Printf("[proxy-drain] 统计人工待办数量失败（指标里这一项会偏低）: %v", err)
+	}
+	var rows []model.ProxyDrainPending
+	if err := s.DB.Select("suspects").
+		Where("manual_review = ?", true).
+		Order("updated_at desc").Limit(drainRaceRecentMax).Find(&rows).Error; err != nil {
+		log.Printf("[proxy-drain] 读取人工待办名单失败（指标里这一项会缺失）: %v", err)
+		return h
+	}
+	for _, row := range rows {
+		h.ManualSuspects = append(h.ManualSuspects, decodeProxyDrainSuspects(row.Suspects)...)
+	}
+	return h
 }
 
 // proxyDrainStep 是「处理一条候选代理」的结果。

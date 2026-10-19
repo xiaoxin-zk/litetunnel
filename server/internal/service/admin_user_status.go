@@ -319,7 +319,10 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 		// 这期间若账号被重新启用（任何实例上），版本变化就是「本次断流
 		// 已过期」的信号。
 		var u model.User
-		if err := tx.Select("state_version").First(&u, id).Error; err != nil {
+		// incarnation 一并读出来：断流意图必须**同时**记住它是为哪个账号
+		// 生命周期登记的。只带 user_id 的话，补偿队列的 flush 会在稍后重新
+		// 读一次 users 表——如果那时 ID 已被复用，旧断流就会绑到新账号上。
+		if err := tx.Select("state_version", "incarnation").First(&u, id).Error; err != nil {
 			return err
 		}
 		gen = u.StateVersion
@@ -328,10 +331,11 @@ func (s *Services) AdminSetUserStatus(id uint, status string) error {
 			// CloseUserProxies 前退出，后台仍能靠这条记录继续断流。
 			drainNotAfter = time.Now()
 			drainIntent = s.recordProxyDrainPendingDB(tx, proxyDrainRequest{
-				userID:   id,
-				prefix:   FrpUserOf(id) + ".",
-				gen:      gen,
-				notAfter: drainNotAfter,
+				userID:      id,
+				prefix:      FrpUserOf(id) + ".",
+				gen:         gen,
+				notAfter:    drainNotAfter,
+				incarnation: u.Incarnation,
 			})
 			if drainIntent == "" {
 				return errors.New("记录账号禁用断流意图失败")

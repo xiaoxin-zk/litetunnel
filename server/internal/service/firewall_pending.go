@@ -104,11 +104,20 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) error 
 		if prev.open == open && prev.proto == proto {
 			attempts = prev.attempts
 		}
-	} else if len(s.fwPending) >= pendingFWLimit {
+	} else if len(s.fwPending)+s.fwReserved >= pendingFWLimit {
 		s.fwMu.Unlock()
 		log.Printf("[firewall] 待处理端口操作已达上限 %d，端口 %d 不再进入重试队列，需要人工清理",
 			pendingFWLimit, port)
 		return ErrFirewallQueueFull
+	} else {
+		// 占位：容量检查与落库之间有空窗，不占位的话多个端口能同时通过检查，
+		// 一起落库之后突破上限。落库结束（无论成败）再归还。
+		s.fwReserved++
+		defer func() {
+			s.fwMu.Lock()
+			s.fwReserved--
+			s.fwMu.Unlock()
+		}()
 	}
 	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: gen}
 	s.fwMu.Unlock()
@@ -175,16 +184,23 @@ func (s *Services) persistPending(port int, item pendingFW) error {
 // 旧任务的删除可能晚于新意图的登记：无条件按端口删会把新待办一起删掉，
 // 重启后那条新意图就没了。版本号让删除只作用于「我要删的那代」。
 func (s *Services) dropPending(port int, gen int64) {
+	// 先删库、后删内存。
+	//
+	// 反过来时：库删除失败，内存那条已经没了——协调器不再重试它，只有重启
+	// 读库才会回来。而「先删库」失败可以简单返回：内存项留着，下一轮重试
+	// 会再走一遍（applyPortIntent 幂等），不会留下「规则没下发、也无人重试」
+	// 的空洞。
+	if err := s.DB.Where("port = ? AND generation = ?", port, gen).
+		Delete(&model.FirewallPending{}).Error; err != nil {
+		log.Printf("[firewall] 清除待办记录失败（端口 %d，保留内存项继续重试）: %v", port, err)
+		return
+	}
+
 	s.fwMu.Lock()
 	if cur, ok := s.fwPending[port]; ok && cur.gen == gen {
 		delete(s.fwPending, port)
 	}
 	s.fwMu.Unlock()
-
-	if err := s.DB.Where("port = ? AND generation = ?", port, gen).
-		Delete(&model.FirewallPending{}).Error; err != nil {
-		log.Printf("[firewall] 清除待办记录失败（端口 %d）: %v", port, err)
-	}
 }
 
 // setPendingIfCurrent 把重试结果写回内存，只在「端口上仍是同一代意图」时。

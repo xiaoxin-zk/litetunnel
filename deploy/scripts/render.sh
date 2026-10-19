@@ -22,22 +22,60 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # 用 mkdir 而不是 flock：macOS 默认没有 flock，而渲染脚本在三种平台上都会被
 # 手工执行。mkdir 是原子的，失败即说明有人在跑。
 LOCK_DIR="${ROOT}/deploy/.render.lock.d"
-if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-  # 崩溃可能留下空目录。按 mtime 判定残留：超过 10 分钟既不可能是正常渲染
-  # （它只做文本替换），也不该让运维去手工清目录。
-  if [[ -n "$(find "${LOCK_DIR}" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
-    echo "清理上次异常退出留下的渲染锁：${LOCK_DIR}" >&2
-    rmdir "${LOCK_DIR}" 2>/dev/null || true
+
+# holder_alive 判断锁持有者是否还活着。
+#
+# 优先用 PID（锁目录里的 pid 文件），只有拿不到 PID 时才退回 mtime。按时间
+# 猜是不可靠的：慢盘或网络盘上一次**正常**渲染完全可能超过任何阈值，而把
+# 活锁删掉会让两个进程同时写配置——那正是这把锁要防的事。反过来，PID 检查
+# 在 Linux 上直接用 /proc/<pid> 是否存在，避免 `kill -0` 对「别人的进程」
+# 返回 EPERM 时被误判成已退出。
+holder_alive() {
+  local pid="$1"
+  if [[ -d /proc ]]; then
+    [[ -d "/proc/${pid}" ]]
+  else
+    kill -0 "${pid}" 2>/dev/null
   fi
-  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
-    echo "另一个 render 正在运行（锁：${LOCK_DIR}）。请等它结束；若是崩溃残留，10 分钟后会自动清理。" >&2
+}
+
+clear_stale_lock() {
+  local pid
+  pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+  if [[ -n "${pid}" ]]; then
+    if holder_alive "${pid}"; then
+      return 1
+    fi
+    echo "清理上次异常退出留下的渲染锁（持有者 PID ${pid} 已不存在）：${LOCK_DIR}" >&2
+    rm -rf "${LOCK_DIR}"
+    return 0
+  fi
+  # 没有 pid 文件（更早的版本写入的锁，或刚创建还没写 PID）：阈值放到 60 分钟，
+  # 正常渲染不可能这么久，而误删活锁的代价远大于多等一会儿。
+  if [[ -n "$(find "${LOCK_DIR}" -maxdepth 0 -mmin +60 2>/dev/null)" ]]; then
+    echo "清理遗留的渲染锁（无 PID，且已超过 60 分钟）：${LOCK_DIR}" >&2
+    rm -rf "${LOCK_DIR}"
+    return 0
+  fi
+  return 1
+}
+
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  if clear_stale_lock; then
+    mkdir "${LOCK_DIR}" 2>/dev/null || {
+      echo "另一个 render 正在运行（锁：${LOCK_DIR}），请等它结束。" >&2
+      exit 1
+    }
+  else
+    echo "另一个 render 正在运行（锁：${LOCK_DIR}，持有者 PID $(cat "${LOCK_DIR}/pid" 2>/dev/null || echo 未知)），请等它结束。" >&2
     exit 1
   fi
 fi
+printf '%s\n' "$$" > "${LOCK_DIR}/pid"
 RELEASE_LOCK=1
 release_lock() {
   if [[ "${RELEASE_LOCK}" == "1" ]]; then
-    rmdir "${LOCK_DIR}" 2>/dev/null || true
+    rm -rf "${LOCK_DIR}"
   fi
 }
 
@@ -310,6 +348,13 @@ if (( ${VARS[LT_PORT_RANGE_START]:-0} >= ${VARS[LT_PORT_RANGE_END]:-0} )); then
   echo "LT_PORT_RANGE_START 必须小于 LT_PORT_RANGE_END。" >&2
   exit 1
 fi
+# 端口池起点必须 >= 1024：1-1023 是特权端口，frps 不以 root 运行时绑定会
+# 直接失败，而失败发生在容器重建之后。Go 侧的校验本来就拒绝这一段，脚本
+# 放行等于「渲染成功、启动失败」。
+if (( ${VARS[LT_PORT_RANGE_START]:-0} < 1024 )); then
+  echo "LT_PORT_RANGE_START=${VARS[LT_PORT_RANGE_START]} 落在特权端口段（<1024），请改用 1024 以上。" >&2
+  exit 1
+fi
 
 for k in "${!VARS[@]}"; do
   if [[ "${VARS[$k]}" == CHANGE_ME* ]]; then
@@ -333,8 +378,14 @@ check_vhost_port() {
     echo "${name}=${port} 不在 1-65535 范围内。" >&2
     exit 1
   fi
-  # 所有实际会监听的本机端口：统一转为十进制整数比较。
-  local reserved=(80 443 "${VARS[LT_GATEWAY_PORT]}" "${VARS[LT_KCP_PORT]}"
+  # 所有实际会监听的本机**TCP** 端口：统一转为十进制整数比较。
+  #
+  # LT_KCP_PORT 不在列表里：KCP 走 UDP，内核允许同号分别绑定 TCP 与 UDP
+  # （frps 的 KCP 正是靠这一点）。把它算进来会让
+  # `LT_GATEWAY_PORT=7001 + LT_KCP_PORT=7001` 这个 .env.example 里合法的
+  # 组合被脚本拒绝，而 Go 侧校验（按协议区分）会放行——同一个 .env 在两个
+  # 入口得到相反结论。
+  local reserved=(80 443 "${VARS[LT_GATEWAY_PORT]}"
     "${VARS[LT_USER_PORT]}" "${VARS[LT_FRPS_API_PORT]}" "${other}")
   local p p_num
   for p in "${reserved[@]}"; do

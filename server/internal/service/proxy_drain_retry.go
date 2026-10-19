@@ -262,9 +262,18 @@ func (s *Services) recordProxyDrainPendingDB(db *gorm.DB, req proxyDrainRequest)
 			// 条件写分两层，理由见函数注释。刻意用布尔列本身做判断而不写
 			// `deleted = 1`：SQLite 存 0/1，PostgreSQL 是真 boolean，
 			// 拿数字字面量去比在 Postgres 上会直接类型错误。
+			// 第三层 intent_at 是给**删号意图**用的：删号意图的 status_gen 恒为 0
+			// （账号已经不存在，没有状态版本可言），于是同一 ID 上先后两次删号
+			// 的 status_gen 都是 0，>= 判不出先后。补偿队列重放一条旧 WAL 时，
+			// 它就能凭「0 >= 0」盖掉后面那条更新的删除意图——被盖掉的那条
+			// 前缀/时间水位/实例快照全都倒退到过去。
+			//
+			// intent_at 是登记时刻，单调不减；同代次下用它做次级判据。
 			gorm.Expr(`(excluded.deleted AND NOT lt_proxy_drain_pending.deleted)
 				OR (excluded.deleted = lt_proxy_drain_pending.deleted
-				    AND excluded.status_gen >= lt_proxy_drain_pending.status_gen)`),
+				    AND (excluded.status_gen > lt_proxy_drain_pending.status_gen
+				         OR (excluded.status_gen = lt_proxy_drain_pending.status_gen
+				             AND excluded.intent_at >= lt_proxy_drain_pending.intent_at)))`),
 		}},
 	}).Create(&rec)
 	if res.Error != nil {
@@ -305,6 +314,25 @@ func (s *Services) clearProxyDrainPending(userID uint, fence string) {
 	}
 }
 
+// captureDrainIncarnation 在把请求交给补偿队列**之前**把账号标识定下来。
+//
+// 只在这里做一次，而不是让队列自己解决：队列跨重启存活，它没有「登记时刻」
+// 这个概念，任何时刻读库读到的都是「现在」。请求一旦带着标识入队，后面无论
+// 多久之后才 flush，落库的都是当初那个账号的生命周期。
+func (s *Services) captureDrainIncarnation(req proxyDrainRequest) proxyDrainRequest {
+	if req.incarnation != "" || s.DB == nil {
+		return req
+	}
+	if inc, _, err := s.currentIncarnation(req.userID); err != nil {
+		log.Printf("[proxy-drain] 读取用户 %d 的账号标识失败，补偿队列将以空标识登记（重试时会转人工）: %v",
+			req.userID, err)
+		return req
+	} else {
+		req.incarnation = inc
+	}
+	return req
+}
+
 // rescheduleProxyDrain 把未关干净的残留重新登记：累计次数、退避下一次时间、
 // 更新实例身份快照；到上限则转终态并保留记录。
 func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOutcome) {
@@ -332,7 +360,12 @@ func (s *Services) rescheduleProxyDrain(req proxyDrainRequest, out proxyDrainOut
 		// 但那条待办可能是「禁用」而本次是「删号」（更强的语义），补写一次
 		// 无害且更准确——recordProxyDrainPending 的覆盖规则会自己判断。
 		if s.drainFallback != nil {
-			s.drainFallback.enqueue(req)
+			// 入队前把账号标识**定下来**。队列的 flush 可能在几分钟后、甚至
+			// 重启之后才跑：那时再读 users 表，读到的是「现在占用这个 ID 的
+			// 账号」。ID 被复用后，旧断流会以新账号身份重新落库，然后按相同
+			// 前缀把新账号的代理关掉。读不到就留空——空标识在重试侧会被判成
+			// 「转人工」，比错误绑定安全。
+			s.drainFallback.enqueue(s.captureDrainIncarnation(req))
 			log.Printf("[proxy-drain] 用户 %d 仍有 %d 个代理未能关闭，本次意图未落库，已放入进程内补偿队列",
 				req.userID, len(out.residual))
 		} else {

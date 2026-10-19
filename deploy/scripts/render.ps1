@@ -245,8 +245,13 @@ function Assert-VhostPort([string]$name, [string]$value, [string]$other) {
         throw "$name=$value is not a decimal port between 1 and 65535."
     }
     # Every port this host actually listens on: a collision fails at startup.
+    # LT_KCP_PORT is deliberately absent: KCP runs over UDP, and the kernel
+    # allows the same number to be bound once per protocol (frps' KCP relies on
+    # it). Counting it here would reject the legitimate
+    # `LT_GATEWAY_PORT=7001 + LT_KCP_PORT=7001` from .env.example while the Go
+    # validator (which is protocol-aware) accepts it.
     $conflicts = @(
-        $vars['LT_GATEWAY_PORT'], $vars['LT_KCP_PORT'], $other,
+        $vars['LT_GATEWAY_PORT'], $other,
         $vars['LT_USER_PORT'], $vars['LT_FRPS_API_PORT'], '80', '443'
     ) | Where-Object { $_ }
     foreach ($c in $conflicts) {
@@ -257,6 +262,13 @@ function Assert-VhostPort([string]$name, [string]$value, [string]$other) {
     }
     $start = [int]$vars['LT_PORT_RANGE_START']
     $end = [int]$vars['LT_PORT_RANGE_END']
+    # Ports below 1024 are privileged: frps does not run as root, so binding one
+    # fails at startup - after the container has already been rebuilt. The Go
+    # validator rejects this range; accept it here and the same .env renders
+    # fine but never starts.
+    if ($start -lt 1024) {
+        throw "LT_PORT_RANGE_START=$start is inside the privileged range (<1024). Use 1024 or above."
+    }
     if ($port -ge $start -and $port -le $end) {
         throw "$name=$value falls inside the tunnel port pool $start-$end. Choose a port outside it."
     }

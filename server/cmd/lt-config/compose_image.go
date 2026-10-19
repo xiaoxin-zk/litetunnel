@@ -27,6 +27,18 @@ func composeServiceImage(path, service string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 这个解析器只认识「services: → 两空格缩进 → image:」。遇到 YAML 的
+	// 组合能力（锚点、include、merge key、flow 映射）时它不会报错，只会
+	// **读不到**，然后返回「找不到 image」——上层再退回默认镜像，校验就又
+	// 变成给一个没人用的镜像背书。
+	//
+	// 与其猜，不如明确指出「看不懂，请让 docker compose 自己解析」。这条
+	// 路径只在 docker CLI 不可用时才会走到（composeServiceImageViaDocker
+	// 优先），所以提示是可操作的：装上 docker 即可。
+	if reason := composeUnsupportedReason(raw); reason != "" {
+		return "", fmt.Errorf("compose 文件 %s %s，内置解析器无法可靠读取镜像名："+
+			"请安装 docker CLI（将改用 docker compose config 解析）", path, reason)
+	}
 	inServices := false
 	inTarget := false
 	indent := 0
@@ -71,6 +83,31 @@ func composeServiceImage(path, service string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("compose 文件 %s 中找不到服务 %s 的 image", path, service)
+}
+
+// composeUnsupportedReason 报告手写解析器读不懂的结构（空串表示能处理）。
+//
+// 判据只认「行首」形态，避免把镜像名或值里的 & 误判成锚点。
+func composeUnsupportedReason(raw []byte) string {
+	for i, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "include:"):
+			return fmt.Sprintf("第 %d 行使用了 include", i+1)
+		case strings.HasPrefix(trimmed, "extends:"):
+			return fmt.Sprintf("第 %d 行使用了 extends", i+1)
+		case strings.HasPrefix(trimmed, "<<:") || strings.HasPrefix(trimmed, "- <<:"):
+			return fmt.Sprintf("第 %d 行使用了 merge key", i+1)
+		case strings.HasSuffix(trimmed, ": &") || strings.Contains(trimmed, ": &"):
+			return fmt.Sprintf("第 %d 行使用了 YAML 锚点", i+1)
+		case strings.HasPrefix(trimmed, "services: {"):
+			return fmt.Sprintf("第 %d 行使用了 flow 风格映射", i+1)
+		}
+	}
+	return ""
 }
 
 // composeServiceImageViaDocker 让 Compose 自己解析出某个服务的镜像。

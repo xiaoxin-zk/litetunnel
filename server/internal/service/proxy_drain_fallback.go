@@ -257,10 +257,49 @@ func (q *proxyDrainFallbackQueue) enqueue(req proxyDrainRequest) {
 		log.Printf("[proxy-drain] 补偿队列已满（%d），丢弃用户 %d 的最旧意图（数据库恢复后自动补写，名单见 drain_fallback.dropped_recent）",
 			proxyDrainFallbackLimit, oldest)
 	}
-	q.items[req.userID] = &proxyDrainFallback{req: req, at: time.Now()}
+	next := &proxyDrainFallback{req: req, at: time.Now()}
+	if cur, ok := q.items[req.userID]; ok && !next.supersedes(*cur) {
+		// 同一用户只保留一条。队列里的旧请求可能**晚于**新请求到达：
+		// 断流在线程池里并发执行，先发起的不一定先完成。无条件覆盖会让一条
+		// 过期意图盖住更新的那条，数据库恢复后按过期意图去关代理。
+		log.Printf("[proxy-drain] 丢弃过期的断流意图（用户 %d：%s 早于队列中已有代次 %d）",
+			req.userID, describeDrainIntent(req), cur.req.gen)
+		return
+	}
+	q.items[req.userID] = next
 	// 入队即落盘：正常排队的那批同样只在内存里的话，「数据库抖一下 +
 	// 进程重启」就会把整批补偿线索一起带走。
 	q.persistAllLocked()
+}
+
+// supersedes 报告 a 是否应当取代队列里的 b（a 更新）。
+//
+// 顺序与数据库的 upsert 条件保持一致：
+//
+//  1. 删号意图压过禁用意图——删号之后不存在「重新启用」，旧禁用意图没有意义；
+//  2. 状态代次更大的更新（同一账本里的先后）；
+//  3. 同代次时比意图时间（notAfter 就是登记时刻）；
+//  4. 再相同就比令牌：令牌是单调字符串，只用来保证「结果确定」，不承担语义。
+func (a proxyDrainFallback) supersedes(b proxyDrainFallback) bool {
+	if a.req.deleted != b.req.deleted {
+		return a.req.deleted
+	}
+	if a.req.gen != b.req.gen {
+		return a.req.gen > b.req.gen
+	}
+	if !a.req.notAfter.Equal(b.req.notAfter) {
+		return a.req.notAfter.After(b.req.notAfter)
+	}
+	return a.req.intent >= b.req.intent
+}
+
+// describeDrainIntent 给日志用的简短描述。
+func describeDrainIntent(req proxyDrainRequest) string {
+	kind := "禁用"
+	if req.deleted {
+		kind = "删号"
+	}
+	return fmt.Sprintf("%s(generation=%d)", kind, req.gen)
 }
 
 // take 取走当前所有待补写的意图（调用方负责写库）。

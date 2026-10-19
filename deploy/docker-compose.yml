@@ -18,6 +18,32 @@
 name: litetunnel
 
 services:
+  # ===== 数据目录初始化 =====
+  #
+  # panel 镜像以 UID 10001（USER lt）运行，而 ./data/panel 首次 `up` 时由
+  # Docker 以 root 创建。绑定挂载保留宿主机属主，于是面板写不了 SQLite、
+  # 客户端分发包和断流 WAL——报错是 "attempt to write a readonly database"，
+  # 而第二次部署（目录已存在、属主可能已被手工改过）又一切正常，极难归因。
+  #
+  # 用一次性容器把属主改对，而不是在文档里要求 chown：手工步骤会被忘记，
+  # 忘记的代价是面板静默不可用。
+  init-data:
+    image: busybox:1.36
+    container_name: lt-init-data
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /data
+        # 10001 对应 panel 镜像里的 lt 用户（server/Dockerfile）。
+        chown -R 10001:10001 /data
+        chmod 750 /data
+    volumes:
+      - ./data/panel:/data
+    restart: "no"
+
   frps:
     image: fatedier/frps:v0.71.0
     container_name: lt-frps
@@ -93,7 +119,12 @@ services:
     #
     # 如果给容器 NET_ADMIN，上面这层隔离就没了——面板被攻破等于主机失守。
     depends_on:
-      - frps
+      # 等 init-data 把 /data 的属主改成 10001 之后再启动，否则第一轮
+      # 写入（建库）就会失败。
+      init-data:
+        condition: service_completed_successfully
+      frps:
+        condition: service_started
 
   caddy:
     # 官方镜像**不含任何 DNS 插件**，只够用在「仅裸域名证书」的部署上。

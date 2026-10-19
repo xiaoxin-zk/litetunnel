@@ -80,6 +80,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # 见 test job 的说明：手工发布要锁到输入版本对应的源码。
+          # fetch-depth: 0 是为了让下面的 latest 判断能看到全部 tag。
+          fetch-depth: 0
           ref: ${{ github.event.inputs.version || github.sha }}
 
       - name: Validate version
@@ -98,6 +100,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # latest 只在「本次发布的就是当前最高版本」时才移动。
+      #
+      # 否则重新发布旧版本（补丁重打、回滚、手工 dispatch 一个旧号）会把
+      # latest 指向旧代码：用户照文档 `pull :latest` 拿到的就是那个旧版本，
+      # 而版本 tag 与 latest 的相对关系彻底失去意义——排查时最先看的就是
+      # latest 到底指哪儿。git tag 需要完整历史，所以上面的 checkout 要
+      # fetch-depth: 0。
+      - name: Decide whether latest may move
+        id: latest
+        run: |
+          set -euo pipefail
+          newest="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          if [[ "${newest}" == "${VERSION}" ]]; then
+            echo "enable=true" >> "$GITHUB_OUTPUT"
+            echo "推送 latest：${VERSION} 是当前最高版本"
+          else
+            echo "enable=false" >> "$GITHUB_OUTPUT"
+            echo "不推送 latest：当前最高版本是 ${newest}，本次发布 ${VERSION}"
+          fi
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -105,7 +127,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/litetunnel-panel
           tags: |
             type=raw,value=${{ env.VERSION }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.latest.outputs.enable }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

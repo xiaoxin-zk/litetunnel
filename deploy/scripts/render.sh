@@ -7,6 +7,10 @@
 # ============================================================
 set -euo pipefail
 
+# 渲染结果里有 token、管理密码等敏感字段：默认权限收紧到 owner-only。
+# 不设的话，脚本在宽松 umask（常见 022）下会产出 0644，同机其他用户可读。
+umask 077
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -306,6 +310,14 @@ apply_conditionals() {
   printf '%s' "${out}"
 }
 
+# 先渲染到同目录的临时文件，等两份都成功后再统一 rename。
+#
+# 直接覆盖输出的话，第二份渲染失败（模板写错、占位符没填）会留下
+# 「frps 新 / Caddy 旧」的混合状态，容器启动时两边对不上，而现场看起来
+# 像是渲染成功了。临时文件与正式文件同目录，rename 才是原子的。
+PENDING_TMP=()
+PENDING_OUT=()
+
 render() {
   local tpl="$1" out="$2"
   local text
@@ -322,12 +334,32 @@ render() {
     exit 1
   fi
 
-  printf '%s' "${text}" > "${out}"
-  echo "已生成 ${out}"
+  local tmp
+  tmp="$(dirname "${out}")/.$(basename "${out}").tmp.$$"
+  printf '%s' "${text}" > "${tmp}"
+  chmod 600 "${tmp}"
+  PENDING_TMP+=("${tmp}")
+  PENDING_OUT+=("${out}")
 }
+
+# 任何一步失败都清掉临时文件：set -e 会直接退出，不能让半成品留在部署目录里。
+cleanup_tmp() {
+  local i
+  for ((i=0; i<${#PENDING_TMP[@]}; i++)); do
+    rm -f "${PENDING_TMP[i]}" 2>/dev/null || true
+  done
+}
+trap cleanup_tmp EXIT
 
 render "${FRPS_TPL}" "${FRPS_OUT}"
 render "${CADDY_TPL}" "${CADDY_OUT}"
+
+# 两份都渲染并校验通过后才作为一次事务提交。
+for ((i=0; i<${#PENDING_TMP[@]}; i++)); do
+  mv -f "${PENDING_TMP[i]}" "${PENDING_OUT[i]}"
+  chmod 600 "${PENDING_OUT[i]}"
+  echo "已生成 ${PENDING_OUT[i]}"
+done
 
 cat <<'EOF'
 

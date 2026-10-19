@@ -144,6 +144,14 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 	// （也是 .env.example 明确写出的组合）会被判成冲突，管理员只能去改一个
 	// 本来没问题的端口号。面板侧的端口池同样按 "tcp|"/"udp|" 两种键记录占用，
 	// 说明协议本来就是判定的一部分。
+	//
+	// 注意这里判的是 **frps 基础设施端口**（网关 / KCP / vhost / API），不是
+	// 隧道远程端口。隧道远程端口是**全局唯一**的（不分协议），由数据库唯一
+	// 索引、端口池分配、端口锁与防火墙待办共同保证（见 model.Tunnel.RemotePort
+	// 的注释）。两者刻意不同：内核允许基础设施端口按 TCP/UDP 各绑一份（KCP
+	// 就靠这一点），而 frps 的 remote_port 是单一数字、防火墙待办也按数字
+	// 收敛，没有协议维度可拆。若要把隧道模型改成 (protocol, port) 复合键，
+	// 必须同时改那四处，不能只改这里的校验。
 	seenPort := map[string]portOwner{
 		portKey(protoTCP, 80):  {proto: protoTCP, name: "固定 HTTP 入口"},
 		portKey(protoTCP, 443): {proto: protoTCP, name: "固定 HTTPS 入口"},

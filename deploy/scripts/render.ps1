@@ -256,6 +256,29 @@ function Apply-Conditionals([string[]]$lines, [hashtable]$values) {
 }
 
 # ---- Render ----
+
+# The generated files carry the frps token and the API password, so they must
+# not stay readable by every local account. Inherited NTFS ACLs usually grant
+# Users:Read, so pin each file to the current user - the equivalent of
+# render.sh's `umask 077` and explicit `chmod 600`.
+function Set-OwnerOnly([string]$path) {
+    if ($env:OS -ne 'Windows_NT') {
+        & chmod 600 $path
+        if ($LASTEXITCODE -ne 0) { throw "chmod 600 $path failed" }
+        return
+    }
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    & icacls.exe $path /inheritance:r /grant:r "${me}:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed to restrict $path to $me" }
+}
+
+# Render into a hidden temp file next to the target and commit only once every
+# template rendered cleanly. Writing straight to the output would leave
+# "frps new / Caddy old" behind when the second render throws, and that mixed
+# pair looks exactly like a successful run.
+$pendingTmp = New-Object System.Collections.Generic.List[string]
+$pendingOut = New-Object System.Collections.Generic.List[string]
+
 function Render([string]$template, [string]$output, [hashtable]$values) {
     $raw      = Get-Content -LiteralPath $template -Raw -Encoding UTF8
     $eol      = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -277,12 +300,41 @@ function Render([string]$template, [string]$output, [hashtable]$values) {
     if ($leftover) {
         throw "Unresolved placeholders in $template : $($leftover -join ', ')"
     }
-    [IO.File]::WriteAllText($output, $text, [System.Text.UTF8Encoding]::new($false))
+
+    $tmp = Join-Path (Split-Path -Parent $output) ('.' + (Split-Path -Leaf $output) + '.tmp.' + $PID)
+    [IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($false))
+    Set-OwnerOnly $tmp
+    $pendingTmp.Add($tmp)
+    $pendingOut.Add($output)
+}
+
+# Replacing inside one directory is atomic on NTFS. File.Replace needs an
+# existing destination, and the first run has none, so fall back to Move.
+function Commit-Rendered([string]$tmp, [string]$output) {
+    if (Test-Path -LiteralPath $output) {
+        [IO.File]::Replace($tmp, $output, $null)
+    } else {
+        [IO.File]::Move($tmp, $output)
+    }
+    Set-OwnerOnly $output
     Write-Host "Generated $output"
 }
 
-Render $frpsTpl  $frpsOut  $vars
-Render $caddyTpl $caddyOut $vars
+try {
+    Render $frpsTpl  $frpsOut  $vars
+    Render $caddyTpl $caddyOut $vars
+    for ($i = 0; $i -lt $pendingTmp.Count; $i++) {
+        Commit-Rendered $pendingTmp[$i] $pendingOut[$i]
+    }
+} finally {
+    # $ErrorActionPreference = 'Stop' unwinds through here on any failure: no
+    # half-written file may survive in the deployment directory.
+    foreach ($t in $pendingTmp) {
+        if (Test-Path -LiteralPath $t) {
+            Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 Write-Host ''
 Write-Host 'Done. Next steps:'

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -139,13 +138,13 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 // 不同 Compose 版本对转义序列的输出方式可能不同，固定分隔符能让解析
 // 明确失败而不是把整行静默塞进 Name、留下空 State。老版本 compose 不认
 // 这个参数时返回空列表——宁可少给信息，也不要掩盖真正的重建错误。
-func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
+func (s *service) serviceStates(ctx context.Context) ([]tlscfg.ServiceState, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	out, err := runDockerIn(probeCtx, s.paths.deployDir, composePSArgs(s.paths)...)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("读取 compose 服务状态失败: %w", err)
 	}
 	var states []tlscfg.ServiceState
 	for _, line := range strings.Split(out, "\n") {
@@ -155,8 +154,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 		}
 		parts := strings.Split(line, "|")
 		if len(parts) != 4 || strings.TrimSpace(parts[0]) == "" {
-			log.Printf("[lt-config] 无法解析 compose 状态行 %q", line)
-			return nil
+			return nil, fmt.Errorf("无法解析 compose 状态行 %q", line)
 		}
 		state := strings.TrimSpace(parts[1])
 		if health := strings.TrimSpace(parts[2]); health != "" {
@@ -170,7 +168,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 			State: state,
 		})
 	}
-	return states
+	return states, nil
 }
 
 // notRunningServices 返回当前不在运行状态的 composeServices。

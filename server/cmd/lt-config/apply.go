@@ -233,8 +233,11 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 			// 请求也不能再覆盖 manifest/备份。启动时阻断只是兜底。
 			s.registerDirtyScene()
 			statesCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			states := s.serviceStates(statesCtx)
+			states, stateErr := s.serviceStates(statesCtx)
 			cancel()
+			if stateErr != nil {
+				states = nil
+			}
 			return res, &partialApplyError{
 				msg:      fmt.Sprintf("配置与容器均已生效，但批次现场无法落定：重启可能把磁盘回滚到旧配置，需人工处理\n%v", err),
 				services: states,
@@ -304,7 +307,7 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 	cleanupPending := errors.Is(rbErr, errBatchCleanupPending)
 	if rbErr != nil && !cleanupPending {
 		s.registerDirtyScene()
-		states := s.serviceStates(rollbackCtx)
+		states, _ := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("容器重建失败，磁盘回滚也失败：磁盘与新容器可能都是新配置，需人工处理"+
 				"\n重建错误: %v\n回滚错误: %v%s", upErr, rbErr, detail),
@@ -328,7 +331,7 @@ func (s *service) recoverFromFailedApply(reqCtx context.Context, batch *writeBat
 		return fmt.Errorf("%w（磁盘与容器均已回滚到旧配置%s，可修改后重试）%s", upErr, note, detail)
 	} else {
 		s.registerDirtyScene()
-		states := s.serviceStates(rollbackCtx)
+		states, _ := s.serviceStates(rollbackCtx)
 		return &partialApplyError{
 			msg: fmt.Sprintf("新配置重建失败，磁盘已回滚为旧配置，但按旧配置重建也失败：容器当前版本未知"+
 				"\n新配置重建错误: %v\n回滚重建错误: %v%s", upErr, reErr, detail),

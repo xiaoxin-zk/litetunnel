@@ -164,11 +164,12 @@ func (s *service) commitFailure(err error) error {
 	s.registerDirtyScene()
 	statesCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	states, _ := s.serviceStates(statesCtx)
 	return &partialApplyError{
 		msg: fmt.Sprintf("本次写盘已回滚（磁盘仍为旧配置），但批次现场未能清理："+
 			"重启后恢复逻辑会按残留记录把整批再回滚一次、覆盖此后的任何修改；"+
 			"在人工清理之前，所有写操作都会被拒绝\n%v", err),
-		services: s.serviceStates(statesCtx),
+		services: states,
 		cause:    err,
 	}
 }

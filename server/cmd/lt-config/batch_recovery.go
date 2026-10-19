@@ -285,6 +285,18 @@ func cleanupLeftovers(p paths) []string {
 			continue
 		}
 		seen[dir] = true
+		blockedBefore := func() bool {
+			for _, b := range blocked {
+				if b == dir {
+					return true
+				}
+			}
+			return false
+		}
+		if blockedBefore() {
+			log.Printf("[lt-config] %s 已属于被阻断的批次目录，跳过本轮清理", dir)
+			continue
+		}
 
 		// 有未完成的批次记录时先按批次整体回滚。单文件备份只能说明「这个
 		// 文件被替换过」，说明不了整批是否提交完整——那正是强杀/断电之后

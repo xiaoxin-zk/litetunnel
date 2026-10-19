@@ -146,6 +146,24 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 			return
 		}
 	}
+	if found && incarnation != "" {
+		// 与后台重试路径（proxyDrainIntentState）同一套身份判断：待办里已经
+		// 带着旧标识时，仍要核对当前 ID 上是不是同一个账号。导入/恢复流程
+		// 复用自增 ID 时，新账号的前缀与旧账号完全相同，照着关会打掉新账号
+		// 刚建立的代理。即时路径以前只保护了「空标识」的升级前待办，反而
+		// 漏掉了更常见的「有标识」路径。
+		_, inc, err := s.userStateVersionAndIncarnation(userID)
+		switch {
+		case err == nil && inc != incarnation:
+			log.Printf("[proxy-drain] 已删账号 %d 的 ID 已被新账号占用（%s ≠ %s），跳过即时断流，旧意图作废",
+				userID, incarnation, inc)
+			return
+		case err != nil && !errors.Is(err, gorm.ErrRecordNotFound):
+			// 读不出来就无法排除 ID 复用：保留待办交给后台重试，绝不动手。
+			log.Printf("[proxy-drain] 已删账号 %d 的标识读取失败，跳过即时断流，保留待办由后台重试: %v", userID, err)
+			return
+		}
+	}
 
 	req := proxyDrainRequest{
 		userID:  userID,
@@ -280,12 +298,21 @@ func (s *Services) drainProxies(ctx context.Context, req proxyDrainRequest) prox
 	if s.Frps == nil {
 		// 没有客户端也不代表代理已经关闭：保留待办，等待配置/依赖恢复后
 		// 由 Worker 重试。否则上层会把空结果当成成功并删除唯一补偿线索。
-		if req.intent == "" {
+		//
+		// 但 noRegister 的请求必须例外：它来自「升级前删号、本来就没有待办」
+		// 的一次性清理（users 行已删，此时新登记的 incarnation 必然为空）。
+		// 强行登记会把一次尽力而为的清理变成长期待办，而空标识的待办在 ID
+		// 复用时无法自证身份，反而增加旧前缀误处理的风险。
+		if req.intent == "" && !req.noRegister {
 			req.intent = s.recordProxyDrainPending(req)
 		}
 		out.unknown = true
 		out.lastErr = "frps 管理客户端未初始化，断流结果未知"
-		log.Printf("[service] 未配置 frps 管理接口，用户 %d 的断流结果未知，已保留待办", req.userID)
+		if req.noRegister {
+			log.Printf("[service] 未配置 frps 管理接口，用户 %d 的断流结果未知（noRegister，不登记长期待办）", req.userID)
+		} else {
+			log.Printf("[service] 未配置 frps 管理接口，用户 %d 的断流结果未知，已保留待办", req.userID)
+		}
 		return out
 	}
 	if req.prefix == "" {
@@ -484,8 +511,12 @@ func (s *Services) verifyClosedProxies(ctx context.Context, req proxyDrainReques
 		// 同名、不同实例：这是本模块最需要留痕的一种结果。
 		msg := fmt.Sprintf("代理 %q 关闭后以另一个实例身份重新出现（clientID/lastStartAt 已变），"+
 			"可能误关了新实例或客户端已重连", t.Name)
-		log.Printf("[user] 用户 %d: %s；已记为残留，由后台按最新身份继续处理", req.userID, msg)
-		s.countProxyDrainRaceSuspect()
+		// 这是本模块唯一「无法从协议层消除」的竞态，必须留下可被人接手的
+		// 告警：日志前缀加 ALERT，同时把代理名记进 ProxyDrainRaceHealth.Recent，
+		// 让管理端直接看到「该人工核对哪条代理」，而不是只有一个计数。
+		log.Printf("[proxy-drain][ALERT] 用户 %d: %s；已记为残留，请人工核对（代理名已记入 race_health.recent）",
+			req.userID, msg)
+		s.countProxyDrainRaceSuspect(t.Name)
 		out.residual = append(out.residual, t)
 		if out.lastErr == "" {
 			out.lastErr = msg
@@ -524,24 +555,46 @@ type ProxyDrainRaceHealth struct {
 	// 非零不等于一定误伤：也可能是我们正确关了旧实例、客户端立刻重新注册。
 	// 但它意味着「有一条关闭动作的结果无法确认」，值得人工看一眼。
 	Suspects uint64 `json:"suspects"`
+	// Recent 是最近几次疑似误伤涉及的代理名（有界）。
+	//
+	// 只有计数时，管理员知道「发生过 3 次」，却不知道该核对哪条代理；
+	// 保留名字后，这个指标本身就可以直接当作人工待办清单使用。
+	Recent []string `json:"recent,omitempty"`
 }
 
+// drainRaceRecentMax 是保留的疑似误伤代理名上限。
+const drainRaceRecentMax = 16
+
 // countProxyDrainRaceSuspect 记一次「关闭结果无法确认」的疑似误伤。
-func (s *Services) countProxyDrainRaceSuspect() {
+func (s *Services) countProxyDrainRaceSuspect(name string) {
 	if s == nil {
 		return
 	}
 	s.drainRaceSuspects.Add(1)
+	if name == "" {
+		return
+	}
+	s.drainRaceMu.Lock()
+	defer s.drainRaceMu.Unlock()
+	s.drainRaceRecent = append(s.drainRaceRecent, name)
+	if over := len(s.drainRaceRecent) - drainRaceRecentMax; over > 0 {
+		s.drainRaceRecent = append(s.drainRaceRecent[:0], s.drainRaceRecent[over:]...)
+	}
 }
 
-// ProxyDrainRaceHealth 返回疑似误伤的累计次数，供管理端系统指标下发。
+// ProxyDrainRaceHealth 返回疑似误伤的累计次数与最近涉及的代理名，供管理端
+// 系统指标下发。Recent 非空时应当按「人工核对代理残留」处理。
 func (s *Services) ProxyDrainRaceHealth() ProxyDrainRaceHealth {
 	if s == nil {
 		return ProxyDrainRaceHealth{}
 	}
+	s.drainRaceMu.Lock()
+	recent := append([]string(nil), s.drainRaceRecent...)
+	s.drainRaceMu.Unlock()
 	return ProxyDrainRaceHealth{
 		Instance: s.instanceID,
 		Suspects: uint64(s.drainRaceSuspects.Load()),
+		Recent:   recent,
 	}
 }
 

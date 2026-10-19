@@ -38,7 +38,13 @@ package service
 // 由运维补配置——所以只记一次启动日志（见 StartProxyDrainWorker）。
 
 import (
+	"bufio"
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,6 +83,12 @@ type proxyDrainFallbackQueue struct {
 	// 保留完整意图后，数据库恢复时由 flush 把它们补写回库，重新获得自动
 	// 补偿机会，而不是停在一个人工处理的名单上。
 	droppedItems []proxyDrainFallback
+	// walPath 是被淘汰意图的落盘文件（空表示不落盘）。
+	//
+	// 进程内队列只覆盖「数据库暂时写不进去」；进程一旦重启，内存队列就没了。
+	// 把完整意图落盘，重启后仍能读回来继续补写——这是「重启即丢」这条
+	// 已知残余风险的兜底，也是给运维留下的人工处理清单。
+	walPath string
 	// persisted 统计成功补写回库的意图数（说明兜底真的生效过）。
 	persisted atomic.Int64
 	// enqueued 统计进入队列的总数（含后来被覆盖的）。
@@ -84,7 +96,75 @@ type proxyDrainFallbackQueue struct {
 }
 
 func newProxyDrainFallbackQueue() *proxyDrainFallbackQueue {
-	return &proxyDrainFallbackQueue{items: make(map[uint]*proxyDrainFallback)}
+	q := &proxyDrainFallbackQueue{
+		items:   make(map[uint]*proxyDrainFallback),
+		walPath: proxyDrainWALPath(),
+	}
+	q.loadDroppedFromWAL()
+	return q
+}
+
+// proxyDrainWALPath 返回「被淘汰断流意图」的落盘路径。
+//
+// 可用 LT_PROXY_DRAIN_WAL 覆盖；默认放在用户缓存目录（没有则临时目录）。
+// 文件名固定而不是带实例标识：目的是让**重启后的同一实例**（通常是同一台
+// 宿主机、同一份部署）能读到上次写下的清单。多实例共享同一磁盘时应通过
+// LT_PROXY_DRAIN_WAL 各自指定，避免互相覆盖。
+func proxyDrainWALPath() string {
+	if p := strings.TrimSpace(os.Getenv("LT_PROXY_DRAIN_WAL")); p != "" {
+		return p
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "litetunnel", "proxy-drain-dropped.jsonl")
+	}
+	return filepath.Join(os.TempDir(), "litetunnel", "proxy-drain-dropped.jsonl")
+}
+
+// proxyDrainWALRecord 是 proxyDrainRequest 的可序列化镜像。
+//
+// proxyDrainRequest 的字段全部不导出（只在包内构造），encoding/json 看不到
+// 它们，直接序列化会得到 {}。这个结构只服务于「被淘汰意图落盘」，字段与
+// req 一一对应。
+type proxyDrainWALRecord struct {
+	UserID     uint               `json:"user_id"`
+	Prefix     string             `json:"prefix"`
+	Gen        uint64             `json:"gen,omitempty"`
+	NotAfter   time.Time          `json:"not_after,omitempty"`
+	Deleted    bool               `json:"deleted,omitempty"`
+	Attempts   int                `json:"attempts,omitempty"`
+	Known      []proxyDrainTarget `json:"known,omitempty"`
+	Intent     string             `json:"intent,omitempty"`
+	NoRegister bool               `json:"no_register,omitempty"`
+	At         time.Time          `json:"at"`
+}
+
+func (r proxyDrainWALRecord) request() proxyDrainRequest {
+	return proxyDrainRequest{
+		userID:     r.UserID,
+		prefix:     r.Prefix,
+		gen:        r.Gen,
+		notAfter:   r.NotAfter,
+		deleted:    r.Deleted,
+		attempts:   r.Attempts,
+		known:      r.Known,
+		intent:     r.Intent,
+		noRegister: r.NoRegister,
+	}
+}
+
+func walRecordOf(it proxyDrainFallback) proxyDrainWALRecord {
+	return proxyDrainWALRecord{
+		UserID:     it.req.userID,
+		Prefix:     it.req.prefix,
+		Gen:        it.req.gen,
+		NotAfter:   it.req.notAfter,
+		Deleted:    it.req.deleted,
+		Attempts:   it.req.attempts,
+		Known:      it.req.known,
+		Intent:     it.req.intent,
+		NoRegister: it.req.noRegister,
+		At:         it.at,
+	}
 }
 
 // enqueue 把一条没能落库的意图放进补偿队列。
@@ -156,21 +236,119 @@ func (q *proxyDrainFallbackQueue) putBack(it proxyDrainFallback) {
 const droppedRecentMax = 16
 
 // rememberDropped 保留一条因队列满被淘汰的完整意图（调用方持锁）。
-// 它不再是「只留个 ID 等人工」，而是等数据库恢复后被 flush 补写回库。
+// 它不再是「只留个 ID 等人工」，而是等数据库恢复后被 flush 补写回库；
+// 同时立刻落盘，保证进程重启后仍能读回来。
 func (q *proxyDrainFallbackQueue) rememberDropped(it proxyDrainFallback) {
 	if len(q.droppedItems) >= droppedRecentMax {
 		q.droppedItems = q.droppedItems[1:]
 	}
 	q.droppedItems = append(q.droppedItems, it)
+	q.persistDroppedLocked()
 }
 
 // takeDropped 取走被淘汰、等待补写的意图。
+//
+// 只清内存、不动 WAL：补写期间若进程崩溃，WAL 里的记录仍在，重启后
+// 还能继续处理。补写成功后再由 persistDropped 把 WAL 收敛。
 func (q *proxyDrainFallbackQueue) takeDropped() []proxyDrainFallback {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	out := q.droppedItems
 	q.droppedItems = nil
 	return out
+}
+
+// loadDroppedFromWAL 把上次进程退出前没来得及补写的被淘汰意图读回内存。
+// 只在队列构造时调用（此时尚未并发共享，不需要持锁）。
+func (q *proxyDrainFallbackQueue) loadDroppedFromWAL() {
+	if q.walPath == "" {
+		return
+	}
+	f, err := os.Open(q.walPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	loaded := 0
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var rec proxyDrainWALRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil || rec.UserID == 0 {
+			continue
+		}
+		at := rec.At
+		if at.IsZero() {
+			at = time.Now()
+		}
+		q.droppedItems = append(q.droppedItems, proxyDrainFallback{req: rec.request(), at: at})
+		loaded++
+		if len(q.droppedItems) > droppedRecentMax {
+			q.droppedItems = q.droppedItems[1:]
+		}
+	}
+	if loaded > 0 {
+		q.dropped.Add(int64(loaded))
+		log.Printf("[proxy-drain] 从 WAL 读回 %d 条被淘汰的断流意图（%s），将尝试补写回库", loaded, q.walPath)
+	}
+}
+
+// persistDropped 把当前 droppedItems 重写进 WAL（自行加锁）。
+func (q *proxyDrainFallbackQueue) persistDropped() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.persistDroppedLocked()
+}
+
+// persistDroppedLocked 把 droppedItems 整体重写到 WAL（调用方持锁）。
+//
+// 用「临时文件 + rename」：写一半崩溃不能留下半行 JSON，否则下次加载
+// 会把整条意图解析失败并静默丢掉。drop 是低频事件，整体重写（最多 16 条）
+// 比维护追加/截断的偏移量简单得多。
+func (q *proxyDrainFallbackQueue) persistDroppedLocked() {
+	if q.walPath == "" {
+		return
+	}
+	dir := filepath.Dir(q.walPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("[proxy-drain] 创建断流兜底 WAL 目录失败: %v", err)
+		return
+	}
+	tmp := q.walPath + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		log.Printf("[proxy-drain] 写断流兜底 WAL 失败: %v", err)
+		return
+	}
+	w := bufio.NewWriter(f)
+	for _, it := range q.droppedItems {
+		b, err := json.Marshal(walRecordOf(it))
+		if err != nil {
+			continue
+		}
+		if _, err := w.Write(b); err != nil {
+			break
+		}
+		_ = w.WriteByte('\n')
+	}
+	if err := w.Flush(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		log.Printf("[proxy-drain] 写断流兜底 WAL 失败: %v", err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, q.walPath); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("[proxy-drain] 替换断流兜底 WAL 失败: %v", err)
+	}
 }
 
 // size 返回当前队列长度（供健康检查/管理页展示）。
@@ -260,4 +438,7 @@ func (s *Services) flushProxyDrainFallback() {
 		// 的淘汰顺序），尝试次数 +1 只用于日志——落库是轻量写，不需要指数退避。
 		s.drainFallback.putBack(it)
 	}
+	// 全部补写成功时 droppedItems 已空；把 WAL 收敛成空文件，否则下次启动
+	// 会把已经处理过的意图再读回来。失败的那些已经由 putBack 写进 WAL。
+	s.drainFallback.persistDropped()
 }

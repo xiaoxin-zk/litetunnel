@@ -197,6 +197,11 @@ type Services struct {
 	// 既然无法消除，至少要让它**可见**——否则一次误关只会表现为「用户说
 	// 连上又断了」，从日志里分不清是断流、是网络还是客户端自身问题。
 	drainRaceSuspects atomic.Int64
+	// drainRaceMu 保护 drainRaceRecent。
+	drainRaceMu sync.Mutex
+	// drainRaceRecent 是最近几次疑似误伤涉及的代理名（有界），
+	// 让「人工待办」能直接点名是哪条代理，而不只是一个计数。
+	drainRaceRecent []string
 
 	// userLocks 按用户分片，串行化「建隧道」与「删除用户」（见 userLock）。
 	userLocks [userLockShards]sync.Mutex

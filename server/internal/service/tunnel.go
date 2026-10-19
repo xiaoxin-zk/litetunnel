@@ -502,7 +502,28 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 // 全程持有该用户的锁：与「编辑隧道」「启停隧道」共用（见 UpdateTunnel）。
 // 删除是「读状态 → 删记录 → 收端口」三步，中间插进一次编辑或状态切换，
 // 那次操作的副作用（比如按启用状态放行的端口）会建立在已被删除的记录上。
+//
+// # 为什么删记录与「收回端口的意图」必须在同一个事务里
+//
+// 以前是「事务提交后再登记待办」（见 outbox.go 开头的说明）：提交与善后之间
+// 进程若被 kill/OOM/滚动重启，隧道记录已经没了、端口号再也查不回来，而宿主机
+// 上的放行规则还在。启动时的规则对齐刻意只补放行、不回收，所以这条规则会一直
+// 留到有人手工清，面板上也没有任何东西提示它。
+//
+// 现在把意图与 DELETE 写进同一个事务：提交点之前任何一步失败都整体回滚，
+// 提交之后意图一定已经在库里，进程无论何时死掉，重启后的后台 worker 都能捡到。
+//
+// 返回值是结构化的（见 TunnelMutationResult）：数据库改成功但规则没跟上时，
+// 调用方仍应报成功、并把 Warning 透给前端——把它压成 error 会让管理员重试删除
+// 并得到「隧道不存在」，以为系统坏了。
 func (s *Services) DeleteTunnel(userID, id uint) error {
+	_, err := s.DeleteTunnelResult(userID, id)
+	return err
+}
+
+// DeleteTunnelResult 是 DeleteTunnel 的结构化版本，供 handler 把「规则待处理」
+// 透给前端（见 TunnelMutationResult）。
+func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, error) {
 	lock := s.userLock(userID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -512,29 +533,61 @@ func (s *Services) DeleteTunnel(userID, id uint) error {
 	var t model.Tunnel
 	if err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return TunnelMutationResult{}, ErrNotFound
+		}
+		return TunnelMutationResult{}, err
+	}
+
+	// 事务内：删记录 + 登记收回端口的意图。
+	//
+	// 取号与写待办都在 tx 上做，不自己开事务（SQLite 单写者，嵌套事务会
+	// 把自己锁死，见 nextFirewallGenTx 的说明）。
+	var intents []portIntent
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Tunnel{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
 			return ErrNotFound
 		}
-		return err
+		if t.RemotePort <= 0 {
+			return nil
+		}
+		gen, err := firewallIntentTx(tx, t.RemotePort, ProtoOfTunnel(t.Type), false)
+		if err != nil {
+			// 意图写不进去就让整个删除回滚：宁可这次删除失败让用户重试，
+			// 也不能留下「隧道没了、端口还开着、没有任何待办」的状态。
+			return err
+		}
+		intents = append(intents, portIntent{
+			port: t.RemotePort, proto: ProtoOfTunnel(t.Type), open: false, gen: gen,
+		})
+		return nil
+	})
+	if err != nil {
+		return TunnelMutationResult{}, err
 	}
 
-	res := s.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Tunnel{})
-	if res.Error != nil {
-		return res.Error
+	// 提交之后再执行（不能放事务里：helper 调用最长几秒，占着事务会阻塞
+	// 所有写者；而且执行失败要留下已提交的待办，回滚会把它一起抹掉）。
+	pending, fatal, warnings := s.executePortIntentsAfterCommit(intents)
+	if fatal != nil {
+		// 连重试队列都没进去：没有任何人会再尝试收回这个端口。删除已经提交
+		// （隧道记录没了），所以不能返回 error 让用户重试——那只会得到
+		// 「隧道不存在」。但必须在 Warning 里写清楚「端口可能还开着、需要人工
+		// 处理」，否则管理员以为一切正常。
+		//
+		// 用 warnings 而不是 intents 拼端口号：fatal 只在真的处理过某个端口时
+		// 才非空，而 warnings 与它一一对应，避免依赖「intents 一定非空」这个
+		// 隐含前提（t.RemotePort<=0 时 intents 为空、fatal 也必然为 nil，
+		// 但让两者解耦更安全）。
+		res := tunnelMutationResult(pending, warnings)
+		res.Warning = "隧道已删除，但端口规则未能收回且无法自动重试（" +
+			fatal.Error() + "），请手工关闭对应端口"
+		return res, nil
 	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
-	}
-
-	// 隧道已删除，收回防火墙上的放行规则。
-	//
-	// 走 applyPortIntent 而不是直接调 FirewallClosePort：后者失败时只写一行
-	// 日志，而记录已经删了、端口号再也查不回来——helper 恰好不可用的话，
-	// 这条规则就永久留在宿主机上，且没有任何地方会再尝试收回。
-	// 若该端口在保护列表中，护栏会拒绝并记日志，属预期行为。
-	if t.RemotePort > 0 {
-		s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
-	}
-	return nil
+	return tunnelMutationResult(pending, warnings), nil
 }
 
 // SetTunnelStatus 启用/停用隧道。
@@ -542,18 +595,25 @@ func (s *Services) DeleteTunnel(userID, id uint) error {
 // 这里只负责「按用户圈定目标」；状态切换本身走 setTunnelStatus——管理员那条
 // 路径也要用同一套检查，两处各写一份迟早会分叉（见 assertTunnelCanEnable）。
 func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
+	_, err := s.SetTunnelStatusResult(userID, id, status)
+	return err
+}
+
+// SetTunnelStatusResult 是 SetTunnelStatus 的结构化版本，供 handler 把
+// 「数据库已更新、规则待处理」透给前端（见 TunnelMutationResult）。
+func (s *Services) SetTunnelStatusResult(userID, id uint, status string) (TunnelMutationResult, error) {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
-		return ErrInvalidParam
+		return TunnelMutationResult{}, ErrInvalidParam
 	}
 
 	var t model.Tunnel
 	if err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrNotFound
+			return TunnelMutationResult{}, ErrNotFound
 		}
-		return err
+		return TunnelMutationResult{}, err
 	}
-	return s.setTunnelStatus(&t, status)
+	return s.setTunnelStatusResult(&t, status)
 }
 
 // assertTunnelCanEnable 是「把隧道切到启用」的唯一前置检查。
@@ -578,7 +638,27 @@ func (s *Services) assertTunnelCanEnable(t *model.Tunnel, status string) error {
 // 状态切换的副作用不止改一行数据库：还要校验 HTTPS 入口、联动防火墙。
 // 这些必须与状态变更保持同一份代码，否则新增一条入口（管理员批量操作、
 // 命令行工具）就会漏掉其中一项。
+//
+// 保留 error 签名作为薄包装（测试与既有调用点继续用它）；需要把「规则待处理」
+// 透给前端的那几条路径改调 setTunnelStatusResult（见 TunnelMutationResult）。
 func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
+	_, err := s.setTunnelStatusResult(t, status)
+	return err
+}
+
+// setTunnelStatusResult 是 setTunnelStatus 的结构化版本。
+//
+// # 为什么状态变更与防火墙意图必须同事务
+//
+// 以前是「UPDATE 提交之后再 applyPortIntent」。停用这条路径当时连返回值都
+// 不看（只写日志），于是 helper 不可用、队列满、数据库写待办失败时，数据库
+// 说「已停用」、端口却一直开着，而且没有任何地方会再尝试收回——这正是
+// outbox.go 开头描述的提交后崩溃窗口的近亲：原因不是进程死掉，而是失败被
+// 吞掉了。
+//
+// 现在把 UPDATE 与意图写进同一个事务：写不进去就整体回滚，接口如实报错让
+// 用户重试；写进去了则提交之后立刻尝试执行，失败留给后台 worker。
+func (s *Services) setTunnelStatusResult(t *model.Tunnel, status string) (TunnelMutationResult, error) {
 	// 与编辑、删除互斥（见 UpdateTunnel 的说明）：这些都是「读状态 → 改数据」
 	// 的操作，交错时各自的读都可能过时。锁按隧道**归属者**取，
 	// 用户侧与管理员侧两条路径共用，谁也不会漏。
@@ -592,42 +672,63 @@ func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
 	var cur model.Tunnel
 	if err := s.DB.First(&cur, t.ID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrNotFound
+			return TunnelMutationResult{}, ErrNotFound
 		}
-		return err
+		return TunnelMutationResult{}, err
 	}
 	t = &cur
 
 	if err := s.assertTunnelCanEnable(t, status); err != nil {
-		return err
+		return TunnelMutationResult{}, err
 	}
 
+	// 事务内：改状态 + 登记防火墙意图。
+	//
 	// 零行更新同样不能当成功：重读到更新之间没有数据库级互斥
 	// （用户锁只拦本进程），这条兜底把残余竞态也如实暴露出来。
-	res := s.DB.Model(&model.Tunnel{}).
-		Where("id = ?", t.ID).
-		Update("status", status)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrNotFound
+	var intents []portIntent
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.Tunnel{}).Where("id = ?", t.ID).Update("status", status)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		if t.RemotePort <= 0 {
+			return nil
+		}
+		open := status == model.TunnelStatusActive
+		gen, err := firewallIntentTx(tx, t.RemotePort, ProtoOfTunnel(t.Type), open)
+		if err != nil {
+			// 意图写不进去就让状态变更回滚：否则数据库说「已停用」、
+			// 端口却还开着，且没有任何待办会再尝试收回。
+			return err
+		}
+		intents = append(intents, portIntent{
+			port: t.RemotePort, proto: ProtoOfTunnel(t.Type), open: open, gen: gen,
+		})
+		return nil
+	})
+	if err != nil {
+		return TunnelMutationResult{}, err
 	}
 
-	if t.RemotePort > 0 {
-		if status == model.TunnelStatusActive {
-			if _, ferr := s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), true); errors.Is(ferr, ErrFirewallQueueFull) || errors.Is(ferr, ErrFirewallQueueUnavailable) {
-				// 同创建隧道：启用已经写库，但放行没成功也没进重试队列，
-				// 隧道会一直连不上且管理页无待办，必须如实报错。
-				return fmt.Errorf("隧道已启用，但防火墙放行失败且无法自动重试：%w", ferr)
-			}
-		} else {
-			// 收回失败要进重试队列：数据库状态已经改了、接口也返回成功，
-			// 只写一行日志的话规则会一直开着，而且没有任何地方会再尝试。
-			s.applyPortIntent(t.RemotePort, ProtoOfTunnel(t.Type), false)
-		}
+	// 提交之后再执行。启用与停用的失败语义不同：
+	//   - 启用：隧道连不上，用户必须知道（但仍按 pending/fatal 区分——
+	//     入了重试队列的会在几十秒内自动恢复，不算失败）；
+	//   - 停用：只是规则没收回，进队列即可，接口报成功。
+	pending, fatal, warnings := s.executePortIntentsAfterCommit(intents)
+	res := tunnelMutationResult(pending, warnings)
+	if status != model.TunnelStatusActive {
+		return res, nil
 	}
-	return nil
+	if fatal != nil {
+		// 连重试队列都没进去：这条放行永远不会有第二次尝试。状态已经改成
+		// 启用，隧道会一直连不上，必须如实报错（与修改前一致）。
+		return res, fmt.Errorf("隧道已启用，但防火墙放行失败且无法自动重试：%w", fatal)
+	}
+	return res, nil
 }
 
 // truncate 按字节上限截断，但绝不切断多字节字符。

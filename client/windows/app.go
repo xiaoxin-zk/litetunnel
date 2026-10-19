@@ -131,6 +131,63 @@ type State struct {
 	// 挂在 State 里而不是只在日志事件里带：登录态变化时前端收到的第一个
 	// 权威值就是这份状态，不用等到下一批日志才知道代次变了。
 	LogEpoch uint64 `json:"log_epoch"`
+
+	// StateSeq 是**状态事件**的单调序号，每推一次状态递增一次。
+	//
+	// # 为什么日志代次不够用
+	//
+	// LogEpoch 保护的是日志批次，它只在「清空日志」时前进。登录态本身没有
+	// 任何序号，于是下面这条路径会闪：
+	//
+	//  1. 用户点退出登录，logout 停进程、翻代次、清凭据、推了一份
+	//     logged_in=false 的状态；
+	//  2. 但某个隧道进程的退出回调还在协程里没跑完（logout 只等到
+	//     logoutCallbackWait 的上限，超时就继续往下走）；
+	//  3. 那个回调里调了一次 emitState —— 它读到的是**当时**的 a.cfg；
+	//     回调若跑在「清凭据之前」的快照上，推出去的就是 logged_in=true；
+	//  4. 前端无条件 applyState，界面在用户已经退出之后又闪回一次已登录
+	//     界面（随后被下一次状态推送纠正）。
+	//
+	// 这与日志混代次是同一类问题：**跨进程事件是异步的，接收端无法自行
+	// 判断先后**。区别在于状态事件更"重"——它决定整个界面显示登录页还是
+	// 主界面，闪一下比日志混入一行刺眼得多。
+	//
+	// # 为什么是「每次 emit 都递增」而不是「每次状态变化才递增」
+	//
+	// 状态内容不变时也可能需要一次推送（例如前端重挂载后的重新对齐）。
+	// 让序号跟着**推送次数**走，判据就变成「这份 payload 是不是在我已经
+	// 见过的那份之后发出的」，与内容是否相同无关，前端只需一个单调比较。
+	//
+	// 前端丢弃规则：payload.state_seq < 本端已接受的最大值 → 丢弃。
+	// 相等则接受（同一次推送可能因重连被投递两次，重复应用同一份状态无害）。
+	StateSeq uint64 `json:"state_seq"`
+
+	// AuthGen 是这份状态所属的**账号代次**（与 StateSeq 一起构成排序键）。
+	//
+	// # 为什么光有序号还不够
+	//
+	// StateSeq 只能保证「序号大的后发出」，它管不了「谁先取号」。退出登录
+	// 与一个迟到的隧道退出回调是两个协程，可能的交错是：
+	//
+	//  1. 回调取号 → 拿到 7，但还没走到 EventsEmit（被调度走）；
+	//  2. logout 取号 → 拿到 8，推 logged_in=false，前端接受；
+	//  3. 回调回来，推序号 7 的 payload —— 前端按序号判旧，丢弃。
+	//
+	// 这条路径没问题。真正漏的是反向交错：回调**在登出之后**才取号，
+	// 于是拿到 9，序号比登出的 8 还大，前端照单全收，把 logged_in=true
+	// 推回界面。序号本身无法表达「这份状态属于上一个账号」——它只反映
+	// 推送时刻，不反映**内容属于谁**。
+	//
+	// AuthGen 补上这一维：登出/接入都会让 authGeneration 前进，而回调
+	// 持有的账号代次在它启动那一刻就定死了（见 startGen）。前端按
+	// (auth_gen, state_seq) 字典序比较：
+	//   - auth_gen 更小 → 整份丢弃（它属于旧账号，无论序号多大）；
+	//   - auth_gen 相等 → 再比 state_seq；
+	//   - auth_gen 更大 → 接受（换了账号，序号基线重来）。
+	//
+	// 这样「旧账号的迟到事件」无论何时到达都进不来，而不是靠运气赶在
+	// 登出推送之前。
+	AuthGen uint64 `json:"auth_gen"`
 }
 
 // App 是暴露给前端的应用对象。
@@ -338,14 +395,21 @@ type App struct {
 
 	// cfgErr 记录本地配置读取失败的原因，通过 State 呈现给用户。
 	cfgErr string
-}
 
-// maskKey 生成用于界面展示的脱敏形式，避免完整 Key 长时间暴露在屏幕上。
-func maskKey(k string) string {
-	if len(k) <= 12 {
-		return "****"
-	}
-	return k[:12] + "********"
+	// stateSeq 是状态事件序号，由 a.mu 保护（见 State.StateSeq）。
+	//
+	// 放在 App 上而不是每次 emit 时读 GetState 的返回值再自增：序号必须
+	// 在**发出事件之前**就定下来，且要和这份 payload 里的其它字段取自
+	// 同一个时刻。先取快照再自增、然后下发，顺序是：
+	//   seq := a.nextStateSeq()   // 持锁自增
+	//   st := a.GetState()        // 持读锁取快照
+	//   st.StateSeq = seq
+	//   EventsEmit(...)
+	//
+	// 两个锁操作之间有极小窗口（另一次 emit 可能插进来先取到更大的序号，
+	// 但它也会先发出事件）。这对前端是安全的：前端只按序号单调丢弃，
+	// 乱序到达时**后发的那份**序号更大、一定被接受，最终停在最新状态上。
+	stateSeq uint64
 }
 
 // NewApp 构造应用对象。
@@ -571,44 +635,6 @@ func (a *App) startOnce(ctx context.Context) {
 // 等于让用户盯着一个关不掉的窗口。
 const shutdownSyncWait = 3 * time.Second
 
-// syncGateChan 返回同步门闩，必要时惰性初始化。
-//
-// 惰性化是为了测试：测试直接构造 App 而没有走 NewApp，字段是零值。
-func (a *App) syncGateChan() chan struct{} {
-	a.gateOnce.Do(func() {
-		if a.syncGate == nil {
-			a.syncGate = make(chan struct{}, 1)
-		}
-	})
-	return a.syncGate
-}
-
-// lockSync 取得同步门闩；ctx 结束则放弃等待并返回其错误。
-//
-// 取不到时调用方必须**直接返回**，不能继续往下走：后续的 unlockSync
-// 会从空 channel 上接收，把自己挂在解锁那一步。
-func (a *App) lockSync(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	select {
-	case a.syncGateChan() <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// lockSyncBlocking 是不可取消的等待，只给关闭流程用（见 shutdown）。
-func (a *App) lockSyncBlocking() {
-	a.syncGateChan() <- struct{}{}
-}
-
-// unlockSync 释放同步门闩。
-func (a *App) unlockSync() {
-	<-a.syncGateChan()
-}
-
 // shutdown 在客户端退出前被调用，确保所有 frpc 子进程一并结束。
 //
 // 顺序有讲究：**取消同步 → 等这一轮退出 → 关闸并停全部进程**。
@@ -666,101 +692,6 @@ func (a *App) shutdown(ctx context.Context) {
 	// 把队列里剩下的日志推出去：停止进程会产出「隧道已断开」「frpc 已退出」
 	// 这类收尾日志，攒在队列里不发，用户下次打开客户端时日志就断在退出前。
 	a.flushLogs()
-}
-
-// GetState 返回当前完整状态。
-func (a *App) GetState() State {
-	// 日志代次必须在拿 a.mu 之前读：它由 logMu 保护，而 ClearLogs 是
-	// 「先拿 logMu、再……不拿 a.mu」的顺序，这里若反过来（持 mu 读
-	// logMu）就构成了 mu → logMu 的锁序，与日志路径形成环。
-	//
-	// 单独提前读一次的代价是它可能与下面那份快照差一拍（正赶上一次清空）。
-	// 这可以接受：代次只用于「丢弃跨代次的旧批次」，而清空本身会立刻
-	// 再推一次状态，界面下一次拿到的就是新值。
-	logEpoch := a.currentLogEpoch()
-
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	// 最后一道保护：这个方法在启动路径与日志回调里都会被调用，
-	// 一旦对 nil 配置取字段就是整个界面白屏（用户只看到「双击没反应」）。
-	// loadConfig 现在保证非 nil，这里再兜一层，让以后的改动也炸不出来。
-	cfg := a.cfg
-	if cfg == nil {
-		cfg = &Config{}
-	}
-
-	// 零值时间序列化成 "0001-01-01T00:00:00Z"，前端没法用它判断
-	// 「还没同步过」，所以未同步时下发 null。
-	var lastSync *time.Time
-	if !a.lastSyncAt.IsZero() {
-		t := a.lastSyncAt
-		lastSync = &t
-	}
-
-	// 复制一份再补运行态：直接改 a.tunnels 会在只读锁下写共享数据，
-	// 而 GetState 会被日志回调高频调用。
-	tunnels := make([]TunnelVO, len(a.tunnels))
-	copy(tunnels, a.tunnels)
-	for i := range tunnels {
-		tunnels[i].Running = a.mgr.Running(tunnels[i].ID)
-		tunnels[i].Registered = a.registered[tunnels[i].ID]
-		// 进程在跑但还没注册成功：把已等待时长带出去，界面据此显示
-		// 「连接中 · 42 秒」，而不是一句没有信息量的「连接中」。
-		//
-		// 直接读 a.connectAt 而不是调 connectWaited：这里已经持有读锁，
-		// 再取一次读锁在有写者在排队时会卡住（Go 的 RWMutex 不保证重入）。
-		if tunnels[i].Running && !tunnels[i].Registered {
-			if at, ok := a.connectAt[tunnels[i].ID]; ok {
-				tunnels[i].PendingSeconds = int(time.Since(at).Seconds())
-			}
-		}
-		// 连上之后错误记录已被清掉，这里取不到就表示当前没有已知错误。
-		if e, ok := a.tunnelErrs[tunnels[i].ID]; ok {
-			at := e.at
-			tunnels[i].LastError = e.msg
-			tunnels[i].LastErrorAt = &at
-		}
-	}
-	if tunnels == nil {
-		tunnels = []TunnelVO{}
-	}
-
-	state := State{
-		ServerURL:      cfg.ServerURL,
-		ServerFixed:    serverFixed(),
-		NeedsServerURL: !serverFixed() && cfg.ServerURL == "",
-		LoggedIn:       cfg.APIKey != "",
-		Username:       a.username,
-		APIKeyMask:     a.apiKeyMask,
-		GatewayHost:    a.gatewayHost,
-		GatewayPort:    a.gatewayPort,
-		TunnelDomain:   a.tunnelDomain,
-		Tunnels:        tunnels,
-		TrafficUsed:    a.trafficUsed,
-		TrafficQuota:   a.trafficQuota,
-		Exceeded:       a.exceeded,
-		Group:          a.group,
-		PaymentEnabled: a.paymentEnabled,
-		BalanceCents:   a.balanceCents,
-		SyncErr:        a.syncErr,
-		LastSyncAt:     lastSync,
-		ConfigError:    a.cfgErr,
-		Version:        Version(),
-		LogEpoch:       logEpoch,
-		// Running 是「有没有任意一条隧道在连」，界面的状态点用它。
-		Running:   a.mgr.AnyRunning(),
-		FrpcFound: a.mgr.Available(),
-		FrpcPath:  a.mgr.ExePath(),
-	}
-	// 构建注入了地址时，界面上始终展示它，而不是本地残留的旧值。
-	if fixed := defaultServerURL(); fixed != "" {
-		state.ServerURL = fixed
-	}
-	if p, err := frpcTunnelsDir(); err == nil {
-		state.ConfigPath = p
-	}
-	return state
 }
 
 // OpenDataDir 在资源管理器中打开数据目录。

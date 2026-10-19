@@ -29,6 +29,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -178,6 +179,13 @@ type proxyDrainOutcome struct {
 	abandoned bool
 	closed    int
 	lastErr   string
+	// closedTargets 是本轮「发出关闭请求并收到成功」的那批代理的**关闭前**身份。
+	//
+	// 单独留下来是为了在整轮结束时统一做一次「关闭后复查」（见
+	// verifyClosedProxies）：frps 的关闭接口只认名字，关闭请求返回成功并不
+	// 等于「关掉的就是比对时那个实例」——从比对到 frps 执行之间，客户端可能
+	// 已经用同名注册了新实例。
+	closedTargets []proxyDrainTarget
 }
 
 // drainProxies 是断流的协调器入口：先落待办 → 跑一轮 → 按结果收尾。
@@ -207,7 +215,19 @@ func (s *Services) drainProxies(ctx context.Context, req proxyDrainRequest) prox
 
 	req.intent = s.recordProxyDrainPending(req)
 	if req.intent == "" {
-		log.Printf("[proxy-drain] 用户 %d 的断流待办落库失败：本次若也没关干净，重启后将没有任何补偿机会", req.userID)
+		// 落库失败（数据库整体不可用）。这时仍要继续断流——能关一个是一个，
+		// 但「本次没关干净」将没有任何持久化补偿。
+		//
+		// 缺陷 4 的修复点：以前这里只记一行日志就完了，而日志会被滚动掉，
+		// 重启后没有任何线索。现在把意图放进**进程内**补偿队列，由后台每
+		// 30 秒尝试补写回库（见 proxy_drain_fallback.go）。它覆盖不了
+		// 「进程紧接着崩溃」这种极端情况，但比「只剩一行日志」强得多。
+		if s.drainFallback != nil {
+			s.drainFallback.enqueue(req)
+			log.Printf("[proxy-drain] 用户 %d 的断流待办落库失败，已放入进程内补偿队列（数据库恢复后自动补写）", req.userID)
+		} else {
+			log.Printf("[proxy-drain] 用户 %d 的断流待办落库失败且无补偿队列：本次若也没关干净，重启后将没有任何补偿机会", req.userID)
+		}
 	}
 
 	out = s.runProxyDrain(ctx, req)
@@ -289,6 +309,7 @@ func (s *Services) closeDrainTargets(ctx context.Context, req proxyDrainRequest,
 		switch step {
 		case drainStepClosed:
 			out.closed++
+			out.closedTargets = append(out.closedTargets, t)
 		case drainStepGone:
 			// 代理已消失，或已经不是发现时那个实例（客户端重连后重新注册）。
 			// 两种情况都**不是**残留：没有需要关的旧实例，也不该误关新的。
@@ -309,7 +330,134 @@ func (s *Services) closeDrainTargets(ctx context.Context, req proxyDrainRequest,
 	if out.lastErr == "" && cache.listErr != nil {
 		out.lastErr = cache.listErr.Error()
 	}
+
+	// 关闭动作全部发完之后做一次统一复查（缺陷 3）。放在整轮末尾、只拉一次
+	// 列表：逐条关闭后各拉一次会把请求数从 O(1) 拉回 O(N)，正是缺陷 5 修掉的
+	// 形态（N 条代理 N+1 次分页抓取，frps 稍慢就耗光 15 秒预算）。
+	return s.verifyClosedProxies(ctx, req, out)
+}
+
+// verifyClosedProxies 在关闭动作发出之后复查「同名代理有没有以另一个实例身份
+// 重新出现」，把可能的误关如实记下来（缺陷 3）。
+//
+// # 为什么只能做到这一步
+//
+// frps v0.71 的管理接口没有「条件关闭」：CloseProxy 是
+// DELETE /api/v2/proxies/{name}/del，只认名字，不认 clientID/lastStartAt。
+// 因此「比对身份」与「frps 执行删除」之间必然存在时间差：
+//
+//	本实例比对通过（旧实例）→ 【另一台实例上客户端重连、同名代理注册成功】
+//	→ 本实例发出 CloseProxy → 关掉的是**新**实例
+//
+// 这个窗口**无法消除**，只能缩小：关闭前用快照复查（closeDrainedProxy），
+// 关闭后再取一次列表看结果。必须在注释与报告里说清楚这一点，而不是把它
+// 当成「已经解决」——把不可能的事说成已修复，比不修更糟。
+//
+// # 两种复查结果的处理
+//
+//   - 同名代理以**不同身份**出现：可能是我们误关了新实例、客户端随即重连，
+//     也可能是我们正确关了旧实例、客户端立刻重新注册。两种情况都无法区分，
+//     但当前事实都是「这个账号的代理在跑」，所以记残留、留下明确日志与指标，
+//     交给后台重试器下一轮按最新快照再关一次。
+//   - 同名代理以**相同身份**仍在列表里：删除请求已经返回成功，而 frps 的
+//     列表对刚删除的代理可能有短暂的可见性延迟；客户端重连也必然刷新
+//     lastStartAt。所以这**不**记为残留（否则每轮都会空转、待办永远清不掉），
+//     但必须留一行日志：真出现「删了还在」的怪状时，这是唯一的线索。
+func (s *Services) verifyClosedProxies(ctx context.Context, req proxyDrainRequest, out proxyDrainOutcome) proxyDrainOutcome {
+	if len(out.closedTargets) == 0 || ctx.Err() != nil {
+		// 没有发出过关闭请求，或时间预算已经用完：不再额外发请求。
+		// 预算用尽时剩余候选已记为残留，复查可以留给下一轮。
+		return out
+	}
+	// 用**新的**快照缓存强制重拉：本轮那份可能还是关闭之前取的。
+	fresh := newProxySnapshotCache(s)
+	snap, err := fresh.current(ctx)
+	if err != nil {
+		// 复查失败不影响「关闭请求已成功」这个事实，但必须留痕：这次关闭
+		// 是否误伤无法确认。不记残留——那会让待办因为一个可观测性动作而
+		// 永远清不掉。
+		log.Printf("[user] 用户 %d 关闭 %d 个代理后无法复查实例身份（列表拉取失败），本次关闭是否误伤无法确认: %v",
+			req.userID, len(out.closedTargets), err)
+		return out
+	}
+
+	// sameIdentity 收集「关闭请求成功后仍在列表里、且身份没变」的代理名，
+	// 用于合并成一条日志（见循环后的说明）。
+	var sameIdentity []string
+	for _, t := range out.closedTargets {
+		cur, ok := snap.lookup(t.Name)
+		if !ok {
+			// 正常情况：关掉之后就不在列表里了。
+			continue
+		}
+		reborn := targetOf(cur)
+		if !reborn.identifiable() || t.matches(cur) {
+			// 同一实例仍在列表里。合并成一条日志（见下方说明），不逐条刷。
+			sameIdentity = append(sameIdentity, t.Name)
+			continue
+		}
+		// 同名、不同实例：这是本模块最需要留痕的一种结果。
+		msg := fmt.Sprintf("代理 %q 关闭后以另一个实例身份重新出现（clientID/lastStartAt 已变），"+
+			"可能误关了新实例或客户端已重连", t.Name)
+		log.Printf("[user] 用户 %d: %s；已记为残留，由后台按最新身份继续处理", req.userID, msg)
+		s.countProxyDrainRaceSuspect()
+		out.residual = append(out.residual, t)
+		if out.lastErr == "" {
+			out.lastErr = msg
+		}
+	}
+	if len(sameIdentity) > 0 {
+		// 只记一条：一批代理同时关掉时逐条打日志会把真正重要的那行淹没。
+		//
+		// 这条日志**不**把记录算成残留：删除请求已经返回成功，而 frps 列表对
+		// 刚删除的代理存在短暂可见性延迟（客户端重连也会刷新 lastStartAt）。
+		// 算成残留会让待办因为一个可观测性动作而永远清不掉，每轮空转。
+		// 但如果它反复出现，说明「删了还在」是真实的，需要人工核对。
+		log.Printf("[user] 用户 %d 的 %d 个代理在关闭请求成功后仍在列表中（实例身份相同）：%s；"+
+			"可能是 frps 列表的可见性延迟，反复出现请人工核对 frps 与宿主机状态",
+			req.userID, len(sameIdentity), strings.Join(sameIdentity, ", "))
+	}
 	return out
+}
+
+// ProxyDrainRaceHealth 是「关闭竞态疑似误伤」的可观测快照（缺陷 3）。
+//
+// 为什么必须暴露出来：这个竞态**无法消除**（frps 只支持按名字关闭），能做的
+// 只有把窗口缩到一次往返并留下证据。而「用户说连上又断了」这类抱怨无法从
+// 日志里区分原因——是断流误伤、是网络抖动、还是客户端自己重启。这个计数器
+// 是唯一能把「疑似误伤」与其它原因分开的线索，因此它必须出现在管理端的系统
+// 指标里，而不是只存在于进程内存。
+//
+// 与 AuditWriteHealth 一样是**实例级**指标：计数只在本进程内存，重启清零，
+// 多实例部署时看到的是某一个实例的数字。字段里带 Instance 就是为了提醒读的
+// 人别把它当成集群合计。
+type ProxyDrainRaceHealth struct {
+	// Instance 是产生这份计数的进程标识（重启会变）。
+	Instance string `json:"instance,omitempty"`
+	// Suspects 是「关闭请求成功后同名代理以另一个实例身份重新出现」的累计次数。
+	//
+	// 非零不等于一定误伤：也可能是我们正确关了旧实例、客户端立刻重新注册。
+	// 但它意味着「有一条关闭动作的结果无法确认」，值得人工看一眼。
+	Suspects uint64 `json:"suspects"`
+}
+
+// countProxyDrainRaceSuspect 记一次「关闭结果无法确认」的疑似误伤。
+func (s *Services) countProxyDrainRaceSuspect() {
+	if s == nil {
+		return
+	}
+	s.drainRaceSuspects.Add(1)
+}
+
+// ProxyDrainRaceHealth 返回疑似误伤的累计次数，供管理端系统指标下发。
+func (s *Services) ProxyDrainRaceHealth() ProxyDrainRaceHealth {
+	if s == nil {
+		return ProxyDrainRaceHealth{}
+	}
+	return ProxyDrainRaceHealth{
+		Instance: s.instanceID,
+		Suspects: uint64(s.drainRaceSuspects.Load()),
+	}
 }
 
 // proxyDrainStep 是「处理一条候选代理」的结果。
@@ -388,6 +536,24 @@ func (s *Services) closeDrainedProxy(ctx context.Context, req proxyDrainRequest,
 		return drainStepGone, ""
 	}
 
+	// # 关闭动作本身的竞态（缺陷 3）：这里只能缩小窗口，不能消除
+	//
+	// 上面刚比对过实例身份，但 CloseProxy 是按**名字**关闭的（frps v0.71 的
+	// DELETE /api/v2/proxies?name=<name> 没有「条件关闭」参数：它只认名字，
+	// 不认 clientID/lastStartAt）。所以从这次比对到 frps 真正执行删除之间，
+	// 仍然存在一个跨实例窗口：
+	//
+	//	本实例比对通过（旧实例）→ 【另一台实例上客户端重连、同名代理注册成功】
+	//	→ 本实例发出 CloseProxy → 关掉的是**新**实例
+	//
+	// 这个窗口**无法消除**：只要关闭接口只认名字，就一定有「比对」与「删除」
+	// 之间的时间差。这里能做的是把它缩小到一次往返——关闭前的快照复查紧贴
+	// 关闭请求（同一把用户锁内、中间不插入任何其它 frps 调用），关闭之后再
+	// 由 closeDrainTargets 末尾的 verifyClosedProxies 统一复查结果。
+	//
+	// 关闭后复查**刻意不放在这里**：逐条关闭后各拉一次全量列表就是缺陷 5 的
+	// 形态（N 条代理 N+1 次分页抓取）。放在整轮末尾只拉一次，代价与收益都
+	// 可接受（见 verifyClosedProxies）。
 	if err := s.Frps.CloseProxy(ctx, t.Name); err != nil {
 		log.Printf("[user] 关闭用户 %d 的代理 %q 失败: %v", req.userID, t.Name, err)
 		return drainStepResidual, err.Error()

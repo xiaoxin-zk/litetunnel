@@ -237,13 +237,23 @@ func validateConfig(addr, token string, p paths) error {
 		return fmt.Errorf("拒绝监听 %s：只允许回环地址", addr)
 	}
 
+	// 三态判定（见 statcheck.go）：Stat 失败可能是「没这个文件」，也可能是
+	// 「读不了」。后者报成「缺少必需文件」会让管理员去补一个其实还在的文件，
+	// 而真正要修的是权限或挂载。启动阶段的错误信息是唯一线索，不能含糊。
 	for _, f := range []string{p.caddyTpl, p.frpsTpl, p.composeFile} {
-		if _, err := os.Stat(f); err != nil {
+		state, err := statFileState(f)
+		switch state {
+		case fileMissing:
 			return fmt.Errorf("缺少必需文件 %s：请确认 LT_CFG_DEPLOY_DIR 指向部署目录", f)
+		case fileUnknown:
+			return fmt.Errorf("无法读取必需文件 %s（%v）：请检查部署目录的权限与挂载", f, err)
 		}
 	}
-	if _, err := os.Stat(p.envFile); err != nil {
+	switch state, err := statFileState(p.envFile); state {
+	case fileMissing:
 		return fmt.Errorf("缺少 .env（%s）：请确认 LT_CFG_ENV_FILE", p.envFile)
+	case fileUnknown:
+		return fmt.Errorf("无法读取 .env（%s，%v）：请检查权限与挂载", p.envFile, err)
 	}
 	// 产物目录必须可写，否则会在「校验都过了、写盘才失败」这一步才暴露。
 	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {
@@ -299,9 +309,16 @@ type service struct {
 	// dockerProbe 缓存 /health 的 docker 可用性探测结果（见 dockerStatus）。
 	// 放在 service 上而不是包级变量：测试要能各自独立地拿到一份空缓存。
 	dockerProbe dockerProbeCache
-	// dockerProbeFn 是探测的替身钩子，正式运行时为 nil（走真实的 docker info）。
-	// 测试环境里没有 docker，而「命令在 ≠ 宿主可用」这条判定必须能被覆盖。
+	// dockerProbeFn 是探测的替身钩子，正式运行时为 nil（走真实的 docker info
+	// 加 compose 探测）。测试环境里没有 docker，而「命令在 ≠ 宿主可用」这条
+	// 判定必须能被覆盖。
 	dockerProbeFn func() dockerProbeResult
+	// composeProbeFn 只替换 compose 那一段探测，正式运行时为 nil。
+	//
+	// 与 dockerProbeFn 分开的理由：整份替身会让「daemon 可用 → 接着探
+	// compose」这条串接逻辑无法被测到，而那正是缺陷 9 的落点。有了这个钩子，
+	// 用真实 probeDockerHost 的结果也能验证 compose 的判定与原因分离。
+	composeProbeFn func() composeProbeResult
 }
 
 // blockedDirsSnapshot 返回阻断目录的副本，供 health 响应使用。

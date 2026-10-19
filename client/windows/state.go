@@ -20,7 +20,38 @@ func (a *App) emitState() {
 	if a.ctx == nil {
 		return
 	}
-	wailsruntime.EventsEmit(a.ctx, "state", a.GetState())
+	// 取号与取快照必须在**同一把锁**内完成（见 State.StateSeq / AuthGen）。
+	//
+	// 分两步做（先 GetState 再 nextStateSeq）会留下一个致命窗口：
+	// GetState 拿读锁取完快照、放锁之后，logout 可能插进来翻代次并推送
+	// 新状态，然后这里才取到更大的序号——于是这份「旧代次的快照」带着
+	// 最大的序号发出去，前端按序号判断会接受它，界面被旧状态覆盖。
+	//
+	// 一次持锁做完就没有这个窗口：快照、序号、代次三者取自同一时刻，
+	// 前端按 (auth_gen, state_seq) 排序时结论必然与真实先后一致。
+	seq, gen, st := a.snapshotForEmit()
+	st.StateSeq = seq
+	st.AuthGen = gen
+	wailsruntime.EventsEmit(a.ctx, "state", st)
+}
+
+// snapshotForEmit 在**一次持锁**内取状态快照、下一个序号、当前账号代次。
+//
+// 抽出来是为了让「三者同源」这件事在代码里可见：任何一处漏在同一把锁内
+// 取，都会重新引入「旧代次快照配新序号」的窗口。
+func (a *App) snapshotForEmit() (seq, gen uint64, st State) {
+	// 日志代次与 GetState 一样，必须在拿 a.mu 之前读（logMu 的锁序，见
+	// GetState 的说明）。
+	logEpoch := a.currentLogEpoch()
+
+	// 用写锁而不是读锁：这里要自增 stateSeq，读锁下写共享字段是数据竞争。
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stateSeq++
+	seq = a.stateSeq
+	gen = a.authGeneration
+	st = a.getStateLocked(logEpoch)
+	return seq, gen, st
 }
 
 func (a *App) emitNotice(msg string) {

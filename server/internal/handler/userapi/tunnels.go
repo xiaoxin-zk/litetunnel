@@ -171,17 +171,26 @@ func (h *Handler) UpdateTunnel(c *gin.Context) {
 }
 
 // DeleteTunnel 删除隧道。
+//
+// 用结构化变体取回结果：数据库改成功但防火墙规则没跟上时，接口仍返回成功，
+// 但把「规则待处理」告诉前端（见 service.TunnelMutationResult）。
 func (h *Handler) DeleteTunnel(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
 		httpx.BadRequest(c, "隧道 ID 非法")
 		return
 	}
-	if err := h.svc.DeleteTunnel(middleware.CurrentUserID(c), id); err != nil {
+	res, err := h.svc.DeleteTunnelResult(middleware.CurrentUserID(c), id)
+	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
-	httpx.OK(c, gin.H{"message": "隧道已删除"})
+	httpx.OK(c, gin.H{
+		"message":          "隧道已删除",
+		"db_updated":       res.DBUpdated,
+		"firewall_pending": res.FirewallPending,
+		"warning":          res.Warning,
+	})
 }
 
 type tunnelStatusReq struct {
@@ -200,9 +209,15 @@ func (h *Handler) SetTunnelStatus(c *gin.Context) {
 		httpx.BadRequest(c, "参数格式不正确")
 		return
 	}
-	if err := h.svc.SetTunnelStatus(middleware.CurrentUserID(c), id, req.Status); err != nil {
+	res, err := h.svc.SetTunnelStatusResult(middleware.CurrentUserID(c), id, req.Status)
+	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
-	httpx.OK(c, gin.H{"message": "状态已更新"})
+	httpx.OK(c, gin.H{
+		"message":          "状态已更新",
+		"db_updated":       res.DBUpdated,
+		"firewall_pending": res.FirewallPending,
+		"warning":          res.Warning,
+	})
 }

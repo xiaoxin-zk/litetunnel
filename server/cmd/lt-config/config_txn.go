@@ -16,9 +16,16 @@ import (
 // Caddyfile 的 {env.X} 取到）。写成「写完一个再写下一个」，中途失败就会在
 // 磁盘上留下新旧混合的配置，而它要到下一次容器重建时才以配置错误的形式爆炸。
 //
-// 本文件只管「准备」与「提交」；回滚与落定见 config_txn_rollback.go，
-// 批次现场的读写见 batch.go，dirty scene 阻断见 config_txn_dirty.go。
-// 单文件的临时文件/备份/替换细节在 envfile.go。
+// # 各部分在哪
+//
+//	本文件                 —— 一批文件：准备、提交、失败翻译
+//	config_txn_rollback.go —— 一批文件：撤回、落定
+//	config_txn_dirty.go    —— 运行时的脏现场阻断
+//	batch.go               —— 批次记录的格式与读写
+//	batch_recovery.go      —— 启动时按记录恢复与残留清理
+//	file_commit.go         —— 单个文件：临时 → 备份 → 替换 → 回滚
+//	envfile.go             —— .env 的读改写与产物权限
+//	dotenv.go              —— .env 一行的语义
 
 // pendingWrite 是一个待写入的产物。
 type pendingWrite struct {
@@ -45,6 +52,10 @@ type writeBatch struct {
 //
 // 「保存并校验」也要给出与「应用」一致的反馈（哪些文件会变），但它的语义
 // 是只读的，所以这里只比较内容。
+//
+// 读不出来一律按「会变化」处理：这里只用于展示，宁可多报一个也不会误删什么；
+// 而把它过滤掉会让「保存并校验」提示「无变化」，紧接着的「保存并应用」却
+// 真的写了盘——两个按钮的说法自相矛盾。
 func pendingChanges(writes []pendingWrite) []string {
 	var names []string
 	for _, w := range writes {

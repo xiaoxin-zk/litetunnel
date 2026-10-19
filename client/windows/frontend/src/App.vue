@@ -30,7 +30,11 @@ const state = ref({
   running: false,
   // 日志代次也要有初值：退出登录时会拿服务端的值来对齐本端，
   // 缺字段的话第一次比较拿到的是 undefined，判断会落到「无变化」分支上。
-  log_epoch: 0
+  log_epoch: 0,
+  // 状态排序键的初值（见 seenAuthGen 的说明）。缺了它们，
+  // stateIsStale 会把首帧的 auth_gen/state_seq 当成 undefined。
+  auth_gen: 0,
+  state_seq: 0
 })
 const logs = ref([])
 // 主进程推送的轻提示（例如「检测到配置变更，已自动同步并重新连接」）。
@@ -43,6 +47,44 @@ const notice = ref(null)
 // 旧账号的慢响应若被放行，会把新账号的状态或日志覆盖掉——登录后短暂闪回
 // 上一个账号、或日志混入上一账号的行。只在「没有更新的写入发生」时才提交。
 let stateSeq = 0
+
+// 已接受状态的排序键 (auth_gen, state_seq)。
+//
+// # 为什么不能只靠 stateSeq（上面那个）
+//
+// 那个 stateSeq 只用于「让在途的 loadState 失效」，它挡不住**事件**乱序：
+// 退出登录时主进程会先推一份 logged_in=false，而某个隧道进程的退出回调
+// 可能在登出**之后**才取号并再推一份 logged_in=true —— 序号更大，前端
+// 照单全收，界面在用户已经退出后又闪回一次已登录。
+//
+// 主进程为此在每份状态里带了 (auth_gen, state_seq)（见 State.AuthGen /
+// State.StateSeq）：auth_gen 是账号代次，登出与接入都会让它前进。比较规则
+// 就是字典序——
+//   - auth_gen 更小：整份丢弃。它属于上一个账号，序号再大也是旧内容；
+//   - auth_gen 相等：再比 state_seq，更小则丢弃；
+//   - auth_gen 更大：接受，序号基线随新账号重来。
+//
+// 这样「旧账号的迟到事件」无论何时到达都进不来，而不是靠运气赶在登出推送
+// 之前。初值用 -1 而不是 0：首次收到的状态可能是 gen=0、seq=1，用 0 做初值
+// 会让「gen=0 且 seq=0」这种极端情况被误判成重复。
+let seenAuthGen = -1
+let seenStateSeq = -1
+
+// stateIsStale 判断一份状态是否比已经接受的更旧（见上面 seenAuthGen 的说明）。
+function stateIsStale(next) {
+  const gen = typeof next.auth_gen === 'number' ? next.auth_gen : 0
+  const seq = typeof next.state_seq === 'number' ? next.state_seq : 0
+  if (gen !== seenAuthGen) return gen < seenAuthGen
+  return seq < seenStateSeq
+}
+
+// markStateSeen 记下已接受状态的排序键。
+function markStateSeen(next) {
+  const gen = typeof next.auth_gen === 'number' ? next.auth_gen : 0
+  const seq = typeof next.state_seq === 'number' ? next.state_seq : 0
+  seenAuthGen = gen
+  seenStateSeq = seq
+}
 
 // wasLoggedIn 记住上一次看到的登录态，用来识别「已登录 → 未登录」这一次跳变。
 //
@@ -59,6 +101,12 @@ let wasLoggedIn = false
 // @update 回传状态的，那条路径并不经过 'state' 事件。
 function applyState(next) {
   if (!next) return
+  // 排序键过滤：比已接受的更旧就直接丢弃（见 seenAuthGen 的说明）。
+  //
+  // 放在这里而不是只放在 'state' 事件回调里：快照（loadState）、事件、
+  // 组件 @update 回传三条路径都会写 state，任何一条漏掉都能把旧状态带回来。
+  if (stateIsStale(next)) return
+  markStateSeen(next)
   const wasIn = wasLoggedIn
   wasLoggedIn = !!next.logged_in
   state.value = next

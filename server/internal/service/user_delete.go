@@ -17,26 +17,26 @@ import (
 // 与 AdminDeleteUser 共用 account_lifecycle.go 里的事务与善后两段，
 // 唯一差别是这里多一道密码复核（在事务内、用户行锁内做）。
 func (s *Services) DeleteAccount(userID uint, password string) error {
-	ports, err := s.deleteAccountTx(userID, password)
+	intents, err := s.deleteAccountTx(userID, password)
 	if err != nil {
 		return err
 	}
-	s.purgeAccountAfterCommit(userID, ports)
+	s.purgeAccountAfterCommit(userID, intents)
 	return nil
 }
 
-// deleteAccountTx 在用户锁内完成注销事务，返回需要回收的端口清单。
+// deleteAccountTx 在用户锁内完成注销事务，返回事务内登记的防火墙意图。
 //
 // 锁的语义与 deleteUserTx 完全一致（只罩住事务、defer 释放），理由不再重复。
-func (s *Services) deleteAccountTx(userID uint, password string) ([]portProto, error) {
+func (s *Services) deleteAccountTx(userID uint, password string) ([]portIntent, error) {
 	lock := s.userLock(userID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	var ports []portProto
+	var intents []portIntent
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		var err error
-		ports, err = accountPurgeTx(tx, userID, func(u *model.User) error {
+		intents, err = accountPurgeTx(tx, userID, func(u *model.User) error {
 			// 密码校验放在锁内、事务内：事务外先验一遍的话，并发改密会让
 			// 「密码正确」的结论作废——注销必须基于**当前**密码，而不是
 			// 请求开始时的旧快照。
@@ -50,5 +50,5 @@ func (s *Services) deleteAccountTx(userID uint, password string) ([]portProto, e
 	if err != nil {
 		return nil, err
 	}
-	return ports, nil
+	return intents, nil
 }

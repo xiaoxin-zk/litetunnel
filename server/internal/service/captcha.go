@@ -250,6 +250,22 @@ func (s *Services) CheckCaptcha(ticket, answer string) bool {
 //
 // 用共享存储而不是进程内计数，是为了让阈值在多实例部署下仍然成立：进程内
 // 计数会被负载均衡按实例数摊薄，N 个实例等于 N 倍额度。
+//
+// # 计数读不出来时要求验证码（fail-closed）
+//
+// count 的第二个返回值是「这个数字是否完整可信」。读库失败时它返回
+// ok=false：只能拿到本实例的补记数，而那通常就是 0。如果这里照旧拿 0 去
+// 比阈值，多实例下攻击者只需等到一次数据库抖动就能让账号级验证码失效——
+// 而账号级验证码是分布式爆破的唯一克星（硬锁按「账号+IP」计，分布式来源
+// 每个 IP 各有额度）。
+//
+// 所以 ok=false 时直接要求验证码：多要一次人机验证，代价是一次点击；
+// 放过去的代价是整条账号级防线在那段时间里不存在。两个方向不对称，
+// 只能选严格的那一边。
+//
+// 注意这不是「永久降级」：dbLoginFailureCounter 在读成功后立刻清除降级
+// 标志（见 markRecovered），下一次判定就恢复正常。降级状态本身可以通过
+// Services.LoginFailDegraded 查询，供健康检查/管理页展示。
 func (s *Services) CaptchaRequired(kind, account string) bool {
 	switch kind {
 	case "register":
@@ -262,7 +278,12 @@ func (s *Services) CaptchaRequired(kind, account string) bool {
 		if s.loginFails == nil {
 			return false
 		}
-		return s.loginFails.count(account, time.Now()) >= threshold
+		n, ok := s.loginFails.count(account, time.Now())
+		if !ok {
+			// 计数不可信：不能拿「可能是 0 的补记数」去比阈值。
+			return true
+		}
+		return n >= threshold
 	default:
 		return false
 	}

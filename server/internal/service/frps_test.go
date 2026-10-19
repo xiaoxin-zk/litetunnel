@@ -222,8 +222,14 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(pages) != 2 {
-		t.Fatalf("请求了 %d 页，期望 2 页", len(pages))
+	// 3 次 = 第 1 页 + 第 2 页 + 收尾复检第 1 页（见 recheckFirstPage）。
+	// 复检是缺陷 10 的修复：分页接口没有稳定快照，不复核第一页就发现不了
+	// 「删一条 + 加一条、total 不变」的错位。它只加一次请求、与页数无关。
+	if len(pages) != 3 {
+		t.Fatalf("请求了 %d 页，期望 3 次（2 页 + 1 次复检），实际序列 %v", len(pages), pages)
+	}
+	if pages[0] != "1" || pages[1] != "2" || pages[2] != "1" {
+		t.Fatalf("请求顺序 = %v，期望 [1 2 1]（最后一页之后复检第 1 页）", pages)
 	}
 	if proxies[200].Name != "lt_u1.last" {
 		t.Fatalf("最后一条 = %q，期望 lt_u1.last", proxies[200].Name)
@@ -438,6 +444,105 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 	defer mu.Unlock()
 	if requests < frpsListAttempts*2 {
 		t.Fatalf("请求了 %d 次，期望重取一次（两轮 × 两页）", requests)
+	}
+}
+
+// TestListProxiesDetectsCollectionChangeWithSameTotal 覆盖「删一条 + 加一条、
+// total 不变」这种最隐蔽的分页错位。
+//
+// 分页接口没有稳定快照：frps 按 (type, name) 排序后切片，翻页期间有人删了一条
+// 又加了一条，total 自始至终不变，但删除点之后的页整体错位一格——被跳过的那条
+// 旧代理不在结果里（随后被判离线），新加的那条被多读一次（随后被判在线）。
+// 条数校验、total 校验、重复校验**全部发现不了**，只有翻页结束后复检第 1 页
+// 才能看出来（见 recheckFirstPage）。
+//
+// 构造：两页都必须是**满页**（frpsPageSize 条），否则实现会在「短页且 total
+// 未满足」处提前报「列表不完整」，根本走不到复检——那就测不到缺陷 10 了。
+//
+// 每轮的请求序列是 [第 1 页, 第 2 页, 复检第 1 页]（见 recheckFirstPage）：
+//
+//	第 1 轮：a0..a199 / b0..b199 / 复检时 a1..a200  ← 集合变了
+//	第 2 轮：同上（重取一次仍然不稳定，才应该最终报错）
+//
+// 用 (n-1)%3 == 2 认「复检」而不是写死 n>=3：ListProxies 会在不稳定时整轮
+// 重取一次（frpsListAttempts=2），只让第 1 轮失败的话第 2 轮会成功返回，
+// 测试就变成「复检生效但重取兜住了」，断言 err != nil 直接挂掉。
+func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	const total = 2 * frpsPageSize
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		n := requests
+		mu.Unlock()
+
+		page := r.URL.Query().Get("page")
+		items := make([]string, 0, frpsPageSize)
+		switch page {
+		case "1":
+			// 每轮的第 3 次请求是复检：整体后移一位（a0 消失、a200 出现），
+			// 条数与 total 都不变，只有集合变了。
+			base := 0
+			if (n-1)%3 == 2 {
+				base = 1
+			}
+			for i := 0; i < frpsPageSize; i++ {
+				items = append(items, fmt.Sprintf(`{"name":"lt_u1.a%d","status":{"phase":"online"}}`, base+i))
+			}
+		default:
+			for i := 0; i < frpsPageSize; i++ {
+				items = append(items, fmt.Sprintf(`{"name":"lt_u1.b%d","status":{"phase":"online"}}`, i))
+			}
+		}
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":%d,"page":%s,"pageSize":%d,"items":[%s]}}`,
+			total, page, frpsPageSize, strings.Join(items, ","))
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err == nil {
+		t.Fatalf("total 不变但集合变化应报错，实际拿到 %d 条且无错误", len(proxies))
+	}
+	if proxies != nil {
+		t.Fatal("结果不稳定时不应返回代理列表：错位的条目会让人被判离线、让新代理被多计流量")
+	}
+	// 错误信息里要能看出「总量没变但集合变了」——只写「列表不稳定」的话，
+	// 运维无法区分这是分页错位还是 frps 返回了残缺响应，两者要查的东西不同。
+	if !strings.Contains(err.Error(), "集合变了") {
+		t.Fatalf("错误信息应说明集合发生变化，实际: %v", err)
+	}
+}
+
+// TestListProxiesRechecksFirstPageOnlyWhenPaginated 覆盖「单页不做复检」。
+//
+// 单页时 total 与 items 出自 frps 的同一次请求（同一个切片算出来的），本身就是
+// 一致快照，再复检一次只是白花一个往返。健康检查与采集是高频路径，这个开销必须
+// 省掉。
+func TestListProxiesRechecksFirstPageOnlyWhenPaginated(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+
+	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":%d,"items":[{"name":"lt_u1.only","status":{"phase":"online"}}]}}`,
+			frpsPageSize)
+	})
+
+	proxies, err := c.ListProxies(context.Background())
+	if err != nil {
+		t.Fatalf("单页列表不该报错: %v", err)
+	}
+	if len(proxies) != 1 {
+		t.Fatalf("期望 1 条，实际 %d 条", len(proxies))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 1 {
+		t.Fatalf("单页只应请求 1 次（不做复检），实际 %d 次", requests)
 	}
 }
 

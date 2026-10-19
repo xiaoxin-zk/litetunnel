@@ -1,8 +1,11 @@
 package frpsplugin
 
-// 代理准入：新建 / 关闭 / 心跳。
+// 代理准入：新建代理。
 //
-// 这些回调决定一条隧道能否上线、参数是否被篡改，以及限速与端口如何下发。
+// 这个回调决定一条隧道能否上线、参数是否被篡改，以及限速如何下发。
+// 它与 plugin_conn.go 共用同一套「账号现在能不能用」的判断，但触发频率
+// 低得多（每条隧道一次，而不是每个连接一次），所以在这里可以承担更
+// 保守的判定：宁可拒绝一次注册让用户重连，也不放行一个已禁用的账号。
 
 import (
 	"encoding/json"
@@ -40,19 +43,6 @@ type newProxyContent struct {
 	Multiplexer        string            `json:"multiplexer"`
 }
 
-type closeProxyContent struct {
-	User      userInfo `json:"user"`
-	ProxyName string   `json:"proxy_name"`
-}
-
-type pingContent struct {
-	User         userInfo `json:"user"`
-	PrivilegeKey string   `json:"privilege_key"`
-	Timestamp    int64    `json:"timestamp"`
-}
-
-// Handler 处理 frps 插件回调。
-
 func (h *Handler) onNewProxy(req *request) response {
 	var content newProxyContent
 	if err := json.Unmarshal(req.Content, &content); err != nil {
@@ -70,9 +60,16 @@ func (h *Handler) onNewProxy(req *request) response {
 	if u.Status != model.UserStatusActive {
 		return deny("账号已被禁用")
 	}
-	// 配额与会话撤销的判定要与 NewUserConn 一致：那边优先用会话级快照，
+	// 配额与禁用的判定要与 NewUserConn 一致：那边优先用会话级快照，
 	// 这边若只看本机全局缓存，多副本下会出现「配额已放宽仍拒注册」或
 	// 「会话已撤销却注册成功、后续连接全被拒」这种自相矛盾的结果。
+	//
+	// 快照未建立时（新会话还没来得及 Ping 一次、或控制面刚重启）必须
+	// 回落到本机标记，且**两个标记都要看**：这里曾经只查超额，于是刚被
+	// 禁用、会话缓存又恰好没命中的账号仍能注册代理成功——注册那一刻
+	// frps 就把端口/域名绑上了，用户看到的是「隧道显示在线但连不上」，
+	// 直到下一次新建连接才被拒。禁用生效的时点被推迟到一个不可预测的
+	// 未来事件（下一次连接），这正是「禁用」语义最不该有的样子。
 	if blocked, exceeded, ok := h.svc.SessionGuard(content.User.RunID); ok {
 		if blocked {
 			return deny("账号已被禁用")
@@ -80,8 +77,28 @@ func (h *Handler) onNewProxy(req *request) response {
 		if exceeded {
 			return deny("流量额度已用尽，请兑换流量或联系管理员")
 		}
-	} else if h.svc.Runtime.IsQuotaExceeded(u.ID) {
-		return deny("流量额度已用尽，请兑换流量或联系管理员")
+	} else {
+		// 没有会话级快照：只能读本机内存标记。这是一份**可能过期的快照**，
+		// 所以要求整个读取过程处于一个稳定的准入版本窗口内（见 localAdmission）。
+		blocked, exceeded, ok := h.localAdmission(u.ID)
+		if !ok {
+			// 读不出可信判定就拒绝注册（fail-closed）。
+			//
+			// 为什么不能「读不干净就按没禁用放行」：放行的后果是把一个可能
+			// 已被禁用的账号的端口重新绑到公网，且没有任何后续事件会纠正
+			// 它——代理一旦注册成功，后续连接准入走的是另一条路径，注册
+			// 本身不会因为账号被禁用而自动撤销。而拒绝的代价只是一次重连：
+			// 客户端会重试，下一轮就能读到稳定状态。两个方向的代价不对称，
+			// 只能选拒绝。
+			log.Printf("[plugin] 用户 %d 的准入状态在读取期间持续变化，无法确认是否已禁用，已拒绝注册", u.ID)
+			return deny("账号状态正在变更，请稍后重试")
+		}
+		if blocked {
+			return deny("账号已被禁用")
+		}
+		if exceeded {
+			return deny("流量额度已用尽，请兑换流量或联系管理员")
+		}
 	}
 
 	// frp 会把代理名规范成 "<user>.<proxy_name>"——也就是 frpc.toml 里的
@@ -183,31 +200,4 @@ func domainMatched(t *model.Tunnel, content *newProxyContent) bool {
 			len(content.CustomDomains) == 0
 	}
 	return false
-}
-
-func (h *Handler) onCloseProxy(req *request) response {
-	var content closeProxyContent
-	if err := json.Unmarshal(req.Content, &content); err != nil {
-		return allow()
-	}
-	if content.User.RunID != "" {
-		h.svc.Runtime.TouchSession(content.User.RunID)
-	}
-	return allow()
-}
-
-func (h *Handler) onPing(req *request) response {
-	var content pingContent
-	if err := json.Unmarshal(req.Content, &content); err != nil {
-		return allow()
-	}
-	if content.User.RunID != "" {
-		h.svc.Runtime.TouchSession(content.User.RunID)
-		h.svc.TouchClientSession(content.User.RunID)
-		// 顺带按需刷新会话的准入快照：多副本时账号可能在别的实例被禁用/超额，
-		// 本地内存标记不会变。放在 Ping（周期性事件）而不是每次新建连接，
-		// 既能让状态在一个 Ping 周期内收敛，又不会把查库压到连接热路径上。
-		h.svc.RefreshSessionGuard(content.User.RunID)
-	}
-	return allow()
 }

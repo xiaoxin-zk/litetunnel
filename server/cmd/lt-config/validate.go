@@ -400,3 +400,21 @@ func containsFold(list []string, want string) bool {
 	}
 	return false
 }
+
+// requireVars 从 .env 解析结果里取出必填项。
+//
+// 「缺必填项」与「值不合法」分开报：前者是部署目录的 .env 不完整（多半是没填
+// 或键名写错），后者是填了但内容有问题。两者的修法不同，合并成一句会让管理员
+// 在配置页与 .env 之间来回猜。
+func requireVars(vars map[string]string, keys []string) error {
+	var missing []string
+	for _, k := range keys {
+		if strings.TrimSpace(vars[k]) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("部署目录的 .env 缺少必填项: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}

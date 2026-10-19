@@ -262,10 +262,36 @@ async function save() {
   }
 }
 
+// showMutationWarning 展示「数据库已更新、防火墙规则待处理」这类部分成功。
+//
+// 后端在删隧道/启停隧道时返回 { db_updated, firewall_pending, warning }：
+// 数据库已经改成功了（重试同一请求只会得到「隧道不存在」），但宿主机上的
+// 放行/收回规则还没生效，已进入后台重试队列。
+//
+// 为什么必须显示出来而不是一律 success：用户看到「已停用」就以为端口已经
+// 关掉了，实际端口可能还开着——这是安全语义上的错误认知。反过来也不能报
+// 错：报错会让用户重试一个已经成功的操作，只会得到「隧道不存在」。
+// 所以用 warning 级别单独提示，并明确说「后台会自动重试，无需重复操作」。
+function showMutationWarning(res) {
+  if (res && res.firewall_pending) {
+    ElMessage({
+      type: 'warning',
+      message: res.warning || '数据库已更新，但防火墙规则尚未生效；后台会自动重试，无需重复操作',
+      duration: 6000
+    })
+    return true
+  }
+  return false
+}
+
 async function toggle(row) {
   const next = row.status === 'active' ? 'disabled' : 'active'
-  await tunnelApi.setStatus(row.id, next)
-  ElMessage.success(next === 'active' ? '已启用' : '已停用')
+  const res = await tunnelApi.setStatus(row.id, next)
+  // 先提示「规则待处理」（如果后端这么说），否则才是普通的成功提示。
+  // 两者不能都弹：同一个动作弹两条消息，用户会以为发生了两件事。
+  if (!showMutationWarning(res)) {
+    ElMessage.success(next === 'active' ? '已启用' : '已停用')
+  }
   await load()
 }
 
@@ -275,8 +301,10 @@ async function remove(row) {
     confirmButtonText: '删除',
     cancelButtonText: '取消'
   })
-  await tunnelApi.remove(row.id)
-  ElMessage.success('已删除')
+  const res = await tunnelApi.remove(row.id)
+  if (!showMutationWarning(res)) {
+    ElMessage.success('已删除')
+  }
   await load()
   emit('refresh-profile')
 }

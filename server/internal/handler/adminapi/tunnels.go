@@ -42,6 +42,10 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 }
 
 // SetTunnelStatus 启用/停用隧道。
+//
+// 用结构化变体取回结果：数据库改成功但防火墙规则没跟上时，接口仍应返回
+// 成功，但必须把「规则待处理」告诉前端（见 service.TunnelMutationResult）。
+// 把它压成一个 error 会让管理员重试并得到「隧道不存在」，以为系统坏了。
 func (h *Handler) SetTunnelStatus(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -53,12 +57,18 @@ func (h *Handler) SetTunnelStatus(c *gin.Context) {
 		httpx.BadRequest(c, "参数格式不正确")
 		return
 	}
-	if err := h.svc.AdminSetTunnelStatus(id, req.Status); err != nil {
+	res, err := h.svc.AdminSetTunnelStatusResult(id, req.Status)
+	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
 	h.audit(c, "tunnel.status", "tunnel", c.Param("id"), "状态变更为 "+req.Status)
-	httpx.OK(c, gin.H{"message": "状态已更新"})
+	httpx.OK(c, gin.H{
+		"message":          "状态已更新",
+		"db_updated":       res.DBUpdated,
+		"firewall_pending": res.FirewallPending,
+		"warning":          res.Warning,
+	})
 }
 
 // DeleteTunnel 删除隧道。
@@ -68,10 +78,16 @@ func (h *Handler) DeleteTunnel(c *gin.Context) {
 		httpx.BadRequest(c, "隧道 ID 非法")
 		return
 	}
-	if err := h.svc.AdminDeleteTunnel(id); err != nil {
+	res, err := h.svc.AdminDeleteTunnelResult(id)
+	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
 	h.audit(c, "tunnel.delete", "tunnel", c.Param("id"), "删除隧道")
-	httpx.OK(c, gin.H{"message": "隧道已删除"})
+	httpx.OK(c, gin.H{
+		"message":          "隧道已删除",
+		"db_updated":       res.DBUpdated,
+		"firewall_pending": res.FirewallPending,
+		"warning":          res.Warning,
+	})
 }

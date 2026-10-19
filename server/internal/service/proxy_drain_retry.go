@@ -569,7 +569,7 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 	// 因此转人工确认。若该 ID 上没有任何账号（删号路径的正常状态），则没有
 	// 可误伤的对象，按删号语义继续。
 	if row.Incarnation == "" {
-		inc, exists, err := s.currentIncarnation(row.UserID)
+		_, exists, err := s.currentIncarnation(row.UserID)
 		if err != nil {
 			// 读不出来 ≠ 账号不存在：ID 可能已经被复用。此时照旧按前缀关代理
 			// 会误伤新账号，保留待办等下一轮再判。

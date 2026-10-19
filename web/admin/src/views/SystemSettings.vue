@@ -87,9 +87,10 @@
               placeholder="@qq.com, @163.com, company.com, *.edu.cn"
             />
             <span class="hint">
-              写 <code>@qq.com</code> 或 <code>qq.com</code> 都等价，均包含其子域；
-              <code>*.edu.cn</code> 只匹配子域、不含 edu.cn 本身。典型用法：企业自有域名列入白名单
-              供员工自由注册；其余公共邮箱仍可注册但受下方限制。填错会被拒绝保存，不会静默失效
+              写 <code>@qq.com</code> 或 <code>qq.com</code> 等价，只放行该域名本身（<code>s.qq.com</code> 不放行）；
+              要放行子域请显式写 <code>*.your-domain.com</code>（不含本域）。
+              典型用法：企业自有域名列入白名单供员工自由注册；其余公共邮箱仍可注册但受下方限制。
+              填错会被拒绝保存，不会静默失效
             </span>
           </el-form-item>
           <el-form-item label="仅白名单可注册">

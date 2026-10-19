@@ -10,7 +10,7 @@ import (
 //
 // 结构对齐 sub2api 的 registrationEmailPolicy：列表项在**解析时**就规范化
 //
-//	@domain   匹配该域及其全部子域
+//	@domain   精确匹配该域本身，不含子域
 //	*.domain  只匹配子域，不含本域
 //
 // 并且把无法识别的项**报出来**，而不是静默丢掉。静默丢弃的代价最隐蔽：
@@ -38,8 +38,9 @@ func (r EmailDomainRule) String() string {
 
 // Match 判断邮箱域名是否命中本规则。
 //
-// 子域按**包含**处理：@qq.com 也匹配 mail.qq.com。否则企业把自有域名列入
-// 白名单后，员工用 mail.企业域名 注册仍会被挡在门外。
+// 两条规则的边界很硬：@qq.com 只认 qq.com，*.qq.com 只认子域。子域不会被
+// 自动放行——白名单一旦自动包含子域，管理员写下的「只允许 qq.com」实际会变成
+// 「允许 qq.com 及任何 s.qq.com」，与他的意图相反。
 func (r EmailDomainRule) Match(domain string) bool {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	if domain == "" || r.Suffix == "" {
@@ -48,7 +49,13 @@ func (r EmailDomainRule) Match(domain string) bool {
 	if r.Wildcard {
 		return strings.HasSuffix(domain, "."+r.Suffix)
 	}
-	return domain == r.Suffix || strings.HasSuffix(domain, "."+r.Suffix)
+	// 精确匹配，**不含子域**。
+	//
+	// 白名单写 @qq.com 就只放行 qq.com 本身：子域太容易被第三方接管
+	// （s.qq.com 这类地址既不是 QQ 邮箱官方的，也不受本平台控制），
+	// 因为它自动包含子域，等于把白名单悄悄放大了。要放行子域必须显式写
+	// *.your-domain.com。
+	return domain == r.Suffix
 }
 
 // ParseEmailDomainRules 解析逗号（含全角）与空白分隔的域名列表。

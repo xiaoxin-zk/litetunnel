@@ -28,25 +28,29 @@ func TestParseEmailDomainRules(t *testing.T) {
 	}
 }
 
-// TestEmailDomainRuleMatch 覆盖子域包含关系。
+// TestEmailDomainRuleMatch 覆盖精确匹配与通配的边界。
 //
-// @qq.com 必须同时匹配 mail.qq.com：企业把自有域名列入白名单后，员工用
-// mail.企业域名 注册是很常见的情况。*.edu.cn 则相反，只匹配子域。
+// @qq.com 绝不能放行 s.qq.com：那类子域不属于 QQ 官方，白名单一旦自动包含
+// 子域，「只允许 qq.com」就变成了「允许任何 s.qq.com」。要放行子域必须显式
+// 写 *.qq.com。
 func TestEmailDomainRuleMatch(t *testing.T) {
 	suffix := EmailDomainRule{Suffix: "qq.com"}
-	if !suffix.Match("qq.com") || !suffix.Match("mail.qq.com") || !suffix.Match("QQ.COM") {
-		t.Error("@qq.com 应匹配本域与其子域")
+	if !suffix.Match("qq.com") || !suffix.Match("QQ.COM") {
+		t.Error("@qq.com 应匹配本域")
+	}
+	if suffix.Match("s.qq.com") || suffix.Match("mail.qq.com") {
+		t.Error("@qq.com 不该放行子域，子域必须显式写 *.qq.com")
 	}
 	if suffix.Match("foxmail.com") || suffix.Match("nqq.com") {
 		t.Error("@qq.com 不该匹配其它域名")
 	}
 
-	wildcard := EmailDomainRule{Suffix: "edu.cn", Wildcard: true}
-	if !wildcard.Match("pku.edu.cn") || !wildcard.Match("a.pku.edu.cn") {
-		t.Error("*.edu.cn 应匹配子域")
+	wildcard := EmailDomainRule{Suffix: "qq.com", Wildcard: true}
+	if !wildcard.Match("s.qq.com") || !wildcard.Match("a.mail.qq.com") {
+		t.Error("*.qq.com 应匹配子域")
 	}
-	if wildcard.Match("edu.cn") {
-		t.Error("*.edu.cn 不该匹配 edu.cn 本身")
+	if wildcard.Match("qq.com") {
+		t.Error("*.qq.com 不该匹配 qq.com 本身")
 	}
 }
 
@@ -97,11 +101,25 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 	if err := svc.checkEmailDomainAdmission("a@qq.com"); err != nil {
 		t.Fatalf("白名单域名应放行: %v", err)
 	}
-	if err := svc.checkEmailDomainAdmission("a@mail.qq.com"); err != nil {
-		t.Fatalf("白名单域名的子域应放行: %v", err)
+	// 白名单只写 @qq.com 时，s.qq.com 这类子域必须拒绝。
+	if err := svc.checkEmailDomainAdmission("a@s.qq.com"); !errors.Is(err, ErrDomainNotTrusted) {
+		t.Fatalf("未写 *.qq.com 时子域应被拒，实际 %v", err)
 	}
 	if err := svc.checkEmailDomainAdmission("a@gmail.com"); !errors.Is(err, ErrDomainNotTrusted) {
 		t.Fatalf("非白名单域名应被拒，实际 %v", err)
+	}
+
+	// 显式写 *.qq.com 之后，子域才被放行，而 qq.com 本身反而不在范围内。
+	if err := svc.Settings.SetMany(map[SettingKey]string{
+		KeyRegisterAllowDomains: "*.qq.com",
+	}); err != nil {
+		t.Fatalf("保存设置失败: %v", err)
+	}
+	if err := svc.checkEmailDomainAdmission("a@s.qq.com"); err != nil {
+		t.Fatalf("*.qq.com 应放行子域: %v", err)
+	}
+	if err := svc.checkEmailDomainAdmission("a@qq.com"); !errors.Is(err, ErrDomainNotTrusted) {
+		t.Fatalf("*.qq.com 不该放行 qq.com 本身，实际 %v", err)
 	}
 
 	// 黑名单优先级更高：即使关掉白名单模式，命中黑名单也必须拒绝。

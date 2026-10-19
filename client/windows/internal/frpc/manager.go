@@ -444,8 +444,20 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		dispatch := current && !stale && !closing && (onExit != nil || onExitGen != nil)
 		if dispatch {
 			m.callbackWG.Add(1)
+			// 必须 defer：回调路径上有多个提前 return，而且上层回调本身
+			// 可能 panic（事件发送时运行时已销毁）。漏掉一次 Done，
+			// WaitCallbacks 以后每次都要等满超时。
+			defer m.callbackWG.Done()
 		}
 		m.mu.Unlock()
+
+		// 回调 panic 不能把整个客户端带走：Wails 事件在退出阶段可能对
+		// 已销毁的目标抛错，那属于「这一次回调没做完」，不是致命错误。
+		defer func() {
+			if r := recover(); r != nil {
+				m.appendLog(tunnelID, tunnelName, fmt.Sprintf("退出回调异常：%v", r))
+			}
+		}()
 
 		// 先通知等待者再写日志：让 Stop 尽早返回，
 		// 避免日志写入（可能触发前端事件）拖慢重启。
@@ -502,7 +514,6 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		// ——新进程接下来会因 "start proxy success" 重新置位。
 		if !m.stillCurrent(tunnelID, gen) {
 			m.appendLog(tunnelID, tunnelName, "frpc 已退出（该隧道已启动新进程，忽略本次退出回调）")
-			m.callbackWG.Done()
 			return
 		}
 		// 在最终代次检查之后立即串行派发 generation 回调；App 仍会在入口
@@ -512,7 +523,6 @@ func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
 		} else if onExit != nil {
 			onExit(tunnelID, tunnelName, err, requested)
 		}
-		m.callbackWG.Done()
 	}()
 
 	return nil
@@ -723,12 +733,28 @@ func findFrpc() string {
 	}
 
 	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
+		if usableExecutable(c) {
 			return c
 		}
 	}
-	if p, err := exec.LookPath(name); err == nil {
+	if p, err := exec.LookPath(name); err == nil && usableExecutable(p) {
 		return p
 	}
 	return ""
+}
+
+// usableExecutable 判断路径是不是一个能直接执行的普通文件。
+//
+// 只 Stat 成功就返回，会把目录或符号链接当成 frpc：Start 时报的是
+// 「permission denied」或「is a directory」，用户完全看不出是路径放错了。
+// Windows 没有可执行位，只要求普通文件；其它平台额外要求任一执行位。
+func usableExecutable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || !info.Mode().IsRegular() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode().Perm()&0o111 != 0
 }

@@ -842,7 +842,14 @@ jobs:
           node-version: '22'
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        working-directory: client/windows
+        shell: pwsh
+        run: |
+          # 版本跟 go.mod 走：@latest 会在两次构建之间漂移，同一份源码
+          # 在 CI 与发布流水线上可能得到不同的构建器行为。
+          $v = go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2
+          if (-not $v) { throw '无法从 go.mod 解析 wails 版本' }
+          go install "github.com/wailsapp/wails/v2/cmd/wails@$v"
 
       - name: Resolve dependencies
         working-directory: client/windows
@@ -882,8 +889,10 @@ jobs:
   # ============================================================
   #  构建并推送镜像到 GHCR
   #
-  #  main 分支每次通过即推送 latest，服务器可直接 pull 部署；
-  #  带版本号的镜像由 release.yml 在打 tag 时推送。
+  #  main 分支每次通过推送 :main 与 :sha-<commit>，**不覆盖 latest**。
+  #  latest 与版本号镜像只由 release.yml 在打 tag 时推送：否则主干上一个
+  #  未发布的合并会把刚发布的 latest 顶掉，用户拉到的是开发版。
+  #  想跟主干的用户显式用 :main，想稳定部署的用版本号或 latest。
   # ============================================================
   publish:
     name: Publish image
@@ -918,7 +927,7 @@ jobs:
           build-args: |
             VERSION=${{ steps.ver.outputs.value }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/litetunnel-panel:latest
+            ghcr.io/${{ github.repository_owner }}/litetunnel-panel:main
             ghcr.io/${{ github.repository_owner }}/litetunnel-panel:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -2,11 +2,33 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// readFileLimited 读取文件并限制体积。
+//
+// manifest 是磁盘上的普通文件，损坏或被人写入超大内容时，一次性 ReadFile
+// 会把 helper 的内存和启动时间一起拖住。超限直接报错，由调用方进入阻断。
+func readFileLimited(path string, max int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("文件 %s 超过大小上限 %d 字节", path, max)
+	}
+	return data, nil
+}
 
 // 本文件是启动时的**恢复**单元：按批次记录把整批文件回滚到提交前状态，
 // 再清理上次异常退出留下的临时文件与备份。
@@ -47,9 +69,9 @@ import (
 // 返回 false 表示**至少有一个文件没能恢复**。此时绝不能删记录与备份：
 // 它们是下一次尝试恢复的唯一依据，而磁盘正处在「新旧混合」状态——
 // 删掉就等于把「还能修」变成「只能人工拼」。
-func recoverBatch(dir string) bool {
+func recoverBatch(dir string, managed map[string]bool) bool {
 	path := filepath.Join(dir, batchManifestName)
-	raw, err := os.ReadFile(path)
+	raw, err := readFileLimited(path, maxManifestBytes)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("[lt-config] 读取批次记录失败（%s）: %v", path, err)
@@ -69,7 +91,7 @@ func recoverBatch(dir string) bool {
 		log.Printf("[lt-config] 批次记录无法解析（%s），保留现场并阻断后续写盘: %v", path, err)
 		return false
 	}
-	if err := validateManifestForRecovery(dir, m); err != nil {
+	if err := validateManifestForRecovery(dir, m, managed); err != nil {
 		log.Printf("[lt-config] 批次记录 schema 或路径不可信（%s），保留现场并阻断后续写盘: %v", path, err)
 		return false
 	}
@@ -285,6 +307,13 @@ func cleanupLeftovers(p paths) []string {
 		}
 		blocked = append(blocked, dir)
 	}
+	// 受管文件白名单在进入目录循环之前算好：它是对抗「manifest 被改成
+	// 指向任意文件」的唯一依据，算不出来就不能继续清理任何目录。
+	managed, managedErr := managedOutputPaths(p)
+	if managedErr != nil {
+		log.Printf("[lt-config] 无法确定受管文件白名单，本次跳过全部恢复与清理: %v", managedErr)
+	}
+
 	seen := map[string]bool{}
 	// 部署根目录必须显式纳入：校验临时目录（.lt-config-caddy-* /
 	// .lt-config-frps-*，里面有挂进容器的凭据）创建在部署根下，而三个
@@ -322,7 +351,7 @@ func cleanupLeftovers(p paths) []string {
 		// 回滚没能完成时**跳过**这个目录的单文件清理：那些备份正是下一次
 		// 恢复的依据，按单文件规则处理（目标在就删备份）会把唯一的退路
 		// 删掉，磁盘从此停在新旧混合状态，再无自动修复的机会。
-		if !recoverBatch(dir) {
+		if managedErr != nil || !recoverBatch(dir, managed) {
 			log.Printf("[lt-config] %s 的批次回滚未完成，跳过本次残留清理", dir)
 			// manifest 可能引用多个目录。首目录恢复失败时，所有关联目录
 			// 都必须阻断，不能让后续遍历把同批次的备份当普通遗留文件删掉。

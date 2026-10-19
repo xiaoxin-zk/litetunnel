@@ -198,6 +198,22 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	}
 	res.Changed = sortedChanged(batch.changed)
 
+	// 内容和权限都没有变化时不必重建容器。
+	//
+	// 重复点「保存并应用」、或只纠正了权限，重建一次就是一次真实的连接
+	// 中断（caddy 与 frps 都会重启）。此前无条件 up --force-recreate，
+	// 把这个本该免费的操作变成了有代价的。
+	//
+	// 「凭据可能变了所以总要重建」不成立：凭据写在 .env 里，内容变了就会
+	// 出现在 Changed 中并走下面的重建。
+	if len(batch.changed) == 0 {
+		// 权限变化不影响容器运行时（.env 内容没变就不会换环境变量），
+		// 因此这里只看内容。重建一次就是 caddy 与 frps 各断一次。
+		res.Applied = false
+		res.Message = "配置内容无变化，未重建容器"
+		return res, nil
+	}
+
 	// 写盘完成、重建容器前再确认一次：避免「磁盘新、容器旧」的中间态。
 	if err := ctx.Err(); err != nil {
 		// 客户端已经走了：磁盘不能留在新配置上，否则下一次重建容器时

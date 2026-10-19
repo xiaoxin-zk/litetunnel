@@ -240,6 +240,19 @@ func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 		m.pending = append(m.pending[:0], m.pending[over:]...)
 		m.pendingDropped += over
 	}
+	// 丢弃提示必须在这里、按正常序号入队。
+	//
+	// 以前是在投递时用 seq=0 现拼一条：前端清空日志是按序号过滤的，
+	// seq=0 永远小于「清空点」，于是一条在清空前产生的提示会在清空之后
+	// 仍然通过过滤，甚至被当成新账号的日志。分配真实序号后，它和普通
+	// 日志一样受清空点约束。
+	if m.pendingDropped > 0 {
+		dropped := m.pendingDropped
+		m.pendingDropped = 0
+		msg := fmt.Sprintf("%s  [客户端] 日志过多，已丢弃 %d 条较早的记录",
+			time.Now().Format("15:04:05"), dropped)
+		m.pending = append(m.pending, logEntry{seq: m.recordTextLocked(msg), text: msg})
+	}
 	select {
 	case m.emitWake <- struct{}{}:
 	default:
@@ -271,19 +284,8 @@ func (m *Manager) emitPending() {
 		m.mu.Lock()
 		batch := m.pending
 		m.pending = nil
-		dropped := m.pendingDropped
-		m.pendingDropped = 0
 		cb := m.onLog
 		m.mu.Unlock()
-
-		if dropped > 0 {
-			// seq=0：合成记录不参与去重，前端总是显示。
-			batch = append([]logEntry{{
-				gen:  0,
-				text: fmt.Sprintf("%s  [客户端] 日志过多，已丢弃 %d 条较早的记录",
-					time.Now().Format("15:04:05"), dropped),
-			}}, batch...)
-		}
 
 		if cb != nil {
 			for _, e := range batch {

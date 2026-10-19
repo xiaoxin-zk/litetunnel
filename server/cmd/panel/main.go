@@ -95,7 +95,16 @@ func main() {
 		svc.StartProxyDrainWorker(ctx),
 	}
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
-	go svc.Monitor.Start(ctx)
+	//
+	// 同样纳入 workers：它在采集 disk/CPU 时会碰文件系统，进程退出时
+	// 正在读盘的那一轮没必要被打断（也不会丢任何必须落库的数据，但
+	// 统一等待能把「退出时还有协程在跑」这种不确定性消掉）。
+	monDone := make(chan struct{})
+	go func() {
+		defer close(monDone)
+		svc.Monitor.Start(ctx)
+	}()
+	workers = append(workers, monDone)
 
 	engine := router.New(cfg, svc,
 		authapi.New(svc, cfg.AdminPath),

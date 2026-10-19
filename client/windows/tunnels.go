@@ -253,7 +253,11 @@ func (a *App) StartTunnel(id uint) (State, error) {
 	}
 	a.emitTunnelLog(t.Name, "正在拉取配置并启动 frpc…")
 	if err := a.startTunnelProcess(ctx, t); err != nil {
-		a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
+		// 只有真正的进程启动失败才计入退避。配置拉取/写盘失败是服务端或
+		// 磁盘的瞬时问题：计入退避会让服务恢复后仍要干等 30 秒到 5 分钟。
+		if !isConfigStage(err) {
+			a.noteStartFailure(id, t.Name, "启动失败："+err.Error())
+		}
 		return a.GetState(), describeManualErr(err)
 	}
 	// 退避由 startTunnelProcess → writeAndStart 在**启动之前**清掉。

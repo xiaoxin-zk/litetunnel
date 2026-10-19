@@ -282,11 +282,13 @@ jobs:
 
             ```bash
             docker login ghcr.io -u <你的用户名> -p <带 read:packages 权限的 PAT>
-            unzip litetunnel-deploy.zip && cd bundle
+            # 压缩包的根就是部署包本身（.env.example / README.md / deploy/），
+            # 没有额外的 bundle 目录。
+            unzip -d litetunnel-deploy litetunnel-deploy.zip && cd litetunnel-deploy
             cp .env.example .env && vi .env          # 填写域名与各项密钥
             bash deploy/scripts/render.sh            # 渲染 frps.toml 与 Caddyfile
-            docker compose -f deploy/docker-compose.yml pull
-            docker compose -f deploy/docker-compose.yml up -d
+            docker compose --env-file .env -f deploy/docker-compose.yml pull
+            docker compose --env-file .env -f deploy/docker-compose.yml up -d
             ```
           files: |
             assets/LiteTunnel-windows-amd64.zip

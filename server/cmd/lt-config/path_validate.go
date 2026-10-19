@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -40,15 +39,18 @@ func validateManagedPaths(p paths) error {
 		}
 		canonical[key] = item.name
 
-		if real, err := filepath.EvalSymlinks(path); err == nil {
-			realKey := strings.ToLower(filepath.Clean(real))
-			if prev, ok := canonical[realKey]; ok && prev != item.name {
-				return fmt.Errorf("%s 与 %s 通过符号链接指向同一文件：%s", item.name, prev, real)
-			}
-			canonical[realKey] = item.name
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("无法解析 %s 输出路径 %s：%w", item.name, path, err)
+		// 解析真实路径。目标不存在时也要解析**父目录**：一个指向部署目录
+		// 之外的父目录符号链接，会让 CreateTemp/写入跟随到那个目录去，
+		// 而字面路径看起来完全正常。
+		real, err := resolveManagedPath(path)
+		if err != nil {
+			return fmt.Errorf("无法解析 %s 输出路径 %s 的真实位置：%w", item.name, path, err)
 		}
+		realKey := strings.ToLower(real)
+		if prev, ok := canonical[realKey]; ok && prev != item.name {
+			return fmt.Errorf("%s 与 %s 指向同一文件（真实路径 %s）", item.name, prev, real)
+		}
+		canonical[realKey] = item.name
 	}
 	return nil
 }

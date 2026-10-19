@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -26,6 +27,13 @@ func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		// 目录不存在是正常的（还没建过隧道）。
+		if os.IsNotExist(err) {
+			return
+		}
+		// 其它失败（权限、磁盘、被占用）不能静默：那个目录里是含接入密钥
+		// 的 frpc.toml，读不到就意味着该清的配置清不掉，而用户看不到任何
+		// 提示。记进同步错误，界面上至少有一个可追的线索。
+		a.setSyncErr(fmt.Errorf("无法读取本地配置文件目录（%s），已删除隧道的配置可能残留：%w", dir, err))
 		return
 	}
 

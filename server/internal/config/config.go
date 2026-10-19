@@ -450,6 +450,28 @@ func (c *Config) validate() error {
 	if c.PortRangeStart < 1024 {
 		return errors.New("端口池起始端口不得低于 1024（禁止占用特权端口）")
 	}
+	// 逐个确认「最终值」落在合法区间，而不只是环境变量能被 Atoi 解析。
+	// 这两个来源不同：struct 也可能被测试/嵌入方直接构造，绕过 Load。
+	for _, item := range []struct {
+		name string
+		val  int
+	}{
+		{"LT_GATEWAY_PORT", c.GatewayPort},
+		{"LT_VHOST_HTTPS_PORT", c.VhostHTTPSPort},
+		{"LT_PORT_RANGE_END", c.PortRangeEnd},
+	} {
+		if item.val < 1 || item.val > 65535 {
+			return fmt.Errorf("%s=%d 不在 1-65535 范围内", item.name, item.val)
+		}
+	}
+	if c.MaxPortsPerUser < 1 {
+		return fmt.Errorf("LT_MAX_PORTS_PER_USER=%d 必须大于 0", c.MaxPortsPerUser)
+	}
+	// 端口池上限必须低于内核临时端口段：与之重叠会让 frps 偶发绑定失败，
+	// 表现为随机的「隧道建不起来」。32768 是 Linux 默认的起始值。
+	if c.PortRangeEnd > 65535 {
+		return fmt.Errorf("LT_PORT_RANGE_END=%d 超过 65535", c.PortRangeEnd)
+	}
 
 	// 转发头信任范围必须显式收窄，否则客户端可伪造来源 IP 绕过限流与白名单。
 	for _, p := range c.TrustedProxies {

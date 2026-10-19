@@ -297,6 +297,12 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 				if errors.Is(err, errSyncDeadline) {
 					return false
 				}
+				// 配置准备失败（拉取/写盘）不进入进程退避：服务端或磁盘
+				// 恢复后应当立刻重试，而不是再等一轮 30 秒起的退避。
+				if isConfigStage(err) {
+					failSync(t, "准备配置失败："+err.Error())
+					return true
+				}
 				failStart(t, "启动失败："+err.Error())
 				return true
 			}
@@ -320,6 +326,10 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 			if err := a.writeAndStart(ctx, t, cfgText); err != nil {
 				if errors.Is(err, errSyncDeadline) {
 					return false
+				}
+				if isConfigStage(err) {
+					failSync(t, "准备配置失败："+err.Error())
+					return true
 				}
 				failStart(t, "重连失败："+err.Error())
 				return true

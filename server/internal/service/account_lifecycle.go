@@ -144,6 +144,16 @@ func recordPurgeIntentsTx(tx *gorm.DB, userID uint, incarnation string, ports []
 	// 失败留给 proxy_drain_retry.go 的后台 worker。Deleted=true 让 worker 知道
 	// 账号已不存在，走「按前缀 + 实例身份尽力关闭」那条路径。
 	now := time.Now()
+	// 围栏令牌必须在事务内生成：提交后的即时断流会先按它认领这条待办。
+	//
+	// 留空的话，deletedDrainFence 读不到凭据，即时断流会重新登记一次待办
+	// ——用新 fence、空 targets 覆盖掉事务里那份现场。虽然 incarnation 有
+	// CASE 保护，但「提交后就不该再改这一行」这个前提一旦破坏，后面任何
+	// 新增字段都会重演同一个覆盖问题。
+	fence, ferr := randomHex(16)
+	if ferr != nil {
+		return nil, fmt.Errorf("生成断流围栏令牌失败，已回滚本次删除: %w", ferr)
+	}
 	pending := model.ProxyDrainPending{
 		UserID:      userID,
 		Incarnation: incarnation,
@@ -151,6 +161,7 @@ func recordPurgeIntentsTx(tx *gorm.DB, userID uint, incarnation string, ports []
 		StatusGen:   0, // 删除路径没有状态代次可比（见 StatusGen 的说明）
 		NotAfter:    0, // 删除路径用 IntentAt 作时间水位
 		Deleted:     true,
+		Fence:       fence,
 		IntentAt:  now.Unix(),
 		// NextAt 兼作租约到期时间：登记时设成「现在就到期」，
 		// 后台 worker 下一轮就能领到它（提交后立即执行失败时）。

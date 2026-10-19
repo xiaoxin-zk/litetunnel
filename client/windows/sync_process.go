@@ -41,10 +41,10 @@ func (a *App) writeAndStart(ctx context.Context, t TunnelVO, cfgText string) err
 	}
 	path, err := frpcConfigPath(t.ID)
 	if err != nil {
-		return err
+		return asConfigStage(err)
 	}
 	if err := writeFrpcConfig(t.ID, cfgText); err != nil {
-		return err
+		return asConfigStage(err)
 	}
 	// 落盘之后、动任何运行态之前再核对一次：写文件本身也要花时间，
 	// 这中间的取消同样不该演变成「超时报错 + 进程起来了」。
@@ -150,16 +150,41 @@ func (a *App) setConfigRev(id uint, rev string) {
 //
 // ctx 是这次开关操作的整笔预算（见 manualOpTimeout）：请求失败或超时都要
 // 如实返回，界面据此提示，而不是让按钮一直转。
+// configStageError 标记「失败发生在准备阶段，而不是进程启动」。
+//
+// 两者的退避语义完全不同：frpc 反复起不来通常是自己配错了（端口冲突、
+// 本地服务没开），退避能减少无意义的日志与 CPU；而配置拉取失败、写盘失败
+// 是网络或磁盘的瞬时问题，服务端一恢复就该立刻重试。以前把它们混在一起，
+// 一次网络抖动就会让用户点「连接」后干等 30 秒到 5 分钟。
+type configStageError struct{ err error }
+
+func (e configStageError) Error() string { return e.err.Error() }
+func (e configStageError) Unwrap() error { return e.err }
+
+// asConfigStage 把错误标记为准备阶段失败（nil 安全）。
+func asConfigStage(err error) error {
+	if err == nil {
+		return nil
+	}
+	return configStageError{err: err}
+}
+
+// isConfigStage 判断错误是否来自「配置准备」而不是进程启动。
+func isConfigStage(err error) bool {
+	var e configStageError
+	return errors.As(err, &e)
+}
+
 func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 	if a.mgr.Running(t.ID) {
 		return nil
 	}
 	if !a.mgr.Available() {
-		return errors.New("未找到 frpc 可执行文件，请将 frpc.exe 放到程序同目录")
+		return asConfigStage(errors.New("未找到 frpc 可执行文件，请将 frpc.exe 放到程序同目录"))
 	}
 	base, apiKey, err := a.currentCredential()
 	if err != nil {
-		return err
+		return asConfigStage(err)
 	}
 	// 手动点连接一律重新拉取,不受摘要缓存影响。
 	//
@@ -169,10 +194,10 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 	// 没有任何异常。一次往返换一个「点了就是最新的」,这个代价值得。
 	cfgText, servedRev, err := a.fetchTunnelConfig(ctx, base, apiKey, t.ID)
 	if err != nil {
-		return err
+		return asConfigStage(err)
 	}
 	if cfgText == "" {
-		return errors.New("服务端未返回该隧道的配置")
+		return asConfigStage(errors.New("服务端未返回该隧道的配置"))
 	}
 	t.ConfigRev = servedRev
 	err = a.writeAndStart(ctx, t, cfgText)

@@ -237,7 +237,11 @@ func TestRecoverBatchKeepsSceneOnUnknownBackupStat(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if recoverBatch(dir) {
+	real, rerr := resolveManagedPath(target)
+	if rerr != nil {
+		t.Fatalf("解析受管路径失败: %v", rerr)
+	}
+	if recoverBatch(dir, map[string]bool{real: true}) {
 		t.Fatal("备份在不在判不出来时必须报告「还没确定」，否则调用方会按已落定删掉记录")
 	}
 	if _, err := os.Stat(manifestPath); err != nil {

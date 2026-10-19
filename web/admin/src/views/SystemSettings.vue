@@ -348,6 +348,19 @@
             />
           </el-form-item>
 
+          <el-form-item label="IP 黑名单">
+            <el-input
+              v-model="form['security.ip_blacklist']"
+              type="textarea"
+              :rows="5"
+              placeholder="每行一个 IP 或 CIDR，例如 203.0.113.7 或 10.0.0.0/8；# 开头为注释"
+            />
+            <span class="hint">
+              命中即拒绝所有接口（健康检查除外），保存后 30 秒内生效。
+              只封单个来源，不会把你自己的管理端一起关在门外——改之前确认当前 IP 不在名单里
+            </span>
+          </el-form-item>
+
           <el-divider content-position="left">审计日志</el-divider>
 
           <el-form-item label="操作日志保留天数">

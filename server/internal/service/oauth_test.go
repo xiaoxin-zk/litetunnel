@@ -94,6 +94,27 @@ func TestOAuthLoginRefusesToCreateAccount(t *testing.T) {
 	}
 }
 
+func TestOAuthLoginRejectsDisabledBoundAccount(t *testing.T) {
+	svc := newTestServices(t, nil)
+	u := makeOAuthUser(t, svc, "bounddisabled", "bound@example.com", true)
+	if err := svc.DB.Create(&model.AuthIdentity{
+		UserID: u.ID, Provider: OAuthProviderGitHub, ProviderUserID: "5005", Email: u.Email,
+	}).Error; err != nil {
+		t.Fatalf("写入绑定记录失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
+		Update("status", model.UserStatusDisabled).Error; err != nil {
+		t.Fatalf("禁用用户失败: %v", err)
+	}
+
+	if _, err := svc.OAuthLogin(OAuthProfile{
+		Provider: OAuthProviderGitHub, Subject: "5005",
+		Email: "bound@example.com", EmailVerified: true,
+	}); !errors.Is(err, ErrAccountDisabled) {
+		t.Fatalf("已绑定但被禁用的账号不能靠第三方登录绕回，实际 %v", err)
+	}
+}
+
 func TestOAuthLoginRejectsDisabledAccount(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := makeOAuthUser(t, svc, "disableduser", "off@example.com", true)

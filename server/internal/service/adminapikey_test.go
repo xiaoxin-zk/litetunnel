@@ -61,6 +61,34 @@ func TestAdminAPIKeyLifecycle(t *testing.T) {
 	}
 }
 
+func TestAdminAPIKeyDiesWithCreator(t *testing.T) {
+	svc := newTestServices(t, nil)
+	admin := mustAdmin(t, svc, "keyowner", "super")
+
+	plain, _, err := svc.CreateAdminAPIKey(admin.ID, AdminAPIKeyInput{Name: "监控"})
+	if err != nil {
+		t.Fatalf("创建 Key 失败: %v", err)
+	}
+	if _, _, _, ok := svc.ResolveAdminAPIKey(plain); !ok {
+		t.Fatal("创建者正常时 Key 应可用")
+	}
+
+	if err := svc.DB.Model(&model.Admin{}).Where("id = ?", admin.ID).
+		Update("status", "disabled").Error; err != nil {
+		t.Fatalf("停用管理员失败: %v", err)
+	}
+	if _, _, _, ok := svc.ResolveAdminAPIKey(plain); ok {
+		t.Fatal("创建者被停用后，遗留 Key 必须立刻失效")
+	}
+
+	if err := svc.DB.Delete(&model.Admin{}, admin.ID).Error; err != nil {
+		t.Fatalf("删除管理员失败: %v", err)
+	}
+	if _, _, _, ok := svc.ResolveAdminAPIKey(plain); ok {
+		t.Fatal("创建者被删除后，遗留 Key 必须立刻失效")
+	}
+}
+
 func TestAdminAPIKeyExpiry(t *testing.T) {
 	svc := newTestServices(t, nil)
 	admin := mustAdmin(t, svc, "keyexpire", "super")

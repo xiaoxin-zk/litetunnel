@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,6 +131,11 @@ type Services struct {
 
 	updateMu    sync.Mutex
 	updateCache *UpdateStatus
+
+	blockMu    sync.Mutex
+	blockRaw   string
+	blockCache []netip.Prefix
+	blockAt    time.Time
 }
 
 const portLockShards = 64

@@ -252,7 +252,15 @@ func (s *Services) OAuthLogin(p OAuthProfile) (*model.User, error) {
 	var ident model.AuthIdentity
 	err := s.DB.Where("provider = ? AND provider_user_id = ?", p.Provider, p.Subject).First(&ident).Error
 	if err == nil {
-		return s.LoadUser(ident.UserID)
+		// 已绑定的账号也必须重新校验状态：被禁用/删除后不能靠第三方登录绕过去。
+		u, err := s.LoadUser(ident.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if u.Status != model.UserStatusActive {
+			return nil, ErrAccountDisabled
+		}
+		return u, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err

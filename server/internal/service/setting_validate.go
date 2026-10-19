@@ -137,6 +137,14 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 备份保留份数需为 1-60 的整数", ErrInvalidParam)
 	}
 
+	if _, invalid := ParseBlocklist(view(KeyIPBlacklist)); len(invalid) > 0 {
+		if len(invalid) > 5 {
+			invalid = invalid[:5]
+		}
+		return fmt.Errorf("%w: IP 黑名单里有无法识别的条目：%s（每行一个 IP 或 CIDR）",
+			ErrInvalidParam, strings.Join(invalid, "、"))
+	}
+
 	if h := strings.TrimSpace(view(KeyGatewayHost)); h != "" {
 		if strings.ContainsAny(h, " \t\r\n/\\:@") {
 			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)

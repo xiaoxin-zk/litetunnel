@@ -37,6 +37,7 @@ const (
 
 	KeyAuditRetentionDays SettingKey = "audit.retention_days"
 	KeyStepUpEnabled      SettingKey = "security.step_up_enabled"
+	KeyIPBlacklist        SettingKey = "security.ip_blacklist"
 	KeyBackupAuto         SettingKey = "backup.auto_enabled"
 	KeyBackupRetention    SettingKey = "backup.retention"
 
@@ -140,6 +141,7 @@ var settingSpecs = []settingSpec{
 
 	{Key: KeyAuditRetentionDays, Default: func(*config.Config) string { return "180" }},
 	{Key: KeyStepUpEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyIPBlacklist, Default: func(*config.Config) string { return "" }},
 	{Key: KeyBackupAuto, Default: func(*config.Config) string { return "true" }},
 	{Key: KeyBackupRetention, SingleLine: true, Default: func(*config.Config) string { return "7" }},
 

@@ -35,6 +35,8 @@ func New(
 		"POST /api/admin/client-packages": service.MaxClientPackageSize + middleware.MultipartOverheadBytes,
 	}))
 	r.Use(middleware.CORSDevOnly(cfg.IsProd()))
+	// 黑名单在鉴权之前生效：被封 IP 连登录接口都进不来。
+	r.Use(middleware.BlockIPs(svc.BlockedPrefixes))
 
 	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		panic(fmt.Sprintf("设置可信代理失败（会导致任意客户端伪造来源 IP）: %v", err))

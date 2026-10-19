@@ -124,6 +124,17 @@ func (s *Services) ResolveAdminAPIKey(plain string) (uint, string, string, bool)
 	if row.Scope != AdminKeyScopeRead {
 		return 0, "", "", false
 	}
+	// 创建者被停用或删除后，Key 必须一起失效：否则删掉管理员仍留着后门。
+	var creator model.Admin
+	if err := s.DB.Select("id", "role", "status").First(&creator, row.CreatedBy).Error; err != nil {
+		return 0, "", "", false
+	}
+	if creator.Status != "" && creator.Status != "active" {
+		return 0, "", "", false
+	}
+	if creator.Role != "super" && creator.Role != "operator" {
+		return 0, "", "", false
+	}
 	now := time.Now()
 	if err := s.DB.Model(&model.AdminAPIKey{}).Where("id = ?", row.ID).
 		Update("last_used_at", now).Error; err != nil {

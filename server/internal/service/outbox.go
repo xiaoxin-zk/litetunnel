@@ -248,6 +248,13 @@ func (s *Services) executePortIntentsAfterCommit(intents []portIntent) (pending 
 			s.dropPending(it.port, it.gen)
 			continue
 		}
+		if errors.Is(err, ErrFirewallStateUnknown) {
+			// 待办已经持久化，但数据库状态暂时读不出来；不能 drop，
+			// 否则本轮“未执行”的意图会从 outbox 消失，重启后也无法补偿。
+			pending++
+			warnings = append(warnings, fmt.Sprintf("端口 %d/%s 当前状态未知，已保留待重试", it.port, it.proto))
+			continue
+		}
 
 		pending++
 		msg := fmt.Sprintf("端口 %d/%s %s失败，已进入重试队列：%v",

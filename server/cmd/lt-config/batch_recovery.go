@@ -75,26 +75,30 @@ func recoverBatch(dir string) bool {
 		// 这里**必须**只清理、不回滚：回滚会把一份正在运行的配置撤回，
 		// 而它在磁盘上、容器里都已经是对的。
 		log.Printf("[lt-config] 发现已提交的批次记录（%d 个文件），清理残留备份", len(m.Files))
-		ok := true
+		// committed 记录必须最后删除：只要任一备份或临时文件还删不掉，
+		// 就保留记录，让下次启动继续按「已生效、只清理」处理。若先删记录，
+		// 残留的旧备份会落入普通遗留清理路径，可能把已经生效的新配置撤回。
 		for _, f := range m.Files {
 			if err := os.Remove(f.Path + backupSuffix); err != nil && !os.IsNotExist(err) {
 				log.Printf("[lt-config] 清理批次备份失败（%s）: %v", f.Path, err)
-				ok = false
+				return false
 			}
 			if f.Tmp != "" {
-				_ = os.Remove(f.Tmp)
+				if err := os.Remove(f.Tmp); err != nil && !os.IsNotExist(err) {
+					log.Printf("[lt-config] 清理批次临时文件失败（%s）: %v", f.Tmp, err)
+					return false
+				}
 			}
+		}
+		if err := os.Remove(path + backupSuffix); err != nil && !os.IsNotExist(err) {
+			log.Printf("[lt-config] 删除批次记录备份失败（%s）: %v", path+backupSuffix, err)
+			return false
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			log.Printf("[lt-config] 删除批次记录失败（%s）: %v", path, err)
-			ok = false
+			return false
 		}
-		if err := os.Remove(path + backupSuffix); err != nil && !os.IsNotExist(err) {
-			ok = false
-		}
-		// 清理没做干净时保留记录，下次启动继续收拾；但备份已经没用了，
-		// 留着也只是占空间。
-		return ok
+		return true
 	}
 
 	log.Printf("[lt-config] 发现未完成的批次提交（%d 个文件），按批次整体回滚", len(m.Files))
@@ -291,7 +295,11 @@ func cleanupLeftovers(p paths) []string {
 		// 删掉，磁盘从此停在新旧混合状态，再无自动修复的机会。
 		if !recoverBatch(dir) {
 			log.Printf("[lt-config] %s 的批次回滚未完成，跳过本次残留清理", dir)
-			blockDir(dir)
+			// manifest 可能引用多个目录。首目录恢复失败时，所有关联目录
+			// 都必须阻断，不能让后续遍历把同批次的备份当普通遗留文件删掉。
+			for _, related := range relatedBatchDirs(dir) {
+				blockDir(related)
+			}
 			continue
 		}
 

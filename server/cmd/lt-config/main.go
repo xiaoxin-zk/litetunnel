@@ -237,6 +237,10 @@ func validateConfig(addr, token string, p paths) error {
 		return fmt.Errorf("拒绝监听 %s：只允许回环地址", addr)
 	}
 
+	if err := validateManagedPaths(p); err != nil {
+		return err
+	}
+
 	// 三态判定（见 statcheck.go）：Stat 失败可能是「没这个文件」，也可能是
 	// 「读不了」。后者报成「缺少必需文件」会让管理员去补一个其实还在的文件，
 	// 而真正要修的是权限或挂载。启动阶段的错误信息是唯一线索，不能含糊。

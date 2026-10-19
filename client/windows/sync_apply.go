@@ -134,6 +134,9 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		a.calibrateRegistered(t.ID, t.Online)
 
 		if t.Status != tunnelStatusActive {
+			// 停用是服务端的明确指令：即使当前没有进程，也必须清掉
+			// 旧的失败退避，否则重新启用后可能继续等待上一次失败的五分钟。
+			a.clearRetry(t.ID)
 			if a.mgr.Running(t.ID) {
 				if err := a.stopTunnelProcess(t); err != nil {
 					return changed, err

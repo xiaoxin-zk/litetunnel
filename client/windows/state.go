@@ -253,7 +253,19 @@ func (a *App) calibrateRegistered(id uint, serverOnline bool) {
 		return
 	}
 
-	a.setTunnelRegistered(id, false)
+	// 只有这次校准读取到的注册时间仍然是当前时间戳时才清除。
+	// 等待宽限期期间若新进程重新注册，registeredAt 已被更新，旧校准不能
+	// 把新进程的在线状态抹掉。
+	a.mu.Lock()
+	stillSame := a.registered[id] && a.registeredAt[id] == at
+	if stillSame {
+		delete(a.registered, id)
+		delete(a.registeredAt, id)
+	}
+	a.mu.Unlock()
+	if !stillSame {
+		return
+	}
 	// 从这里开始重新计时：frpc 进程还在，正在自己重连。没有起点的话，
 	// 界面只会显示「连接中」，用户分不清是刚掉线还是已经卡了很久。
 	a.markReconnectStart(id)

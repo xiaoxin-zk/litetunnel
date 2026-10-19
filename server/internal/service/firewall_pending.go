@@ -250,7 +250,7 @@ func (s *Services) applyPortIntentLocked(port int, proto string, open bool) (act
 			return false, perr
 		}
 		log.Printf("[firewall] 无法确认端口 %d 的当前状态，本次不动手、已加入重试队列: %v", port, verr)
-		return false, nil
+		return false, ErrFirewallStateUnknown
 	}
 	if !valid {
 		log.Printf("[firewall] 端口 %d 的意图已过时（当前状态与%s不符），本次跳过", port, actionName(open))

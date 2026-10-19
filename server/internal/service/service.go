@@ -96,6 +96,10 @@ var (
 	// 与 ErrFirewallQueueFull 必须分开：后者是「队列满了，需要人工清理」，
 	// 前者是「数据库故障，需要查库」——把两者都报成队列满会让管理员找错方向。
 	ErrFirewallQueueUnavailable = errors.New("防火墙待办队列不可用（数据库故障），端口操作无法持久化重试")
+	// ErrFirewallStateUnknown 表示待办已持久化，但当前数据库状态无法确认。
+	// 它不能被当成成功，否则 outbox 会删除刚写入的待办；也不能当成队列
+	// 不可用，否则会误报需要人工处理。调用方应保留待办，交给后台重试。
+	ErrFirewallStateUnknown = errors.New("防火墙目标状态未知，意图已保留待重试")
 
 	// 邮箱验证码相关
 	ErrEmailRequired     = errors.New("请填写有效的邮箱地址")

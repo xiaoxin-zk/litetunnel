@@ -58,6 +58,10 @@ func (m *Manager) LogEntries() []LogEntry {
 func (m *Manager) ClearLogs() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 历史、重复合并状态和待投递队列必须同一把锁下清空：只清 logs 的话，
+	// 已在途的旧批次会在下一次 dispatch 时重新落进新账号/新页面。
+	m.pending = nil
+	m.pendingDropped = 0
 	m.logs = nil
 	m.logBytes = 0
 	// 重复行合并状态也要清：留着的话，清空后的第一条日志如果恰好与

@@ -155,6 +155,9 @@ func (s *service) renderAndApply(ctx context.Context, req tlscfg.RenderRequest) 
 	// unless-stopped）。校验阶段把它们改掉，之后宿主机或容器只要重启一次，
 	// 这份「还没应用」的新配置就会真的生效——而面板侧记录的状态仍是上一份，
 	// 两边对不上，也没有任何地方会提示。
+	if req.Apply && !req.WriteEnv {
+		return res, errors.New("Apply=true 必须同时 WriteEnv=true：否则模板文件与容器读取的 .env 会不一致")
+	}
 	if !req.Apply {
 		res.Changed = pendingChanges(writes)
 		res.Message = "配置已生成并通过校验（未写入、未应用）"

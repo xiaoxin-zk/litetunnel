@@ -559,9 +559,28 @@ function buildPayload() {
 async function load() {
   loading.value = true
   try {
-    const [settings, st] = await Promise.all([settingsApi.get(), domainApi.status()])
-    applySettings(settings)
-    status.value = st || {}
+    const [settingsResult, statusResult] = await Promise.allSettled([
+      settingsApi.get(),
+      domainApi.status()
+    ])
+    if (settingsResult.status === 'fulfilled') {
+      applySettings(settingsResult.value)
+    } else {
+      ElMessage.error(settingsResult.reason?.message || '配置加载失败')
+    }
+    if (statusResult.status === 'fulfilled') {
+      status.value = statusResult.value || { helper_configured: false, helper_reason: '配置服务状态未知' }
+    } else {
+      // 请求失败时不能继续保留旧的「可用」状态，否则用户会在健康状态未知
+      // 时继续点击保存，得到一个与实际环境不符的结论。
+      status.value = {
+        ...(status.value || {}),
+        helper: { ...(status.value?.helper || {}), available: false },
+        helper_configured: false,
+        helper_reason: statusResult.reason?.message || '配置服务状态获取失败'
+      }
+      ElMessage.warning(status.value.helper_reason)
+    }
   } finally {
     loading.value = false
   }

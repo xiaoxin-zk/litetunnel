@@ -78,6 +78,17 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		return ErrMailDisabled
 	}
 
+	// 注册与换绑：域名准入提前到**发码这一步**。
+	//
+	// 只在 Register 里判断的话，用户要走完「填邮箱 → 收验证码 → 填密码」才被
+	// 告知域名不允许，体验上就像限制没有生效。找回密码不查域名——那条路径对
+	// 任何域名都必须给出同样的结果，否则会变成账号枚举工具。
+	if scene == EmailSceneRegister || scene == EmailSceneChange {
+		if err := s.checkEmailDomainAdmission(email); err != nil {
+			return err
+		}
+	}
+
 	// 找回场景只认「已验证」的邮箱：未验证的地址从来没证明过归属，
 	// 不能当作恢复凭据（见 ForgotPassword 的同一条规则）。
 	// 用 lower() 比较：老库里可能存着大小写混写的地址。

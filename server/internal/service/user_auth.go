@@ -66,19 +66,19 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, ErrEmailRequired
 	}
 
-	// 4. 邮箱域名黑名单：拦住一次性邮箱批量注册
-	if in.Email != "" && s.emailDomainBlocked(in.Email) {
-		return nil, ErrEmailNotAllowed
+	// 4. 邮箱域名准入：黑名单拦住一次性邮箱，白名单模式下非白名单域名一律拒绝。
+	//
+	// 走 checkEmailDomainAdmission 而不是在这里各写一段：发验证码那一步要用
+	// 同一套判断（见 sendEmailCode），两处各写一份迟早会分叉。
+	if err := s.checkEmailDomainAdmission(in.Email); err != nil {
+		return nil, err
 	}
 
-	domain := emailDomain(in.Email)
-	trusted := s.isTrustedEmailDomain(domain)
-	// 5. 白名单模式：开启后非白名单域名一律拒绝
-	if s.Settings.Bool(KeyRegisterWhitelistOnly) && !trusted {
-		return nil, ErrDomainNotTrusted
-	}
+	// 限额与额度键统一按公共后缀主域归一：否则换个子域就能绕过「每域名每日上限」。
+	domain := RegistrationDomainKey(in.Email)
+	trusted := s.isTrustedEmailDomain(emailDomain(in.Email))
 
-	// 6. 频率限制。白名单域名可选择跳过：企业自有域名下员工批量注册属正常行为。
+	// 5. 频率限制。白名单域名可选择跳过：企业自有域名下员工批量注册属正常行为。
 	skipLimits := trusted && s.Settings.Bool(KeyRegisterTrustedSkipLimits)
 	if !skipLimits {
 		// 单 IP 每日上限：拦住同一台机器批量注册
@@ -264,6 +264,7 @@ func (s *Services) prepareNewUser(username, email, password, ip string, emailVer
 	now := time.Now()
 
 	group := s.defaultGroup()
+	// EmailDomain 存主域而不是完整域名：每日限额按公共后缀归一，子域不能各算一份。
 	user := &model.User{
 		Username:        username,
 		Email:           email,
@@ -276,7 +277,7 @@ func (s *Services) prepareNewUser(username, email, password, ip string, emailVer
 		APIKeyEnc:       apiEnc,
 		APIKeyCreatedAt: &now,
 		RegisterIP:      truncate(ip, 64),
-		EmailDomain:     truncate(emailDomain(email), 128),
+		EmailDomain:     truncate(RegistrationDomainKey(email), 128),
 		EmailVerified:   emailVerified,
 	}
 	if group != nil {
@@ -317,32 +318,6 @@ func isUniqueConflict(err error) bool {
 	return strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate key")
 }
 
-// emailDomainBlocked 判断邮箱域名是否命中黑名单。
-//
-// 支持两种写法：`example.com` 同时匹配 example.com 与其子域，
-// 也容忍误写的 `@example.com`。
-func (s *Services) emailDomainBlocked(email string) bool {
-	raw := strings.TrimSpace(s.Settings.Get(KeyRegisterBlockDomains))
-	if raw == "" {
-		return false
-	}
-	at := strings.LastIndex(email, "@")
-	if at < 0 || at == len(email)-1 {
-		return false
-	}
-	domain := strings.ToLower(email[at+1:])
-	for _, d := range strings.Split(raw, ",") {
-		d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(d), "@")))
-		if d == "" {
-			continue
-		}
-		if domain == d || strings.HasSuffix(domain, "."+d) {
-			return true
-		}
-	}
-	return false
-}
-
 // emailDomain 从邮箱中取出小写域名，取不到时返回空串。
 func emailDomain(email string) string {
 	email = strings.TrimSpace(email)
@@ -351,14 +326,6 @@ func emailDomain(email string) string {
 		return ""
 	}
 	return strings.ToLower(email[at+1:])
-}
-
-// isTrustedEmailDomain 判断邮箱域名是否命中白名单。
-func (s *Services) isTrustedEmailDomain(domain string) bool {
-	if domain == "" {
-		return false
-	}
-	return DomainInList(domain, ParseDomainList(s.Settings.Get(KeyRegisterAllowDomains)))
 }
 
 // checkDomainRate 限制单个邮箱域名在自然日内的注册数量。

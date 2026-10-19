@@ -41,40 +41,9 @@ func ParsePortList(s string) map[int]bool {
 	return out
 }
 
-// ParseDomainList 解析逗号分隔的域名列表，统一转小写并去掉 @ 前缀。
-//
-// 与 ParsePortList 一样采取宽容策略：忽略空项与格式明显错误的项，
-// 不让一个笔误导致整份配置无法保存。
-func ParseDomainList(s string) map[string]bool {
-	out := make(map[string]bool)
-	for _, part := range strings.Split(s, ",") {
-		part = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(part), "@")))
-		if part == "" || strings.ContainsAny(part, " \t\r\n/\\") {
-			continue
-		}
-		// 只接受形如 a.b 的域名，避免把 IP 或路径写进来。
-		if !strings.Contains(part, ".") {
-			continue
-		}
-		out[part] = true
-	}
-	return out
-}
-
-// DomainInList 判断邮箱域名是否命中列表（含子域）。
-func DomainInList(domain string, list map[string]bool) bool {
-	if domain == "" || len(list) == 0 {
-		return false
-	}
-	domain = strings.ToLower(domain)
-	for d := range list {
-		if domain == d || strings.HasSuffix(domain, "."+d) {
-			return true
-		}
-	}
-	return false
-}
-
+// 域名列表的解析与匹配已收敛到 registration_email_policy.go：
+// 原来的 ParseDomainList/DomainInList 采用「解析不了就丢掉」的宽容策略，
+// 与黑名单自己那一套剥 @ 的逻辑并存，同一个域名在两处会按不同规则解释。
 func boolStr(b bool) string {
 	if b {
 		return "true"

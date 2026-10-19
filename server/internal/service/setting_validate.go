@@ -113,14 +113,28 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 单域名每日注册上限需为 0-1000 的整数", ErrInvalidParam)
 	}
 
-	allowDomains := ParseDomainList(view(KeyRegisterAllowDomains))
-	blockDomains := ParseDomainList(view(KeyRegisterBlockDomains))
-	for d := range allowDomains {
-		if blockDomains[d] {
-			return fmt.Errorf("%w: 域名 %s 同时出现在白名单与黑名单中，行为不可预期", ErrInvalidParam, d)
+	// 域名列表在保存时就逐项校验：旧实现是「能解析的留下、解析不了的丢掉」，
+	// 少打一个字符的结果是配置看着保存成功、实际永远不生效。
+	allowRules, badAllow := ParseEmailDomainRules(view(KeyRegisterAllowDomains))
+	blockRules, badBlock := ParseEmailDomainRules(view(KeyRegisterBlockDomains))
+	if len(badAllow) > 0 {
+		return fmt.Errorf("%w: 白名单里这些项无法识别：%s（可写 @qq.com、qq.com 或 *.edu.cn）",
+			ErrInvalidParam, strings.Join(badAllow, "、"))
+	}
+	if len(badBlock) > 0 {
+		return fmt.Errorf("%w: 黑名单里这些项无法识别：%s（可写 @qq.com、qq.com 或 *.edu.cn）",
+			ErrInvalidParam, strings.Join(badBlock, "、"))
+	}
+	for _, a := range allowRules {
+		for _, b := range blockRules {
+			// 只拦写法完全相同的项：@qq.com 与 *.qq.com 是有意组合
+			// （允许本域、只拦子域），不该被这条规则判成冲突。
+			if a.String() == b.String() {
+				return fmt.Errorf("%w: %s 同时出现在白名单与黑名单中，行为不可预期", ErrInvalidParam, a.String())
+			}
 		}
 	}
-	if truthy(KeyRegisterWhitelistOnly) && len(allowDomains) == 0 {
+	if truthy(KeyRegisterWhitelistOnly) && len(allowRules) == 0 {
 		return fmt.Errorf("%w: 选择「仅允许白名单域名注册」时必须先填写白名单", ErrInvalidParam)
 	}
 

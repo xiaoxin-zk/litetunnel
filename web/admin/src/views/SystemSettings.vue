@@ -70,9 +70,11 @@
               v-model="form['register.blocked_email_domains']"
               type="textarea"
               :rows="2"
-              placeholder="逗号分隔，如 tempmail.com, mailinator.com"
+              placeholder="逗号分隔，如 @tempmail.com, mailinator.com"
             />
-            <span class="hint">命中域名及其子域将被直接拒绝，优先级最高</span>
+            <span class="hint">
+              命中域名及其子域将被直接拒绝，优先级最高；发验证码时就会提示，不用等到提交注册
+            </span>
           </el-form-item>
 
           <el-divider content-position="left">邮箱域名白名单</el-divider>
@@ -82,15 +84,19 @@
               v-model="form['register.allowed_email_domains']"
               type="textarea"
               :rows="2"
-              placeholder="逗号分隔，如 company.com, partner.cn"
+              placeholder="@qq.com, @163.com, company.com, *.edu.cn"
             />
             <span class="hint">
-              典型用法：企业自有域名列入白名单供员工自由注册；其余公共邮箱仍可注册但受下方限制
+              写 <code>@qq.com</code> 或 <code>qq.com</code> 都等价，均包含其子域；
+              <code>*.edu.cn</code> 只匹配子域、不含 edu.cn 本身。典型用法：企业自有域名列入白名单
+              供员工自由注册；其余公共邮箱仍可注册但受下方限制。填错会被拒绝保存，不会静默失效
             </span>
           </el-form-item>
           <el-form-item label="仅白名单可注册">
             <el-switch v-model="boolForm['register.whitelist_only']" />
-            <span class="hint">开启后非白名单邮箱一律无法注册（填写白名单后才可开启）</span>
+            <span class="hint">
+              开启后非白名单邮箱一律无法注册（填写白名单后才可开启）；发验证码时即拦截
+            </span>
           </el-form-item>
           <el-form-item label="单域名每日上限">
             <el-input-number v-model="numForm['register.max_per_domain_per_day']" :min="0" :max="1000" />

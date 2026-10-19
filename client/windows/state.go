@@ -118,8 +118,15 @@ func (a *App) recordTunnelErr(id uint, line string) bool {
 
 // setTunnelRegistered 标记某条隧道的代理是否已注册成功。
 func (a *App) setTunnelRegistered(id uint, up bool) {
+	a.setTunnelRegisteredGen(id, 0, up)
+}
+
+func (a *App) setTunnelRegisteredGen(id uint, gen uint64, up bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
 	if a.registered == nil {
 		a.registered = map[uint]bool{}
 	}
@@ -191,6 +198,15 @@ func (a *App) markStartGeneration(id uint) {
 		a.startGen = map[uint]uint64{}
 	}
 	a.startGen[id] = a.authGeneration
+}
+
+// managerGenerationCurrentLocked 必须在 a.mu 内调用。
+// 它把 Manager 的代次校验前移到状态写入的同一临界区。
+func (a *App) managerGenerationCurrentLocked(id uint, gen uint64) bool {
+	if gen == 0 || a.mgr == nil {
+		return gen == 0
+	}
+	return a.mgr.Current(id, gen)
 }
 
 // startGeneration 返回这条隧道记录的启动代次，以及它是否属于当前账号。
@@ -303,12 +319,19 @@ func (a *App) emitStateThrottled(id uint) {
 // 进程起不来）：那些失败同样让这条隧道连不上，只写进日志的话，
 // 界面上的隧道行仍然什么原因都不显示。
 func (a *App) recordTunnelErrMsg(id uint, msg string) bool {
+	return a.recordTunnelErrMsgGen(id, 0, msg)
+}
+
+func (a *App) recordTunnelErrMsgGen(id uint, gen uint64, msg string) bool {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return false
+	}
 	if a.tunnelErrs == nil {
 		a.tunnelErrs = map[uint]tunnelErr{}
 	}
@@ -323,8 +346,15 @@ func (a *App) recordTunnelErrMsg(id uint, msg string) bool {
 // 连上之后必须清：否则界面会一直挂着一次已经过去的失败，
 // 用户会以为现在还是坏的。
 func (a *App) clearTunnelErr(id uint) {
+	a.clearTunnelErrGen(id, 0)
+}
+
+func (a *App) clearTunnelErrGen(id uint, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
 	delete(a.tunnelErrs, id)
 }
 

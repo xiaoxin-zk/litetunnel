@@ -245,8 +245,15 @@ func (a *App) noteStartFailure(id uint, name, reason string) {
 
 // clearRetry 清掉一条隧道的退避状态。
 func (a *App) clearRetry(id uint) {
+	a.clearRetryGen(id, 0)
+}
+
+func (a *App) clearRetryGen(id uint, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
 	delete(a.retries, id)
 }
 

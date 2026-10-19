@@ -1,10 +1,15 @@
 package service
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
 )
+
+func svgDataURL(body string) string {
+	return siteSVGPrefix + base64.StdEncoding.EncodeToString([]byte(body))
+}
 
 func TestSiteLogoValidation(t *testing.T) {
 	svc := newTestServices(t, nil)
@@ -17,9 +22,20 @@ func TestSiteLogoValidation(t *testing.T) {
 		{"png data URL", "data:image/png;base64,iVBORw0KGgo=", true},
 		{"webp data URL", "data:image/webp;base64,UklGRg==", true},
 		{"外链", "https://cdn.example.com/logo.png", false},
-		{"svg", "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", false},
+		{
+			"svg 静态图",
+			svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>`),
+			true,
+		},
+		{"svg 内联脚本", svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`), false},
+		{"svg 事件属性", svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>`), false},
+		{"svg foreignObject", svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><body/></foreignObject></svg>`), false},
+		{"svg 外链引用", svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg"><image href="https://evil.example/x.png"/></svg>`), false},
+		{"svg 实体声明", svgDataURL(`<!DOCTYPE svg [<!ENTITY x "y">]><svg>&x;</svg>`), false},
+		{"svg 非法 base64", siteSVGPrefix + "!!!not-base64!!!", false},
 		{"非图片", "data:text/html;base64,PGI+", false},
 		{"超限", "data:image/png;base64," + strings.Repeat("A", siteLogoDataURLMax), false},
+		{"svg 超限", svgDataURL(strings.Repeat("<svg></svg>", siteSVGSourceMax/11+10)), false},
 	}
 	for _, c := range cases {
 		err := svc.UpdateSettings(map[SettingKey]string{KeySiteLogo: c.logo})

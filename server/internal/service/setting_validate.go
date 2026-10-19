@@ -1,8 +1,10 @@
 package service
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -171,6 +173,8 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 
 const (
 	siteLogoDataURLMax = 360000 // 约 256KB 图片（base64 后膨胀 4/3）
+	siteSVGSourceMax   = 100 * 1024
+	siteSVGDataURLMax  = 140000
 	siteSubtitleMax    = 120
 	siteHomeContentMax = 20000
 )
@@ -182,10 +186,55 @@ var siteLogoPrefixes = []string{
 	"data:image/gif;base64,",
 }
 
+const siteSVGPrefix = "data:image/svg+xml;base64,"
+
+// SVG 只做静态图片使用，因此把能执行代码或引用外部资源的写法整类拒掉，
+// 而不是依赖前端永远只用 <img> 渲染这一条约定。
+var (
+	svgBlockedTokens = []string{
+		"<script", "<foreignobject", "<!entity", "<!doctype", "javascript:",
+		"url(http", "url(//", "url('http", "url(\"http",
+	}
+	svgEventHandler = regexp.MustCompile(`(?i)\son[a-z]+\s*=`)
+	svgExternalRef  = regexp.MustCompile(`(?i)(xlink:href|href)\s*=\s*["']\s*(https?:)?//`)
+)
+
+func validateSVGLogo(logo string) error {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(logo, siteSVGPrefix))
+	if err != nil {
+		return fmt.Errorf("%w: SVG 内容不是合法的 base64", ErrInvalidParam)
+	}
+	if len(raw) > siteSVGSourceMax {
+		return fmt.Errorf("%w: SVG 体积超限，压缩到 100KB 以内再上传", ErrInvalidParam)
+	}
+	low := strings.ToLower(string(raw))
+	for _, tok := range svgBlockedTokens {
+		if strings.Contains(low, tok) {
+			return fmt.Errorf("%w: SVG 里含有不允许的内容（%s），请导出为 png 后上传", ErrInvalidParam, tok)
+		}
+	}
+	if svgEventHandler.MatchString(low) {
+		return fmt.Errorf("%w: SVG 里含有事件属性（on*=），请导出为 png 后上传", ErrInvalidParam)
+	}
+	if svgExternalRef.MatchString(low) {
+		return fmt.Errorf("%w: SVG 不得引用外部资源", ErrInvalidParam)
+	}
+	return nil
+}
+
 // validateSiteBrand 校验站点品牌字段。Logo 直接以 data URL 存设置表，
 // 不依赖对象存储，因此必须限制类型与体积，避免把设置行写爆。
 func validateSiteBrand(view func(SettingKey) string) error {
 	if logo := strings.TrimSpace(view(KeySiteLogo)); logo != "" {
+		if strings.HasPrefix(logo, siteSVGPrefix) {
+			if len(logo) > siteSVGDataURLMax {
+				return fmt.Errorf("%w: SVG 体积超限，压缩到 100KB 以内再上传", ErrInvalidParam)
+			}
+			if err := validateSVGLogo(logo); err != nil {
+				return err
+			}
+			return validateSiteBrandRest(view)
+		}
 		ok := false
 		for _, p := range siteLogoPrefixes {
 			if strings.HasPrefix(logo, p) {
@@ -194,13 +243,17 @@ func validateSiteBrand(view func(SettingKey) string) error {
 			}
 		}
 		if !ok {
-			return fmt.Errorf("%w: 站点 Logo 只支持 png/jpeg/webp/gif 的 data URL（形如 data:image/png;base64,...），"+
-				"不接受外链与 SVG（SVG 可携带脚本）", ErrInvalidParam)
+			return fmt.Errorf("%w: 站点 Logo 只支持 png/jpeg/webp/gif/svg 的 data URL（形如 data:image/png;base64,...），"+
+				"不接受外链", ErrInvalidParam)
 		}
 		if len(logo) > siteLogoDataURLMax {
 			return fmt.Errorf("%w: 站点 Logo 体积超限，压缩到 256KB 以内再上传", ErrInvalidParam)
 		}
 	}
+	return validateSiteBrandRest(view)
+}
+
+func validateSiteBrandRest(view func(SettingKey) string) error {
 	if n := len([]rune(view(KeySiteSubtitle))); n > siteSubtitleMax {
 		return fmt.Errorf("%w: 站点副标题不能超过 %d 字", ErrInvalidParam, siteSubtitleMax)
 	}

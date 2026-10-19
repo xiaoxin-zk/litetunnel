@@ -44,7 +44,7 @@
               <el-upload
                 :auto-upload="false"
                 :show-file-list="false"
-                accept="image/png,image/jpeg,image/webp,image/gif"
+                accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
                 :on-change="onLogoChange"
               >
                 <el-button>选择图片</el-button>
@@ -54,8 +54,8 @@
               </el-button>
             </div>
             <span class="hint">
-              PNG / JPEG / WebP / GIF，256KB 以内。图片以 data URL 存在设置表里，不依赖对象存储；
-              不接受外链与 SVG（SVG 可携带脚本）
+              PNG / JPEG / WebP / GIF 限 256KB，SVG 限 100KB。图片以 data URL 存在设置表里，不依赖对象存储；
+              不接受外链。SVG 会在保存时扫描脚本、事件属性与外部引用，命中即拒绝
             </span>
           </el-form-item>
           <el-form-item label="首页说明">
@@ -683,12 +683,17 @@ async function testMail() {
 }
 
 const LOGO_MAX_BYTES = 256 * 1024
+const LOGO_SVG_MAX_BYTES = 100 * 1024
 
 function onLogoChange(file) {
   const raw = file && file.raw
   if (!raw) return
-  if (raw.size > LOGO_MAX_BYTES) {
-    ElMessage.warning('图片不能超过 256KB，请压缩后再上传')
+  const isSvg = raw.type === 'image/svg+xml'
+  const limit = isSvg ? LOGO_SVG_MAX_BYTES : LOGO_MAX_BYTES
+  if (raw.size > limit) {
+    ElMessage.warning(
+      isSvg ? 'SVG 不能超过 100KB，请精简后重试' : '图片不能超过 256KB，请压缩后再上传'
+    )
     return
   }
   const reader = new FileReader()

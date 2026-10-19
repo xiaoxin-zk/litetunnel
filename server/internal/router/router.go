@@ -149,7 +149,7 @@ func New(
 	adminRead := r.Group("/api/admin")
 	adminRead.Use(middleware.Limit(adminAPILimiter, "admin-api"))
 	adminRead.Use(adminAllow.Middleware())
-	adminRead.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity))
+	adminRead.Use(middleware.AdminReadAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity, svc.ResolveAdminAPIKey))
 	{
 		adminRead.GET("/profile", adminH.Profile)
 		adminRead.PUT("/profile", adminH.UpdateProfile)
@@ -173,6 +173,7 @@ func New(
 		adminRead.GET("/settings", adminH.GetSettings)
 		adminRead.GET("/mail-templates", adminH.ListMailTemplates)
 		adminRead.GET("/domain/status", adminH.DomainStatus)
+		adminRead.GET("/admin-api-keys", adminH.ListAdminAPIKeys)
 	}
 
 	adminWrite := r.Group("/api/admin")
@@ -217,6 +218,9 @@ func New(
 
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
+		adminSuper.POST("/admin-api-keys", adminH.CreateAdminAPIKey)
+		adminSuper.DELETE("/admin-api-keys/:id", adminH.RevokeAdminAPIKey)
+
 		adminSuper.PUT("/mail-templates/:event", adminH.SaveMailTemplate)
 		adminSuper.POST("/mail-templates/:event/preview", adminH.PreviewMailTemplate)
 		adminSuper.DELETE("/mail-templates/:event", adminH.ResetMailTemplate)

@@ -171,6 +171,12 @@ export const settingsApi = {
   testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
+export const adminKeyApi = {
+  list: () => http.get('/admin-api-keys'),
+  create: (data) => http.post('/admin-api-keys', data),
+  revoke: (id) => http.delete(`/admin-api-keys/${id}`)
+}
+
 export const mailTemplateApi = {
   list: () => http.get('/mail-templates'),
   save: (event, data) => http.put(`/mail-templates/${event}`, data),

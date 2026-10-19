@@ -395,6 +395,66 @@
         </el-form>
       </el-tab-pane>
 
+      <el-tab-pane label="集成 Key" name="apikey">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 16px"
+          title="只读 Key 用于外部集成（监控、报表、导出），不能调用任何写接口"
+          description="请求头使用 X-Admin-Key。Key 只存哈希，明文仅在创建时显示一次；创建与吊销需要超级管理员，开启 step-up 后还需动态口令。"
+        />
+        <div style="margin-bottom: 12px">
+          <el-button type="primary" @click="keyDialog = true">新建 Key</el-button>
+        </div>
+        <el-table :data="adminKeys" size="small" style="max-width: 960px">
+          <el-table-column prop="name" label="名称" min-width="120" />
+          <el-table-column prop="masked" label="Key" min-width="180" />
+          <el-table-column prop="scope" label="作用域" width="90" />
+          <el-table-column label="最近使用" width="170">
+            <template #default="{ row }">{{ fmtTime(row.last_used_at) || '从未' }}</template>
+          </el-table-column>
+          <el-table-column label="到期" width="170">
+            <template #default="{ row }">{{ fmtTime(row.expires_at) || '长期有效' }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="90">
+            <template #default="{ row }">
+              <el-button link type="danger" @click="revokeKey(row)">吊销</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <el-dialog v-model="keyDialog" title="新建只读 Key" width="480px">
+          <el-form label-width="90px">
+            <el-form-item label="名称">
+              <el-input v-model="keyForm.name" placeholder="如 监控探针" />
+            </el-form-item>
+            <el-form-item label="有效期">
+              <el-input-number v-model="keyForm.expires_in_days" :min="0" :max="3650" /> 天
+              <span class="hint">0 表示长期有效</span>
+            </el-form-item>
+          </el-form>
+          <template #footer>
+            <el-button @click="keyDialog = false">取消</el-button>
+            <el-button type="primary" :loading="keySaving" @click="createKey">创建</el-button>
+          </template>
+        </el-dialog>
+
+        <el-dialog v-model="keyResultVisible" title="Key 已创建" width="560px">
+          <el-alert
+            type="warning"
+            :closable="false"
+            show-icon
+            title="明文只显示这一次，关闭后无法再查看"
+          />
+          <el-input :model-value="newKeyPlain" readonly style="margin-top: 12px" />
+          <template #footer>
+            <el-button @click="copyKey">复制</el-button>
+            <el-button type="primary" @click="keyResultVisible = false">我已保存</el-button>
+          </template>
+        </el-dialog>
+      </el-tab-pane>
+
       <el-tab-pane label="邮件模板" name="mail">
         <el-alert
           type="info"
@@ -447,7 +507,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
-import { mailTemplateApi, settingsApi } from '../api'
+import { adminKeyApi, mailTemplateApi, settingsApi } from '../api'
 
 const SECRET_MASK = '__UNCHANGED__'
 
@@ -652,9 +712,60 @@ async function previewMail() {
   }
 }
 
+const adminKeys = ref([])
+const keyDialog = ref(false)
+const keySaving = ref(false)
+const keyResultVisible = ref(false)
+const newKeyPlain = ref('')
+const keyForm = reactive({ name: '', expires_in_days: 0 })
+
+function fmtTime(v) {
+  if (!v) return ''
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString()
+}
+
+async function loadAdminKeys() {
+  adminKeys.value = await adminKeyApi.list()
+}
+
+async function createKey() {
+  keySaving.value = true
+  try {
+    const res = await adminKeyApi.create({
+      name: keyForm.name,
+      expires_in_days: keyForm.expires_in_days || 0
+    })
+    newKeyPlain.value = res.key
+    keyDialog.value = false
+    keyResultVisible.value = true
+    keyForm.name = ''
+    keyForm.expires_in_days = 0
+    await loadAdminKeys()
+  } finally {
+    keySaving.value = false
+  }
+}
+
+async function revokeKey(row) {
+  await adminKeyApi.revoke(row.id)
+  ElMessage.success('已吊销，使用该 Key 的集成会立刻失效')
+  await loadAdminKeys()
+}
+
+async function copyKey() {
+  try {
+    await navigator.clipboard.writeText(newKeyPlain.value)
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选中复制')
+  }
+}
+
 onMounted(() => {
   load()
   loadMailTemplates()
+  loadAdminKeys()
 })
 </script>
 

@@ -86,6 +86,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.LoginLog{},
 		&model.MailTemplate{},
 		&model.StepUpGrant{},
+		&model.AdminAPIKey{},
 		&model.PasswordResetToken{},
 		&model.EmailCode{},
 		&model.Setting{},

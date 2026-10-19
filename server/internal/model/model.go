@@ -290,6 +290,23 @@ type StepUpGrant struct {
 
 func (StepUpGrant) TableName() string { return "lt_admin_stepup_grants" }
 
+// AdminAPIKey 是供外部集成使用的管理员只读 Key。
+// 只存哈希，明文仅在创建时返回一次；不可用于任何写操作。
+type AdminAPIKey struct {
+	ID         uint       `gorm:"primarykey" json:"id"`
+	Name       string     `gorm:"size:64;not null" json:"name"`
+	Prefix     string     `gorm:"size:32;not null" json:"prefix"`
+	KeyHash    string     `gorm:"size:64;uniqueIndex;not null" json:"-"`
+	Scope      string     `gorm:"size:16;not null" json:"scope"`
+	CreatedBy  uint       `gorm:"index" json:"created_by"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	ExpiresAt  *time.Time `gorm:"index" json:"expires_at"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (AdminAPIKey) TableName() string { return "lt_admin_api_keys" }
+
 type EmailCode struct {
 	ID        uint       `gorm:"primarykey" json:"id"`
 	Email     string     `gorm:"size:128;index;not null" json:"-"`

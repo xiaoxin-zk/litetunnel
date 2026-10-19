@@ -137,6 +137,10 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return fmt.Errorf("%w: 备份保留份数需为 1-60 的整数", ErrInvalidParam)
 	}
 
+	if err := validateAlertSettings(view); err != nil {
+		return err
+	}
+
 	if _, invalid := ParseBlocklist(view(KeyIPBlacklist)); len(invalid) > 0 {
 		if len(invalid) > 5 {
 			invalid = invalid[:5]
@@ -282,6 +286,43 @@ func validateSiteBrandRest(view func(SettingKey) string) error {
 	}
 	if n := len(view(KeySiteHomeContent)); n > siteHomeContentMax {
 		return fmt.Errorf("%w: 首页内容不能超过 %d 字节", ErrInvalidParam, siteHomeContentMax)
+	}
+	return nil
+}
+
+// validateAlertSettings 保证告警阈值落在有意义区间：
+// 百分比越界会让规则永不触发或每次采样都触发；Webhook 不是 http(s) 或目标地址为空，
+// 则告警在推送阶段才失败，界面上看起来「已启用」却一条都发不出去。
+func validateAlertSettings(view func(SettingKey) string) error {
+	upstream := view(KeyAlertWebhook)
+	if upstream != "" && upstream != SecretMask {
+		if !strings.HasPrefix(upstream, "http://") && !strings.HasPrefix(upstream, "https://") {
+			return fmt.Errorf("%w: 告警 Webhook 需以 http:// 或 https:// 开头", ErrInvalidParam)
+		}
+		if len(upstream) > 500 {
+			return fmt.Errorf("%w: 告警 Webhook 地址过长", ErrInvalidParam)
+		}
+	}
+	if upstream == "" {
+		switch strings.ToLower(strings.TrimSpace(view(KeyAlertEnabled))) {
+		case "true", "1", "yes", "on":
+			return fmt.Errorf("%w: 启用告警前请先填写 Webhook 地址，否则告警无处可发", ErrInvalidParam)
+		}
+	}
+	for _, item := range []struct {
+		key  SettingKey
+		name string
+	}{
+		{KeyAlertErrorRate, "错误率告警阈值"},
+		{KeyAlertDisk, "磁盘告警阈值"},
+	} {
+		n, err := strconv.Atoi(strings.TrimSpace(view(item.key)))
+		if err != nil || n < 0 || n > 100 {
+			return fmt.Errorf("%w: %s需为 0-100 的整数百分比（0 表示关闭该项检查）", ErrInvalidParam, item.name)
+		}
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(view(KeyAlertBackupHours))); err != nil || n < 0 || n > 8760 {
+		return fmt.Errorf("%w: 备份超时告警需为 0-8760 的整数小时（0 表示关闭该项检查）", ErrInvalidParam)
 	}
 	return nil
 }

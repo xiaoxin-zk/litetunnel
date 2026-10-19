@@ -290,6 +290,34 @@ type StepUpGrant struct {
 
 func (StepUpGrant) TableName() string { return "lt_admin_stepup_grants" }
 
+// MetricSample 是告警用的趋势样本，按采集窗口落一行。
+// 时间列刻意不叫 at：部分数据库把 at 当保留字，裸写会带来转义问题。
+type MetricSample struct {
+	ID          uint      `gorm:"primarykey" json:"id"`
+	At          time.Time `gorm:"column:sampled_at;index" json:"at"`
+	Requests    int64     `json:"requests"`
+	Errors      int64     `json:"errors"`
+	ErrorRate   float64   `json:"error_rate"`
+	DiskUsedPct float64   `json:"disk_used_pct"`
+	CreatedAt   time.Time `json:"-"`
+}
+
+func (MetricSample) TableName() string { return "lt_metric_samples" }
+
+// AlertEvent 记录一次告警，同时用于计算冷却时间。
+type AlertEvent struct {
+	ID        uint      `gorm:"primarykey" json:"id"`
+	Kind      string    `gorm:"size:32;index" json:"kind"`
+	Level     string    `gorm:"size:16" json:"level"`
+	Message   string    `gorm:"type:text" json:"message"`
+	Value     float64   `json:"value"`
+	Threshold float64   `json:"threshold"`
+	Delivered bool      `json:"delivered"`
+	CreatedAt time.Time `gorm:"index" json:"created_at"`
+}
+
+func (AlertEvent) TableName() string { return "lt_alert_events" }
+
 // AuthIdentity 记录第三方账号与本站账号的绑定关系。
 // (provider, provider_user_id) 唯一，避免同一个第三方账号绑到多个本站账号上。
 type AuthIdentity struct {

@@ -31,6 +31,8 @@ func New(
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.SecurityHeaders())
+	// 告警口径是「整个控制面的 5xx 比例」，因此在全局装统计中间件。
+	r.Use(middleware.HTTPStatsMiddleware())
 	r.Use(middleware.LimitBodySizeFor(middleware.MaxRequestBodyBytes, map[string]int64{
 		"POST /api/admin/client-packages": service.MaxClientPackageSize + middleware.MultipartOverheadBytes,
 	}))
@@ -185,6 +187,9 @@ func New(
 		adminRead.GET("/domain/status", adminH.DomainStatus)
 		adminRead.GET("/admin-api-keys", adminH.ListAdminAPIKeys)
 		adminRead.GET("/backups", adminH.ListBackups)
+		adminRead.GET("/alerts/settings", adminH.GetAlertSettings)
+		adminRead.GET("/alerts/events", adminH.ListAlertEvents)
+		adminRead.GET("/alerts/metrics", adminH.ListMetricSamples)
 	}
 
 	adminWrite := r.Group("/api/admin")
@@ -238,6 +243,8 @@ func New(
 
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
+		adminSuper.PUT("/alerts/settings", adminH.UpdateAlertSettings)
+		adminSuper.POST("/alerts/settings/test", adminH.TestAlertWebhook)
 		adminSuper.POST("/admin-api-keys", adminH.CreateAdminAPIKey)
 		adminSuper.DELETE("/admin-api-keys/:id", adminH.RevokeAdminAPIKey)
 

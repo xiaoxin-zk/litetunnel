@@ -65,6 +65,7 @@ func main() {
 		{"maintenance-worker", svc.StartMaintenanceWorker(ctx)},
 		{"firewall-reconciler", svc.StartFirewallReconciler(ctx)},
 		{"proxy-drain-worker", svc.StartProxyDrainWorker(ctx)},
+		{"alert-worker", svc.StartAlertWorker(ctx)},
 	}
 	monDone := make(chan struct{})
 	go func() {

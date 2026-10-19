@@ -18,6 +18,7 @@ const routes = [
       { path: 'firewall', name: 'firewall', meta: { title: '端口与防火墙' }, component: () => import('../views/Firewall.vue') },
       { path: 'client-dist', name: 'client-dist', meta: { title: '客户端分发' }, component: () => import('../views/ClientDist.vue') },
       { path: 'backups', name: 'backups', meta: { title: '备份与恢复' }, component: () => import('../views/Backups.vue') },
+      { path: 'alerts', name: 'alerts', meta: { title: '告警与监控' }, component: () => import('../views/Alerts.vue') },
       { path: 'system', name: 'system', meta: { title: '系统设置' }, component: () => import('../views/SystemSettings.vue') },
       { path: 'settings', name: 'settings', meta: { title: '账号设置' }, component: () => import('../views/Settings.vue') }
     ]

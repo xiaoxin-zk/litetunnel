@@ -99,6 +99,8 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.RuntimeLease{},
 		&model.ProxyDrainPending{},
 		&model.LoginFailCounter{},
+		&model.MetricSample{},
+		&model.AlertEvent{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}

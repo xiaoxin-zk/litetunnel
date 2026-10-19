@@ -21,6 +21,7 @@
         <el-menu-item index="/firewall"><el-icon><Lock /></el-icon><span>端口与防火墙</span></el-menu-item>
         <el-menu-item index="/client-dist"><el-icon><Download /></el-icon><span>客户端分发</span></el-menu-item>
         <el-menu-item index="/backups"><el-icon><FolderOpened /></el-icon><span>备份与恢复</span></el-menu-item>
+        <el-menu-item index="/alerts"><el-icon><Bell /></el-icon><span>告警与监控</span></el-menu-item>
         <el-menu-item index="/system"><el-icon><Tools /></el-icon><span>系统设置</span></el-menu-item>
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon><span>账号设置</span></el-menu-item>
       </el-menu>

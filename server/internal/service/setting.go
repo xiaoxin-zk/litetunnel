@@ -109,6 +109,12 @@ const (
 	KeyTrafficBaselineReady SettingKey = "traffic.baseline_ready"
 
 	KeyTrafficResetMarkReady SettingKey = "traffic.reset_mark_ready"
+
+	KeyAlertEnabled     SettingKey = "alert.enabled"
+	KeyAlertWebhook     SettingKey = "alert.webhook_url"
+	KeyAlertErrorRate   SettingKey = "alert.error_rate_pct"
+	KeyAlertDisk        SettingKey = "alert.disk_pct"
+	KeyAlertBackupHours SettingKey = "alert.backup_stale_hours"
 )
 
 const SecretMask = "__UNCHANGED__"
@@ -230,6 +236,12 @@ var settingSpecs = []settingSpec{
 
 	{Key: KeyTrafficBaselineReady, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyTrafficResetMarkReady, Internal: true, Default: func(*config.Config) string { return "" }},
+
+	{Key: KeyAlertEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyAlertWebhook, Secret: true, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyAlertErrorRate, Default: func(*config.Config) string { return "5" }},
+	{Key: KeyAlertDisk, Default: func(*config.Config) string { return "90" }},
+	{Key: KeyAlertBackupHours, Default: func(*config.Config) string { return "48" }},
 }
 
 var settingByKey = func() map[SettingKey]settingSpec {

@@ -203,6 +203,14 @@ export const domainApi = {
   dnsCheck: () => http.post('/domain/dns-check')
 }
 
+export const alertApi = {
+  settings: () => http.get('/alerts/settings'),
+  saveSettings: (data) => http.put('/alerts/settings', data),
+  test: () => http.post('/alerts/settings/test'),
+  events: (limit) => http.get('/alerts/events', { params: limit ? { limit } : {} }),
+  metrics: (limit) => http.get('/alerts/metrics', { params: limit ? { limit } : {} })
+}
+
 export const logApi = {
   audit: (params) => http.get('/audit-logs', { params }),
   clients: (params) => http.get('/clients', { params }),

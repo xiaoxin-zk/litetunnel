@@ -9,6 +9,7 @@
             {{ state.gateway_host || '-' }}:{{ state.gateway_port || '-' }}
             <template v-if="state.username"> · {{ state.username }}</template>
           </div>
+          <div v-if="state.frontend_url" class="muted">{{ state.frontend_url }}</div>
           <div class="muted" :class="{ 'sync-warn': state.sync_err }">{{ syncText }}</div>
         </div>
       </div>

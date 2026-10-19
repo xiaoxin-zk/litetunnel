@@ -32,6 +32,7 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 	a.tunnels = data.Tunnels
 	a.gatewayHost = data.ServerAddr
 	a.gatewayPort = data.ServerPort
+	a.frontendURL = data.FrontendURL
 	a.tunnelDomain = data.TunnelDomain
 	a.trafficUsed = data.TrafficUsed
 	a.trafficQuota = data.TrafficQuota

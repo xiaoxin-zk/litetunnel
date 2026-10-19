@@ -26,6 +26,13 @@
           <el-form-item label="站点副标题">
             <el-input v-model="form['site.subtitle']" placeholder="显示在登录页站点名下方，留空则不显示" />
           </el-form-item>
+          <el-form-item label="服务器地址">
+            <el-input v-model="form['site.frontend_url']" placeholder="https://panel.example.com" />
+            <span class="hint">
+              用户在浏览器访问面板的完整地址（可带端口）。它直接作为用户端接入信息里的「服务器地址」展示，
+              第三方登录回调也用它；留空则回落到面板域名
+            </span>
+          </el-form-item>
           <el-form-item label="站点 Logo">
             <div style="display: flex; align-items: center; gap: 12px">
               <img

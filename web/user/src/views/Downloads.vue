@@ -57,7 +57,28 @@
           <div class="lt-card-title">接入信息</div>
           <el-descriptions :column="1" border size="small">
             <el-descriptions-item label="服务器地址">
+              <span class="lt-mono">{{ info.frontend_url || '未配置' }}</span>
+              <el-button
+                v-if="info.frontend_url"
+                link
+                type="primary"
+                style="margin-left: 8px"
+                @click="copyText(info.frontend_url, '服务器地址')"
+              >
+                复制
+              </el-button>
+            </el-descriptions-item>
+            <el-descriptions-item label="隧道网关">
               <span class="lt-mono">{{ info.server_addr || '-' }}:{{ info.server_port || '-' }}</span>
+              <el-button
+                v-if="info.server_addr"
+                link
+                type="primary"
+                style="margin-left: 8px"
+                @click="copyText(`${info.server_addr}:${info.server_port}`, '隧道网关')"
+              >
+                复制
+              </el-button>
             </el-descriptions-item>
             <el-descriptions-item label="客户端标识">
               <span class="lt-mono">{{ info.user || '-' }}</span>
@@ -137,8 +158,19 @@
 
 <script setup>
 import { onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { Refresh, Monitor, Download } from '@element-plus/icons-vue'
 import { clientApi, downloadFrpcConfig, downloadClientFile } from '../api'
+
+async function copyText(text, label) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success(`${label}已复制`)
+  } catch {
+    ElMessage.warning('复制失败，请手动选中复制')
+  }
+}
 import { formatBytes, formatTime } from '../utils/format'
 
 const files = ref([])

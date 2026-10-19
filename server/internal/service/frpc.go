@@ -135,6 +135,17 @@ type ClientInfo struct {
 	TunnelDomain  string `json:"tunnel_domain"`
 	ProxyNameFmt  string `json:"proxy_name_format"`
 	BandwidthUnit string `json:"bandwidth_unit"`
+	FrontendURL   string `json:"frontend_url"`
+}
+
+// FrontendURL 是用户在浏览器访问面板的完整地址（可带端口），
+// 作为接入信息里的「服务器地址」展示。未配置时回落到面板对外地址，保证这一栏永远有值可复制。
+// 留空时回落到面板对外地址，保证接入信息这一栏永远有值可复制。
+func (s *Services) FrontendURL() string {
+	if v := strings.TrimRight(strings.TrimSpace(s.Settings.Get(KeySiteFrontendURL)), "/"); v != "" {
+		return v
+	}
+	return strings.TrimRight(s.UserPublicURL(), "/")
 }
 
 func (s *Services) GatewayEndpoint() (string, int) {
@@ -164,6 +175,7 @@ func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 		TunnelDomain:  s.TunnelDomain(),
 		ProxyNameFmt:  "{user}.{name}",
 		BandwidthUnit: "MB/KB (字节/秒)",
+		FrontendURL:   s.FrontendURL(),
 	}, nil
 }
 

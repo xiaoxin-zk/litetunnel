@@ -14,6 +14,7 @@ import (
 type clientInfo struct {
 	ServerAddr   string `json:"server_addr"`
 	ServerPort   int    `json:"server_port"`
+	FrontendURL  string `json:"frontend_url"`
 	User         string `json:"user"`
 	TunnelDomain string `json:"tunnel_domain"`
 }
@@ -157,6 +158,7 @@ func (a *App) Connect(apiKey, serverURL string) (State, error) {
 	a.apiKeyMask = maskKey(apiKey)
 	a.gatewayHost = info.ServerAddr
 	a.gatewayPort = info.ServerPort
+	a.frontendURL = info.FrontendURL
 	a.tunnelDomain = info.TunnelDomain
 	a.tunnels = info.Tunnels
 	a.trafficUsed = info.TrafficUsed
@@ -240,6 +242,7 @@ func (a *App) resetPerAccountState() {
 	a.tunnels = nil
 	a.gatewayHost = ""
 	a.gatewayPort = 0
+	a.frontendURL = ""
 	a.tunnelDomain = ""
 	a.trafficUsed = 0
 	a.trafficQuota = 0

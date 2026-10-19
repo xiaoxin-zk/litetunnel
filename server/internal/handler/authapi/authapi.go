@@ -147,6 +147,7 @@ func (h *Handler) PublicSettings(c *gin.Context) {
 		"site_name":              s.Get(service.KeySiteName),
 		"site_subtitle":          s.Get(service.KeySiteSubtitle),
 		"site_logo":              s.Get(service.KeySiteLogo),
+		"frontend_url":           h.svc.FrontendURL(),
 		"home_content":           s.Get(service.KeySiteHomeContent),
 		"announcement":           s.Get(service.KeySiteAnnouncement),
 		"icp":                    s.Get(service.KeySiteICP),

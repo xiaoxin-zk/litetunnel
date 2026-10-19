@@ -50,6 +50,7 @@ type State struct {
 
 	GatewayHost  string     `json:"gateway_host"`
 	GatewayPort  int        `json:"gateway_port"`
+	FrontendURL  string     `json:"frontend_url"`
 	TunnelDomain string     `json:"tunnel_domain"`
 	Tunnels      []TunnelVO `json:"tunnels"`
 	TrafficUsed  int64      `json:"traffic_used"`
@@ -93,6 +94,7 @@ type App struct {
 	apiKeyMask   string
 	gatewayHost  string
 	gatewayPort  int
+	frontendURL  string
 	tunnelDomain string
 	trafficUsed  int64
 	trafficQuota int64

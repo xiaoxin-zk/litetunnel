@@ -62,7 +62,11 @@ func (s *Services) OAuthAvailable(provider string) bool {
 }
 
 // PanelBaseURL 是对外可访问的面板地址，OAuth 回调与前端跳转都以它为准。
+// 优先级：显式填写的前端地址 > 面板域名 > 环境里的对外地址。
 func (s *Services) PanelBaseURL() string {
+	if v := strings.TrimRight(strings.TrimSpace(s.Settings.Get(KeySiteFrontendURL)), "/"); v != "" {
+		return v
+	}
 	if d := normalizeDomainValue(s.Settings.Get(KeyDomainPanel)); d != "" {
 		return "https://" + d
 	}

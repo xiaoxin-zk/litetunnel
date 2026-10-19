@@ -204,6 +204,17 @@ func validateSiteBrand(view func(SettingKey) string) error {
 	if n := len([]rune(view(KeySiteSubtitle))); n > siteSubtitleMax {
 		return fmt.Errorf("%w: 站点副标题不能超过 %d 字", ErrInvalidParam, siteSubtitleMax)
 	}
+	if api := strings.TrimSpace(view(KeySiteFrontendURL)); api != "" {
+		if !strings.HasPrefix(api, "https://") && !strings.HasPrefix(api, "http://") {
+			return fmt.Errorf("%w: 服务器地址要填完整地址，以 http:// 或 https:// 开头，例如 https://panel.example.com", ErrInvalidParam)
+		}
+		if strings.HasSuffix(api, "/") {
+			return fmt.Errorf("%w: 服务器地址不要以 / 结尾", ErrInvalidParam)
+		}
+		if len(api) > 200 {
+			return fmt.Errorf("%w: 服务器地址过长", ErrInvalidParam)
+		}
+	}
 	if n := len(view(KeySiteHomeContent)); n > siteHomeContentMax {
 		return fmt.Errorf("%w: 首页内容不能超过 %d 字节", ErrInvalidParam, siteHomeContentMax)
 	}

@@ -158,6 +158,7 @@ func TestNonWhitelistQuota(t *testing.T) {
 		KeyRegisterAllowDomains:      "@company.com",
 		KeyRegisterWhitelistOnly:     "true",
 		KeyRegisterNonWhitelistQuota: "1",
+		KeyRegisterRequireEmail:      "false",
 	}); err != nil {
 		t.Fatalf("保存设置失败: %v", err)
 	}

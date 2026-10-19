@@ -14,6 +14,33 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# ---- 并发锁 ----
+#
+# 两个 render 同时跑会交叉读写：A 把 B 刚提交的新文件当成旧文件备份、A 回滚
+# 时又把 B 的成果覆盖回去。这里的动作是「备份 + 替换」，天然要求串行。
+#
+# 用 mkdir 而不是 flock：macOS 默认没有 flock，而渲染脚本在三种平台上都会被
+# 手工执行。mkdir 是原子的，失败即说明有人在跑。
+LOCK_DIR="${ROOT}/deploy/.render.lock.d"
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  # 崩溃可能留下空目录。按 mtime 判定残留：超过 10 分钟既不可能是正常渲染
+  # （它只做文本替换），也不该让运维去手工清目录。
+  if [[ -n "$(find "${LOCK_DIR}" -maxdepth 0 -mmin +10 2>/dev/null)" ]]; then
+    echo "清理上次异常退出留下的渲染锁：${LOCK_DIR}" >&2
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+  fi
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    echo "另一个 render 正在运行（锁：${LOCK_DIR}）。请等它结束；若是崩溃残留，10 分钟后会自动清理。" >&2
+    exit 1
+  fi
+fi
+RELEASE_LOCK=1
+release_lock() {
+  if [[ "${RELEASE_LOCK}" == "1" ]]; then
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+  fi
+}
+
 ENV_FILE="${ROOT}/.env"
 FRPS_TPL="${ROOT}/deploy/frps/frps.toml.template"
 FRPS_OUT="${ROOT}/deploy/frps/frps.toml"
@@ -110,15 +137,22 @@ done < "${ENV_FILE}"
 split_public_url() {
   local raw="${1:-}"
   local scheme="https"
-  if [[ "${raw}" == http://* ]]; then
+  # scheme 按小写比较，域名统一折成小写：
+  #
+  #   - 面板（apply.go）接受 HTTPS:// 大写写法（先 ToLower 再判断），脚本却会
+  #     落到「不支持的协议」分支——同一份 .env 在面板里能保存、在脚本里炸。
+  #   - 域名大小写无关（DNS 不区分），但 Go 侧的 checkDomain 只接受小写。
+  #     这里折成小写，才能保证脚本渲染成功的东西面板也一定接受。
+  local lower="${raw,,}"
+  if [[ "${lower}" == http://* ]]; then
     scheme="http"
-  elif [[ "${raw}" == https://* ]]; then
+  elif [[ "${lower}" == https://* ]]; then
     scheme="https"
-  elif [[ "${raw}" == *://* ]]; then
+  elif [[ "${lower}" == *://* ]]; then
     echo "LT_USER_PUBLIC_URL 只支持 http 或 https。" >&2
     exit 1
   fi
-  raw="${raw#http://}"
+  raw="${lower#http://}"
   raw="${raw#https://}"
   raw="${raw%/}"
   VARS[LT_USER_SCHEME]="${scheme}"
@@ -144,6 +178,8 @@ fi
 VARS[LT_ADMIN_ALLOW_CIDR]="${VARS[LT_ADMIN_ALLOW_CIDR]:-127.0.0.1/32}"
 VARS[LT_ACME_EMAIL]="${VARS[LT_ACME_EMAIL]:-admin@${USER_DOMAIN}}"
 VARS[LT_TUNNEL_DOMAIN]="${VARS[LT_TUNNEL_DOMAIN]:-}"
+# 与面板保持一致：域名折成小写（DNS 不区分大小写，而 Go 侧只接受小写）。
+VARS[LT_TUNNEL_DOMAIN]="${VARS[LT_TUNNEL_DOMAIN],,}"
 
 # 域名规则必须与面板（server/internal/service/tlsconfig.go 的 checkDomain）
 # 一致，否则会出现「脚本能渲染、面板拒绝保存」或相反的分叉：
@@ -156,6 +192,15 @@ VARS[LT_TUNNEL_DOMAIN]="${VARS[LT_TUNNEL_DOMAIN]:-}"
 check_domain() {
   local name="$1" d="$2"
   [[ -z "${d}" ]] && return 0
+  # DNS 不区分大小写，但 Go 侧的 checkDomain 只接受小写。这里先折成小写，
+  # 三种实现（Bash/PowerShell/Go）才可能对「同一个值是否合法」给出一致结论。
+  d="${d,,}"
+  # 控制字符一律拒绝：原来只挡空格与制表符，CR/FF/VT 会顺着模板进到
+  # Caddyfile 与 frps.toml，产出一份「看起来正常、加载时莫名失败」的配置。
+  if [[ "${d}" == *[[:cntrl:]]* ]]; then
+    echo "${name} 含有控制字符（换行/回车等），请检查 .env 里的值。" >&2
+    exit 1
+  fi
   if [[ "${d}" == *" "* || "${d}" == *$'\t'* || "${d}" == */* || "${d}" == *\\* || "${d}" == *"*"* ]]; then
     echo "${name}=${d} 含有非法字符（只填裸域名，不带 scheme、路径或 *）。" >&2
     exit 1
@@ -229,6 +274,40 @@ for k in "${REQUIRED[@]}"; do
 done
 if (( ${#MISSING[@]} > 0 )); then
   echo "以下配置项缺失，请在 .env 中补齐：${MISSING[*]}" >&2
+  exit 1
+fi
+
+# 数值校验必须在**任何算术展开之前**跑完。
+#
+# 原来端口池的两个值直接进 (( )) 比较（`port_num >= ${VARS[LT_PORT_RANGE_START]}`），
+# 而 bash 的算术展开会把未过滤的字符串当变量名/表达式求值：一个写成
+# "15000 着" 或 "1+1" 的值，要么静默算错、要么让整段比较结果失真，
+# 端口冲突检查随之失效——而它守的是「vhost 端口不要撞上隧道端口池」。
+require_port() {
+  local name="$1" val="$2" max="$3"
+  if [[ -z "${val}" ]]; then
+    return 0
+  fi
+  if [[ ! "${val}" =~ ^[0-9]{1,5}$ ]]; then
+    echo "${name}=${val} 不是十进制整数。" >&2
+    exit 1
+  fi
+  local n=$((10#${val}))
+  if (( n < 1 || n > max )); then
+    echo "${name}=${val} 不在 1-${max} 范围内。" >&2
+    exit 1
+  fi
+}
+
+for k in LT_GATEWAY_PORT LT_KCP_PORT LT_VHOST_HTTP_PORT LT_VHOST_HTTPS_PORT \
+  LT_FRPS_API_PORT LT_USER_PORT LT_PORT_RANGE_START LT_PORT_RANGE_END; do
+  require_port "${k}" "${VARS[$k]:-}" 65535
+done
+# 单用户端口数不是端口号，但同样会进模板并被 frps 解析：非数字会让 frps
+# 启动失败，而失败发生在容器重建之后。
+require_port LT_MAX_PORTS_PER_USER "${VARS[LT_MAX_PORTS_PER_USER]:-}" 65535
+if (( ${VARS[LT_PORT_RANGE_START]:-0} >= ${VARS[LT_PORT_RANGE_END]:-0} )); then
+  echo "LT_PORT_RANGE_START 必须小于 LT_PORT_RANGE_END。" >&2
   exit 1
 fi
 
@@ -372,7 +451,7 @@ cleanup_tmp() {
     rm -f "${PENDING_TMP[i]}" 2>/dev/null || true
   done
 }
-trap cleanup_tmp EXIT
+trap 'cleanup_tmp; release_lock' EXIT
 
 render "${FRPS_TPL}" "${FRPS_OUT}"
 render "${CADDY_TPL}" "${CADDY_OUT}"

@@ -20,6 +20,27 @@ $frpsOut  = Join-Path $root 'deploy/frps/frps.toml'
 $caddyTpl = Join-Path $root 'deploy/caddy/Caddyfile.template'
 $caddyOut = Join-Path $root 'deploy/caddy/Caddyfile'
 
+# Serialise concurrent runs. Two renders interleaving would back up each other's
+# half-finished files and then "roll back" to the wrong content.
+#
+# OpenOrCreate + FileShare.None: the OS handle is the lock, so a crashed run
+# cannot leave a stale lock behind (unlike a lock file that merely exists).
+$lockPath = Join-Path $root 'deploy/.render.lock'
+try {
+    $renderLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+} catch [System.IO.IOException] {
+    throw "Another render.ps1 run is in progress (lock: $lockPath). Wait for it to finish."
+}
+
+function Release-RenderLock {
+    if ($script:renderLock) {
+        $script:renderLock.Dispose()
+        $script:renderLock = $null
+    }
+    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+}
+
 # Input policy, identical to render.sh: only regular files (a symlink is fine as
 # long as it resolves to one), and a hard size cap. Without the cap a .env that
 # was replaced by a huge or endless file would be read into memory until the
@@ -97,7 +118,10 @@ function Split-PublicUrl([string]$raw) {
     } elseif ($raw -match '://') {
         throw 'LT_USER_PUBLIC_URL only supports http or https.'
     }
-    $domain = ($raw -replace '^https?://', '').TrimEnd('/')
+    # Lower-case the domain: DNS is case-insensitive but the panel's checkDomain
+    # only accepts lower case, so an "Example.COM" value would render here and
+    # then be rejected when the admin saves the same value in the console.
+    $domain = ($raw -replace '^https?://', '').TrimEnd('/').ToLowerInvariant()
     return @{ Scheme = $scheme; Domain = $domain }
 }
 
@@ -126,6 +150,12 @@ $vars['LT_TUNNEL_DOMAIN']    = if ($vars['LT_TUNNEL_DOMAIN']) { $vars['LT_TUNNEL
 # 1-63 chars of [a-z0-9-] and not starting/ending with '-'.
 function Assert-Domain([string]$name, [string]$d) {
     if ([string]::IsNullOrEmpty($d)) { return }
+    # Any control character is a hard no: they survive into frps.toml/Caddyfile
+    # and produce a file that looks fine but fails to load. render.sh rejects the
+    # same set ([:cntrl:]) so both renderers agree with the Go side.
+    if ($d -match '[\x00-\x1F\x7F]') {
+        throw "$name=$d contains control characters (newline, carriage return, ...)."
+    }
     if ($d -match '[\s/\\*]') {
         throw "$name=$d contains illegal characters (bare domain only: no scheme, path or *)."
     }
@@ -150,6 +180,14 @@ function Assert-Domain([string]$name, [string]$d) {
             throw "$name=$d has a label '$l' outside [a-z0-9-]."
         }
     }
+}
+
+# Normalise to lower case before validating, so what we render is exactly what
+# the panel would accept (and what ends up in the templates).
+$vars['LT_USER_DOMAIN'] = $userDomain.ToLowerInvariant()
+$userDomain = $vars['LT_USER_DOMAIN']
+if ($vars['LT_TUNNEL_DOMAIN']) {
+    $vars['LT_TUNNEL_DOMAIN'] = $vars['LT_TUNNEL_DOMAIN'].ToLowerInvariant()
 }
 
 Assert-Domain 'LT_USER_DOMAIN' $userDomain
@@ -426,6 +464,9 @@ try {
             if ($b) { Remove-Item -LiteralPath $b -Force -ErrorAction SilentlyContinue }
         }
     }
+    # Early throws (validation) leave only an empty lock file behind: the OS
+    # handle is what serialises runs, and it is released when the process exits.
+    Release-RenderLock
 }
 
 Write-Host ''

@@ -148,6 +148,58 @@ SHIM
 }
 
 # ------------------------------------------------------------
+CASE="dotenv 引号与转义：多参数 DNS 配置不能带引号进模板"
+{
+  d="$(new_fixture dotenv)"
+  # 双引号值里的空格必须原样保留，$$ 必须还原成字面量 $。failure 的形态很隐蔽：
+  # 带引号的值会原样进 Caddyfile，Caddy 把它当成**一个**参数，dns 指令收到
+  # 错误的参数个数后拒绝加载，而渲染脚本会说「成功」。
+  sed -i \
+    -e 's#^LT_TUNNEL_DOMAIN=.*#LT_TUNNEL_DOMAIN=tunnel.example.com#' \
+    -e 's#^LT_CADDY_DNS_PROVIDER=.*#LT_CADDY_DNS_PROVIDER=cloudflare#' \
+    -e 's#^LT_CADDY_DNS_ARGS=.*#LT_CADDY_DNS_ARGS="{env.CF_A} {env.CF_B} prefix$$suffix"#' \
+    "${d}/.env"
+  if run_render "${d}"; then ok "渲染成功"; else fail "渲染失败：$(tail -3 "${d}/render.log")"; fi
+  cf="${d}/deploy/caddy/Caddyfile"
+  if grep -qF 'dns cloudflare {env.CF_A} {env.CF_B} prefix$suffix' "${cf}" 2>/dev/null; then
+    ok "引号与 \$\$ 按 dotenv 语义解析"
+  else
+    fail "DNS 参数渲染不符合 dotenv 语义：$(grep -n 'dns ' "${cf}" 2>/dev/null || echo 未找到 dns 行)"
+  fi
+}
+
+# ------------------------------------------------------------
+CASE="端口池非数字输入必须被拒绝"
+{
+  d="$(new_fixture badport)"
+  # 原来这个值直接进 (( )) 做区间比较：bash 把非法内容当算术表达式求值，
+  # 端口冲突检查要么静默失效、要么给出误导性的结果。
+  sed -i 's#^LT_PORT_RANGE_START=.*#LT_PORT_RANGE_START=15000abc#' "${d}/.env"
+  if run_render "${d}"; then
+    fail "非数字端口应当被拒绝"
+  else
+    ok "按预期拒绝"
+  fi
+  grep -q '不是十进制整数' "${d}/render.log" && ok "错误信息明确" || fail "错误信息未说明是数值问题"
+  [[ ! -f "${d}/deploy/frps/frps.toml" ]] && ok "未产出任何配置文件" || fail "校验失败仍写出了配置"
+}
+
+# ------------------------------------------------------------
+CASE="并发锁：已有锁时拒绝执行，且不误删活锁"
+{
+  d="$(new_fixture lock)"
+  mkdir -p "${d}/deploy/.render.lock.d"
+  if run_render "${d}"; then
+    fail "已有锁时应当拒绝执行"
+  else
+    ok "按预期拒绝"
+  fi
+  grep -q '正在运行' "${d}/render.log" && ok "提示可读" || fail "缺少并发提示"
+  [[ -d "${d}/deploy/.render.lock.d" ]] && ok "未误删仍在使用的锁" || fail "锁被误删"
+  rmdir "${d}/deploy/.render.lock.d"
+}
+
+# ------------------------------------------------------------
 CASE="输入文件策略：非普通文件与超限文件"
 {
   d="$(new_fixture inputs)"

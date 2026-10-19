@@ -104,6 +104,29 @@ try {
         Where-Object { $_.Name -like '.*.tmp.*' -or $_.Name -like '.*.bak.*' })
     if ($leftovers.Count -eq 0) { Ok 'no temp/backup leftovers' } else { Fail "$($leftovers.Count) temp/backup files left behind" }
 
+    Write-Host 'dotenv quoting and $$ escaping'
+    # A quoted multi-argument value must reach the template without quotes and
+    # with $$ collapsed to $: otherwise Caddy receives one argument where it
+    # expects two and refuses the whole Caddyfile, while the renderer says "ok".
+    $dir2 = New-Fixture 'dotenv'
+    $envPath = Join-Path $dir2 '.env'
+    $text = Get-Content -LiteralPath $envPath -Raw
+    $text = [regex]::Replace($text, '(?m)^LT_TUNNEL_DOMAIN=.*$', 'LT_TUNNEL_DOMAIN=tunnel.example.com')
+    $text = [regex]::Replace($text, '(?m)^LT_CADDY_DNS_PROVIDER=.*$', 'LT_CADDY_DNS_PROVIDER=cloudflare')
+    $text = [regex]::Replace($text, '(?m)^LT_CADDY_DNS_ARGS=.*$', 'LT_CADDY_DNS_ARGS="{env.CF_A} {env.CF_B} prefix$$suffix"')
+    Set-Content -LiteralPath $envPath -Value $text -NoNewline -Encoding UTF8
+    $code = Invoke-Render $dir2
+    if ($code -ne 0) {
+        Fail "dotenv fixture failed (exit $code): $((Get-Content -LiteralPath (Join-Path $dir2 'render.log') -Raw))"
+    } else {
+        $caddy2 = Get-Content -LiteralPath (Join-Path $dir2 'deploy/caddy/Caddyfile') -Raw
+        if ($caddy2 -match 'dns cloudflare \{env\.CF_A\} \{env\.CF_B\} prefix\$suffix') {
+            Ok 'quoted multi-arg value and $$ unescaped correctly'
+        } else {
+            Fail "unexpected dns line: $(($caddy2 -split "`n" | Where-Object { $_ -match '^\s*dns ' }) -join '|')"
+        }
+    }
+
     Write-Host 'unresolved placeholder keeps the previous files'
     $before = (Get-FileHash -LiteralPath $frpsOut -Algorithm SHA256).Hash
     Add-Content -LiteralPath (Join-Path $dir 'deploy/caddy/Caddyfile.template') -Value '${NOT_DEFINED_ANYWHERE}'

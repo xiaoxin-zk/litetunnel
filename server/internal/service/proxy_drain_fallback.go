@@ -263,6 +263,10 @@ func (q *proxyDrainFallbackQueue) enqueue(req proxyDrainRequest) {
 // 返回值带上入队时刻与尝试次数，让 putBack 能还原原始顺序：「丢弃最旧」
 // 靠 at 判断，若放回时统一盖成当前时间，队列满时的淘汰顺序就变成随机的。
 func (q *proxyDrainFallbackQueue) take() []proxyDrainFallback {
+	// 这里刻意**不**重写 WAL：取走之后补写还没发生，此时把内存里的空队列
+	// 落盘，等于「先把线索擦掉再尝试」，一旦补写失败或进程崩溃就彻底丢了。
+	// 保持取走前的快照，最坏情况是重启后重放几条已经写成功的意图——补写是
+	// 幂等 upsert，重复一次没有副作用，漏一条却是真的丢补偿。
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.items) == 0 {

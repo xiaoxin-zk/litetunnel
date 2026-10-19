@@ -422,14 +422,14 @@ func (a *App) clearTunnelErrGen(id uint, gen uint64) {
 	delete(a.tunnelErrs, id)
 }
 
-// emitTunnelReady 在 frpc 报告代理启动成功后，补上「现在可以用这个地址了」。
+// emitTunnelReadyEpoch 在 frpc 报告代理启动成功后，补上「现在可以用这个地址了」。
 //
 // 地址必须紧跟在「启动成功」之后：用户要的就是「该把哪个地址发给朋友」，
 // 让他自己去列表里再找一遍完全是多余的。
-// emitTunnelReadyEpoch 以指定账号代次补发「启动成功」说明。
 //
 // 调用方是日志回调：那里的账号代次来自「启动这条进程时的账号」，
-// 必须原样传下来，而不是在这里重新取一次当前的账号。
+// 必须原样传下来，而不是在这里重新取一次当前的账号——重新取会把上一账号
+// 进程的成功说明写进新账号的日志。
 func (a *App) emitTunnelReadyEpoch(acct accountEpoch, id uint, name string) {
 	a.mu.RLock()
 	addr := ""

@@ -443,7 +443,9 @@ func (s *SettingStore) SetMany(in map[SettingKey]string) error {
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		for _, p := range toWrite {
 			row := model.Setting{Key: p.key}
-			if err := tx.Where("key = ?", p.key).Assign(model.Setting{Value: p.value}).
+			// 必须用 map 而不是结构体：GORM 的 Assign(struct) 会跳过零值，
+			// 导致「把设置清空」永远写不进去（旧值残留，界面却显示已保存）。
+			if err := tx.Where("key = ?", p.key).Assign(map[string]any{"value": p.value}).
 				FirstOrCreate(&row).Error; err != nil {
 				return err
 			}
@@ -473,7 +475,7 @@ func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
 		for k, v := range in {
 			key := string(k)
 			row := model.Setting{Key: key}
-			if err := tx.Where("key = ?", key).Assign(model.Setting{Value: v}).
+			if err := tx.Where("key = ?", key).Assign(map[string]any{"value": v}).
 				FirstOrCreate(&row).Error; err != nil {
 				return err
 			}

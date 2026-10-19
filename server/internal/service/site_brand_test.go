@@ -48,6 +48,39 @@ func TestSiteLogoValidation(t *testing.T) {
 	}
 }
 
+func TestSettingsCanBeCleared(t *testing.T) {
+	svc := newTestServices(t, nil)
+
+	if err := svc.UpdateSettings(map[SettingKey]string{
+		KeySiteLogo: "data:image/png;base64,iVBORw0KGgo=",
+	}); err != nil {
+		t.Fatalf("设置 Logo 失败: %v", err)
+	}
+	if svc.Settings.Get(KeySiteLogo) == "" {
+		t.Fatal("Logo 应已保存")
+	}
+
+	if err := svc.UpdateSettings(map[SettingKey]string{KeySiteLogo: ""}); err != nil {
+		t.Fatalf("清空 Logo 失败: %v", err)
+	}
+	if got := svc.Settings.Get(KeySiteLogo); got != "" {
+		t.Fatalf("清空后不该残留旧值，实际 %q", got)
+	}
+
+	if err := svc.UpdateSettings(map[SettingKey]string{KeyIPBlacklist: "10.0.0.0/8"}); err != nil {
+		t.Fatalf("设置黑名单失败: %v", err)
+	}
+	if err := svc.UpdateSettings(map[SettingKey]string{KeyIPBlacklist: ""}); err != nil {
+		t.Fatalf("清空黑名单失败: %v", err)
+	}
+	if got := svc.Settings.Get(KeyIPBlacklist); got != "" {
+		t.Fatalf("黑名单清空后不该残留，实际 %q", got)
+	}
+	if len(svc.BlockedPrefixes()) != 0 {
+		t.Fatal("黑名单清空后不应继续拦截")
+	}
+}
+
 func TestSiteSubtitleAndHomeContentLimits(t *testing.T) {
 	svc := newTestServices(t, nil)
 

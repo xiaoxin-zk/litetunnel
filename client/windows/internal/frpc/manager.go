@@ -50,6 +50,20 @@ func (m *Manager) Current(tunnelID uint, gen uint64) bool {
 	return m.stillCurrent(tunnelID, gen)
 }
 
+// SetTunnelAccount 记下这条隧道启动时所属的账号代次。
+//
+// 必须在 Start 之前调用：Manager 的启动/停止日志靠它盖章，上层据此判断
+// 一行日志是不是属于当前登录会话。0 表示「不属于任何账号」，上层按放行处理
+// （未接入代次之前的启动日志）。
+func (m *Manager) SetTunnelAccount(tunnelID uint, acct uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.accounts == nil {
+		m.accounts = make(map[uint]uint64)
+	}
+	m.accounts[tunnelID] = acct
+}
+
 // exitLock 返回某条隧道的退出回调锁。
 func (m *Manager) exitLock(tunnelID uint) *sync.Mutex {
 	return &m.exitMu[tunnelID%exitLockShards]
@@ -95,6 +109,13 @@ type Manager struct {
 	logBytes int
 
 	exePath string
+
+	// accounts 记录每条隧道**启动时**所属的账号代次，用于给生命周期日志盖章。
+	//
+	// 启动、停止、退出这些行由 Manager 自己拼，不经过进程管道；没有账号代次
+	// 时上层只能按「收到日志那一刻的当前账号」补，于是登出之后姗姗来迟的
+	// 「已停止」会被记到新账号名下——而那行描述的明明是上一个账号的进程。
+	accounts map[uint]uint64
 
 	// closed 表示已进入关闭流程：此后 Start 直接失败，见 Close。
 	closed bool

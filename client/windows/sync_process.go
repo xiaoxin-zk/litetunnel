@@ -365,9 +365,21 @@ func (a *App) clearRetry(id uint) {
 }
 
 func (a *App) clearRetryGen(id uint, gen uint64) {
+	a.clearRetryAcct(id, noEpoch, gen)
+}
+
+// clearRetryAcct 清退避，同时核对进程代次与账号代次（同一把锁内）。
+//
+// 分开校验没有意义：调用方先 epochCurrent、再进来拿锁，登出可以正好落在
+// 这两步之间，于是上一个账号的「连上了」把新账号同 ID 的退避清掉——新账号
+// 明明在失败，却被当成刚成功过，重连被推迟。
+func (a *App) clearRetryAcct(id uint, acct accountEpoch, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
+	if !a.accountStillLocked(acct) {
 		return
 	}
 	delete(a.retries, id)

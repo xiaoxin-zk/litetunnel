@@ -566,16 +566,16 @@ func (a *App) startup(ctx context.Context) {
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
 			// 原始输出只有一行 start proxy success，用户看不出这意味着
 			// 「可以把地址发给朋友了」——而那恰恰是他最需要的信息。
-			a.clearTunnelErrGen(id, gen)
+			a.clearTunnelErrAcct(id, epoch, gen)
 			// 连上了就把退避清掉：下次断开时应当立即重试，
 			// 而不是继承上一次失败的等待时间。
-			a.clearRetryGen(id, gen)
+			a.clearRetryAcct(id, epoch, gen)
 			// 立刻把这条隧道标成「已注册」并推一次状态。
 			//
 			// 服务端的 Online 要等采集（30 秒一轮）+ 客户端同步（20 秒一轮），
 			// 用户会盯着「连接中」等一整轮，误以为连不上；而 frpc 此刻已经
 			// 报告成功了，没有理由让他等。服务端采集值仍用于后续校准。
-			a.setTunnelRegisteredGen(id, gen, true)
+			a.setTunnelRegisteredAcct(id, epoch, gen, true)
 			a.emitTunnelReadyEpoch(epoch, id, name)
 			if a.epochCurrent(epoch) {
 				// 不直接 emitState：这里是日志投递协程，一旦 Wails 事件阻塞，
@@ -654,7 +654,7 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 	}
 	// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
 	// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
-	a.setTunnelRegisteredGen(id, gen, false)
+	a.setTunnelRegisteredAcct(id, epoch, gen, false)
 	if !a.epochCurrent(epoch) {
 		return
 	}
@@ -675,7 +675,7 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 		// 我们自己停的（用户关开关、退出登录、配置变更重连）：
 		// 不是失败，不该进入退避——否则用户关掉一条隧道，
 		// 界面反而开始报「启动失败，30 秒后重试」。
-		a.clearRetryGen(id, gen)
+		a.clearRetryAcct(id, epoch, gen)
 	default:
 		// 非请求退出都算失败并进入退避，包括 err == nil 的情况：
 		// frpc 自己干净退出同样意味着这条隧道没在跑，不加退避就会

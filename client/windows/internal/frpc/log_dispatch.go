@@ -351,7 +351,11 @@ func (m *Manager) emitPending() {
 // recordLocked 在已持有锁的前提下写入一行日志，返回可推送的副本。
 func (m *Manager) recordLocked(tunnelID uint, tunnelName string, gen uint64, line string, now time.Time) logEntry {
 	stamped := fmt.Sprintf("%s  %s  %s", now.Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
-	return logEntry{id: tunnelID, name: tunnelName, gen: gen, seq: m.recordTextLocked(stamped), text: stamped}
+	// 生命周期日志盖的是「这条隧道启动时所属的账号」，不是「现在写到哪一行」。
+	// 二者在登出竞态里恰好不同：登出后旧进程的「已停止」仍会到，若按当前账号
+	// 盖章，这条日志就会出现在新账号的列表里。
+	return logEntry{id: tunnelID, name: tunnelName, gen: gen, seq: m.recordTextLocked(stamped),
+		text: stamped, acct: m.accounts[tunnelID]}
 }
 
 // recordTextLocked 写入一行已经格式化好的文本，并返回它分配的序号。

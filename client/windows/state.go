@@ -227,9 +227,24 @@ func (a *App) setTunnelRegistered(id uint, up bool) {
 }
 
 func (a *App) setTunnelRegisteredGen(id uint, gen uint64, up bool) {
+	a.setTunnelRegisteredAcct(id, noEpoch, gen, up)
+}
+
+// setTunnelRegisteredAcct 是带账号代次的版本：两代次与写入必须在同一把锁内。
+//
+// 只比进程代次是不够的：登出会先停进程、超时后翻账号代次，而 Exit 回调可能在
+// 那之后才跑到这里。此时进程代次**仍然成立**（它就是当前那个已退出的进程），
+// 但账号已经换了——于是上一个账号的退出把新账号同 ID 的隧道标成未注册。
+//
+// 判据必须在 a.mu 内、与写入同源；在调用方先 epochCurrent 再进这里，中间
+// 那个窗口正好就是登出流程要利用的。
+func (a *App) setTunnelRegisteredAcct(id uint, acct accountEpoch, gen uint64, up bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
+	if !a.accountStillLocked(acct) {
 		return
 	}
 	if a.registered == nil {
@@ -303,6 +318,12 @@ func (a *App) markStartGeneration(id uint) {
 		a.startGen = map[uint]uint64{}
 	}
 	a.startGen[id] = a.authGeneration
+	// 同一时刻把账号代次交给 Manager：它的启动/停止/退出日志靠这个盖章。
+	// 必须在 Start 之前——进程一启动就可能输出，那条日志要带的是「启动它的
+	// 账号」，不是「写日志那一刻的账号」。
+	if a.mgr != nil {
+		a.mgr.SetTunnelAccount(id, a.authGeneration)
+	}
 }
 
 // managerGenerationCurrentLocked 必须在 a.mu 内调用。
@@ -466,9 +487,17 @@ func (a *App) clearTunnelErr(id uint) {
 }
 
 func (a *App) clearTunnelErrGen(id uint, gen uint64) {
+	a.clearTunnelErrAcct(id, noEpoch, gen)
+}
+
+// clearTunnelErrAcct 清错误记录，进程代次与账号代次在同一把锁内校验。
+func (a *App) clearTunnelErrAcct(id uint, acct accountEpoch, gen uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return
+	}
+	if !a.accountStillLocked(acct) {
 		return
 	}
 	delete(a.tunnelErrs, id)

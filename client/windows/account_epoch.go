@@ -68,6 +68,21 @@ func (a *App) tunnelEpoch(id uint) (accountEpoch, bool) {
 	return accountEpoch(gen), true
 }
 
+// accountStillLocked 报告给定代次是否仍是当前账号，调用方须已持有 a.mu。
+//
+// noEpoch（未接入之前产生的行为）一律放行：那时还没有账号可误伤，而这类
+// 调用来自同步路径，它们自己另有 authGen 闸门。
+//
+// 存在的意义是把「账号代次 + 进程代次 + 写入」放进同一个临界区。所有
+// *Acct 变体的状态写入都走这里，避免「调用方先检查、再进锁写」之间被
+// 登出插进来。
+func (a *App) accountStillLocked(acct accountEpoch) bool {
+	if !acct.known() {
+		return true
+	}
+	return uint64(acct) == a.authGeneration
+}
+
 // accountEpochLocked 必须在已持有 a.mu 时调用。
 //
 // 单独抽出来是为了让「在临界区内读账号代次」这件事显式可见：需要与

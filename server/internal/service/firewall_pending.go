@@ -171,8 +171,7 @@ func (s *Services) persistPending(port int, item pendingFW) error {
 			//     last_err，多实例下旧的重试状态不能覆盖新的。
 			gorm.Expr("excluded.generation > lt_firewall_pending.generation OR (excluded.generation = lt_firewall_pending.generation AND excluded.attempts >= lt_firewall_pending.attempts)"),
 		}},
-	}).Create(&rec).Error
-	if err != nil {
+	}).Create(&rec).Error; err != nil {
 		log.Printf("[firewall] 待办落库失败（端口 %d）: %v", port, err)
 		return err
 	}

@@ -199,19 +199,19 @@ jobs:
         working-directory: client/windows
         run: go mod download
 
-      - name: Vet
+      # 只能 vet 子包：main 包依赖 //go:embed all:frontend/dist，而 dist 是
+      # wails build 的产物、不入库。`go vet ./...` 会把 main 包一起解析，
+      # 于是直接报 "pattern all:frontend/dist: no matching files"。
+      # main 包的 vet 与测试放在构建之后（见下方 Vet (main package)）。
+      - name: Vet (internal)
         working-directory: client/windows
-        run: go vet ./...
+        run: go vet ./internal/...
 
       # 发布前先测后打：这里复制 CI 的客户端测试，保证 tag 发布与日常 CI
       # 至少跑同一套用例。构建失败可以重来，发布出去的 bug 没法回收。
       - name: Unit tests (internal)
         working-directory: client/windows
         run: go test ./internal/...
-
-      - name: Unit tests (main package)
-        working-directory: client/windows
-        run: go test .
 
       # 必须先于构建执行：go:embed 在**编译期**读取文件，
       # 顺序反了会直接编译失败（找不到 assets/frpc.exe）。
@@ -259,6 +259,16 @@ jobs:
           # 同时注入平台地址与版本号，版本号会显示在客户端界面上，
           # 用户报障时能直接说出自己在跑哪个版本。
           wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=$env:VERSION"
+
+      # main 包依赖 //go:embed all:frontend/dist，dist 由上面的 wails build
+      # 生成，所以 vet 与测试都排在构建之后。构建之前的门禁只覆盖子包。
+      - name: Vet (main package)
+        working-directory: client/windows
+        run: go vet .
+
+      - name: Unit tests (main package)
+        working-directory: client/windows
+        run: go test .
 
       # -tags embedfrpc 只在发布路径上启用，日常 CI 走不到：内嵌文件是空文件、
       # 是错误页、或下载后被截断，编译与打包都不会报错，只有用户双击后才发现

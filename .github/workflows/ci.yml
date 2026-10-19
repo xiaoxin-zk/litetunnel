@@ -897,9 +897,14 @@ jobs:
       # （netstat / tasklist 的输出格式），它全在子包里。
       # vet 与 test 一起跑：vet 能抓到的（格式化串、锁值复制、不可达代码）
       # 多半不会让测试失败，但会在运行期变成难查的 bug。
-      - name: Vet
+      #
+      # 这里只能 vet 子包：main 包依赖 //go:embed all:frontend/dist，
+      # 而 dist 是 wails build 的产物、不入库。`go vet ./...` 会把 main 包
+      # 一起解析，于是直接报 "pattern all:frontend/dist: no matching files"。
+      # main 包在构建之后单独 vet（见下方 Vet (main package)）。
+      - name: Vet (internal)
         working-directory: client/windows
-        run: go vet ./...
+        run: go vet ./internal/...
 
       - name: Unit tests
         working-directory: client/windows
@@ -921,9 +926,13 @@ jobs:
           # 带地址的正式安装包由 release.yml 产出。
           wails build -clean -platform windows/amd64
 
-      # main 包的测试只能放在构建之后：它依赖 //go:embed frontend/dist，
+      # main 包的 vet 与测试只能放在构建之后：它依赖 //go:embed frontend/dist，
       # 前端没构建出来就编译不过。本地配置的原子写入与损坏处理都在这个包里，
       # 而这两条路径只在异常情况下才会走到——没有测试就没人守得住。
+      - name: Vet (main package)
+        working-directory: client/windows
+        run: go vet .
+
       - name: Unit tests (main package)
         working-directory: client/windows
         run: go test .

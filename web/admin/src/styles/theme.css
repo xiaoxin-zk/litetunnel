@@ -1,0 +1,138 @@
+/**
+ * 管理端主题：浅薰衣草白帆布 + 紫色主色 + 青绿点缀。
+ * 只做视觉层覆盖，不改任何业务样式类名。
+ */
+:root {
+  --lt-canvas: #f7f5ff;
+  --lt-ink: #2b2440;
+  --lt-ink-soft: #6f6689;
+  --lt-primary: #6d5bd0;
+  --lt-primary-strong: #5644c0;
+  --lt-primary-soft: #ede7ff;
+  --lt-accent: #17b8a6;
+  --lt-accent-soft: #e2f8f4;
+  --lt-line: #ece7fb;
+
+  --el-color-primary: #6d5bd0;
+  --el-color-primary-light-3: #9a8ce0;
+  --el-color-primary-light-5: #b9afe9;
+  --el-color-primary-light-7: #d8d2f4;
+  --el-color-primary-light-8: #e5e1f8;
+  --el-color-primary-light-9: #f1eefc;
+  --el-color-primary-dark-2: #5644c0;
+  --el-border-radius-base: 10px;
+  --el-text-color-primary: #2b2440;
+  --el-text-color-regular: #4b4463;
+}
+
+body {
+  background:
+    radial-gradient(1100px 520px at 82% -8%, #efe7ff 0%, rgba(247, 245, 255, 0) 62%),
+    radial-gradient(900px 480px at -5% 100%, #e6f8f4 0%, rgba(247, 245, 255, 0) 58%),
+    var(--lt-canvas);
+  color: var(--lt-ink);
+}
+
+.lt-card {
+  background: #fff;
+  border: 1px solid var(--lt-line);
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(88, 66, 168, 0.06);
+}
+
+.lt-card-title {
+  color: var(--lt-ink);
+}
+
+.lt-muted {
+  color: var(--lt-ink-soft);
+}
+
+/* 侧边栏：浅薰衣草画布，不再压深色 */
+.aside {
+  background: linear-gradient(180deg, #f5f0ff 0%, #eae3ff 100%) !important;
+  border-right: 1px solid #e4dcfb !important;
+}
+
+.aside .brand .brand-title {
+  color: #2b2440 !important;
+}
+
+.aside .brand .brand-sub {
+  color: #7a7194 !important;
+}
+
+.aside .brand .logo {
+  background: linear-gradient(135deg, #8071e6 0%, #5a48c0 100%) !important;
+  color: #fff !important;
+  box-shadow: 0 8px 18px rgba(109, 91, 208, 0.32);
+}
+
+.aside .menu {
+  background: transparent !important;
+  border-right: none !important;
+}
+
+.aside .menu .el-menu-item {
+  color: #554d70 !important;
+  height: 42px;
+  margin: 2px 10px;
+  border-radius: 11px;
+}
+
+.aside .menu .el-menu-item:hover {
+  background: rgba(255, 255, 255, 0.72) !important;
+  color: var(--lt-primary-strong) !important;
+}
+
+.aside .menu .el-menu-item.is-active {
+  background: #fff !important;
+  color: var(--lt-primary-strong) !important;
+  font-weight: 600;
+  box-shadow: 0 8px 18px rgba(109, 91, 208, 0.16);
+}
+
+.aside .aside-foot {
+  border-top: 1px solid #e4dcfb !important;
+}
+
+.aside .ver-btn {
+  color: #6f6689 !important;
+}
+
+.header {
+  background: transparent;
+}
+
+/* 指标卡：紫色放射底 + 青绿进度条 */
+.metric {
+  background:
+    radial-gradient(120px 90px at 88% -20%, rgba(109, 91, 208, 0.12), rgba(255, 255, 255, 0) 70%),
+    linear-gradient(165deg, #ffffff 0%, #faf8ff 100%);
+  border: 1px solid var(--lt-line);
+  border-radius: 14px;
+  padding: 14px 16px;
+}
+
+.metric-label {
+  color: var(--lt-ink-soft);
+}
+
+.metric-value {
+  font-weight: 700;
+}
+
+.metric-sub {
+  color: #8d85a6;
+}
+
+.el-table th.el-table__cell {
+  background: #f7f4ff !important;
+  color: #5a5170;
+}
+
+.el-tag--success {
+  --el-tag-bg-color: var(--lt-accent-soft);
+  --el-tag-text-color: #0f8d7f;
+  --el-tag-border-color: #bdeee7;
+}

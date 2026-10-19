@@ -177,6 +177,13 @@ export const settingsApi = {
   testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
+export const backupApi = {
+  list: () => http.get('/backups'),
+  create: () => http.post('/backups'),
+  remove: (name) => http.delete(`/backups/${encodeURIComponent(name)}`),
+  restore: (name) => http.post(`/backups/${encodeURIComponent(name)}/restore`)
+}
+
 export const adminKeyApi = {
   list: () => http.get('/admin-api-keys'),
   create: (data) => http.post('/admin-api-keys', data),

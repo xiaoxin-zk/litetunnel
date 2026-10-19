@@ -197,6 +197,7 @@ func New(
 	adminWrite.Use(adminAllow.Middleware())
 	adminWrite.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity, "super", "operator"))
 	{
+		adminWrite.POST("/alerts/events/:id/resolve", adminH.ResolveAlertEvent)
 		adminWrite.POST("/users", adminH.CreateUser)
 		adminWrite.PUT("/users/:id", adminH.UpdateUser)
 		adminWrite.DELETE("/users/:id", adminH.DeleteUser)

@@ -126,6 +126,22 @@ func (h *Handler) ListAlertEvents(c *gin.Context) {
 	httpx.OK(c, gin.H{"events": list})
 }
 
+// ResolveAlertEvent 手动关闭一条仍在 firing 的告警。
+// 冷却窗口内即使条件仍在也不会再提醒，相当于一次有审计记录的静默。
+func (h *Handler) ResolveAlertEvent(c *gin.Context) {
+	id, err := parseID(c)
+	if err != nil {
+		httpx.BadRequest(c, "非法的告警 ID")
+		return
+	}
+	if err := h.svc.ResolveAlertEvent(id); err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "alert.resolve", "alert", strconv.FormatUint(uint64(id), 10), "手动解决告警")
+	httpx.OK(c, gin.H{"message": "已标记为手动解决"})
+}
+
 func (h *Handler) ListMetricSamples(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
 	list, err := h.svc.ListMetricSamples(limit)

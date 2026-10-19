@@ -159,6 +159,32 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("回填账号生命周期标识失败: %w", err)
 	}
 
+	// 事件状态是后加的列：老库里的历史告警没有状态，按「仍在 firing」处理，
+	// 否则它们永远不会被自动恢复，面板上会一直挂着一个空状态。
+	if err := db.Model(&model.AlertEvent{}).
+		Where("status IS NULL OR status = ''").
+		Update("status", model.AlertStatusFiring).Error; err != nil {
+		return nil, fmt.Errorf("回填告警事件状态失败: %w", err)
+	}
+
+	// 旧逻辑每 30 分钟就新开一条事件，同一 kind 可能已经有多条 firing。
+	// 先收敛成最新一条，再建唯一索引：否则索引建不出来，多实例下还会重复推送。
+	if err := db.Exec(
+		`UPDATE lt_alert_events SET status = ?, resolved_at = created_at
+		  WHERE status = ? AND id NOT IN (
+		      SELECT MAX(id) FROM lt_alert_events WHERE status = ? GROUP BY kind
+		  )`,
+		model.AlertStatusResolved, model.AlertStatusFiring, model.AlertStatusFiring,
+	).Error; err != nil {
+		log.Printf("[store] 收敛重复的进行中告警失败: %v", err)
+	}
+	if err := db.Exec(
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_alert_events_firing
+		 ON lt_alert_events(kind) WHERE status = 'firing'`,
+	).Error; err != nil {
+		log.Printf("[store] 进行中告警唯一索引未建立（多实例下可能重复推送）: %v", err)
+	}
+
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)
 	}

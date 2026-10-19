@@ -14,8 +14,8 @@
         :closable="false"
         show-icon
         style="margin-bottom: 16px"
-        title="每 5 分钟采样一次，命中阈值才推送；同一类告警 30 分钟内不重复发送"
-        :description="`样本保留 ${sampleKeepDays} 天，供下方趋势图使用。冷却按告警类型计算并落库，进程重启后仍然有效。`"
+        title="每 5 分钟采样一次，命中阈值才推送；同一事件每 30 分钟提醒一次，恢复时再推一条"
+        :description="`样本保留 ${sampleKeepDays} 天，供下方趋势图使用。事件状态落库，进程重启后仍然有效。`"
       />
 
       <el-form label-width="150px" style="max-width: 780px">
@@ -36,8 +36,9 @@
             </span>
           </div>
           <div class="hint">
-            以 POST + JSON 推送，字段：<span class="lt-mono">kind / level / message / value / threshold / site / at</span>；
-            返回 2xx 视为推送成功
+            以 POST + JSON 推送，字段：<span class="lt-mono">event_id / kind / status / level / message / value / threshold / site / at / fired_at</span>；
+            <span class="lt-mono">status</span> 为 <span class="lt-mono">firing</span>（触发）、
+            <span class="lt-mono">resolved</span>（恢复）或 <span class="lt-mono">test</span>（测试）；返回 2xx 视为推送成功
           </div>
           <div class="hint">
             出站策略：拒绝云厂商元数据与链路本地地址，且不跟随 3xx 跳转；
@@ -86,34 +87,61 @@
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>告警历史</span>
-        <el-button link type="primary" :loading="loadingEvents" @click="loadEvents">刷新</el-button>
+        <div class="row">
+          <el-radio-group v-model="statusFilter" size="small">
+            <el-radio-button value="">全部</el-radio-button>
+            <el-radio-button value="firing">进行中</el-radio-button>
+            <el-radio-button value="resolved">已恢复</el-radio-button>
+            <el-radio-button value="manual_resolved">手动解决</el-radio-button>
+          </el-radio-group>
+          <el-button link type="primary" :loading="loadingEvents" @click="loadEvents">刷新</el-button>
+        </div>
       </div>
-      <el-table :data="events" size="small" empty-text="还没有告警">
+      <el-table :data="visibleEvents" size="small" empty-text="还没有告警">
         <el-table-column label="时间" width="180">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="类型" width="130">
+        <el-table-column label="类型" width="120">
           <template #default="{ row }">{{ kindLabel(row.kind) }}</template>
         </el-table-column>
-        <el-table-column label="级别" width="100">
+        <el-table-column label="级别" width="90">
           <template #default="{ row }">
             <el-tag size="small" :type="row.level === 'critical' ? 'danger' : row.level === 'warning' ? 'warning' : 'info'">
               {{ row.level }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="message" label="内容" min-width="320" show-overflow-tooltip />
-        <el-table-column label="推送" width="90">
+        <el-table-column prop="message" label="内容" min-width="300" show-overflow-tooltip />
+        <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <el-tag size="small" :type="row.delivered ? 'success' : 'info'">
-              {{ row.delivered ? '成功' : '未送达' }}
+            <el-tag size="small" :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="通知" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="notifyState(row).ok ? 'success' : 'info'">
+              {{ notifyState(row).text }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="100" align="right">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.status === 'firing'"
+              link
+              type="warning"
+              :loading="resolving === row.id"
+              @click="resolveEvent(row)"
+            >
+              手动解决
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
       <div class="lt-muted" style="margin-top: 10px">
-        「未送达」表示 Webhook 请求失败（超时、非 2xx 或地址不可达），可在这里确认接收端是否正常。
-        历史只保留最近 {{ eventKeepDays }} 天。
+        「进行中」表示条件仍在命中，期间每 30 分钟提醒一次；条件自行回落会自动变成「已恢复」，并推送一条恢复通知（触发通知没送达时不补发）。
+        「手动解决」用于已经知道、暂时不想再被提醒的告警：30 分钟内同类问题不再打扰，之后仍在命中才重新开一条。
+        历史只保留最近 {{ eventKeepDays }} 天（仍在进行中的不清理）。
       </div>
     </div>
   </div>
@@ -122,7 +150,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { alertApi } from '../api'
 
 const loadingConfig = ref(false)
@@ -159,8 +187,66 @@ const rangeLabel = computed(
 )
 const samples = ref([])
 const events = ref([])
+const statusFilter = ref('')
+const resolving = ref(0)
 const chartRef = ref()
 let chart = null
+
+const visibleEvents = computed(() =>
+  statusFilter.value ? events.value.filter((e) => e.status === statusFilter.value) : events.value
+)
+
+function statusLabel(status) {
+  switch (status) {
+    case 'resolved':
+      return '已恢复'
+    case 'manual_resolved':
+      return '手动解决'
+    case 'firing':
+    case '':
+    case undefined:
+      return '进行中'
+    default:
+      return status
+  }
+}
+
+function statusTagType(status) {
+  if (status === 'resolved') return 'success'
+  if (status === 'manual_resolved') return 'info'
+  return 'danger'
+}
+
+// 通知列分两种语义：进行中看触发通知是否送达，已恢复看恢复通知是否送达。
+function notifyState(row) {
+  if (row.status === 'resolved') {
+    return { ok: !!row.resolved_notified, text: row.resolved_notified ? '恢复已通知' : '恢复未通知' }
+  }
+  if (row.status === 'manual_resolved') {
+    return { ok: true, text: '—' }
+  }
+  return { ok: !!row.delivered, text: row.delivered ? '已推送' : '未送达' }
+}
+
+async function resolveEvent(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确认把「${kindLabel(row.kind)}」标记为手动解决？30 分钟内同类告警不会再提醒。`,
+      '手动解决告警',
+      { type: 'warning', confirmButtonText: '确认解决', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  resolving.value = row.id
+  try {
+    await alertApi.resolve(row.id)
+    ElMessage.success('已标记为手动解决')
+    await loadEvents()
+  } finally {
+    resolving.value = 0
+  }
+}
 
 const KIND_LABELS = {
   error_rate: '接口错误率',

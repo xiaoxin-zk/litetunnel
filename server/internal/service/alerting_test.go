@@ -1,9 +1,11 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -174,6 +176,276 @@ func TestRunAlertCyclePrunesOldSamples(t *testing.T) {
 	}
 	if kept[0].ID == old.ID {
 		t.Error("保留下来的不该是过期样本")
+	}
+}
+
+// 记录 Webhook 收到的 payload，供生命周期断言使用。
+type alertSink struct {
+	mu       sync.Mutex
+	payloads []map[string]any
+}
+
+func (s *alertSink) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		s.mu.Lock()
+		s.payloads = append(s.payloads, p)
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (s *alertSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.payloads)
+}
+
+func (s *alertSink) at(i int) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.payloads[i]
+}
+
+// 条件恢复后事件必须被标成 resolved 并推一条恢复通知；重复调用不能再推。
+func TestAlertLifecycleResolveAndNotify(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+	if err := svc.UpdateSettings(alertSettingMap(srv.URL, true)); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 95%", 95, 90)
+	svc.resolveAlert("disk", "磁盘使用率已回落至 70%")
+
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if ev.Status != model.AlertStatusResolved {
+		t.Fatalf("状态 = %q，期望 resolved", ev.Status)
+	}
+	if ev.ResolvedAt == nil {
+		t.Fatal("恢复时间不能为空")
+	}
+	if !ev.ResolvedNotified {
+		t.Error("恢复通知送达后应标记 resolved_notified")
+	}
+	if got := sink.count(); got != 2 {
+		t.Fatalf("应推送触发 + 恢复两条，实际 %d 条", got)
+	}
+	if status := sink.at(0)["status"]; status != model.AlertStatusFiring {
+		t.Errorf("第一条应是 firing，实际 %v", status)
+	}
+	if status := sink.at(1)["status"]; status != model.AlertStatusResolved {
+		t.Errorf("第二条应是 resolved，实际 %v", status)
+	}
+
+	svc.resolveAlert("disk", "磁盘使用率已回落至 70%")
+	if got := sink.count(); got != 2 {
+		t.Errorf("重复恢复不该再推送，实际累计 %d 条", got)
+	}
+}
+
+// 自动恢复后短时间复发，视为同一次抖动：重开原事件，不新增行、不补发通知。
+func TestAlertReopensSilentlyWithinCooldown(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+	if err := svc.UpdateSettings(alertSettingMap(srv.URL, true)); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 95%", 95, 90)
+	svc.resolveAlert("disk", "磁盘使用率已回落至 70%")
+
+	var first model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&first).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 96%", 96, 90)
+
+	var rows []model.AlertEvent
+	if err := svc.DB.Find(&rows).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("冷却窗口内复发应重开原事件，实际 %d 条", len(rows))
+	}
+	if rows[0].ID != first.ID {
+		t.Errorf("事件 ID 变了：%d → %d", first.ID, rows[0].ID)
+	}
+	if rows[0].Status != model.AlertStatusFiring {
+		t.Errorf("复发后状态 = %q，期望 firing", rows[0].Status)
+	}
+	if rows[0].ResolvedAt != nil {
+		t.Error("重开后恢复时间应清空")
+	}
+	if got := sink.count(); got != 2 {
+		t.Errorf("静默重开不该补发通知，实际累计 %d 条", got)
+	}
+}
+
+// 手动解决是「有记录的静默」：冷却内不再打扰，冷却后条件仍在才开新事件。
+func TestManualResolveSuppressesRepeatUntilCooldown(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+	if err := svc.UpdateSettings(alertSettingMap(srv.URL, true)); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 95%", 95, 90)
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if err := svc.ResolveAlertEvent(ev.ID); err != nil {
+		t.Fatalf("手动解决失败: %v", err)
+	}
+	if err := svc.ResolveAlertEvent(ev.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("重复解决应返回未找到，实际 %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 96%", 96, 90)
+
+	var rows []model.AlertEvent
+	if err := svc.DB.Find(&rows).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("冷却内手动解决应保持静默，实际 %d 条", len(rows))
+	}
+	if rows[0].Status != model.AlertStatusManualResolved {
+		t.Errorf("状态 = %q，期望 manual_resolved", rows[0].Status)
+	}
+
+	// 冷却过去后条件仍在：应该开一条新事件。
+	if err := svc.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).
+		Update("resolved_at", time.Now().Add(-2*alertCooldown)).Error; err != nil {
+		t.Fatalf("调整恢复时间失败: %v", err)
+	}
+	svc.raiseAlert("disk", "critical", "磁盘使用率 97%", 97, 90)
+
+	rows = nil
+	if err := svc.DB.Order("id ASC").Find(&rows).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("冷却后应开新事件，实际 %d 条", len(rows))
+	}
+	if rows[1].Status != model.AlertStatusFiring {
+		t.Errorf("新事件状态 = %q，期望 firing", rows[1].Status)
+	}
+}
+
+// 长期故障不能只在开头响一声：同一事件每 30 分钟提醒一次，并带上最新读数。
+func TestRaiseAlertRemindsEveryCooldown(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+	if err := svc.UpdateSettings(alertSettingMap(srv.URL, true)); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 95%", 95, 90)
+
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if err := svc.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).
+		Update("last_notified_at", time.Now().Add(-alertCooldown-time.Minute)).Error; err != nil {
+		t.Fatalf("调整提醒时间失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 97%", 97, 90)
+
+	var rows []model.AlertEvent
+	if err := svc.DB.Find(&rows).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("提醒不该新增事件，实际 %d 条", len(rows))
+	}
+	if rows[0].Message != "磁盘使用率 97%" {
+		t.Errorf("提醒应带上最新读数，实际 %q", rows[0].Message)
+	}
+	if got := sink.count(); got != 2 {
+		t.Errorf("应推送触发 + 提醒两条，实际 %d 条", got)
+	}
+}
+
+// 数据不足时不能把正在响的告警误判成恢复：
+// 面板刚启动、监控还没采到磁盘读数，DiskTotal 为 0，看着像「磁盘 0%」。
+func TestRunAlertCycleKeepsFiringWhenDataUnavailable(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+
+	settings := alertSettingMap(srv.URL, true)
+	settings[KeyAlertDisk] = "1"
+	settings[KeyAlertErrorRate] = "0"
+	settings[KeyAlertBackupHours] = "0"
+	if err := svc.UpdateSettings(settings); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "磁盘使用率 95%", 95, 90)
+	svc.runAlertCycle(time.Now()) // Monitor 还没有磁盘读数
+
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if ev.Status != model.AlertStatusFiring {
+		t.Fatalf("读数未知时不该自动恢复，状态 = %q", ev.Status)
+	}
+	if got := sink.count(); got != 1 {
+		t.Errorf("读数未知时不该推恢复通知，实际累计 %d 条", got)
+	}
+}
+
+// 走完整一轮采样：条件真正消失时，事件要自动恢复并推送恢复通知。
+func TestRunAlertCycleResolvesWhenConditionClears(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+
+	settings := alertSettingMap(srv.URL, true)
+	settings[KeyAlertDisk] = "0" // 关掉另外两条规则，避免干扰断言
+	settings[KeyAlertErrorRate] = "0"
+	settings[KeyAlertBackupHours] = "1"
+	if err := svc.UpdateSettings(settings); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	// 先造一条「备份超时」告警，再补一份新备份，让条件自行消失。
+	svc.raiseAlert("backup_stale", "warning", "已有 99 小时没有成功备份", 99, 1)
+	if _, err := svc.CreateBackup(""); err != nil {
+		t.Fatalf("创建备份失败: %v", err)
+	}
+
+	svc.runAlertCycle(time.Now())
+
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if ev.Status != model.AlertStatusResolved {
+		t.Fatalf("条件不再命中后状态 = %q，期望 resolved", ev.Status)
+	}
+	if !ev.ResolvedNotified {
+		t.Error("应推送恢复通知并标记 resolved_notified")
+	}
+	if got := sink.count(); got != 2 {
+		t.Errorf("应推送触发 + 恢复两条，实际 %d 条", got)
 	}
 }
 

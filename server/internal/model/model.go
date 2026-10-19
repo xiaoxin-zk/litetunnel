@@ -304,15 +304,35 @@ type MetricSample struct {
 
 func (MetricSample) TableName() string { return "lt_metric_samples" }
 
-// AlertEvent 记录一次告警，同时用于计算冷却时间。
+const (
+	// AlertStatusFiring 表示问题仍在持续；同一 kind 同时最多只有一条。
+	AlertStatusFiring = "firing"
+	// AlertStatusResolved 表示条件已自行恢复（下一轮采样不再命中）。
+	AlertStatusResolved = "resolved"
+	// AlertStatusManualResolved 表示管理员手动关掉了这条告警。
+	AlertStatusManualResolved = "manual_resolved"
+)
+
+// AlertEvent 记录一次告警，同时用于计算冷却时间与判断是否仍在 firing。
 type AlertEvent struct {
-	ID        uint      `gorm:"primarykey" json:"id"`
-	Kind      string    `gorm:"size:32;index" json:"kind"`
-	Level     string    `gorm:"size:16" json:"level"`
-	Message   string    `gorm:"type:text" json:"message"`
-	Value     float64   `json:"value"`
-	Threshold float64   `json:"threshold"`
-	Delivered bool      `json:"delivered"`
+	ID        uint    `gorm:"primarykey" json:"id"`
+	Kind      string  `gorm:"size:32;index" json:"kind"`
+	Level     string  `gorm:"size:16" json:"level"`
+	Message   string  `gorm:"type:text" json:"message"`
+	Value     float64 `json:"value"`
+	Threshold float64 `json:"threshold"`
+	Delivered bool    `json:"delivered"`
+
+	Status     string     `gorm:"size:16;index;default:firing" json:"status"`
+	ResolvedAt *time.Time `json:"resolved_at"`
+
+	// LastNotifiedAt 是最近一次「触发通知」成功送达的时间，用于每 30 分钟提醒一次；
+	// 与 CreatedAt 分开，避免把提醒当成新事件，也避免长期故障只有一次提醒。
+	LastNotifiedAt *time.Time `json:"last_notified_at"`
+
+	// ResolvedNotified 只表示「恢复通知是否送达」，触发通知看 Delivered。
+	ResolvedNotified bool `gorm:"not null;default:0" json:"resolved_notified"`
+
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 

@@ -208,6 +208,7 @@ export const alertApi = {
   saveSettings: (data) => http.put('/alerts/settings', data),
   test: () => http.post('/alerts/settings/test'),
   events: (limit) => http.get('/alerts/events', { params: limit ? { limit } : {} }),
+  resolve: (id) => http.post(`/alerts/events/${id}/resolve`),
   metrics: (limit) => http.get('/alerts/metrics', { params: limit ? { limit } : {} })
 }
 

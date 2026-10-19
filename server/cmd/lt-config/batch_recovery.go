@@ -316,14 +316,16 @@ func cleanupLeftovers(p paths) []string {
 			switch {
 			case strings.HasPrefix(name, ".lt-config-tmp-"):
 				if rerr := os.Remove(filepath.Join(dir, name)); rerr != nil {
-					log.Printf("[lt-config] 清理遗留临时文件失败（%s）: %v", name, rerr)
+					log.Printf("[lt-config] 清理遗留临时文件失败，阻断后续写盘（%s）: %v", name, rerr)
+					blockDir(dir)
 				}
 			case e.IsDir() && isValidateTempDir(name):
 				// 校验用的临时目录里有挂进容器的 env 文件（DNS 凭据）。
 				// 只清普通临时文件的话，异常退出后这些凭据会一直留在部署
 				// 目录里——而那是个能被备份、被同步、被随手打包带走的地方。
 				if rerr := os.RemoveAll(filepath.Join(dir, name)); rerr != nil {
-					log.Printf("[lt-config] 清理遗留校验目录失败（%s）: %v", name, rerr)
+					log.Printf("[lt-config] 清理遗留校验目录失败，阻断后续写盘（%s）: %v", name, rerr)
+					blockDir(dir)
 				}
 			case strings.HasSuffix(name, backupSuffix):
 				if !cleanupOneBackup(dir, name) {

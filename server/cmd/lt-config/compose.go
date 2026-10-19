@@ -132,6 +132,8 @@ func (s *service) verifyServicesRunning(ctx context.Context) error {
 }
 
 // serviceStates 读取各 compose 容器的实际状态，用于「部分应用」时如实上报。
+// 解析到格式异常的行时返回 nil，而不是拼出不完整列表；调用方应将 nil
+// 视为状态读取失败并在 partial 信息中明确提示。
 //
 // 用 --format 取「服务名 | 状态」一行一条。使用竖线而不是 Tab：
 // 不同 Compose 版本对转义序列的输出方式可能不同，固定分隔符能让解析
@@ -154,7 +156,7 @@ func (s *service) serviceStates(ctx context.Context) []tlscfg.ServiceState {
 		parts := strings.Split(line, "|")
 		if len(parts) != 4 || strings.TrimSpace(parts[0]) == "" {
 			log.Printf("[lt-config] 无法解析 compose 状态行 %q", line)
-			continue
+			return nil
 		}
 		state := strings.TrimSpace(parts[1])
 		if health := strings.TrimSpace(parts[2]); health != "" {

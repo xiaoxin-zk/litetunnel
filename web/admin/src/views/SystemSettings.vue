@@ -292,6 +292,16 @@
             <span class="hint">允许的瞬时峰值，默认 60；调低可防刷，但页面并发加载多时易误伤</span>
           </el-form-item>
 
+          <el-divider content-position="left">敏感操作二次验证</el-divider>
+
+          <el-form-item label="开启 step-up">
+            <el-switch v-model="boolForm['security.step_up_enabled']" />
+            <span class="hint">
+              开启后，改系统设置、管理员管理、防火墙与域名操作、重置用户凭据都需要再输一次动态口令，
+              通过后本次登录 15 分钟内有效。开关本身也受保护：关闭它同样要先验证
+            </span>
+          </el-form-item>
+
           <el-divider content-position="left">审计日志</el-divider>
 
           <el-form-item label="操作日志保留天数">
@@ -450,7 +460,8 @@ const BOOL_KEYS = [
   'smtp.enabled',
   'payment.enabled',
   'firewall.enabled',
-  'firewall.auto_open'
+  'firewall.auto_open',
+  'security.step_up_enabled'
 ]
 
 const NUM_KEYS = [

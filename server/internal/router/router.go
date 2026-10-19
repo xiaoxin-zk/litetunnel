@@ -187,8 +187,9 @@ func New(
 		adminWrite.POST("/users/:id/quota", adminH.SetUserQuota)
 		adminWrite.POST("/users/:id/traffic-reset", adminH.ResetUserTraffic)
 		adminWrite.POST("/users/:id/group", adminH.SetUserGroup)
-		adminWrite.POST("/users/:id/password", adminH.ResetUserPassword)
-		adminWrite.POST("/users/:id/reset-secret", adminH.ResetUserSecret)
+		adminWrite.POST("/users/:id/password", middleware.StepUp(svc), adminH.ResetUserPassword)
+		adminWrite.POST("/users/:id/reset-secret", middleware.StepUp(svc), adminH.ResetUserSecret)
+		adminWrite.POST("/step-up", adminH.StepUpVerify)
 
 		adminWrite.POST("/groups", adminH.CreateGroup)
 		adminWrite.PUT("/groups/:id", adminH.UpdateGroup)
@@ -206,6 +207,7 @@ func New(
 	adminSuper.Use(middleware.Limit(adminAPILimiter, "admin-super"))
 	adminSuper.Use(adminAllow.Middleware())
 	adminSuper.Use(middleware.AdminAuth(cfg.AdminJWTSecret, svc.ResolveAdminIdentity, "super"))
+	adminSuper.Use(middleware.StepUp(svc))
 	{
 		adminSuper.POST("/admins", adminH.CreateAdmin)
 		adminSuper.PUT("/admins/:id", adminH.UpdateAdmin)

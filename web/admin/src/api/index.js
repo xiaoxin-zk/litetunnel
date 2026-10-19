@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import router from '../router'
 
 const http = axios.create({
@@ -26,19 +26,59 @@ http.interceptors.response.use(
     }
     return body ? body.data : null
   },
-  (err) => {
+  async (err) => {
     const status = err.response?.status
-    const message = err.response?.data?.message || err.message || '网络异常'
+    const body = err.response?.data
+    const message = body?.message || err.message || '网络异常'
     if (status === 401) {
       localStorage.removeItem(TOKEN_KEY)
       if (router.currentRoute.value.path !== '/login') {
         router.push('/login')
       }
     }
+
+    // 敏感操作门控：后端返回 step_up_required 时弹出动态口令，验证通过后重试原请求一次。
+    if (status === 403 && body?.data?.step_up_required) {
+      try {
+        await requestStepUp()
+      } catch {
+        return Promise.reject(err)
+      }
+      const cfg = err.config || {}
+      if (!cfg.__stepUpRetried) {
+        cfg.__stepUpRetried = true
+        return http(cfg)
+      }
+    }
+
     ElMessage.error(message)
     return Promise.reject(err)
   }
 )
+
+let stepUpPending = null
+
+function requestStepUp() {
+  if (!stepUpPending) {
+    stepUpPending = (async () => {
+      const { value } = await ElMessageBox.prompt(
+        '该操作需要二次验证，请输入认证器中的 6 位动态口令',
+        '敏感操作验证',
+        {
+          inputPattern: /^\d{6}$/,
+          inputErrorMessage: '请输入 6 位数字',
+          confirmButtonText: '验证',
+          cancelButtonText: '取消'
+        }
+      )
+      await http.post('/step-up', { code: value })
+      ElMessage.success('验证通过，有效期 15 分钟')
+    })().finally(() => {
+      stepUpPending = null
+    })
+  }
+  return stepUpPending
+}
 
 export default http
 

@@ -36,6 +36,7 @@ const (
 	KeyLoginMaxPerMinute SettingKey = "login.max_per_minute"
 
 	KeyAuditRetentionDays SettingKey = "audit.retention_days"
+	KeyStepUpEnabled      SettingKey = "security.step_up_enabled"
 
 	KeyAPIRatePerMinute SettingKey = "api.rate_limit_per_minute"
 	KeyAPIRateBurst     SettingKey = "api.rate_limit_burst"
@@ -128,6 +129,7 @@ var settingSpecs = []settingSpec{
 	{Key: KeyLoginMaxPerMinute, Default: func(*config.Config) string { return "10" }},
 
 	{Key: KeyAuditRetentionDays, Default: func(*config.Config) string { return "180" }},
+	{Key: KeyStepUpEnabled, Default: func(*config.Config) string { return "false" }},
 
 	{Key: KeyAPIRatePerMinute, Default: func(*config.Config) string { return "120" }},
 	{Key: KeyAPIRateBurst, Default: func(*config.Config) string { return "60" }},

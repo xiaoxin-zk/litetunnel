@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ const (
 	CtxAdminRole  = "lt_admin_role"
 	CtxAdminName  = "lt_admin_name"
 	CtxAuthMethod = "lt_auth_method"
+	CtxSessionID  = "lt_session_id"
 )
 
 const (
@@ -446,6 +448,11 @@ func AdminAuth(secret string, resolve IdentityResolver, allowRoles ...string) gi
 		c.Set(CtxAdminID, claims.UserID)
 		c.Set(CtxAdminName, claims.Username)
 		c.Set(CtxAdminRole, claims.Role)
+		// 本项目的管理员会话就是一枚 JWT，没有服务端会话表；
+		// 用签发时间当会话标识，同一次登录拿到的令牌共享一个 step-up 授权。
+		if claims.IssuedAt != nil {
+			c.Set(CtxSessionID, strconv.FormatInt(claims.IssuedAt.Unix(), 10))
+		}
 		c.Next()
 	}
 }

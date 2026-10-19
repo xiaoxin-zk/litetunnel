@@ -75,6 +75,7 @@ func (s *Services) runMaintenance(ctx context.Context) {
 		}
 	}
 	s.PurgeExpiredLoginFails(now.Add(-loginFailWindow), deadline)
+	s.PurgeExpiredStepUpGrants(now)
 
 	middleware.SweepIdleLimiters()
 }

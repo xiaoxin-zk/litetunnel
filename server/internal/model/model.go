@@ -277,6 +277,19 @@ type MailTemplate struct {
 
 func (MailTemplate) TableName() string { return "lt_mail_templates" }
 
+// StepUpGrant 记录某个管理员会话在有效期内已通过 TOTP 二次验证，
+// 一条记录对应一次「登录令牌签发批次」，过期即失效。
+type StepUpGrant struct {
+	ID         uint      `gorm:"primarykey" json:"id"`
+	AdminID    uint      `gorm:"uniqueIndex:idx_stepup_session;not null" json:"admin_id"`
+	SessionKey string    `gorm:"size:64;uniqueIndex:idx_stepup_session;not null" json:"session_key"`
+	ExpiresAt  time.Time `gorm:"index;not null" json:"expires_at"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (StepUpGrant) TableName() string { return "lt_admin_stepup_grants" }
+
 type EmailCode struct {
 	ID        uint       `gorm:"primarykey" json:"id"`
 	Email     string     `gorm:"size:128;index;not null" json:"-"`

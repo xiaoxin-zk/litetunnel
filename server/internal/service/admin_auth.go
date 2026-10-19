@@ -180,7 +180,7 @@ func (s *Services) updateAdminSecurityTx(tx *gorm.DB, id uint, updates map[strin
 }
 
 func (s *Services) AdminTOTPDisable(id uint, password string) error {
-	return s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+	err := s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
 		if !auth.VerifyPassword(a.Password, password) {
 			return false, fmt.Errorf("%w: 登录密码不正确", ErrInvalidParam)
 		}
@@ -193,6 +193,11 @@ func (s *Services) AdminTOTPDisable(id uint, password string) error {
 			"totp_pending_secret": "",
 		})
 	})
+	if err != nil {
+		return err
+	}
+	s.DropStepUpGrant(id)
+	return nil
 }
 
 func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string) error {
@@ -229,11 +234,12 @@ func (s *Services) AdminChangePassword(id uint, oldPassword, newPassword string)
 		return err
 	}
 	s.Runtime.InvalidateIdentity(IdentityKindAdmin, id)
+	s.DropStepUpGrant(id)
 	return nil
 }
 
 func (s *Services) AdminClearTOTP(id uint) error {
-	return s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
+	err := s.withAdminSecurity(id, func(tx *gorm.DB, a *model.Admin) (bool, error) {
 		if !a.TOTPEnabled && a.TOTPSecret == "" && a.TOTPPendingSecret == "" {
 			return false, nil
 		}
@@ -244,4 +250,9 @@ func (s *Services) AdminClearTOTP(id uint) error {
 			"totp_verified_at":    nil,
 		})
 	})
+	if err != nil {
+		return err
+	}
+	s.DropStepUpGrant(id)
+	return nil
 }

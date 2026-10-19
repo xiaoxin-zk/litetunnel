@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -771,7 +772,7 @@ func TestPruneBatchIsBatched(t *testing.T) {
 		}
 	}
 
-	n := svc.pruneBatch("过期验证码", &model.EmailCode{},
+	n := svc.pruneBatch(context.Background(), "过期验证码", &model.EmailCode{},
 		"created_at < ?", time.Now().Add(-emailCodeRetention))
 	if n != maintenanceBatchSize {
 		t.Fatalf("单批最多删 %d 条，实际 %d", maintenanceBatchSize, n)

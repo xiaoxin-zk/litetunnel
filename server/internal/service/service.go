@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,6 +123,12 @@ type Services struct {
 	fwKick chan struct{}
 
 	instanceID string
+	// nodeID 是稳定标识（主机名 + 监听地址），跨重启不变，用于告警事件归属。
+	// instanceID 是每次进程启动随机生成的，只适合租约这类「本次运行」语义。
+	nodeID string
+
+	settingsUpdateMu sync.Mutex
+	backupMu         sync.Mutex
 
 	collectorOwned atomic.Bool
 
@@ -176,6 +183,7 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),
 
 		instanceID: newInstanceID(),
+		nodeID:     newNodeID(cfg),
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
@@ -204,6 +212,24 @@ func newInstanceID() string {
 		return id
 	}
 	return fmt.Sprintf("t%d", time.Now().UnixNano())
+}
+
+// newNodeID 生成跨重启稳定的节点标识：主机名 + 监听地址。
+// 同一台机器上跑多个面板（不同端口）也能区分，重启后仍是同一个值，
+// 这样重启前还在 firing 的告警重启后仍能被同一个节点恢复。
+func newNodeID(cfg *config.Config) string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "panel"
+	}
+	addr := ""
+	if cfg != nil {
+		addr = strings.TrimSpace(cfg.UserAddr)
+	}
+	if addr == "" {
+		return host
+	}
+	return host + "@" + addr
 }
 
 type mailSender interface {

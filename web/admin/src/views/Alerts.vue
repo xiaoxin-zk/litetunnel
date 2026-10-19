@@ -237,6 +237,7 @@
       </el-table>
       <div class="lt-muted" style="margin-top: 10px">
         「进行中」表示条件仍在命中，期间每 30 分钟提醒一次；条件自行回落会自动变成「已恢复」，并推送一条恢复通知（触发通知没送达时不补发）。
+        「邮件已入队」只代表已交给发件箱，最终投递失败会变成「邮件失败」。
         「手动解决」用于已经知道、暂时不想再被提醒的告警：30 分钟内同类问题不再打扰，之后仍在命中才重新开一条。
         历史只保留最近 {{ eventKeepDays }} 天（仍在进行中的不清理）。
       </div>
@@ -353,7 +354,11 @@ function notifyState(row) {
   if (row.status === 'manual_resolved') {
     return { ok: true, text: '—' }
   }
-  return { ok: !!row.delivered, text: row.delivered ? '已推送' : '未送达' }
+  // Webhook 与邮件分开显示：入队不等于对方服务器已经收到，最终失败也要如实标出来。
+  if (row.delivered) return { ok: true, text: '已推送' }
+  if (row.mail_failed) return { ok: false, text: '邮件失败' }
+  if (row.mail_queued) return { ok: true, text: '邮件已入队' }
+  return { ok: false, text: '未送达' }
 }
 
 async function resolveEvent(row) {

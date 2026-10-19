@@ -150,6 +150,10 @@ func (s *Services) FrontendURL() string {
 
 func (s *Services) GatewayEndpoint() (string, int) {
 	host := strings.TrimSpace(s.Settings.Get(KeyGatewayHost))
+	// 留空时回落到服务端配置：页面写着「可留空」，下发空地址会让客户端连不上。
+	if host == "" && s.Cfg != nil {
+		host = strings.TrimSpace(s.Cfg.GatewayHost)
+	}
 	port := s.Settings.Int(KeyGatewayPort)
 	if port <= 0 || port > 65535 {
 		port = s.Cfg.GatewayPort

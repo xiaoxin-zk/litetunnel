@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.org/x/net/publicsuffix"
@@ -169,7 +170,8 @@ func (s *Services) checkNonWhitelistQuota(db *gorm.DB, domain string, quota int)
 	}
 	var n int64
 	if err := db.Model(&model.User{}).Where("email_domain = ?", domain).Count(&n).Error; err != nil {
-		return nil
+		// 查询失败时拒绝：白名单外名额不能因为数据库故障被绕过。
+		return fmt.Errorf("检查白名单外注册名额失败: %w", err)
 	}
 	if n >= int64(quota) {
 		return ErrNonWhitelistQuota

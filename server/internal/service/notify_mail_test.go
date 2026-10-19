@@ -64,8 +64,11 @@ func TestAlertEmailEnqueuesAndCountsAsDelivered(t *testing.T) {
 	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
 		t.Fatalf("读取告警失败: %v", err)
 	}
-	if !ev.Delivered {
-		t.Error("邮件已入队时事件应标记为已通知")
+	if !ev.MailQueued {
+		t.Error("邮件入队后应标记 mail_queued")
+	}
+	if ev.Delivered {
+		t.Error("只入队、没有 Webhook 2xx 时不该标记 delivered")
 	}
 }
 

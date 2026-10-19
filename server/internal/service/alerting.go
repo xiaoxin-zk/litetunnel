@@ -131,6 +131,7 @@ func (s *Services) runAlertCycle(now time.Time) {
 
 	sample := model.MetricSample{
 		At: now, Requests: stats.Total, Errors: stats.Errors,
+		Instance: s.nodeID,
 	}
 	if stats.Total > 0 {
 		sample.ErrorRate = float64(stats.Errors) / float64(stats.Total) * 100
@@ -301,7 +302,9 @@ func (s *Services) sustained(n int, at time.Time, ok func(model.MetricSample) bo
 		return true
 	}
 	var rows []model.MetricSample
-	if err := s.DB.Where("sampled_at <= ?", at).Order("sampled_at DESC").Limit(n).Find(&rows).Error; err != nil {
+	// 只看本实例的样本：多实例部署时别人的「正常窗口」不能打断我的连续计数。
+	if err := s.DB.Where("sampled_at <= ? AND instance = ?", at, s.nodeID).
+		Order("sampled_at DESC").Limit(n).Find(&rows).Error; err != nil {
 		log.Printf("[alert] 读取指标样本失败，本轮按「未持续」处理: %v", err)
 		return false
 	}
@@ -328,10 +331,12 @@ func (s *Services) sustained(n int, at time.Time, ok func(model.MetricSample) bo
 //   - 超过冷却：开一条新事件并推送。
 func (s *Services) raiseAlert(kind, level, message string, value, threshold float64) {
 	var last model.AlertEvent
-	if err := s.DB.Where("kind = ?", kind).Order("id DESC").First(&last).Error; err == nil {
+	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '')", kind, s.nodeID).
+		Order("id DESC").First(&last).Error; err == nil {
 		switch {
 		case last.Status == model.AlertStatusFiring:
-			if !last.Delivered {
+			// 只有两个通道都没成功时才重试；邮件已入队时重复投递只会多收一封。
+			if !last.Delivered && !last.MailQueued {
 				s.deliverAlert(last)
 				return
 			}
@@ -358,14 +363,15 @@ func (s *Services) raiseAlert(kind, level, message string, value, threshold floa
 
 	ev := model.AlertEvent{
 		Kind: kind, Level: level, Message: message, Value: value, Threshold: threshold,
-		Status: model.AlertStatusFiring,
+		Status: model.AlertStatusFiring, Instance: s.nodeID,
 	}
 	if err := s.DB.Create(&ev).Error; err != nil {
-		// 唯一索引兜底：并发下另一实例已经开了同一条 firing，复用它的记录。
+		// 唯一索引兜底：同一实例并发评估时已经开了同一条 firing，复用它的记录。
 		var open model.AlertEvent
-		if e := s.DB.Where("kind = ? AND status = ?", kind, model.AlertStatusFiring).
+		if e := s.DB.Where("kind = ? AND instance = ? AND status = ?",
+			kind, s.nodeID, model.AlertStatusFiring).
 			Order("id DESC").First(&open).Error; e == nil {
-			if !open.Delivered {
+			if !open.Delivered && !open.MailQueued {
 				s.deliverAlert(open)
 			}
 			return
@@ -384,6 +390,10 @@ func (s *Services) reopenAlert(ev model.AlertEvent) {
 		Updates(map[string]any{
 			"status":      model.AlertStatusFiring,
 			"resolved_at": nil,
+			// 重开意味着「这次恢复已经作废」，下一次恢复必须重新通知；
+			// 否则旧值 true 会让恢复邮件永远不再尝试。
+			"resolved_notified": false,
+			"mail_failed":       false,
 		}).Error
 	if err != nil {
 		log.Printf("[alert] 重开告警失败: %v", err)
@@ -394,7 +404,8 @@ func (s *Services) reopenAlert(ev model.AlertEvent) {
 // 每轮采样对所有未命中的规则都会调用一次，因此必须幂等。
 func (s *Services) resolveAlert(kind, message string) {
 	var last model.AlertEvent
-	if err := s.DB.Where("kind = ?", kind).Order("id DESC").First(&last).Error; err != nil {
+	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '')", kind, s.nodeID).
+		Order("id DESC").First(&last).Error; err != nil {
 		return
 	}
 	if last.Status != model.AlertStatusFiring {
@@ -463,23 +474,30 @@ func (s *Services) refreshAlert(ev *model.AlertEvent) {
 // 任一成功就算「已通知」；都失败时只记日志，下一轮采样重试同一条。
 func (s *Services) deliverAlert(ev model.AlertEvent) {
 	cfg := s.AlertConfig()
-	delivered := false
-	if cfg.WebhookURL != "" {
+	updates := map[string]any{}
+
+	webhookOK := ev.Delivered
+	if cfg.WebhookURL != "" && !webhookOK {
 		if err := s.postWebhook(ev); err != nil {
 			// 地址里通常带 token，日志只记出站策略能安全展示的部分。
 			log.Printf("[alert] Webhook 推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
 		} else {
-			delivered = true
+			webhookOK = true
+			updates["delivered"] = true
 		}
 	}
-	if s.sendAlertEmail(ev, false) {
-		delivered = true
+
+	// 邮件已入队就不再重复投递；最终失败过的允许在下一轮提醒里再试一次。
+	if !ev.MailQueued && s.sendAlertEmail(ev, false) {
+		updates["mail_queued"] = true
+		updates["mail_failed"] = false
 	}
-	if !delivered {
+
+	if len(updates) == 0 {
 		return
 	}
-	s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).
-		Updates(map[string]any{"delivered": true, "last_notified_at": time.Now()})
+	updates["last_notified_at"] = time.Now()
+	s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Updates(updates)
 }
 
 // deliverResolved 推送恢复通知。触发通知都没送达时不再单发「已恢复」：
@@ -490,13 +508,13 @@ func (s *Services) deliverResolved(ev model.AlertEvent, message string) {
 		return
 	}
 	if cfg.Silenced(time.Now()) {
-		// 静默期间不打扰：状态照常恢复，只是不发消息；标记已处理，
-		// 避免静默结束后再补一条过期的「已恢复」。
-		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
+		// 静默期间不打扰，也不把 resolved_notified 置真：
+		// 页面要如实显示「恢复未通知」，静默结束后冷却窗口内仍会补一次。
 		return
 	}
-	if !ev.Delivered {
-		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
+	if !ev.Delivered && !ev.MailQueued {
+		// 触发通知两个通道都没出去，不单发「已恢复」。
+		// 同样不置真，避免页面谎报「恢复已通知」。
 		return
 	}
 

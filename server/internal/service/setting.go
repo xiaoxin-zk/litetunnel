@@ -211,6 +211,10 @@ var settingSpecs = []settingSpec{
 		if _, port, err := splitHostPortLoose(c.UserAddr); err == nil && port != "" {
 			parts = append(parts, port)
 		}
+		// 网关端口必须默认受保护：它在隧道端口池之外，被误关就是全站断连。
+		if c.GatewayPort > 0 {
+			parts = append(parts, strconv.Itoa(c.GatewayPort))
+		}
 		return strings.Join(parts, ",")
 	}},
 
@@ -537,6 +541,40 @@ func (s *SettingStore) SetInternal(in map[SettingKey]string) error {
 		return err
 	}
 	return s.reloadLocked()
+}
+
+// CompareAndSwap 只在当前值等于 old 时写入 next，返回是否由本实例抢到。
+// 报告调度用它做跨实例的「按期认领」：设置值是 UTC RFC3339，字符串序与时间序一致。
+func (s *SettingStore) CompareAndSwap(k SettingKey, old, next string) (bool, error) {
+	spec, ok := settingByKey[k]
+	if !ok || !spec.Internal {
+		return false, fmt.Errorf("%w: %s 不是系统维护项", ErrInvalidParam, k)
+	}
+
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	res := s.db.Model(&model.Setting{}).
+		Where("key = ? AND value = ?", string(k), old).
+		Update("value", next)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected == 0 {
+		if old != "" {
+			return false, nil
+		}
+		// 首次运行还没有这一行：尝试插入。并发插入会撞主键，视为没抢到。
+		row := model.Setting{Key: string(k), Value: next}
+		ins := s.db.Where("key = ?", string(k)).FirstOrCreate(&row)
+		if ins.Error != nil || ins.RowsAffected == 0 {
+			return false, nil
+		}
+	}
+	if err := s.reloadLocked(); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (s *SettingStore) hasRow(k SettingKey) bool {

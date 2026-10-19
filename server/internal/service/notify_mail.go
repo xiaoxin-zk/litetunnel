@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -126,10 +127,18 @@ func (s *Services) sendAlertEmail(ev model.AlertEvent, resolved bool) bool {
 	if !resolved && levelRank(ev.Level) < levelRank(cfg.EmailMinLevel) {
 		return false
 	}
-	if s.alertMailOverLimit(cfg.EmailHourlyLimit) {
+	remaining := s.alertMailRemaining(cfg.EmailHourlyLimit)
+	if remaining <= 0 {
 		log.Printf("[alert] 邮件通知已达每小时上限（%d 封），本轮跳过（%s）",
 			cfg.EmailHourlyLimit, ev.Kind)
 		return false
+	}
+	// 剩余额度不足时只发给前几个收件人：一次告警不该把额度顶穿。
+	recipients := cfg.EmailRecipients
+	if len(recipients) > remaining {
+		log.Printf("[alert] 邮件额度只剩 %d 封，本次只发给前 %d 个收件人（%s）",
+			remaining, remaining, ev.Kind)
+		recipients = recipients[:remaining]
 	}
 
 	vars := map[string]string{
@@ -159,8 +168,10 @@ func (s *Services) sendAlertEmail(ev model.AlertEvent, resolved bool) bool {
 	}
 
 	queued := false
-	for _, to := range cfg.EmailRecipients {
-		if err := s.enqueueMail(to, subject, body, kind, nil, mailQuota{}); err != nil {
+	for _, to := range recipients {
+		// 带上事件 ID：发件箱最终失败时可以回写这条告警，页面才不会谎报「已通知」。
+		payload := map[string]any{"alert_event_id": ev.ID}
+		if err := s.enqueueMail(to, subject, body, kind, payload, mailQuota{}); err != nil {
 			log.Printf("[alert] 告警邮件入队失败（收件人 %s）: %v", maskEmail(to), err)
 			continue
 		}
@@ -169,11 +180,12 @@ func (s *Services) sendAlertEmail(ev model.AlertEvent, resolved bool) bool {
 	return queued
 }
 
-// alertMailOverLimit 按「封数」限制告警邮件，防止一个抖动指标把邮箱刷爆。
-// 统计失败时返回 false：宁可多发一封，也不要因为一次查询失败把告警吞掉。
-func (s *Services) alertMailOverLimit(limit int) bool {
+// alertMailRemaining 返回本小时还能发多少封告警邮件。
+// 统计失败时返回收件人上限：宁可多发一封，也不要因为一次查询失败把告警吞掉。
+// 注意这里只收敛单次调用；多实例并发仍可能各发各的，已在 known-limits 登记。
+func (s *Services) alertMailRemaining(limit int) int {
 	if limit <= 0 {
-		return false
+		return maxNotifyRecipients
 	}
 	var n int64
 	err := s.DB.Model(&model.MailOutbox{}).
@@ -183,9 +195,13 @@ func (s *Services) alertMailOverLimit(limit int) bool {
 		Count(&n).Error
 	if err != nil {
 		log.Printf("[alert] 统计告警邮件数量失败，跳过限流: %v", err)
-		return false
+		return maxNotifyRecipients
 	}
-	return n >= int64(limit)
+	remaining := limit - int(n)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
 }
 
 // ReportConfig 是定时报告的运行期配置。收件人复用告警邮件的那一份列表：
@@ -257,37 +273,38 @@ func (s *Services) runDueReports(now time.Time) {
 		return
 	}
 	if cfg.DailyEnabled {
-		if due, start, end := s.dailyReportWindow(cfg, now); due {
-			s.sendSummaryReport("daily", start, end, now)
-		}
+		occ, start, end := s.dailyReportWindow(cfg, now)
+		s.claimAndSendReport("daily", KeyReportDailyLastAt, occ, start, end, now)
 	}
 	if cfg.WeeklyEnabled {
-		if due, start, end := s.weeklyReportWindow(cfg, now); due {
-			s.sendSummaryReport("weekly", start, end, now)
-		}
+		occ, start, end := s.weeklyReportWindow(cfg, now)
+		s.claimAndSendReport("weekly", KeyReportWeeklyLastAt, occ, start, end, now)
 	}
 }
 
-// dailyReportWindow 返回「今天这一期是否该发」以及统计区间。
-// 区间固定为截止时间往前 24 小时，与实际运行时刻无关，补发时口径一致。
-func (s *Services) dailyReportWindow(cfg ReportConfig, now time.Time) (bool, time.Time, time.Time) {
-	scheduled := time.Date(now.Year(), now.Month(), now.Day(), cfg.DailyHour, 0, 0, 0, now.Location())
-	if now.Before(scheduled) {
-		return false, time.Time{}, time.Time{}
-	}
-	if last := parseSettingTime(s.Settings.Get(KeyReportDailyLastAt)); !last.IsZero() && !last.Before(scheduled) {
-		return false, time.Time{}, time.Time{}
-	}
-	return true, scheduled.AddDate(0, 0, -1), scheduled
+// dailyReportWindow 返回最近一期日报的「计划时刻」与统计区间。
+// 区间按自然日对齐（计划时刻往前一整天）：流量这类日粒度数据不会把首尾两个日桶重复计入。
+// 取「最近一期」而不是「今天这一期」，停机错过一次后仍能补发。
+func (s *Services) dailyReportWindow(cfg ReportConfig, now time.Time) (time.Time, time.Time, time.Time) {
+	occ := lastDailyOccurrence(now, cfg.DailyHour)
+	end := time.Date(occ.Year(), occ.Month(), occ.Day(), 0, 0, 0, 0, occ.Location())
+	return occ, end.AddDate(0, 0, -1), end
 }
 
 // weeklyReportWindow 取「最近一次到点的周报时刻」，因此停机错过一天也能补发。
-func (s *Services) weeklyReportWindow(cfg ReportConfig, now time.Time) (bool, time.Time, time.Time) {
-	occurrence := lastWeeklyOccurrence(now, cfg.WeeklyWeekday, cfg.WeeklyHour)
-	if last := parseSettingTime(s.Settings.Get(KeyReportWeeklyLastAt)); !last.IsZero() && !last.Before(occurrence) {
-		return false, time.Time{}, time.Time{}
+func (s *Services) weeklyReportWindow(cfg ReportConfig, now time.Time) (time.Time, time.Time, time.Time) {
+	occ := lastWeeklyOccurrence(now, cfg.WeeklyWeekday, cfg.WeeklyHour)
+	end := time.Date(occ.Year(), occ.Month(), occ.Day(), 0, 0, 0, 0, occ.Location())
+	return occ, end.AddDate(0, 0, -7), end
+}
+
+// lastDailyOccurrence 返回不晚于 now 的最近一个 hour:00。
+func lastDailyOccurrence(now time.Time, hour int) time.Time {
+	occ := time.Date(now.Year(), now.Month(), now.Day(), clampInt(hour, 0, 23), 0, 0, 0, now.Location())
+	if occ.After(now) {
+		occ = occ.AddDate(0, 0, -1)
 	}
-	return true, occurrence.AddDate(0, 0, -7), occurrence
+	return occ
 }
 
 // lastWeeklyOccurrence 返回不晚于 now 的最近一个「周 X 的 hour:00」。
@@ -306,18 +323,6 @@ func lastWeeklyOccurrence(now time.Time, weekday, hour int) time.Time {
 	return occ
 }
 
-func parseSettingTime(raw string) time.Time {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return time.Time{}
-	}
-	t, err := time.Parse(time.RFC3339, v)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
-}
-
 // SendTestReport 立即入队一份最近 24 小时的摘要，用于验证 SMTP 与模板。
 // 不写发送标记，因此不会影响正常日报的节奏。
 func (s *Services) SendTestReport(now time.Time) error {
@@ -334,47 +339,61 @@ func (s *Services) SendTestReport(now time.Time) error {
 	return nil
 }
 
-func (s *Services) sendSummaryReport(kind string, start, end, now time.Time) {
-	cfg := s.ReportConfig()
-	if s.enqueueSummaryReport(cfg, kind, start, end, now) == 0 {
+// claimAndSendReport 用「把标记从上一期改成这一期」的方式跨实例认领报告期：
+// 只有 CAS 成功的实例才发送，避免多实例同时读到旧标记后各发一封。
+// 一封都没发出去时把标记退回，下一轮重试。
+func (s *Services) claimAndSendReport(kind string, marker SettingKey, occurrence, start, end, now time.Time) {
+	prev := s.Settings.Get(marker)
+	next := occurrence.UTC().Format(time.RFC3339)
+	if prev == next {
+		// 这一期已经认领过。Postgres 把「值没变」也算作命中行，
+		// 不加这个判断会每 5 分钟重发一次。
 		return
 	}
+	claimed, err := s.Settings.CompareAndSwap(marker, prev, next)
+	if err != nil {
+		log.Printf("[report] 认领 %s 失败: %v", kind, err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	if s.enqueueSummaryReport(s.ReportConfig(), kind, start, end, now) > 0 {
+		log.Printf("[report] 已入队%s（%s ~ %s）", reportName(kind),
+			start.Format("2006-01-02"), end.Format("2006-01-02"))
+		return
+	}
+	if _, err := s.Settings.CompareAndSwap(marker, next, prev); err != nil {
+		log.Printf("[report] 回滚 %s 认领失败: %v", kind, err)
+	}
+}
 
-	marker := KeyReportDailyLastAt
+func reportName(kind string) string {
 	if kind == "weekly" {
-		marker = KeyReportWeeklyLastAt
+		return "周报"
 	}
-	if err := s.Settings.SetInternal(map[SettingKey]string{
-		marker: now.UTC().Format(time.RFC3339),
-	}); err != nil {
-		log.Printf("[report] 记录 %s 发送时间失败（下轮可能重复发送）: %v", kind, err)
-	}
-	log.Printf("[report] 已入队%s", map[string]string{"daily": "日报", "weekly": "周报"}[kind])
+	return "日报"
 }
 
 // enqueueSummaryReport 生成并投递摘要邮件，返回成功入队的封数。
 func (s *Services) enqueueSummaryReport(cfg ReportConfig, kind string, start, end, now time.Time) int {
 	data := s.buildReportData(start, end, now)
 
-	reportName := "日报"
-	if kind == "weekly" {
-		reportName = "周报"
-	}
 	vars := map[string]string{
 		"site_name":       s.Settings.Get(KeySiteName),
-		"report_name":     reportName,
-		"period":          fmt.Sprintf("%s ~ %s", start.Format("2006-01-02 15:04"), end.Format("2006-01-02 15:04")),
+		"report_name":     reportName(kind),
+		"period":          fmt.Sprintf("%s ~ %s", start.Format("2006-01-02"), end.Format("2006-01-02")),
 		"generated_at":    now.Format("2006-01-02 15:04:05"),
-		"users_total":     fmt.Sprintf("%d", data.UsersTotal),
-		"users_new":       fmt.Sprintf("%d", data.UsersNew),
-		"tunnels_total":   fmt.Sprintf("%d", data.TunnelsTotal),
-		"tunnels_online":  fmt.Sprintf("%d", data.TunnelsOnline),
-		"traffic":         formatBytesCN(data.TrafficIn + data.TrafficOut),
-		"error_rate":      fmt.Sprintf("%.2f", data.ErrorRateAvg),
-		"disk":            fmt.Sprintf("%.1f", data.DiskPct),
+		"users_total":     numOrUnknown(data.UsersOK, data.UsersTotal),
+		"users_new":       numOrUnknown(data.UsersOK, data.UsersNew),
+		"tunnels_total":   numOrUnknown(data.TunnelsOK, data.TunnelsTotal),
+		"tunnels_online":  numOrUnknown(data.TunnelsOK, data.TunnelsOnline),
+		"traffic":         data.trafficText(),
+		"error_rate":      pctOrUnknown(data.MetricsOK, data.ErrorRateAvg, 2),
+		"disk":            pctOrUnknown(data.MetricsOK, data.DiskPct, 1),
 		"last_backup":     data.lastBackupText(),
-		"alerts_firing":   fmt.Sprintf("%d", data.AlertsFiring),
-		"alerts_resolved": fmt.Sprintf("%d", data.AlertsResolved),
+		"alerts_firing":   numOrUnknown(data.AlertsOK, data.AlertsFiring),
+		"alerts_resolved": numOrUnknown(data.AlertsOK, data.AlertsResolved),
 		"alert_lines":     data.alertLines(),
 	}
 
@@ -412,9 +431,41 @@ type reportData struct {
 	BackupHours    float64
 	HasBackup      bool
 	Recent         []model.AlertEvent
+
+	// 查询失败时保持 false：摘要里显示「未知」，而不是把 0 当成真实统计。
+	UsersOK   bool
+	TunnelsOK bool
+	TrafficOK bool
+	AlertsOK  bool
+	MetricsOK bool
+	BackupOK  bool
+}
+
+func numOrUnknown(ok bool, v int64) string {
+	if !ok {
+		return "未知"
+	}
+	return fmt.Sprintf("%d", v)
+}
+
+func pctOrUnknown(ok bool, v float64, digits int) string {
+	if !ok {
+		return "未知"
+	}
+	return strconv.FormatFloat(v, 'f', digits, 64)
+}
+
+func (d reportData) trafficText() string {
+	if !d.TrafficOK {
+		return "未知"
+	}
+	return formatBytesCN(d.TrafficIn + d.TrafficOut)
 }
 
 func (d reportData) lastBackupText() string {
+	if !d.BackupOK {
+		return "未知"
+	}
 	if !d.HasBackup {
 		return "无可用备份"
 	}
@@ -446,21 +497,28 @@ func (s *Services) buildReportData(start, end, now time.Time) reportData {
 	var d reportData
 	db := s.DB
 
+	d.UsersOK = true
 	if err := db.Model(&model.User{}).Count(&d.UsersTotal).Error; err != nil {
 		log.Printf("[report] 统计用户总数失败: %v", err)
+		d.UsersOK = false
 	}
 	if err := db.Model(&model.User{}).
 		Where("created_at >= ? AND created_at < ?", start, end).
 		Count(&d.UsersNew).Error; err != nil {
 		log.Printf("[report] 统计新增用户失败: %v", err)
+		d.UsersOK = false
 	}
+
+	d.TunnelsOK = true
 	if err := db.Model(&model.Tunnel{}).Count(&d.TunnelsTotal).Error; err != nil {
 		log.Printf("[report] 统计隧道总数失败: %v", err)
+		d.TunnelsOK = false
 	}
 	var tunnels []model.Tunnel
 	if err := db.Select("id", "status", "last_online_at").
 		Where("status = ?", model.TunnelStatusActive).Find(&tunnels).Error; err != nil {
 		log.Printf("[report] 读取隧道列表失败: %v", err)
+		d.TunnelsOK = false
 	} else {
 		for i := range tunnels {
 			if s.IsTunnelOnline(&tunnels[i]) {
@@ -469,27 +527,33 @@ func (s *Services) buildReportData(start, end, now time.Time) reportData {
 		}
 	}
 
+	// 流量按日聚合：区间左闭右开，避免 24 小时窗口把首尾两个日桶都算进来。
 	var traffic struct {
 		InBytes  int64
 		OutBytes int64
 	}
 	if err := db.Model(&model.TrafficDaily{}).
 		Select("COALESCE(SUM(in_bytes),0) AS in_bytes, COALESCE(SUM(out_bytes),0) AS out_bytes").
-		Where("date >= ? AND date <= ?", start.Format("2006-01-02"), end.Format("2006-01-02")).
+		Where("date >= ? AND date < ?", start.Format("2006-01-02"), end.Format("2006-01-02")).
 		Scan(&traffic).Error; err != nil {
 		log.Printf("[report] 统计流量失败: %v", err)
+	} else {
+		d.TrafficIn, d.TrafficOut = traffic.InBytes, traffic.OutBytes
+		d.TrafficOK = true
 	}
-	d.TrafficIn, d.TrafficOut = traffic.InBytes, traffic.OutBytes
 
+	d.AlertsOK = true
 	if err := db.Model(&model.AlertEvent{}).
 		Where("created_at >= ? AND created_at < ?", start, end).
 		Count(&d.AlertsFiring).Error; err != nil {
 		log.Printf("[report] 统计新增告警失败: %v", err)
+		d.AlertsOK = false
 	}
 	if err := db.Model(&model.AlertEvent{}).
 		Where("resolved_at >= ? AND resolved_at < ?", start, end).
 		Count(&d.AlertsResolved).Error; err != nil {
 		log.Printf("[report] 统计恢复告警失败: %v", err)
+		d.AlertsOK = false
 	}
 
 	var avg struct {
@@ -501,11 +565,14 @@ func (s *Services) buildReportData(start, end, now time.Time) reportData {
 		Where("sampled_at >= ? AND sampled_at < ?", start, end).
 		Scan(&avg).Error; err != nil {
 		log.Printf("[report] 统计指标失败: %v", err)
+	} else {
+		d.ErrorRateAvg, d.DiskPct = avg.Rate, avg.Disk
+		d.MetricsOK = true
 	}
-	d.ErrorRateAvg, d.DiskPct = avg.Rate, avg.Disk
 
-	if hours, ok := s.backupStaleHours(now); ok {
-		d.HasBackup, d.BackupHours = true, hours
+	if hours, exists, ok := s.latestBackupAge(now); ok {
+		d.BackupOK = true
+		d.HasBackup, d.BackupHours = exists, hours
 	}
 
 	if err := db.Model(&model.AlertEvent{}).

@@ -279,7 +279,8 @@ func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) e
 	if err := db.Model(&model.User{}).
 		Where("email_domain = ? AND created_at >= ?", domain, dayStart).
 		Count(&n).Error; err != nil {
-		return nil
+		// 查询失败时拒绝注册：放行等于在数据库故障时绕过域名配额。
+		return fmt.Errorf("检查邮箱域名注册频率失败: %w", err)
 	}
 	if overLimit(n, limit, inclusive) {
 		return ErrDomainRegisterLimited

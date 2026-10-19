@@ -106,7 +106,8 @@ func checkMailQuota(tx *gorm.DB, to, kind string, q mailQuota) error {
 			return errMailQuotaCooldown
 		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
+			// 查询失败必须拒绝：放行等于在数据库故障时绕过频控。
+			return err
 		}
 	}
 
@@ -120,7 +121,7 @@ func checkMailQuota(tx *gorm.DB, to, kind string, q mailQuota) error {
 		}
 		var n int64
 		if err := qry.Count(&n).Error; err != nil {
-			return nil
+			return err
 		}
 		if n >= int64(q.dailyLimit) {
 			return errMailQuotaDaily
@@ -392,12 +393,31 @@ func (s *Services) finishMailAction(row model.MailOutbox, token string) {
 	}
 }
 
+// noteAlertMailFailed 把「邮件最终没发出去」回写到关联的告警事件。
+// 否则事件会一直停留在「邮件已入队」，页面和健康检查都会当成已通知。
+func (s *Services) noteAlertMailFailed(row model.MailOutbox) {
+	if row.Kind != model.MailKindAlertFiring && row.Kind != model.MailKindAlertResolved {
+		return
+	}
+	var payload struct {
+		AlertEventID uint `json:"alert_event_id"`
+	}
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil || payload.AlertEventID == 0 {
+		return
+	}
+	if err := s.DB.Model(&model.AlertEvent{}).Where("id = ?", payload.AlertEventID).
+		Update("mail_failed", true).Error; err != nil {
+		log.Printf("[mail] 回写告警邮件失败状态出错: %v", err)
+	}
+}
+
 func (s *Services) failMail(row model.MailOutbox, token string, err error) {
 	attempts := row.Attempts + 1
 	if attempts >= mailMaxAttempts {
 		log.Printf("[mail] 发送失败且已达重试上限（收件人 %s，类型 %s，共 %d 次）: %v"+
 			"；该凭据未生效，用户原有凭据仍然可用",
 			maskEmail(row.To), row.Kind, attempts, err)
+		s.noteAlertMailFailed(row)
 		s.finishMail(row.ID, token, mailFinish{
 			status:         model.MailFailed,
 			attempts:       attempts,

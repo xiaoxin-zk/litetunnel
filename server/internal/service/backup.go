@@ -87,6 +87,12 @@ func (s *Services) ListBackups() ([]BackupFile, error) {
 
 // CreateBackup 用 VACUUM INTO 做热备：不锁写、产出的是单文件一致快照。
 func (s *Services) CreateBackup(tag string) (BackupFile, error) {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+	return s.createBackupLocked(tag)
+}
+
+func (s *Services) createBackupLocked(tag string) (BackupFile, error) {
 	if !s.BackupSupported() {
 		return BackupFile{}, ErrBackupUnsupported
 	}
@@ -94,8 +100,18 @@ func (s *Services) CreateBackup(tag string) (BackupFile, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return BackupFile{}, fmt.Errorf("创建备份目录失败: %w", err)
 	}
-	name := backupNamePrefix + time.Now().Format(backupTimeLayout) + tag + ".db"
+	// 文件名精确到毫秒并做重名检查：同一秒内连续备份不能互相覆盖。
+	name := backupNamePrefix + time.Now().Format(backupTimeLayout) +
+		fmt.Sprintf("-%03d", time.Now().Nanosecond()/1e6) + tag + ".db"
 	path := filepath.Join(dir, name)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			break
+		}
+		name = fmt.Sprintf("%s%s-%03d-%d%s.db", backupNamePrefix,
+			time.Now().Format(backupTimeLayout), time.Now().Nanosecond()/1e6, i, tag)
+		path = filepath.Join(dir, name)
+	}
 
 	if err := s.DB.Exec("VACUUM INTO ?", path).Error; err != nil {
 		// VACUUM INTO 需要 SQLite >= 3.27；老库退回「checkpoint + 拷贝」。
@@ -186,6 +202,9 @@ func (s *Services) BackupFilePath(name string) (string, error) {
 }
 
 func (s *Services) DeleteBackup(name string) error {
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+
 	path, err := s.backupPath(name)
 	if err != nil {
 		return err
@@ -202,6 +221,10 @@ func (s *Services) DeleteBackup(name string) error {
 // RestoreBackup 先用当前库做一份 pre-restore 安全备份，再把备份覆盖回数据库文件。
 // 调用方负责紧接着重启进程，否则现有连接仍持有旧的数据页。
 func (s *Services) RestoreBackup(name string) error {
+	// 与备份/删除串行：恢复过程中再插一次备份会覆盖正在使用的快照。
+	s.backupMu.Lock()
+	defer s.backupMu.Unlock()
+
 	if !s.BackupSupported() {
 		return ErrBackupUnsupported
 	}
@@ -213,7 +236,7 @@ func (s *Services) RestoreBackup(name string) error {
 		return ErrBackupNotFound
 	}
 
-	if _, err := s.CreateBackup(backupPreRestore); err != nil {
+	if _, err := s.createBackupLocked(backupPreRestore); err != nil {
 		return fmt.Errorf("恢复前的安全备份失败，已中止: %w", err)
 	}
 	if err := s.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {

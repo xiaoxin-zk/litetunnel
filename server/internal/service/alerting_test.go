@@ -254,6 +254,38 @@ func TestAlertLifecycleResolveAndNotify(t *testing.T) {
 	}
 }
 
+// 两台实例各自采样：A 的故障不能被 B 的正常样本「恢复」。
+func TestAlertEventsAreScopedPerInstance(t *testing.T) {
+	svc := newTestServices(t, nil)
+	sink := &alertSink{}
+	srv := sink.server(t)
+	if err := svc.UpdateSettings(alertSettingMap(srv.URL, true)); err != nil {
+		t.Fatalf("保存告警设置失败: %v", err)
+	}
+
+	svc.raiseAlert("disk", "critical", "A 实例磁盘 95%", 95, 90)
+	var ev model.AlertEvent
+	if err := svc.DB.Order("id DESC").First(&ev).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if ev.Instance != svc.nodeID {
+		t.Fatalf("事件归属 = %q，期望 %q", ev.Instance, svc.nodeID)
+	}
+
+	// 模拟另一台实例的正常采样：它不应该动到这条事件。
+	orig := svc.nodeID
+	svc.nodeID = "other-host@0.0.0.0:7848"
+	svc.resolveAlert("disk", "B 实例磁盘正常")
+	svc.nodeID = orig
+
+	if err := svc.DB.First(&ev, ev.ID).Error; err != nil {
+		t.Fatalf("重新读取告警失败: %v", err)
+	}
+	if ev.Status != model.AlertStatusFiring {
+		t.Fatalf("另一实例不该恢复本实例的事件，状态 = %q", ev.Status)
+	}
+}
+
 // 自动恢复后短时间复发，视为同一次抖动：重开原事件，不新增行、不补发通知。
 func TestAlertReopensSilentlyWithinCooldown(t *testing.T) {
 	svc := newTestServices(t, nil)
@@ -288,6 +320,9 @@ func TestAlertReopensSilentlyWithinCooldown(t *testing.T) {
 	}
 	if rows[0].ResolvedAt != nil {
 		t.Error("重开后恢复时间应清空")
+	}
+	if rows[0].ResolvedNotified {
+		t.Error("重开后应清掉「恢复已通知」，否则下一次恢复永远不会再尝试")
 	}
 	if got := sink.count(); got != 2 {
 		t.Errorf("静默重开不该补发通知，实际累计 %d 条", got)
@@ -457,7 +492,9 @@ func TestSustainedRequiresConsecutiveWindows(t *testing.T) {
 	now := time.Now()
 	cfg := AlertConfig{ErrorRatePct: 5, SustainedWindows: 2}
 	stats := middleware.HTTPStatsSnapshot{Total: 100, Errors: 20}
-	cur := model.MetricSample{At: now, Requests: 100, Errors: 20, ErrorRate: 20}
+	cur := model.MetricSample{
+		At: now, Requests: 100, Errors: 20, ErrorRate: 20, Instance: svc.nodeID,
+	}
 	if err := svc.DB.Create(&cur).Error; err != nil {
 		t.Fatalf("写入当前样本失败: %v", err)
 	}
@@ -473,7 +510,9 @@ func TestSustainedRequiresConsecutiveWindows(t *testing.T) {
 		t.Error("只有 1 个窗口超标时不该触发（要求连续 2 个）")
 	}
 
-	prev := model.MetricSample{At: now.Add(-alertInterval), Requests: 100, Errors: 20, ErrorRate: 20}
+	prev := model.MetricSample{
+		At: now.Add(-alertInterval), Requests: 100, Errors: 20, ErrorRate: 20, Instance: svc.nodeID,
+	}
 	if err := svc.DB.Create(&prev).Error; err != nil {
 		t.Fatalf("写入上一窗口样本失败: %v", err)
 	}
@@ -486,12 +525,14 @@ func TestSustainedRequiresConsecutiveWindows(t *testing.T) {
 	if err := svc.DB.Where("1 = 1").Delete(&model.MetricSample{}).Error; err != nil {
 		t.Fatalf("清理样本失败: %v", err)
 	}
-	stale := model.MetricSample{At: now.Add(-3 * time.Hour), Requests: 100, Errors: 20, ErrorRate: 20}
+	stale := model.MetricSample{
+		At: now.Add(-3 * time.Hour), Requests: 100, Errors: 20, ErrorRate: 20, Instance: svc.nodeID,
+	}
 	if err := svc.DB.Create(&stale).Error; err != nil {
 		t.Fatalf("写入陈旧样本失败: %v", err)
 	}
 	if err := svc.DB.Create(&model.MetricSample{
-		At: now, Requests: 100, Errors: 20, ErrorRate: 20,
+		At: now, Requests: 100, Errors: 20, ErrorRate: 20, Instance: svc.nodeID,
 	}).Error; err != nil {
 		t.Fatalf("写入当前样本失败: %v", err)
 	}

@@ -136,8 +136,9 @@ func (s *Services) HealthReport() HealthReport {
 
 	// 告警
 	var firing, undelivered int64
+	// 按 kind 去重：多实例各自持有一条 firing，但那是同一个问题。
 	if err := s.DB.Model(&model.AlertEvent{}).
-		Where("status = ?", model.AlertStatusFiring).Count(&firing).Error; err != nil {
+		Where("status = ?", model.AlertStatusFiring).Distinct("kind").Count(&firing).Error; err != nil {
 		components = append(components, HealthComponent{
 			Key: "alerts", Name: "告警", Weight: 25, Status: "unknown", Detail: "读取告警失败",
 		})
@@ -166,8 +167,9 @@ func (s *Services) HealthReport() HealthReport {
 			Key: "alerts", Name: "告警", Score: score, Weight: 25, Status: status, Detail: detail,
 		})
 		if err := s.DB.Model(&model.AlertEvent{}).
-			Where("status = ? AND delivered = ?", model.AlertStatusFiring, false).
-			Count(&undelivered).Error; err == nil && undelivered > 0 {
+			Where("status = ? AND delivered = ? AND mail_queued = ?",
+				model.AlertStatusFiring, false, false).
+			Distinct("kind").Count(&undelivered).Error; err == nil && undelivered > 0 {
 			todos = append(todos, HealthTodo{
 				Key: "alert_undelivered", Level: "warning",
 				Title:  "告警没有送达",
@@ -232,7 +234,7 @@ func (s *Services) HealthReport() HealthReport {
 			Link:   "/alerts",
 		})
 	}
-	if cfg.EmailEnabled && !s.MailEnabled() {
+	if (cfg.EmailEnabled || s.ReportConfig().Enabled) && !s.MailEnabled() {
 		todos = append(todos, HealthTodo{
 			Key: "mail_not_ready", Level: "warning",
 			Title:  "邮件通道未就绪",

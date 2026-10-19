@@ -94,8 +94,10 @@
             </span>
           </el-form-item>
           <el-form-item label="隧道网关端口">
-            <el-input-number v-model="numForm['gateway.port']" :min="1" :max="65535" />
-            <span class="hint">客户端连接 frps 的端口，默认 7001；留空回落 <code>LT_GATEWAY_PORT</code></span>
+            <el-input-number v-model="numForm['gateway.port']" :min="0" :max="65535" />
+            <span class="hint">
+              客户端连接 frps 的端口，默认 7001；填 0（或留空）回落 <code>LT_GATEWAY_PORT</code>
+            </span>
           </el-form-item>
         </el-form>
       </el-tab-pane>

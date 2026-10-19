@@ -158,6 +158,9 @@ func New(
 		}
 	}
 
+	// 这一组是「只读 + 本人自助」：auditor 可以读所有列表，也可以改自己的资料/密码/双因素，
+	// 这些操作只影响本人账号，不构成越权；所有影响他人或系统状态的写操作都在
+	// 下面的 adminWrite / adminSuper 组，auditor 在那里会被拒。
 	adminRead := r.Group("/api/admin")
 	adminRead.Use(middleware.Limit(adminAPILimiter, "admin-api"))
 	adminRead.Use(adminAllow.Middleware())

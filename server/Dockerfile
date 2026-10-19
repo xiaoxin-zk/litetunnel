@@ -54,7 +54,8 @@ USER lt
 # （管理后台挂载路径由 LT_ADMIN_PATH 决定，默认 /lt-console）
 EXPOSE 7848
 
+# 端口跟随 LT_USER_ADDR（默认 0.0.0.0:7848），改端口后健康检查不会误报。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:7848/healthz || exit 1
+  CMD-SHELL port="${LT_USER_ADDR##*:}"; wget -qO- "http://127.0.0.1:${port:-7848}/healthz" || exit 1
 
 ENTRYPOINT ["/app/panel"]

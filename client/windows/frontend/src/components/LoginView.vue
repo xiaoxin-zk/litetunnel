@@ -128,6 +128,10 @@ const error = ref('')
 const form = reactive({ server: '', apiKey: '' })
 
 let attempt = 0
+// 用计数器而不是「序号是否仍然最新」决定何时收起 loading：
+// 编辑表单会让序号前进，旧请求结束时若不清计数，按钮会永久禁用。
+let loadPending = 0
+let sendPending = 0
 
 async function submit() {
   error.value = ''
@@ -141,6 +145,7 @@ async function submit() {
   }
 
   const seq = ++attempt
+  loadPending++
   loading.value = true
   try {
     const next = await api.connect(form.apiKey.trim(), form.server.trim())
@@ -150,7 +155,11 @@ async function submit() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
   } finally {
-    if (seq === attempt) loading.value = false
+    loadPending--
+    if (loadPending <= 0) {
+      loadPending = 0
+      loading.value = false
+    }
   }
 }
 
@@ -203,6 +212,7 @@ async function sendCode() {
   }
   error.value = ''
   const seq = ++attempt
+  sendPending++
   sending.value = true
   try {
     await api.sendEmailCode(form.server.trim(), account, 'reset')
@@ -217,7 +227,11 @@ async function sendCode() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '验证码发送失败'
   } finally {
-    if (seq === attempt) sending.value = false
+    sendPending--
+    if (sendPending <= 0) {
+      sendPending = 0
+      sending.value = false
+    }
   }
 }
 
@@ -247,6 +261,7 @@ async function submitReset() {
   }
 
   const seq = ++attempt
+  loadPending++
   loading.value = true
   try {
     await api.resetPassword(
@@ -257,7 +272,6 @@ async function submitReset() {
       reset.password
     )
     if (seq !== attempt) return
-    loading.value = false
     reset.oldPassword = ''
     reset.emailCode = ''
     reset.password = ''
@@ -268,7 +282,11 @@ async function submitReset() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '重置失败，请检查填写的信息'
   } finally {
-    if (seq === attempt) loading.value = false
+    loadPending--
+    if (loadPending <= 0) {
+      loadPending = 0
+      loading.value = false
+    }
   }
 }
 

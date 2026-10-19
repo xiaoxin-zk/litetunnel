@@ -14,6 +14,11 @@ import (
 )
 
 func (s *Services) UpdateSettings(in map[SettingKey]string) error {
+	// 读快照 → 合并 → 校验 → 写入必须串行，否则并发的部分更新可能各自通过校验，
+	// 合起来却是非法状态（例如一边打开告警、一边清空所有通知通道）。
+	s.settingsUpdateMu.Lock()
+	defer s.settingsUpdateMu.Unlock()
+
 	if touchesDomainSettings(in) {
 		s.domainMu.Lock()
 		defer s.domainMu.Unlock()
@@ -156,8 +161,11 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)
 		}
 	}
-	if n, err := strconv.Atoi(view(KeyGatewayPort)); err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("%w: 网关端口需为 1-65535 的整数", ErrInvalidParam)
+	// 端口留空或填 0 表示沿用 LT_GATEWAY_PORT（默认 7001），与页面提示保持一致。
+	if raw := strings.TrimSpace(view(KeyGatewayPort)); raw != "" {
+		if n, err := strconv.Atoi(raw); err != nil || n < 0 || n > 65535 {
+			return fmt.Errorf("%w: 网关端口需为 0-65535 的整数，0 表示沿用服务端配置", ErrInvalidParam)
+		}
 	}
 
 	if n, err := strconv.Atoi(view(KeyAPIRatePerMinute)); err != nil || n < 1 || n > 100000 {
@@ -372,9 +380,8 @@ func validateAlertSettings(view func(SettingKey) string) error {
 	reportOn := truthySetting(view, KeyReportEnabled)
 	dailyOn := truthySetting(view, KeyReportDailyEnabled)
 	weeklyOn := truthySetting(view, KeyReportWeeklyEnabled)
-	if (dailyOn || weeklyOn) && !reportOn {
-		return fmt.Errorf("%w: 已选择日报/周报，请同时打开「定时报告」总开关", ErrInvalidParam)
-	}
+	// 子开关先留着、总开关先关掉是合法操作（总开关才是唯一生效条件），
+	// 不能因此拒绝保存，否则用户关不掉报告。
 	if reportOn && !dailyOn && !weeklyOn {
 		return fmt.Errorf("%w: 定时报告至少要选择日报或周报中的一种", ErrInvalidParam)
 	}

@@ -27,7 +27,12 @@ func AdminReadAuth(secret string, resolve IdentityResolver, keyResolve AdminKeyR
 			if !checkIdentity(c, resolve, claims.UserID, claims.Version) {
 				return
 			}
-			if claims.Role != "super" && claims.Role != "operator" {
+			// auditor（审计只读）本来就只该读：所有写接口都挂在
+			// AdminAuth(super/operator) 之后，这里必须放行它，
+			// 否则该角色登录后连 /profile 都拿不到，面板直接不可用。
+			switch claims.Role {
+			case "super", "operator", "auditor":
+			default:
 				httpx.Forbidden(c, "当前角色无此操作权限")
 				return
 			}

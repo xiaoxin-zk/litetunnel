@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xiaoxin-zk/litetunnel/server/internal/outbound"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
@@ -295,12 +296,9 @@ func validateSiteBrandRest(view func(SettingKey) string) error {
 // 则告警在推送阶段才失败，界面上看起来「已启用」却一条都发不出去。
 func validateAlertSettings(view func(SettingKey) string) error {
 	upstream := view(KeyAlertWebhook)
-	if upstream != "" && upstream != SecretMask {
-		if !strings.HasPrefix(upstream, "http://") && !strings.HasPrefix(upstream, "https://") {
-			return fmt.Errorf("%w: 告警 Webhook 需以 http:// 或 https:// 开头", ErrInvalidParam)
-		}
-		if len(upstream) > 500 {
-			return fmt.Errorf("%w: 告警 Webhook 地址过长", ErrInvalidParam)
+	if upstream != "" {
+		if _, err := outbound.ValidateHTTPURL(upstream); err != nil {
+			return fmt.Errorf("%w: 告警 Webhook %v", ErrInvalidParam, err)
 		}
 	}
 	if upstream == "" {

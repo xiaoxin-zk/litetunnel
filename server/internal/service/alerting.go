@@ -13,6 +13,7 @@ import (
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
+	"github.com/xiaoxin-zk/litetunnel/server/internal/outbound"
 )
 
 // 这些数值会展示在管理端，导出出去避免页面另写一份。
@@ -139,10 +140,15 @@ func (s *Services) backupStaleHours(now time.Time) (float64, bool) {
 }
 
 // raiseAlert 受冷却时间约束，避免同一个问题每五分钟刷一次 Webhook。
+// 冷却窗口内如果上一条还没送达，就重试同一条：既不会因为一次网络抖动
+// 让运维等满 30 分钟，也不会把历史表刷成一堆重复行。
 func (s *Services) raiseAlert(kind, level, message string, value, threshold float64) {
 	var last model.AlertEvent
 	err := s.DB.Where("kind = ?", kind).Order("id DESC").First(&last).Error
 	if err == nil && time.Since(last.CreatedAt) < alertCooldown {
+		if !last.Delivered {
+			s.deliverAlert(last)
+		}
 		return
 	}
 	ev := model.AlertEvent{Kind: kind, Level: level, Message: message, Value: value, Threshold: threshold}
@@ -150,8 +156,15 @@ func (s *Services) raiseAlert(kind, level, message string, value, threshold floa
 		log.Printf("[alert] 记录告警失败: %v", err)
 		return
 	}
+	s.deliverAlert(ev)
+}
+
+// deliverAlert 推送并回写送达状态。失败只记日志：告警记录本身已经落库，
+// 下一轮采样会重试同一条。
+func (s *Services) deliverAlert(ev model.AlertEvent) {
 	if err := s.postWebhook(ev); err != nil {
-		log.Printf("[alert] Webhook 推送失败（%s）: %v", kind, err)
+		// 地址里通常带 token，日志只记出站策略能安全展示的部分。
+		log.Printf("[alert] Webhook 推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
 		return
 	}
 	s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("delivered", true)
@@ -162,7 +175,12 @@ func (s *Services) postWebhook(ev model.AlertEvent) error {
 	if cfg.WebhookURL == "" {
 		return nil
 	}
-	body, _ := json.Marshal(map[string]any{
+	// 保存时校验过，这里再校验一次：设置可能来自旧版本，或被直接写进了数据库。
+	target, err := outbound.ValidateHTTPURL(cfg.WebhookURL)
+	if err != nil {
+		return fmt.Errorf("%w: Webhook 地址不可用（%v）", ErrInvalidParam, err)
+	}
+	body, err := json.Marshal(map[string]any{
 		"kind":      ev.Kind,
 		"level":     ev.Level,
 		"message":   ev.Message,
@@ -171,22 +189,25 @@ func (s *Services) postWebhook(ev model.AlertEvent) error {
 		"site":      s.Settings.Get(KeySiteName),
 		"at":        ev.CreatedAt.Format(time.RFC3339),
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), outbound.RequestTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.WebhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "LiteTunnel-Alert")
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	resp, err := outbound.Client().Do(req)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return fmt.Errorf("接收端返回 HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

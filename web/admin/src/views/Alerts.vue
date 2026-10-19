@@ -39,6 +39,10 @@
             以 POST + JSON 推送，字段：<span class="lt-mono">kind / level / message / value / threshold / site / at</span>；
             返回 2xx 视为推送成功
           </div>
+          <div class="hint">
+            出站策略：拒绝云厂商元数据与链路本地地址，且不跟随 3xx 跳转；
+            内网自建接收端（127.0.0.1 / 192.168.x）可用
+          </div>
         </el-form-item>
 
         <el-form-item label="接口错误率阈值">
@@ -139,10 +143,12 @@ const form = ref({
 })
 // 已保存的地址不回显：留空即保持原值，只有用户真的改过输入框才覆盖。
 const webhookConfigured = ref(false)
+const webhookHost = ref('')
 const webhookDirty = ref(false)
-const webhookPlaceholder = computed(() =>
-  webhookConfigured.value ? '已配置，留空表示不修改' : 'https://example.com/hook'
-)
+const webhookPlaceholder = computed(() => {
+  if (!webhookConfigured.value) return 'https://example.com/hook'
+  return webhookHost.value ? `已配置（${webhookHost.value}），留空表示不修改` : '已配置，留空表示不修改'
+})
 
 const sampleKeepDays = ref(14)
 const eventKeepDays = ref(90)
@@ -178,6 +184,7 @@ async function loadConfig() {
   try {
     const res = (await alertApi.settings()) || {}
     webhookConfigured.value = !!res.webhook_configured
+    webhookHost.value = res.webhook_host || ''
     webhookDirty.value = false
     sampleKeepDays.value = Number(res.sample_keep_days ?? 14)
     eventKeepDays.value = Number(res.event_keep_days ?? 90)

@@ -315,8 +315,27 @@ func (a *App) noteStartFailure(id uint, name, reason string) {
 }
 
 func (a *App) noteStartFailureGen(id uint, gen uint64, name, reason string) {
+	a.noteStartFailureAcct(id, a.captureEpoch(), gen, name, reason)
+}
+
+// noteStartFailureAcct 记一次失败，并把它绑定到**产生这次失败时的账号**。
+//
+// acct 有两个用途：
+//   - 写 retries 之前核对账号：退出回调迟到时不能替新账号推进退避
+//     （那会让新账号的隧道白等一轮，而它根本没失败过）；
+//   - 给「第 N 次失败」那行日志盖章：它由客户端自己写（gen=0），
+//     没有进程代次可反查，只能靠调用方带来的代次。
+//
+// gen 仍然是进程代次：同一账号下重连时，旧进程的失败不能算到新进程头上。
+func (a *App) noteStartFailureAcct(id uint, acct accountEpoch, gen uint64, name, reason string) {
 	a.mu.Lock()
 	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		a.mu.Unlock()
+		return
+	}
+	// 账号核对与 retries 写入必须在同一把锁内：分开做的话，两次快照之间
+	// 正好完成一次登出，就会把失败记进新账号的表里。
+	if acct.known() && a.accountEpochLocked() != acct {
 		a.mu.Unlock()
 		return
 	}
@@ -336,7 +355,7 @@ func (a *App) noteStartFailureGen(id uint, gen uint64, name, reason string) {
 
 	// 把「什么时候再试」说清楚。不说的话，用户只看到反复失败，
 	// 分不清客户端是在退避还是已经放弃。
-	a.emitTunnelLog(name, fmt.Sprintf("%s（第 %d 次失败，%s 后重试）",
+	a.emitTunnelLogEpoch(acct, name, fmt.Sprintf("%s（第 %d 次失败，%s 后重试）",
 		reason, attempts, delay.Round(time.Second)))
 }
 

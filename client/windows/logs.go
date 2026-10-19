@@ -30,11 +30,27 @@ func shortLine(s string) string {
 //
 // 走 Manager 的统一缓冲而不是只进推送队列：历史快照与实时推送必须是同一份
 // 数据，否则界面重新加载日志时，启动同步、重连这类说明会凭空消失。
+//
+// 这一版按**调用时刻**的账号代次盖章，只适用于「就在当前账号的同步流程里」
+// 的调用点。异步路径（退出回调、迟到的收尾说明）必须用带 acct 的版本：
+// 它们在跑完之前账号可能已经换了一茬，盖章时再取就盖成了新账号。
 func (a *App) emitLog(msg string) {
+	a.emitLogEpoch(a.captureEpoch(), msg)
+}
+
+// emitLogEpoch 以指定账号代次写一行客户端说明。
+//
+// 代次会在两个地方生效：这里先按它挡一次（不属于当前账号的迟到调用连
+// 日志都不产生），再由投递回调按代次写进待推送队列、由 flush 再挡一次
+// （挡「检查通过之后才发生登出」的那个窗口）。
+func (a *App) emitLogEpoch(acct accountEpoch, msg string) {
 	if a.mgr == nil {
 		return
 	}
-	a.mgr.AppendRaw(time.Now().Format("15:04:05") + "  " + msg)
+	if !a.epochCurrent(acct) {
+		return
+	}
+	a.mgr.AppendRawAccount(uint64(acct), time.Now().Format("15:04:05")+"  "+msg)
 }
 
 // emitTunnelLog 往运行日志里追加一行带隧道前缀的说明。
@@ -44,16 +60,31 @@ func (a *App) emitLog(msg string) {
 // 每条隧道一个进程之后，日志是多个进程交织在一起的，
 // 没有前缀就分不出哪一行属于哪条隧道。
 func (a *App) emitTunnelLog(name, msg string) {
+	a.emitTunnelLogEpoch(a.captureEpoch(), name, msg)
+}
+
+// emitTunnelLogEpoch 以指定账号代次写一行隧道说明（语义见 emitLogEpoch）。
+func (a *App) emitTunnelLogEpoch(acct accountEpoch, name, msg string) {
 	if a.mgr == nil {
 		return
 	}
-	a.mgr.AppendRaw(fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
+	if !a.epochCurrent(acct) {
+		return
+	}
+	a.mgr.AppendRawAccount(uint64(acct),
+		fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
 }
 
 // pendingLog 是一条等待推送的日志。
 //
 // 带序号是为了让「清空」能挡住清空前产生、清空后才入队的在途行。
+//
+// 带账号代次是因为序号挡不住另一半：清空之后才**产生**的旧账号行（迟到
+// 回调写的「隧道已断开」「第 3 次失败」，或旧进程退出的收尾日志）序号比
+// 清空点大，按序号看完全合法，但内容属于上一个账号。代次让这类行在
+// 入队与出队时各被拦一次。
 type pendingLog struct {
+	acct accountEpoch
 	seq  uint64
 	text string
 }
@@ -99,16 +130,17 @@ const maxLogBatchBytes = 128 * 1024
 // 只减少了 DOM 更新，挡不住这层开销，真正被堵住的是这条桥。
 const logFlushInterval = 120 * time.Millisecond
 
-// appendLogLine 把一行日志放进待推送队列，返回是否真的入队。
+// appendLogLineAcct 把一行日志放进待推送队列，返回是否真的入队。
 //
 // 返回值是「这行仍属于当前账号」的判据：被清空点挡下的行（seq <=
-// logDroppedSeq）来自已经清掉的历史或上一个账号。回调必须用它来决定
-// 是否允许这行**改动运行态**——日志可以丢，状态不能被旧行改写。
-func (a *App) appendLogLine(seq uint64, line string) bool {
+// logDroppedSeq）来自已经清掉的历史，被代次挡下的行来自上一个账号。
+// 回调必须用它来决定是否允许这行**改动运行态**——日志可以丢，状态
+// 不能被旧行改写。
+func (a *App) appendLogLineAcct(acct accountEpoch, seq uint64, line string) bool {
 	if a.ctx == nil {
 		return false
 	}
-	accepted, batchReady := a.pushLog(seq, line)
+	accepted, batchReady := a.pushLogAcct(acct, seq, line)
 	if !accepted {
 		return false
 	}
@@ -124,15 +156,27 @@ func (a *App) appendLogLine(seq uint64, line string) bool {
 	return true
 }
 
-// pushLog 入队一行，返回「是否入队」与「是否已经攒够一批可以立刻推送」。
+// pushLog 入队一行，按当前账号代次盖章（见 pushLogAcct）。
+//
+// 保留这个签名是给测试与「确实产生于当前账号」的调用方用的。
+func (a *App) pushLog(seq uint64, line string) (accepted, batchReady bool) {
+	return a.pushLogAcct(a.captureEpoch(), seq, line)
+}
+
+// pushLogAcct 入队一行，返回「是否入队」与「是否已经攒够一批可以立刻推送」。
 //
 // 两个返回值必须分开：调用方需要知道这一行是否属于当前账号（据此决定
 // 能否改运行态），而「攒够一批」只是推送时机的提示，不能当作入队与否。
 //
-// 没有 ctx 依赖也不发事件：队列行为本身要能被单测覆盖——「有界」「丢最旧」
-// 「一批不超过 maxLogBatch」这几条一旦坏了，症状只是日志少了几行或内存涨了，
-// 不看队列本身根本发现不了。
-func (a *App) pushLog(seq uint64, line string) (accepted, batchReady bool) {
+// 账号代次检查放在加锁之前：epochCurrent 要拿 a.mu，而日志的锁序是
+// logMu → mu（见 currentLogEpoch 的说明），在这里先读、再进 logMu，
+// 与既有顺序一致。检查本身不可能覆盖「读完到入队之间换了号」的窗口，
+// 那一半由 takeLogBatchWithEpoch 在出队时再挡一次。
+func (a *App) pushLogAcct(acct accountEpoch, seq uint64, line string) (accepted, batchReady bool) {
+	if acct.known() && !a.epochCurrent(acct) {
+		return false, false
+	}
+
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 
@@ -162,7 +206,7 @@ func (a *App) pushLog(seq uint64, line string) (accepted, batchReady bool) {
 		a.logDropped += drop
 	}
 
-	a.logBuf = append(a.logBuf, pendingLog{seq: seq, text: line})
+	a.logBuf = append(a.logBuf, pendingLog{acct: acct, seq: seq, text: line})
 	a.logBufBytes += len(line)
 	return true, len(a.logBuf) >= maxLogBatch
 }
@@ -180,13 +224,41 @@ func (a *App) takeLogBatch() []string {
 	return out
 }
 
+// dropForeignLogsLocked 丢掉队列里属于其他账号的行。
+//
+// 调用方必须已持有 logMu。只丢「明确属于别的账号」的行：acct 为
+// noEpoch 的行产生于接入之前，它们不属于任何已结束的会话，没有理由
+// 因为一次登录而被抹掉（那会让「正在接入…」这类诊断行凭空消失）。
+func (a *App) dropForeignLogsLocked(cur accountEpoch) {
+	kept := a.logBuf[:0]
+	for _, it := range a.logBuf {
+		if it.acct.known() && it.acct != cur {
+			a.logBufBytes -= len(it.text)
+			continue
+		}
+		kept = append(kept, it)
+	}
+	a.logBuf = kept
+}
+
 // takeLogBatchWithEpoch 取出批次，并在**同一把锁内**捕获当时的代次。
 //
 // 分两步（先取批次、再读代次）会有一个窄窗口：清空恰好发生在两步之间时，
 // 清空前的批次会被标成新代次，前端就过滤不掉了。
 func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
+	// 账号代次在进 logMu 之前读：日志的锁序是 logMu → mu（见 pushLogAcct）。
+	acct := a.captureEpoch()
+
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
+
+	// 出队前再按账号筛一遍。
+	//
+	// 入队那次检查与登出之间存在一个窗口：行通过了检查、还没进队列时，
+	// 用户点了退出登录并清理了日志——于是这一行带着旧代次躺在队列里。
+	// 队列在清空时是空的，所以它不会被清空拦住；只有这里能挡下它。
+	// 没有这个过滤，换账号后界面仍会先冒出上一段日志。
+	a.dropForeignLogsLocked(acct)
 
 	if len(a.logBuf) == 0 && a.logDropped == 0 {
 		return nil, a.logEpoch

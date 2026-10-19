@@ -160,6 +160,13 @@ type logEntry struct {
 	gen  uint64
 	seq  uint64
 	text string
+	// acct 是产生这一行时所在的**账号代次**（0 表示「不来自某个账号」）。
+	//
+	// 进程输出不带它：那一行的归属由上层按「启动该进程时的账号」反查
+	// （见 App 的日志回调）。只有客户端自己写的说明行（AppendRawAccount）
+	// 需要把代次一路带到投递端——这些行没有进程可反查，而它们恰恰是
+	// 迟到回调最常写出来的东西。
+	acct uint64
 }
 
 // AppendRaw 记录一条由客户端自己格式化好的日志（启动同步、重连说明等）。
@@ -168,6 +175,17 @@ type logEntry struct {
 // 于是界面重新加载日志时它们会凭空消失，而它们恰恰是解释「客户端在做什么」
 // 的关键信息。
 func (m *Manager) AppendRaw(line string) {
+	m.AppendRawAccount(0, line)
+}
+
+// AppendRawAccount 记录一条客户端说明行，并带上它所属的**账号代次**。
+//
+// acct 会被一路带到投递回调与待推送队列：没有它，上层无法分辨「这一行是
+// 当前账号刚写的」还是「上一个账号的回调迟到写出来的」——两者的进程代次
+// 都是 0，序号又只能拦住清空点之前产生的行。
+//
+// acct 为 0 表示「不属于任何账号」（未接入时的启动日志），上层按放行处理。
+func (m *Manager) AppendRawAccount(acct uint64, line string) {
 	line = strings.TrimRight(line, "\r\n")
 	line = clipLogLine(line, maxLogLineBytes)
 	if line == "" {
@@ -175,7 +193,7 @@ func (m *Manager) AppendRaw(line string) {
 	}
 
 	m.mu.Lock()
-	e := logEntry{seq: m.recordTextLocked(line), text: line}
+	e := logEntry{seq: m.recordTextLocked(line), text: line, acct: acct}
 	// 与 appendLog 同理：加锁入队、解锁后由投递协程按序调用回调。
 	m.enqueueEmitLocked([]logEntry{e})
 	m.mu.Unlock()
@@ -299,19 +317,25 @@ func (m *Manager) emitPending() {
 		batch := m.pending
 		m.pending = nil
 		cb := m.onLog
+		cbGen := m.onLogGen
+		cbAcct := m.onLogAcct
 		m.mu.Unlock()
 
-		if cb != nil {
+		// 三选一而不是全调：SetXxxCallbacks 每次都会把另外两个置空，这里按
+		// 「携带信息最多的那个」分派即可。日志行只会被投递一次——同一行
+		// 既进历史又进推送队列，重复回调会让前端看到两遍。
+		switch {
+		case cbAcct != nil:
 			for _, e := range batch {
-				cb(e.id, e.name, e.seq, e.text)
+				cbAcct(e.acct, e.id, e.name, e.gen, e.seq, e.text)
 			}
-		}
-		m.mu.Lock()
-		cbGen := m.onLogGen
-		m.mu.Unlock()
-		if cbGen != nil {
+		case cbGen != nil:
 			for _, e := range batch {
 				cbGen(e.id, e.name, e.gen, e.seq, e.text)
+			}
+		case cb != nil:
+			for _, e := range batch {
+				cb(e.id, e.name, e.seq, e.text)
 			}
 		}
 

@@ -172,6 +172,10 @@ type Manager struct {
 	// onLog 收到的行已经带好前缀；seq 是该行的单调序号。
 	onLog func(tunnelID uint, tunnelName string, seq uint64, line string)
 	onLogGen func(tunnelID uint, tunnelName string, gen uint64, seq uint64, line string)
+	// onLogAcct 额外携带行所属的账号代次（仅客户端说明行非零，见
+	// AppendRawAccount）。生产 App 用这个接口：没有账号维度的回调无法
+	// 分辨「上一账号的迟到日志」，而它恰恰是跨账号污染的唯一入口。
+	onLogAcct func(acct uint64, tunnelID uint, tunnelName string, gen uint64, seq uint64, line string)
 	// onExit 在某个隧道的进程退出时调用。
 	//
 	// requested 为 true 表示这次退出是 Stop 主动请求的（用户关掉开关、
@@ -209,6 +213,7 @@ func (m *Manager) SetCallbacks(
 	m.onLog = onLog
 	m.onExit = onExit
 	m.onLogGen = nil
+	m.onLogAcct = nil
 	m.onExitGen = nil
 }
 
@@ -223,6 +228,25 @@ func (m *Manager) SetGenerationCallbacks(
 	m.onLogGen = onLog
 	m.onExitGen = onExit
 	m.onLog = nil
+	m.onLogAcct = nil
+	m.onExit = nil
+}
+
+// SetAccountCallbacks 注册「带账号代次」的日志回调 + 带进程代次的退出回调。
+//
+// 生产 App 用本接口：日志的账号归属必须在投递端就带着走。只靠进程代次
+// 不够——客户端自己的说明行（emitLog / emitTunnelLog）没有进程，而退出
+// 回调超时后仍然可能写它们；那些行必须能被上层认出「属于上一个账号」。
+func (m *Manager) SetAccountCallbacks(
+	onLog func(acct uint64, tunnelID uint, tunnelName string, gen uint64, seq uint64, line string),
+	onExit func(tunnelID uint, tunnelName string, gen uint64, err error, requested bool),
+) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onLogAcct = onLog
+	m.onExitGen = onExit
+	m.onLog = nil
+	m.onLogGen = nil
 	m.onExit = nil
 }
 

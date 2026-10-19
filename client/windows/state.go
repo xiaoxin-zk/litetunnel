@@ -376,6 +376,14 @@ func (a *App) recordTunnelErrMsg(id uint, msg string) bool {
 }
 
 func (a *App) recordTunnelErrMsgGen(id uint, gen uint64, msg string) bool {
+	return a.recordTunnelErrMsgAcct(id, a.captureEpoch(), gen, msg)
+}
+
+// recordTunnelErrMsgAcct 记下错误说明，并核对它所属的账号。
+//
+// 账号校验必须在 a.mu 内、与写入同源：分开两次快照的话，登出可以恰好
+// 落在两次之间，于是上一个账号的失败原因被写进新账号的界面。
+func (a *App) recordTunnelErrMsgAcct(id uint, acct accountEpoch, gen uint64, msg string) bool {
 	msg = clampStatusText(strings.TrimSpace(msg))
 	if msg == "" {
 		return false
@@ -383,6 +391,9 @@ func (a *App) recordTunnelErrMsgGen(id uint, gen uint64, msg string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if gen != 0 && !a.managerGenerationCurrentLocked(id, gen) {
+		return false
+	}
+	if acct.known() && a.accountEpochLocked() != acct {
 		return false
 	}
 	if a.tunnelErrs == nil {
@@ -415,7 +426,11 @@ func (a *App) clearTunnelErrGen(id uint, gen uint64) {
 //
 // 地址必须紧跟在「启动成功」之后：用户要的就是「该把哪个地址发给朋友」，
 // 让他自己去列表里再找一遍完全是多余的。
-func (a *App) emitTunnelReady(id uint, name string) {
+// emitTunnelReadyEpoch 以指定账号代次补发「启动成功」说明。
+//
+// 调用方是日志回调：那里的账号代次来自「启动这条进程时的账号」，
+// 必须原样传下来，而不是在这里重新取一次当前的账号。
+func (a *App) emitTunnelReadyEpoch(acct accountEpoch, id uint, name string) {
 	a.mu.RLock()
 	addr := ""
 	for i := range a.tunnels {
@@ -426,8 +441,8 @@ func (a *App) emitTunnelReady(id uint, name string) {
 	}
 	a.mu.RUnlock()
 
-	a.emitTunnelLog(name, "隧道启动成功")
+	a.emitTunnelLogEpoch(acct, name, "隧道启动成功")
 	if addr != "" {
-		a.emitTunnelLog(name, "使用 >>"+addr+"<< 连接你的隧道")
+		a.emitTunnelLogEpoch(acct, name, "使用 >>"+addr+"<< 连接你的隧道")
 	}
 }

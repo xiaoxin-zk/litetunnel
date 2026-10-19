@@ -489,7 +489,7 @@ func (a *App) startup(ctx context.Context) {
 	// 日志出的第一行就进批量队列：只要开始产生日志，推送到前端的节奏就
 	// 由推送协程决定，而不是「一行一次 Wails 调用」。
 	a.startLogFlusher()
-	a.mgr.SetGenerationCallbacks(func(id uint, name string, gen uint64, seq uint64, line string) {
+	a.mgr.SetAccountCallbacks(func(acct uint64, id uint, name string, gen uint64, seq uint64, line string) {
 		// 日志回调在 Manager 内排队，旧进程的行可能晚于新进程到达。
 		// 只有当前 generation 才能修改注册、退避和错误状态；旧日志仍保留
 		// 用于诊断，但不再污染当前隧道运行态。
@@ -497,23 +497,42 @@ func (a *App) startup(ctx context.Context) {
 		// 这里必须先把三类行分开，它们的约束完全不同：
 		//
 		//  1. 进程输出（gen != 0）：受进程代次约束，且只有**真正入队**的行
-		//     才允许改运行态。被清空点挡下的行属于旧账号，它只能说明
+		//     才允许改运行态。被清空点或账号代次挡下的行，只能说明
 		//     「那一代进程说过这句话」。
 		//  2. 客户端诊断（gen == 0）：没有进程代次，也不代表任何进程状态。
 		//     只进日志，绝不参与 start proxy success / 错误文本解析——
 		//     隧道名与说明文本是用户可填的，恰好带上关键词就会清掉真实
 		//     错误、把隧道误标成已注册。
-		//  3. 账号代次：日志层的隔离由「ClearLogs 清空 Manager 待投递队列」
-		//     加 logDroppedSeq（清空点）共同完成；两者在翻代次之后执行，
-		//     排队期间捕获的旧批次都会被挡下。
+		//  3. 账号代次：客户端诊断行自带（见 AppendRawAccount），进程输出
+		//     按「启动该进程时的账号」（startGen）反查。它比日志序号更根本：
+		//     序号只能挡住清空**之前**产生的行，而迟到回调产生的行序号更大。
 		if gen == 0 {
-			a.appendLogLine(seq, line)
+			epoch := accountEpoch(acct)
+			if !epoch.known() {
+				// 旧接口（AppendRaw）写出的行没有代次：按调用时刻的账号算。
+				epoch = a.captureEpoch()
+			}
+			a.appendLogLineAcct(epoch, seq, line)
+			return
+		}
+
+		// 进程输出的账号归属必须来自启动记账，不能取「此刻」的账号：
+		// 取此刻等于把上一账号进程的行盖章成新账号的，正是要防的事。
+		epoch, ok := a.tunnelEpoch(id)
+		if !ok {
+			// 查不到记账（隧道已删 / 退出登录已清表）：无法证明它属于
+			// 当前账号，日志与状态一律不处理。
 			return
 		}
 		if !a.mgr.Current(id, gen) {
 			return
 		}
-		if !a.appendLogLine(seq, line) {
+		if !a.appendLogLineAcct(epoch, seq, line) {
+			return
+		}
+		// 入队之后、写运行态之前再核一次账号：上面那次入队检查与这里
+		// 之间用户可能已经退出登录。
+		if !a.epochCurrent(epoch) {
 			return
 		}
 		switch {
@@ -531,8 +550,10 @@ func (a *App) startup(ctx context.Context) {
 			// 用户会盯着「连接中」等一整轮，误以为连不上；而 frpc 此刻已经
 			// 报告成功了，没有理由让他等。服务端采集值仍用于后续校准。
 			a.setTunnelRegisteredGen(id, gen, true)
-			a.emitTunnelReady(id, name)
-			a.emitState()
+			a.emitTunnelReadyEpoch(epoch, id, name)
+			if a.epochCurrent(epoch) {
+				a.emitState()
+			}
 		case frpc.IsErrorLine(line):
 			// 记下错误原文并刷新状态，让界面能显示「为什么一直连不上」，
 			// 而不是永远停在一句「连接中」上。
@@ -540,7 +561,7 @@ func (a *App) startup(ctx context.Context) {
 			// 但只在错误原文**变化**时刷新，并对同一隧道限频：一次连接失败
 			// 可能瞬间刷出上千行同样的错误，逐行推状态纯属浪费（每推一次都
 			// 要序列化整个状态），而重复的错误对用户没有新信息。
-			if a.recordTunnelErrMsgGen(id, gen, line) {
+			if a.recordTunnelErrMsgAcct(id, epoch, gen, line) && a.epochCurrent(epoch) {
 				a.emitStateThrottled(id)
 			}
 		}
@@ -579,20 +600,43 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 	// 启动会写出同一个值，删错就把下一次的记录抹掉了（详见
 	// startGeneration 的说明）。条目由 pruneTunnelState 与
 	// resetPerAccountState 负责回收。
-	if _, current := a.startGeneration(id); !current {
+	startEpoch, current := a.startGeneration(id)
+	if !current {
 		// 记录已被清掉（退出登录或隧道被删）时同样落到这里：那也
 		// 说明「无法证明它属于当前账号」，按不处理即可——
 		// 下一轮同步会据实对账，甚至已经把这条隧道停掉了。
 		return
 	}
+	// 账号代次在这里只读一次，之后每一处副作用前都要再核一遍。
+	//
+	// 入口这一次校验只挡得住「回调开始时账号已经换了」。但回调会发 Wails
+	// 事件（界面线程繁忙时可能阻塞数秒），退出登录的等待上限一到就继续
+	// 往下走：翻代次、清凭据、清运行态。回调随后恢复执行，剩下的
+	// noteStartFailure / clearRetry / emitState 全都落在新账号上——
+	// 给它记一笔没发生过的失败、推进一次退避、再推一份脏状态给界面。
+	//
+	// 一次校验无法覆盖这段时间，所以判据必须跟着每一处副作用走。
+	epoch := accountEpoch(startEpoch)
+	if !a.epochCurrent(epoch) {
+		return
+	}
 	// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
 	// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
 	a.setTunnelRegisteredGen(id, gen, false)
+	if !a.epochCurrent(epoch) {
+		return
+	}
 	// 用户刚刚主动断开（StopTunnel / 停用同步）：进程恰好在 Stop 之前退出时
 	// 回调拿到的是 requested=false，这里把上层记录的意图合并进来，避免一次
 	// 正常断开被当成启动失败。
+	//
+	// 消费意图本身也是写操作：账号已经换了就不该再动新账号那张表
+	// （它属于另一套进程与另一批用户操作）。
 	if a.consumeStopIntent(id, gen) {
 		requested = true
+	}
+	if !a.epochCurrent(epoch) {
+		return
 	}
 	switch {
 	case requested:
@@ -608,9 +652,13 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 		if err != nil {
 			reason = "frpc 异常退出：" + err.Error()
 		}
-		a.noteStartFailureGen(id, gen, name, reason)
+		// 代次随失败记账一起传下去：它推导出的那行日志同样不能落进
+		// 新账号的日志里（那会显示成「新账号的隧道失败了」）。
+		a.noteStartFailureAcct(id, epoch, gen, name, reason)
 	}
-	a.emitState()
+	if a.epochCurrent(epoch) {
+		a.emitState()
+	}
 }
 
 // domReady 在 WebView 加载完成、前端脚本就绪后调用，负责「打开即连」。

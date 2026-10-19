@@ -202,6 +202,8 @@
         </el-form-item>
         <div class="hint">
           控制台地址（域名或公网 IP），必须解析到本机；找回密码邮件也用它拼链接。
+          可以带端口（如 <span class="mono">203.0.113.10:7848</span>）：默认值就是从
+          <span class="mono">LT_USER_PUBLIC_URL</span> 派生的，端口会原样写进 Caddy 站点地址。
           协议取自 <span class="mono">LT_USER_PUBLIC_URL</span>：填 <span class="mono">http://</span> 时
           Caddy 不申请证书、也不发送 HSTS，适合无域名/无法备案的部署，但凭据会明文传输。
         </div>

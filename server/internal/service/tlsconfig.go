@@ -158,7 +158,7 @@ func (s *Services) domainConfigVars(snap DomainConfigSnapshot) (map[string]strin
 	if snap.Panel == "" {
 		return nil, fmt.Errorf("%w: 请先填写面板域名（HTTP 模式可填域名或公网 IP）", ErrInvalidParam)
 	}
-	if err := checkDomain(snap.Panel); err != nil {
+	if err := checkPanelDomain(snap.Panel); err != nil {
 		return nil, fmt.Errorf("%w: 面板域名 %s", ErrInvalidParam, err.Error())
 	}
 	if snap.Tunnel != "" {
@@ -655,6 +655,55 @@ func normalizeDomainValue(v string) string {
 	v = strings.TrimPrefix(v, "http://")
 	v = strings.TrimRight(v, "/")
 	return strings.TrimSpace(v)
+}
+
+// splitDomainPort 把 "host[:port]" 拆成主机与端口两部分。
+//
+// 面板域名常常直接来自 LT_USER_PUBLIC_URL，而后者是**对外访问地址**：直连部署
+// 写成 http://203.0.113.10:7848 是常态。若把冒号一并判为非法，派生出来的默认
+// 值就永远过不了自己的校验——后台保存任何设置（改个 SMTP 端口）都会被
+// 「面板域名不合法（含有非法字符 ":"）」顶回来。
+func splitDomainPort(d string) (host, port string, err error) {
+	i := strings.IndexByte(d, ':')
+	if i < 0 {
+		return d, "", nil
+	}
+	// 多个冒号只可能是 IPv6 字面量。这一套链路（Caddy 站点地址、证书签发、
+	// 域名段校验）都不支持它，明确拒绝比给出一个含混的错误好。
+	if strings.Count(d, ":") > 1 {
+		return "", "", fmt.Errorf("含有非法字符 %q（IPv6 地址暂不支持，请改用域名或 IPv4）", ":")
+	}
+	host, port = d[:i], d[i+1:]
+	if host == "" {
+		return "", "", fmt.Errorf("缺少主机部分")
+	}
+	if port == "" {
+		return "", "", fmt.Errorf("端口不能为空")
+	}
+	return host, port, nil
+}
+
+// checkPanelDomain 校验面板域名：允许 host[:port]。
+//
+// 端口在这里是合法的：Caddy 站点地址本身就支持 [scheme://]host[:port]，
+// 对外地址带端口时下发的就是带端口的站点地址。隧道根域名不走这里——子域名
+// 转发由 Caddy 按域名匹配，端口没有意义。
+func checkPanelDomain(d string) error {
+	host, port, err := splitDomainPort(d)
+	if err != nil {
+		return err
+	}
+	if err := checkDomain(host); err != nil {
+		return err
+	}
+	if port == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("端口 %q 不合法（需 1-65535 的整数）", port)
+	}
+	return nil
 }
 
 // checkDomain 校验裸域名。规则与宿主机 helper 保持一致（见 cmd/lt-config）。

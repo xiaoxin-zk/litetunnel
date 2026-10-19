@@ -141,6 +141,39 @@ try {
     $leftovers = @(Get-ChildItem -Path (Join-Path $dir 'deploy') -Recurse -Force -File |
         Where-Object { $_.Name -like '.*.tmp.*' -or $_.Name -like '.*.bak.*' })
     if ($leftovers.Count -eq 0) { Ok 'no temp/backup leftovers after failure' } else { Fail "$($leftovers.Count) temp files left behind after failure" }
+    Write-Host 'panel public URL with a port'
+    # The panel domain is derived from LT_USER_PUBLIC_URL, and a direct-connect
+    # deployment writes http://203.0.113.10:7848. Rejecting the colon would make
+    # "save in the panel" and "render on the host" disagree.
+    $dir3 = New-Fixture 'port'
+    $envPath3 = Join-Path $dir3 '.env'
+    $text3 = Get-Content -LiteralPath $envPath3 -Raw
+    $text3 = [regex]::Replace($text3, '(?m)^LT_USER_PUBLIC_URL=.*$', 'LT_USER_PUBLIC_URL=http://203.0.113.10:7848')
+    Set-Content -LiteralPath $envPath3 -Value $text3 -NoNewline -Encoding UTF8
+    $code = Invoke-Render $dir3
+    if ($code -ne 0) {
+        Fail "host:port was rejected (exit $code): $((Get-Content -LiteralPath (Join-Path $dir3 'render.log') -Raw))"
+    } else {
+        $caddy3 = Get-Content -LiteralPath (Join-Path $dir3 'deploy/caddy/Caddyfile') -Raw
+        if ($caddy3 -match 'http://203\.0\.113\.10:7848') {
+            Ok 'Caddyfile keeps the port'
+        } else {
+            Fail 'Caddyfile lost the port'
+        }
+    }
+
+    Write-Host 'invalid port is still rejected'
+    $dir4 = New-Fixture 'badport'
+    $envPath4 = Join-Path $dir4 '.env'
+    $text4 = Get-Content -LiteralPath $envPath4 -Raw
+    $text4 = [regex]::Replace($text4, '(?m)^LT_USER_PUBLIC_URL=.*$', 'LT_USER_PUBLIC_URL=http://panel.example.com:99999')
+    Set-Content -LiteralPath $envPath4 -Value $text4 -NoNewline -Encoding UTF8
+    $code = Invoke-Render $dir4
+    if ($code -eq 0) {
+        Fail 'port 99999 should have been rejected'
+    } else {
+        Ok 'invalid port rejected'
+    }
 } finally {
     if (Test-Path -LiteralPath $work) {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

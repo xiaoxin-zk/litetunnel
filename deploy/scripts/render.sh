@@ -275,7 +275,38 @@ check_domain() {
   done
 }
 
-check_domain LT_USER_DOMAIN "${USER_DOMAIN}"
+# 面板域名允许带端口：它来自 LT_USER_PUBLIC_URL（对外访问地址），直连部署写成
+# http://203.0.113.10:7848 是常态，而 Caddy 站点地址本身就支持 host[:port]。
+# 隧道根域名不带端口——子域名转发按域名匹配，端口没有意义。
+check_domain_with_port() {
+  local name="$1" d="$2"
+  [[ -z "${d}" ]] && return 0
+  if [[ "${d}" == *:* ]]; then
+    local host="${d%%:*}" port="${d#*:}"
+    if [[ "${port}" == *:* ]]; then
+      echo "${name}=${d} 含有多个冒号（IPv6 地址暂不支持，请改用域名或 IPv4）。" >&2
+      exit 1
+    fi
+    if [[ -z "${host}" || -z "${port}" ]]; then
+      echo "${name}=${d} 的端口写法不完整，应形如 panel.example.com:7848。" >&2
+      exit 1
+    fi
+    if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+      echo "${name}=${d} 的端口 ${port} 不合法（需 1-65535 的整数）。" >&2
+      exit 1
+    fi
+    local n=$((10#${port}))
+    if (( n < 1 || n > 65535 )); then
+      echo "${name}=${d} 的端口 ${port} 不合法（需 1-65535 的整数）。" >&2
+      exit 1
+    fi
+    check_domain "${name}" "${host}"
+  else
+    check_domain "${name}" "${d}"
+  fi
+}
+
+check_domain_with_port LT_USER_DOMAIN "${USER_DOMAIN}"
 check_domain LT_TUNNEL_DOMAIN "${VARS[LT_TUNNEL_DOMAIN]}"
 if [[ -n "${VARS[LT_TUNNEL_DOMAIN]}" && "${VARS[LT_TUNNEL_DOMAIN]}" == "${USER_DOMAIN}" ]]; then
   echo "LT_TUNNEL_DOMAIN 不能与面板域名相同：泛域名证书会覆盖面板自身的 *.域名。" >&2

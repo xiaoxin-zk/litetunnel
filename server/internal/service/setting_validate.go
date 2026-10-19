@@ -189,7 +189,9 @@ func validateDomainSettings(view, current func(SettingKey) string) error {
 		}
 		return nil
 	}
-	if err := checkDomain(panel); err != nil {
+	// 面板域名允许带端口（checkPanelDomain）：它的默认值来自 LT_USER_PUBLIC_URL，
+	// 而对外访问地址带端口是常态，用 checkDomain 会把默认值判成非法。
+	if err := checkPanelDomain(panel); err != nil {
 		return fmt.Errorf("%w: 面板域名不合法（%s）", ErrInvalidParam, err.Error())
 	}
 

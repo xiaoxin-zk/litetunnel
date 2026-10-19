@@ -224,6 +224,38 @@ CASE="输入文件策略：非普通文件与超限文件"
   fi
 }
 
+# ------------------------------------------------------------
+# 面板对外地址带端口：直连部署写成 http://203.0.113.10:7848 是常态，而面板的
+# 「面板域名」默认值就是从这个地址派生的（端口保留）。脚本若把冒号判成非法，
+# 就会出现「面板保存通过、渲染直接失败」的分叉。
+CASE="面板对外地址带端口（host:port）"
+{
+  d="$(new_fixture port)"
+  sed -E -i.bak 's#^LT_USER_PUBLIC_URL=.*#LT_USER_PUBLIC_URL=http://203.0.113.10:7848#' "${d}/.env"
+  if run_render "${d}"; then
+    ok "渲染成功"
+  else
+    fail "带端口的对外地址被拒绝：$(tail -3 "${d}/render.log")"
+  fi
+  if grep -q 'http://203.0.113.10:7848' "${d}/deploy/caddy/Caddyfile" 2>/dev/null; then
+    ok "Caddyfile 站点地址保留端口"
+  else
+    fail "Caddyfile 没有带上端口：$(grep -m1 '^http' "${d}/deploy/caddy/Caddyfile" 2>/dev/null)"
+  fi
+}
+
+# 端口写错必须仍然被拒绝，不能因为「放宽了端口」把整个域名校验一起废掉。
+CASE="面板对外地址端口非法"
+{
+  d="$(new_fixture badport)"
+  sed -E -i.bak 's#^LT_USER_PUBLIC_URL=.*#LT_USER_PUBLIC_URL=http://panel.example.com:99999#' "${d}/.env"
+  if run_render "${d}"; then
+    fail "端口 99999 应当被拒绝"
+  else
+    grep -q '端口' "${d}/render.log" && ok "拒绝非法端口" || fail "错误信息里没有提到端口"
+  fi
+}
+
 echo
 if (( FAILS > 0 )); then
   echo "render.sh 夹具失败：${FAILS} 项" >&2

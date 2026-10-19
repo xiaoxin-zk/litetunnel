@@ -534,3 +534,32 @@ func TestUpdateSettingsDomainSaveWaitsForApply(t *testing.T) {
 	}
 	// 不释放锁直接返回：doneDomain 里的协程会在测试结束后拿到锁并退出。
 }
+
+// TestPanelDomainAllowsPort 覆盖「面板域名的默认值永远过不了自己的校验」。
+//
+// 默认值来自 LT_USER_PUBLIC_URL，而对外访问地址带端口是常态（直连部署常写
+// http://203.0.113.10:7848）。若校验把冒号判成非法，管理员改任何一项设置
+// （比如 SMTP 端口）都会被这个他根本没碰过的历史值顶回来。
+func TestPanelDomainAllowsPort(t *testing.T) {
+	svc := newTestServices(t, &config.Config{UserPublicURL: "http://203.0.113.10:7848"})
+	if got := svc.Settings.Get(KeyDomainPanel); got != "203.0.113.10:7848" {
+		t.Fatalf("面板域名默认值应保留端口，实际 %q", got)
+	}
+	if err := svc.UpdateSettings(map[SettingKey]string{KeyDomainPanel: "203.0.113.10:7848"}); err != nil {
+		t.Fatalf("带端口的面板域名不该被拒: %v", err)
+	}
+	if err := checkPanelDomain("panel.example.com:8443"); err != nil {
+		t.Fatalf("合法端口被拒: %v", err)
+	}
+	for _, bad := range []string{
+		"panel.example.com:0",
+		"panel.example.com:70000",
+		"panel.example.com:abc",
+		"panel.example.com:",
+		"2001:db8::1",
+	} {
+		if err := checkPanelDomain(bad); err == nil {
+			t.Fatalf("%q 应被判为非法", bad)
+		}
+	}
+}

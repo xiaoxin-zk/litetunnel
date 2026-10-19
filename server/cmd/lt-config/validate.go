@@ -74,7 +74,7 @@ func (s *service) validateVars(vars map[string]string, res *tlscfg.RenderResult)
 	if panel == "" {
 		return errors.New("面板域名为空：Caddy 需要一个站点地址（域名或 IP）")
 	}
-	if err := validDomain(panel); err != nil {
+	if err := validPanelDomain(panel); err != nil {
 		return fmt.Errorf("面板域名不合法: %w", err)
 	}
 
@@ -411,6 +411,37 @@ func validDomain(d string) error {
 			}
 			return fmt.Errorf("%q 含有非法字符 %q", d, string(r))
 		}
+	}
+	return nil
+}
+
+// validPanelDomain 校验面板域名：允许 host[:port]，其余规则与裸域名一致。
+//
+// 面板对外地址常常带端口（LT_USER_PUBLIC_URL=http://203.0.113.10:7848），面板侧
+// 保存的就是这个值，Caddy 站点地址也支持 [scheme://]host[:port]。若这里坚持
+// 「只接受裸域名」，面板保存通过、下发却必然失败，管理员只会看到一条与
+// 自己填的内容对不上的错误。
+func validPanelDomain(d string) error {
+	d = strings.TrimSpace(d)
+	host, port := d, ""
+	if i := strings.IndexByte(d, ':'); i >= 0 {
+		if strings.Count(d, ":") > 1 {
+			return fmt.Errorf("%q 含有非法字符 %q（IPv6 地址暂不支持，请改用域名或 IPv4）", d, ":")
+		}
+		host, port = d[:i], d[i+1:]
+		if port == "" {
+			return fmt.Errorf("%q 的端口为空", d)
+		}
+	}
+	if err := validDomain(host); err != nil {
+		return err
+	}
+	if port == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("%q 的端口 %q 不合法（需 1-65535 的整数）", d, port)
 	}
 	return nil
 }

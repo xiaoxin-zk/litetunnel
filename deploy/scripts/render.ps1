@@ -182,6 +182,32 @@ function Assert-Domain([string]$name, [string]$d) {
     }
 }
 
+# The panel domain may carry a port: it is derived from LT_USER_PUBLIC_URL (an
+# externally reachable address, often http://203.0.113.10:7848) and Caddy site
+# addresses accept [scheme://]host[:port]. The tunnel root domain stays bare —
+# subdomains are matched by name, so a port would be meaningless there.
+function Assert-DomainWithPort([string]$name, [string]$d) {
+    if ([string]::IsNullOrEmpty($d)) { return }
+    if (-not $d.Contains(':')) {
+        Assert-Domain $name $d
+        return
+    }
+    $idx = $d.IndexOf(':')
+    $hostPart = $d.Substring(0, $idx)
+    $portPart = $d.Substring($idx + 1)
+    if ($portPart.Contains(':')) {
+        throw "$name=$d contains multiple colons (IPv6 is not supported, use a domain or IPv4)."
+    }
+    if ([string]::IsNullOrEmpty($hostPart) -or [string]::IsNullOrEmpty($portPart)) {
+        throw "$name=$d has an incomplete port (expected e.g. panel.example.com:7848)."
+    }
+    $n = 0
+    if (-not [int]::TryParse($portPart, [ref]$n) -or $n -lt 1 -or $n -gt 65535) {
+        throw "$name=$d has an invalid port '$portPart' (want 1-65535)."
+    }
+    Assert-Domain $name $hostPart
+}
+
 # Normalise to lower case before validating, so what we render is exactly what
 # the panel would accept (and what ends up in the templates).
 $vars['LT_USER_DOMAIN'] = $userDomain.ToLowerInvariant()
@@ -190,7 +216,7 @@ if ($vars['LT_TUNNEL_DOMAIN']) {
     $vars['LT_TUNNEL_DOMAIN'] = $vars['LT_TUNNEL_DOMAIN'].ToLowerInvariant()
 }
 
-Assert-Domain 'LT_USER_DOMAIN' $userDomain
+Assert-DomainWithPort 'LT_USER_DOMAIN' $userDomain
 Assert-Domain 'LT_TUNNEL_DOMAIN' $vars['LT_TUNNEL_DOMAIN']
 if ($vars['LT_TUNNEL_DOMAIN'] -and $vars['LT_TUNNEL_DOMAIN'] -eq $userDomain) {
     throw 'LT_TUNNEL_DOMAIN must differ from the panel domain: a wildcard certificate would cover the panel itself.'

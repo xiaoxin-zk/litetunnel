@@ -8,8 +8,6 @@
             <el-button v-if="!downloadUrl" link :icon="Refresh" @click="load">刷新</el-button>
           </div>
 
-          <!-- 管理员配置了外部下载地址（通常是 GitHub Releases）：
-               直接引导过去，不列本地文件。 -->
           <template v-if="downloadUrl">
             <el-alert
               type="info"
@@ -27,7 +25,6 @@
             </div>
           </template>
 
-          <!-- 未配置外部地址：回退到服务器本地目录分发 -->
           <template v-else>
             <el-table :data="files" v-loading="loading" stripe>
               <el-table-column label="文件" prop="name" min-width="220">
@@ -147,17 +144,12 @@ import { formatBytes, formatTime } from '../utils/format'
 const files = ref([])
 const info = ref({})
 const loading = ref(false)
-// 管理员配置的外部下载地址，为空时回退到本地目录分发
 const downloadUrl = ref('')
 
 function fmtBytes(v) {
   return formatBytes(v)
 }
 
-/** 在新标签打开外部下载页。
- *
- * 用 window.open 而不是直接跳转：用户可能正在对照本页的「三步接入」
- * 操作，跳走会打断流程。加 noopener 防止新页面通过 window.opener 反向操作本页。 */
 function openDownloadUrl() {
   if (!downloadUrl.value) return
   window.open(downloadUrl.value, '_blank', 'noopener,noreferrer')
@@ -167,8 +159,6 @@ async function load() {
   loading.value = true
   try {
     const [d, i] = await Promise.all([clientApi.downloads(), clientApi.info()])
-    // 后端在配置了外部地址时返回 { download_url, files }，
-    // 未配置时 files 为本地目录内容、download_url 为空。
     files.value = d?.files || []
     downloadUrl.value = d?.download_url || ''
     info.value = i || {}

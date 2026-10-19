@@ -8,10 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 )
 
-// ParsePortList 解析 "22,80,443,10000-10100" 形式的端口列表。
-//
-// 同时支持单个端口与闭区间，非法片段会被忽略而不是让整次调用失败——
-// 这是运营配置，容忍个别笔误比直接报错更实用。
 func ParsePortList(s string) map[int]bool {
 	out := make(map[int]bool)
 	for _, part := range strings.Split(s, ",") {
@@ -25,7 +21,6 @@ func ParsePortList(s string) map[int]bool {
 			if err1 != nil || err2 != nil || start <= 0 || end < start || end > 65535 {
 				continue
 			}
-			// 区间过大时截断，避免有人填 1-65535 把内存吃光。
 			if end-start > 4096 {
 				end = start + 4096
 			}
@@ -41,9 +36,6 @@ func ParsePortList(s string) map[int]bool {
 	return out
 }
 
-// 域名列表的解析与匹配已收敛到 registration_email_policy.go：
-// 原来的 ParseDomainList/DomainInList 采用「解析不了就丢掉」的宽容策略，
-// 与黑名单自己那一套剥 @ 的逻辑并存，同一个域名在两处会按不同规则解释。
 func boolStr(b bool) string {
 	if b {
 		return "true"
@@ -51,7 +43,6 @@ func boolStr(b bool) string {
 	return "false"
 }
 
-// defaultTerms 是注册页默认展示的条款与禁止滥用说明。
 var defaultTerms = func(*config.Config) string {
 	return strings.Join([]string{
 		"一、服务说明",
@@ -75,7 +66,6 @@ var defaultTerms = func(*config.Config) string {
 	}, "\n")
 }
 
-// splitHostPortLoose 宽松地拆出监听地址中的端口，用于生成默认的保护端口列表。
 func splitHostPortLoose(addr string) (string, string, error) {
 	i := strings.LastIndex(addr, ":")
 	if i < 0 {

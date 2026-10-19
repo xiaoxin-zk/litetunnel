@@ -136,8 +136,6 @@ func checkNftInputCompatibility(raw []byte, target ...nftTarget) error {
 		if c.Hook != "input" || (c.Family != "inet" && c.Family != "ip" && c.Family != "ip6") {
 			continue
 		}
-		// 独立基链中的 accept 不能覆盖其他基链的 drop；非空链可能包含跳转、
-		// verdict map 或条件拒绝。未实现完整求值时，仅接受空的 accept 基链。
 		if c.Type != "filter" || c.Policy != "accept" || rules[key(c.Family, c.Table, c.Name)] != 0 {
 			return fmt.Errorf("nftables input 基链 %s 不兼容：无法保证专属链的放行生效，请由现有防火墙管理器放行端口", key(c.Family, c.Table, c.Name))
 		}

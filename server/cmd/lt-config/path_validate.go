@@ -6,9 +6,6 @@ import (
 	"strings"
 )
 
-// validateManagedPaths 校验配置工具管理的输出路径不会互相覆盖，也不会占用
-// 批次恢复使用的保留文件名。路径先绝对化、清理，再比较；若目标已经存在，
-// 额外解析软链接，避免两个逻辑路径最终指向同一个文件。
 func validateManagedPaths(p paths) error {
 	managed := []struct {
 		name   string
@@ -39,9 +36,6 @@ func validateManagedPaths(p paths) error {
 		}
 		canonical[key] = item.name
 
-		// 解析真实路径。目标不存在时也要解析**父目录**：一个指向部署目录
-		// 之外的父目录符号链接，会让 CreateTemp/写入跟随到那个目录去，
-		// 而字面路径看起来完全正常。
 		real, err := resolveManagedPath(path)
 		if err != nil {
 			return fmt.Errorf("无法解析 %s 输出路径 %s 的真实位置：%w", item.name, path, err)

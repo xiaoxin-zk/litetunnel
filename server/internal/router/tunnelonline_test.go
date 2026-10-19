@@ -26,21 +26,12 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
 )
 
-// 这个文件补的是「解析成功但状态没真正生效」这一类缺陷的缺口。
-//
-// service 包里的单测只覆盖到 ListProxies 的解析与 phase → bool 的判定。
-// 从解析结果到接口字段之间还有三段：采集器把结果写进运行态、handler 把它
-// 读出来、JSON 里叫 online。任何一段断掉，隧道在界面上都显示「连接中」，
-// 而所有单元测试仍然是绿的——这次的故障正是这个形态（envelope 没解开时
-// 就是这样，一路静默）。
-
-// fakeFrps 是一个可以切换返回内容的假 frps 管理接口。
 type fakeFrps struct {
 	*httptest.Server
 
 	mu       sync.Mutex
-	mode     string // online / garbage
-	proxy    string // 形如 lt_u1.mc
+	mode     string
+	proxy    string
 	requests int
 }
 
@@ -57,7 +48,6 @@ func newFakeFrps() *fakeFrps {
 			_, _ = w.Write([]byte("<html>502 Bad Gateway</html>"))
 			return
 		}
-		// frps v0.71 的真实形状：成功码 200，分页对象包在 data 里。
 		fmt.Fprintf(w,
 			`{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":200,"items":[{"name":%q,"user":"lt_u1","clientID":"fake","status":{"phase":"online","todayTrafficIn":0,"todayTrafficOut":0,"curConns":0}}]}}`,
 			proxy)
@@ -83,7 +73,6 @@ func (f *fakeFrps) requestCount() int {
 	return f.requests
 }
 
-// syncBuffer 是并发安全的日志缓冲：采集器在后台协程里写日志。
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -101,15 +90,9 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// TestTunnelOnlineReachesClientAPI 断言「frps 上报在线」能一路走到接口字段。
-//
-// 链路：假 frps 响应 → ListProxies 解析 → collectTraffic 写入运行态 →
-// /api/user/client/info 的 tunnels[].online。
 func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// 捕获日志：既断言「采集失败被记录」，也用它确认那一轮采集真的处理完了
-	// （请求计数只能证明请求发出，证明不了处理结束）。
 	var logs syncBuffer
 	prevOut := log.Writer()
 	log.SetOutput(&logs)
@@ -136,7 +119,6 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 		GatewayPort: 7001,
 		AdminPath:   "/admin-console",
 
-		// 采集器把小于 5 秒的间隔抬到 5 秒，这里就用最小值。
 		TrafficPollInterval: 5 * time.Second,
 	}
 
@@ -149,7 +131,6 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 	}
 	svc := service.New(db, cfg)
 
-	// 一条真实存在的用户与隧道：采集器只认库里的 (用户 ID, 隧道名)。
 	u := &model.User{
 		Username: "tunnelonline",
 		Password: "not-used-in-this-test",
@@ -170,7 +151,6 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 	if err := db.Create(tunnel).Error; err != nil {
 		t.Fatalf("建隧道失败: %v", err)
 	}
-	// frps 上报的是规范化后的代理名 <user>.<隧道名>。
 	frps.setProxy(service.FrpUserOf(u.ID) + "." + tunnel.Name)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,14 +158,11 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("取数据库连接失败: %v", err)
 	}
-	// 先停采集器再关连接：否则临时目录里的 sqlite 文件在测试结束时仍被占用，
-	// t.TempDir 的清理会失败（Windows 上尤其明显）。
 	defer func() {
 		cancel()
 		_ = sqlDB.Close()
 	}()
 
-	// 采集器启动即跑一次，所以这里不必等 5 秒的轮询周期。
 	svc.StartTrafficCollector(ctx)
 
 	engine := New(cfg, svc,
@@ -200,14 +177,11 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 		t.Fatalf("生成 API Key 失败: %v", err)
 	}
 
-	// ---- 1) frps 报 online，接口必须给出 online=true ----
 	waitOnline(t, engine, apiKey, tunnel.Name, true)
 
-	// ---- 2) 响应读不懂时必须保留上次状态，而不是整体翻成离线 ----
 	before := frps.requestCount()
 	frps.setMode("garbage")
 
-	// 等一轮采集真正处理完：日志里出现「保留上次在线状态」即为处理结束。
 	waitForLog(t, &logs, "保留上次在线状态", 10*time.Second)
 	if got := frps.requestCount(); got <= before {
 		t.Fatalf("假 frps 未收到新一轮请求（%d → %d）", before, got)
@@ -216,7 +190,6 @@ func TestTunnelOnlineReachesClientAPI(t *testing.T) {
 	waitOnline(t, engine, apiKey, tunnel.Name, true)
 }
 
-// getTunnelOnline 请求客户端接入信息接口，取出指定隧道的 online 字段。
 func getTunnelOnline(t *testing.T, engine *gin.Engine, apiKey, name string) (bool, string) {
 	t.Helper()
 
@@ -253,11 +226,6 @@ func getTunnelOnline(t *testing.T, engine *gin.Engine, apiKey, name string) (boo
 	return false, ""
 }
 
-// waitOnline 轮询接口直到 online 达到期望值。
-//
-// 采集在后台协程里跑，与测试的请求存在竞争，所以必须轮询而不是断言一次。
-// 重试次数刻意压得很小：该接口走的是真实限流中间件（默认突发容量 60），
-// 轮询过密会把自己限流成 429。
 func waitOnline(t *testing.T, engine *gin.Engine, apiKey, name string, want bool) {
 	t.Helper()
 
@@ -273,7 +241,6 @@ func waitOnline(t *testing.T, engine *gin.Engine, apiKey, name string, want bool
 	t.Fatalf("等待隧道 %s 的 online=%v 超时，最后一次响应: %s", name, want, last)
 }
 
-// waitForLog 等到日志里出现指定片段。
 func waitForLog(t *testing.T, logs *syncBuffer, want string, timeout time.Duration) {
 	t.Helper()
 

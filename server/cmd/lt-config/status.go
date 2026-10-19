@@ -18,13 +18,8 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
-// dnsTimeout 是单条记录解析的超时。
-//
-// 给得短是有意的：DNS 检查出现在设置页上，一条查不通的记录
-// 不该让整个页面转圈一分钟。
 const dnsTimeout = 5 * time.Second
 
-// maxCheckNames 限制一次检查解析多少条记录，避免被当成 DNS 放大工具。
 const maxCheckNames = 20
 
 func (s *service) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
@@ -48,9 +43,6 @@ func (s *service) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
 
 	records := make([]tlscfg.DNSRecord, 0, len(req.Names))
 	for _, name := range req.Names {
-		// 客户端断开就停手：每条记录最多查 5 秒，20 条串起来近两分钟。
-		// 没有这个检查，管理员关掉页面后这些查询仍会一条条跑完，
-		// 反复点「检查」就叠出一堆后台任务。
 		if err := r.Context().Err(); err != nil {
 			break
 		}
@@ -63,15 +55,8 @@ func (s *service) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"records": records})
 }
 
-// lookup 解析一条记录并给出可操作的提示。
-//
-// 提示不是客套话：DNS 是这套部署里**唯一**没法用代码兜底的环节
-// （证书签不下来、网站打不开，根因十有八九在这里），
-// 把「下一步该看什么」直接写进结果，能省掉一轮来回问。
 func (s *service) lookup(parent context.Context, name, expected string) tlscfg.DNSRecord {
 	rec := tlscfg.DNSRecord{Name: name}
-	// 单条仍受 dnsTimeout 限制，但父上下文（请求）被取消时立即结束：
-	// 客户端已经走了，没有人在等这份结果。
 	ctx, cancel := context.WithTimeout(parent, dnsTimeout)
 	defer cancel()
 
@@ -93,8 +78,6 @@ func (s *service) lookup(parent context.Context, name, expected string) tlscfg.D
 	}
 	sort.Strings(rec.IPs)
 
-	// CNAME 链单独查一次：解析出的地址与预期不符时，别名往往是原因
-	// （CNAME 指向 CDN 或旧服务器，改 A 记录当然不生效）。
 	if cname, err := s.resolver().LookupCNAME(ctx, name); err == nil {
 		cname = strings.TrimSuffix(cname, ".")
 		if !strings.EqualFold(cname, name) {
@@ -129,10 +112,6 @@ func hasIP(r tlscfg.DNSRecord, want string) bool {
 	return false
 }
 
-// resolver 返回用于检查的解析器。
-//
-// 默认用系统的；LT_CFG_DNS_SERVER 可以指定（例如 223.5.5.5）——
-// 服务器自身的解析器被改坏时，检查结果会误导管理员去改本来就正确的记录。
 func (s *service) resolver() *net.Resolver {
 	server := strings.TrimSpace(os.Getenv("LT_CFG_DNS_SERVER"))
 	if server == "" {
@@ -159,45 +138,19 @@ func (s *service) handleCerts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, status)
 }
 
-// certStatus 扫描 Caddy 的证书存储目录。
-//
-// 为什么不问 Caddy：它的 admin API 是关闭的（这是刻意的，见包注释），
-// 而证书本来就落在磁盘上。直接读文件既不需要开任何接口，
-// 也能读出**实际**在用的那份证书——包括它到底覆盖了哪些域名。
-// 证书扫描的资源上限。
-//
-// 这些数字远高于正常规模（Caddy 每个域名一张证书，几十张已算多），
-// 只用来挡住「目录被塞满 / 深目录 / 超大文件」这类异常输入。
 const (
-	certScanMaxFiles     = 2000
-	certScanMaxDepth     = 6
-	certScanMaxFileBytes = 1 << 20 // 1 MiB
-	certScanBudget       = 2 * time.Second
-	// certScanMaxTotalBytes 是**累计**读入证书内容的字节上限。
-	//
-	// 单文件上限 1 MiB 只挡住「一个巨大的文件」；2000 个文件各自接近 1 MiB
-	// 时，总读入量仍是 2 GiB，而 parseLeafCert 会把每份整读进内存再解析。
-	// 只靠 2 秒墙钟也不可靠：快设备上 2 秒能读很多，慢盘上又读不了几个——
-	// 时间预算挡不住「快设备上的一次内存尖峰」。
+	certScanMaxFiles      = 2000
+	certScanMaxDepth      = 6
+	certScanMaxFileBytes  = 1 << 20
+	certScanBudget        = 2 * time.Second
 	certScanMaxTotalBytes = 32 << 20
-	// certScanMaxCerts 是列出的证书条数上限。
-	//
-	// 文件数上限不等于证书条数：一个 .pem 里能塞很多份证书，而每份都要
-	// 序列化进响应体。这个上限守的是**响应体**与前端渲染，不是 IO。
-	certScanMaxCerts = 500
-	// certScanMaxSANs 是单张证书列出的 SAN 条数上限。
-	//
-	// x509 允许几乎任意多的 SAN。一张带几万个名字的证书会把响应体放大到
-	// 几 MB，而界面根本展示不了——截断并把事实写进 reason，比悄悄撑爆好。
-	certScanMaxSANs = 100
+	certScanMaxCerts      = 500
+	certScanMaxSANs       = 100
 )
 
 func (s *service) certStatus() tlscfg.CertStatus {
 	root := filepath.Join(s.paths.caddyData, "certificates")
 	st := tlscfg.CertStatus{}
-	// 三态（见 statcheck.go）：目录不存在与读不了是两件事。把「权限不足」
-	// 报成「尚未发现证书」，会把管理员引去查 Caddy 的签发日志，而真正该
-	// 看的是这个目录的权限与挂载。
 	switch state, err := statFileState(root); state {
 	case fileMissing:
 		st.Reason = fmt.Sprintf("尚未发现证书：%s 不存在（Caddy 还没为任何域名签发过证书）", root)
@@ -208,20 +161,11 @@ func (s *service) certStatus() tlscfg.CertStatus {
 	}
 	st.Available = true
 
-	// 回调吞掉单条错误是为了「一棵子树读不了不要拖垮整份列表」，
-	// 但吞掉之后 WalkDir 的返回值和「一切正常」就分不出来了，
-	// 所以这里自己记住第一个失败，供下面的诊断文案使用。
-	//
-	// 同时给扫描设硬上限：caddyData 是宿主机上的可写目录，里面可能有用户
-	// 自己塞进来的东西（备份、导出、甚至刻意构造的深目录）。没有上限时
-	// 一次 /certs 请求就能把 helper 卡在 IO 上，而它是面板状态页同步调用的。
 	var (
-		walkErr  error
-		scanned  int
-		readByte int64
-		truncate string
-		// sansTruncated 记住「有证书的 SAN 列表被截断过」，用于在 reason 里
-		// 说明清楚：界面上少列几个名字不该让管理员以为证书只覆盖了这些。
+		walkErr       error
+		scanned       int
+		readByte      int64
+		truncate      string
 		sansTruncated bool
 		started       = time.Now()
 	)
@@ -252,12 +196,6 @@ func (s *service) certStatus() tlscfg.CertStatus {
 			truncate = fmt.Sprintf("文件数超过 %d", certScanMaxFiles)
 			return filepath.SkipAll
 		}
-		// 单文件上限：parseLeafCert 会整份读入内存，一个几百 MB 的
-		// 「.pem」足以让这次请求失败或长期占住内存。
-		//
-		// 累计上限同理，且不可省：单文件合规不代表整体合规——2000 个 1 MiB
-		// 的文件加起来是 2 GiB。两者一个管「单个坏文件」，一个管「一整片
-		// 合规文件加起来的内存尖峰」。
 		if info, ierr := d.Info(); ierr == nil {
 			if info.Size() > certScanMaxFileBytes {
 				return nil
@@ -268,7 +206,6 @@ func (s *service) certStatus() tlscfg.CertStatus {
 			}
 			readByte += info.Size()
 		}
-		// 响应体上限：证书条数要单独设，文件数挡不住「一个 pem 里很多份」。
 		if len(st.Certs) >= certScanMaxCerts {
 			truncate = fmt.Sprintf("证书数超过 %d", certScanMaxCerts)
 			return filepath.SkipAll
@@ -284,8 +221,6 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		st.Certs = append(st.Certs, item)
 		return nil
 	})
-	// 遍历失败（权限不足、IO 错误）与「目录里确实没有证书」是两种完全不同的状况：
-	// 前者报成「还没签发成功」会把管理员引向错误的方向去查 Caddy 日志。
 	switch {
 	case walkErr != nil && len(st.Certs) == 0:
 		st.Reason = fmt.Sprintf("读取证书目录失败：%v", walkErr)
@@ -310,7 +245,6 @@ func (s *service) certStatus() tlscfg.CertStatus {
 			st.Reason = note
 		}
 	}
-	// 最快到期的排最前：这才是管理员需要动手的那一张。
 	sort.Slice(st.Certs, func(i, j int) bool {
 		return st.Certs[i].NotAfter < st.Certs[j].NotAfter
 	})
@@ -339,17 +273,12 @@ func parseLeafCert(path string) (*x509.Certificate, bool) {
 	}
 }
 
-// toCertificate 把 x509 证书转成展示用的结构。
-//
-// 第二个返回值表示 SAN 列表是否被截断：证书里的 DNSNames 没有上限，一张
-// 构造出来的证书可以带几万个名字，原样塞进响应体会把状态接口撑成几 MB。
 func toCertificate(cert *x509.Certificate, path string) (tlscfg.Certificate, bool) {
 	domain := cert.Subject.CommonName
 	if domain == "" && len(cert.DNSNames) > 0 {
 		domain = cert.DNSNames[0]
 	}
 	kind := "unknown"
-	// Caddy 的目录结构：<data>/certificates/<acme|local>/<issuer>/<域名>/<域名>.crt
 	switch {
 	case strings.Contains(filepath.ToSlash(path), "/acme/"):
 		kind = "acme"

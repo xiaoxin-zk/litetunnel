@@ -100,15 +100,6 @@ function onPage(p) {
   load()
 }
 
-// showMutationWarning 展示「数据库已更新、防火墙规则待处理」这类部分成功。
-//
-// 后端在删隧道/启停隧道时返回 { db_updated, firewall_pending, warning }：
-// 数据库已经改成功了（重试同一请求只会得到「隧道不存在」），但宿主机上的
-// 放行/收回规则还没生效，已进入后台重试队列。
-//
-// 管理端尤其需要这条提示：管理员看到「已停用」就会认为端口已经关闭，而实际
-// 端口可能还对外开着——这是安全语义上的错误认知。反过来也不能报错，报错会
-// 让管理员重试一个已经成功的操作，只会得到「隧道不存在」，以为系统坏了。
 function showMutationWarning(res) {
   if (res && res.firewall_pending) {
     ElMessage({
@@ -124,7 +115,6 @@ function showMutationWarning(res) {
 async function toggle(row) {
   const next = row.status === 'active' ? 'disabled' : 'active'
   const res = await tunnelApi.setStatus(row.id, next)
-  // 两者不能都弹：同一个动作弹两条消息，用户会以为发生了两件事。
   if (!showMutationWarning(res)) {
     ElMessage.success('已更新')
   }

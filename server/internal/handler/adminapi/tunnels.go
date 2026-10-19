@@ -9,7 +9,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/httpx"
 )
 
-// ListTunnels 全部隧道。
 func (h *Handler) ListTunnels(c *gin.Context) {
 	page, pageSize, offset := httpx.Pagination(c)
 	userID, _ := strconv.ParseUint(c.Query("user_id"), 10, 64)
@@ -41,11 +40,6 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 	httpx.PageOK(c, out, total, page, pageSize)
 }
 
-// SetTunnelStatus 启用/停用隧道。
-//
-// 用结构化变体取回结果：数据库改成功但防火墙规则没跟上时，接口仍应返回
-// 成功，但必须把「规则待处理」告诉前端（见 service.TunnelMutationResult）。
-// 把它压成一个 error 会让管理员重试并得到「隧道不存在」，以为系统坏了。
 func (h *Handler) SetTunnelStatus(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -71,7 +65,6 @@ func (h *Handler) SetTunnelStatus(c *gin.Context) {
 	})
 }
 
-// DeleteTunnel 删除隧道。
 func (h *Handler) DeleteTunnel(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {

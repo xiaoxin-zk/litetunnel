@@ -7,9 +7,6 @@ import (
 	"testing"
 )
 
-// TestRenderDropsEmptyConditionalBlock 覆盖最要命的那条语义：
-// 变量为空时整段删除，而不是留下一个空地址行——后者会让 Caddy
-// 拒绝加载**整份** Caddyfile，也就是「一个可选项没填，整个反代起不来」。
 func TestRenderDropsEmptyConditionalBlock(t *testing.T) {
 	tpl := strings.Join([]string{
 		"admin off",
@@ -41,7 +38,6 @@ func TestRenderDropsEmptyConditionalBlock(t *testing.T) {
 	}
 }
 
-// TestRenderNestedConditionals 嵌套时，外层丢弃必须连带内层一起丢弃。
 func TestRenderNestedConditionals(t *testing.T) {
 	tpl := "# @if A\nouter\n# @if B\ninner\n# @endif\n# @endif\n"
 
@@ -62,17 +58,12 @@ func TestRenderNestedConditionals(t *testing.T) {
 	}
 }
 
-// TestRenderRejectsLeftoverPlaceholder 残留占位符必须直接失败。
-//
-// 这是「校验后应用」的第一道闸：宁可在渲染阶段报错，
-// 也不要把一份 Caddy 拒绝加载的配置写进部署目录。
 func TestRenderRejectsLeftoverPlaceholder(t *testing.T) {
 	if _, err := Render("port = ${LT_MISSING_PORT}\n", map[string]string{}); err == nil {
 		t.Fatal("残留占位符应导致渲染失败")
 	}
 }
 
-// TestRenderPrefersLongerKeys 键名互为前缀时，必须长键先替换。
 func TestRenderPrefersLongerKeys(t *testing.T) {
 	out, err := Render("a=${LT_USER_PORT} b=${LT_USER_PORT_X}\n", map[string]string{
 		"LT_USER_PORT":   "7848",
@@ -86,10 +77,6 @@ func TestRenderPrefersLongerKeys(t *testing.T) {
 	}
 }
 
-// TestRenderRealTemplates 用仓库里真实的模板跑一遍。
-//
-// 目的不是校验内容，而是让「模板新增了占位符、而调用方没给值」
-// 这类问题在单测里就暴露——否则它只会在某台服务器重启 Caddy 时爆发。
 func TestRenderRealTemplates(t *testing.T) {
 	root := filepath.Join("..", "..", "..", "deploy")
 	cases := []struct {
@@ -146,10 +133,6 @@ func TestRenderRealTemplates(t *testing.T) {
 	}
 }
 
-// TestRenderCaddyHTTPMode 覆盖「没有域名证书的部署」。
-//
-// HTTP 站点不能发送 HSTS：那会让浏览器把后续请求强制升级到 https，
-// 而该站点根本没有证书——表现就是「配置改对了却打不开」。
 func TestRenderCaddyHTTPMode(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "caddy", "Caddyfile.template"))
 	if err != nil {

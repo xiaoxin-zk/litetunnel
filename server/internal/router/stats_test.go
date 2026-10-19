@@ -15,15 +15,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
 )
 
-// TestStatsOverviewFailsLoudlyWhenQueryFails 覆盖「统计查询失败显示成零值」。
-//
-// StatsOverview 原先只检查第一个查询（总用户数），后面活跃用户、隧道、
-// 在线客户端与流量都忽略错误。数据库部分故障时，那几个数字会是 0——
-// 而 0 在首页上**看起来完全正常**：管理员会以为「真的没有在线客户端」，
-// 而不是「数据库出了问题」。把失败当成真实的零值比直接报错更危险。
-//
-// 用例删掉一张**靠后**才查的表：前面的查询仍然成功，只有后面那一项失败，
-// 正是原代码会静默吞掉的那种情形。
 func TestStatsOverviewFailsLoudlyWhenQueryFails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -54,8 +45,6 @@ func TestStatsOverviewFailsLoudlyWhenQueryFails(t *testing.T) {
 
 	svc := service.New(db, cfg)
 
-	// 直接挂处理函数：本用例只关心它对查询失败的反应，
-	// 鉴权与路由前缀由 router 的其它用例覆盖。
 	engine := gin.New()
 	engine.GET("/stats/overview", adminapi.New(svc).StatsOverview)
 
@@ -70,7 +59,6 @@ func TestStatsOverviewFailsLoudlyWhenQueryFails(t *testing.T) {
 		t.Fatalf("正常情况下统计接口应返回 200，实际 %d", code)
 	}
 
-	// 删掉「在线客户端数」依赖的表：它是靠后才查的一项。
 	if err := db.Migrator().DropTable(&model.ClientSession{}); err != nil {
 		t.Fatalf("删表失败: %v", err)
 	}

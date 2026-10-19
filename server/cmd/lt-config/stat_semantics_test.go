@@ -9,26 +9,6 @@ import (
 	"testing"
 )
 
-// 这一组守的是「Stat 失败 ≠ 文件不存在」。
-//
-// 权限不足、路径被占用、I/O 出错时 os.Stat 同样返回 err，而且 err 不是
-// ENOENT。早期实现用 `err == nil` 判断「文件在」，于是这些失败被读成
-// 「目标文件本来就不存在」：备份不写，提交后崩溃就再也没有旧内容可恢复。
-// 只有 os.IsNotExist 才算「不存在」，其余必须中止。
-
-// statErrorPath 构造一个能让 os.Stat 返回**非 ENOENT** 错误的路径，
-// 且不依赖权限设置（CI 以 root 跑的时候 chmod 根本挡不住）。
-//
-// 做法：在路径中间放一个普通文件，让 Stat 去解析 `<file>/x`。
-//
-//   - Linux：内核返回 ENOTDIR（"not a directory"），os.IsNotExist 为假，
-//     正是要构造的那种「判不出来」的 Stat 失败；
-//   - Windows：Go 的 syscall.Errno.Is 把 ERROR_PATH_NOT_FOUND 也算作
-//     ErrNotExist（os.IsNotExist 会返回 true），构造不出来。
-//
-// 所以 Windows 上这条路走不通，两个用例会用 os.IsNotExist 自检后 t.Skip。
-// 这条性质的有效验证在 Linux CI（ubuntu-latest）上完成——本机是 Windows，
-// 跳过不等于没覆盖，只是覆盖发生在 CI。
 func statErrorPath(t *testing.T, dir string) string {
 	t.Helper()
 	blocker := filepath.Join(dir, "blocker")
@@ -38,15 +18,6 @@ func statErrorPath(t *testing.T, dir string) string {
 	return filepath.Join(blocker, "target.txt")
 }
 
-// TestWriteManifestAbortsOnNonNotExistStatError 覆盖批次记录里的 Existed 判定。
-//
-// 这里必须先确认「构造出来的确实是非 ENOENT 错误」，否则整个用例只是空转：
-// 如果平台把这种路径也报成不存在（Windows 就把 ERROR_PATH_NOT_FOUND 归为
-// ErrNotExist），断言会变得毫无意义，于是直接跳过——真正的验证在
-// Linux CI 上完成。
-//
-// 直接构造 writeBatch 而不用 prepareWrites：后者会在同一个（其实是文件的）
-// 父目录里建临时文件，更早就失败了，测不到 writeManifest 的判定。
 func TestWriteManifestAbortsOnNonNotExistStatError(t *testing.T) {
 	dir := t.TempDir()
 	bad := statErrorPath(t, dir)
@@ -65,18 +36,13 @@ func TestWriteManifestAbortsOnNonNotExistStatError(t *testing.T) {
 	if _, err := b.writeManifest(); err == nil {
 		t.Fatal("Stat 返回非 ENOENT 错误时必须中止，而不能记成「文件原本不存在」")
 	} else if !strings.Contains(err.Error(), bad) {
-		// 错误串必须带路径：否则管理员不知道是哪个文件判不出来。
 		t.Errorf("错误信息应带上出问题的路径，实际: %v", err)
 	}
-	// 中止必须发生在写入批次记录之前：此刻一个目标文件都没动，不该留下记录。
 	if _, err := os.Stat(filepath.Join(dir, batchManifestName)); !os.IsNotExist(err) {
 		t.Error("判定失败时不该写下批次记录")
 	}
 }
 
-// TestWriteManifestMarksMissingFileAsNotExisted 是上面的对照组：
-// 真的不存在（ENOENT）时仍然要记 Existed=false 并继续，否则「新建文件」
-// 这条正常路径会被误伤。
 func TestWriteManifestMarksMissingFileAsNotExisted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "Caddyfile")
@@ -100,7 +66,6 @@ func TestWriteManifestMarksMissingFileAsNotExisted(t *testing.T) {
 		t.Error("不存在的目标文件必须记 Existed=false，否则回滚会试图从备份恢复一个从未存在过的文件")
 	}
 
-	// 已存在时记 Existed=true。
 	if err := os.WriteFile(path, []byte("old\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -120,8 +85,6 @@ func TestWriteManifestMarksMissingFileAsNotExisted(t *testing.T) {
 	}
 }
 
-// TestStagedFileCommitAbortsOnNonNotExistStatError 覆盖 stagedFile.commit：
-// 判不出「目标在不在」时不能在没有任何备份的情况下替换。
 func TestStagedFileCommitAbortsOnNonNotExistStatError(t *testing.T) {
 	dir := t.TempDir()
 	bad := statErrorPath(t, dir)
@@ -129,7 +92,6 @@ func TestStagedFileCommitAbortsOnNonNotExistStatError(t *testing.T) {
 		t.Skipf("平台把路径中间是文件的情况报成了不存在，无法构造非 ENOENT 的 Stat 错误: %v", err)
 	}
 
-	// stagedFile 的临时文件必须与目标同目录，这里手工构造一个。
 	st := &stagedFile{name: "Caddyfile", path: bad, tmp: filepath.Join(dir, ".lt-config-tmp-x")}
 	if err := os.WriteFile(st.tmp, []byte("new\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -146,14 +108,11 @@ func TestStagedFileCommitAbortsOnNonNotExistStatError(t *testing.T) {
 	if st.existed {
 		t.Error("判不出来时不能把 existed 记成 true，那会让回滚去恢复一份不存在的内容")
 	}
-	// 中止发生在动目标之前：临时文件还在，调用方还能重试或丢弃。
 	if _, serr := os.Stat(st.tmp); serr != nil {
 		t.Errorf("中止时不该动候选内容（临时文件应仍在）: %v", serr)
 	}
 }
 
-// TestStagedFileCommitRestoresOnENOENT 对照组：目标真的不存在时，
-// commit 必须正常成功，回滚语义是「删掉新文件」而不是「放回备份」。
 func TestStagedFileCommitRestoresOnENOENT(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "Caddyfile")
@@ -183,12 +142,8 @@ func TestStagedFileCommitRestoresOnENOENT(t *testing.T) {
 	}
 }
 
-// TestRollbackFailedCommitReportsCleanupPending 覆盖问题 3 的核心：
-// 已回滚但批次记录删不掉时必须能被 errors.Is(err, errBatchCleanupPending)
-// 识别，而不是静默返回一句「已回滚」。
 func TestRollbackFailedCommitReportsCleanupPending(t *testing.T) {
 	dir := t.TempDir()
-	// 用目录占住记录路径：os.Remove 对非空目录一定失败（各平台一致）。
 	blocked := filepath.Join(dir, batchManifestName)
 	if err := os.MkdirAll(blocked, 0o755); err != nil {
 		t.Fatal(err)
@@ -216,8 +171,6 @@ func TestRollbackFailedCommitReportsCleanupPending(t *testing.T) {
 	}
 }
 
-// TestRollbackFailedCommitCleansUpNormally 对照组：记录删得掉时行为不变，
-// 不能因为新增了阻断判定就把普通失败也报成「现场未清理」。
 func TestRollbackFailedCommitCleansUpNormally(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, batchManifestName)
@@ -245,12 +198,6 @@ func TestRollbackFailedCommitCleansUpNormally(t *testing.T) {
 	}
 }
 
-// TestCommitFailureRegistersDirtyScene 守住「调用方必须阻断」这一环：
-// 只要 commit 返回 errBatchCleanupPending，renderAndApply 就要把目录登记进
-// 阻断集合（经 commitFailure），之后所有写操作被挡住，直到人工清理。
-//
-// 这里直接覆盖 commitFailure 而不是跑整个 renderAndApply：后者的前置条件
-// （docker 校验、模板渲染）与本条判定无关，走完整流程只会让用例更脆。
 func TestCommitFailureRegistersDirtyScene(t *testing.T) {
 	s, p := newRenderOnlyService(t)
 
@@ -267,8 +214,6 @@ func TestCommitFailureRegistersDirtyScene(t *testing.T) {
 		t.Fatalf("现场未清理必须报 partial（磁盘已回滚、容器状态未知），实际类型 %T", got)
 	}
 	if len(partial.services) != 0 {
-		// 测试环境没有 docker，serviceStates 必然为空——这里只是确认它被调用
-		// 过而不是 panic。
 		t.Logf("容器状态: %v", partial.services)
 	}
 	if dir := s.dirtyDir(); dir == "" {
@@ -277,8 +222,6 @@ func TestCommitFailureRegistersDirtyScene(t *testing.T) {
 		t.Errorf("阻断的目录应当是部署产物所在目录，实际 %q", dir)
 	}
 
-	// 普通写盘失败不能被误判成「现场未清理」：那会让一次可以重试的失败
-	// 变成必须人工介入的阻断。
 	s2, _ := newRenderOnlyService(t)
 	plain := s2.commitFailure(errors.New("替换 Caddyfile 失败，已回滚（磁盘仍为旧配置）"))
 	if errors.Is(plain, errBatchCleanupPending) {

@@ -1,6 +1,5 @@
 <template>
   <div v-loading="loading">
-    <!-- ============ 当前分发方式 ============ -->
     <div class="lt-card">
       <div class="lt-card-title">当前分发方式</div>
 
@@ -36,7 +35,6 @@
       </el-descriptions>
     </div>
 
-    <!-- ============ 上传 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">上传安装包</div>
 
@@ -57,7 +55,6 @@
         </template>
       </el-upload>
 
-      <!-- 选中后的确认区：先看清单再上传，避免选错文件白传几十 MB -->
       <div v-if="picked" class="picked">
         <div class="picked-info">
           <el-icon><Document /></el-icon>
@@ -88,7 +85,6 @@
       />
     </div>
 
-    <!-- ============ 已上传 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>已上传的安装包（{{ files.length }}）</span>
@@ -142,8 +138,6 @@ const loading = ref(false)
 const files = ref([])
 const downloadUrl = ref('')
 const distDir = ref('')
-// 服务端下发上限，前端只做「提前告知」——
-// 真正的限制在服务端，两处不一致时以服务端为准。
 const maxSize = ref(100 << 20)
 
 const picked = ref(null)
@@ -159,8 +153,6 @@ function handlePick(file) {
   pickErr.value = ''
   const raw = file?.raw || file
   if (!raw) return
-  // 客户端先拦一道：几十 MB 白传一次代价不小。
-  // 但服务端仍有完整校验（扩展名白名单、魔数、大小），这里不是安全边界。
   if (raw.size > maxSize.value) {
     pickErr.value = `文件 ${fmtBytes(raw.size)} 超过上限 ${maxSizeMB.value} MB`
     picked.value = null
@@ -187,7 +179,6 @@ async function doUpload() {
     pickErr.value = ''
     await load()
   } catch {
-    // 失败提示由响应拦截器统一处理
   } finally {
     uploading.value = false
   }

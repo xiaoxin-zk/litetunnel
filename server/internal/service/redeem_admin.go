@@ -1,10 +1,5 @@
 package service
 
-// 兑换码管理：生成、查询、启停与删除。
-//
-// 与用户核销事务（redeem.go）分开：前者是管理员操作，后者要保证
-// 并发下的权益一致性，两者的失败处理与审查重点不同。
-
 import (
 	"errors"
 	"fmt"
@@ -40,9 +35,6 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		if in.GroupID == 0 {
 			return nil, fmt.Errorf("%w: 升级分组必须指定目标分组", ErrInvalidParam)
 		}
-		// 分组存在性检查移到了下面的写事务里（对分组行 FOR UPDATE）：
-		// 事务外检查、稍后才插入码的话，删除分组可能从检查通过之后
-		// 插进来，生成一批指向已删除分组的码——又是废纸。
 	case model.RedeemTypeDuration:
 		if in.Value <= 0 {
 			return nil, fmt.Errorf("%w: 天数必须大于 0", ErrInvalidParam)
@@ -57,10 +49,6 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		in.MaxUses = 1
 	}
 
-	// 批次号带随机后缀：秒级时间戳在同一秒内两次生成会撞号，而管理页
-	// 正是按批次号筛选的——两批码混在一个批次里，批次维度就失去了意义。
-	// 6 个随机十六进制字符（crypto/rand），同秒撞上 2^24 分之一的概率
-	// 在这里完全可以接受；即便真撞了也只是批次展示合并，不影响兑换。
 	suffix, err := randomHex(3)
 	if err != nil {
 		return nil, err
@@ -91,11 +79,6 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		})
 	}
 
-	// 分组升级码：分组存在性检查与写码放进同一事务，并对分组行 FOR UPDATE
-	// ——与 DeleteGroup、AdminSetUserGroup 用同一把分组行锁互斥。
-	// 不锁的话，删除分组可以插进「检查通过 → 插入码」之间，
-	// 生成一批指向已删除分组的码；锁住行之后，删除会等到本事务提交，
-	// 提交后那批码是未核销状态，DeleteGroup 的检查会拦住它。
 	if in.Type == model.RedeemTypeGroup {
 		err := s.DB.Transaction(func(tx *gorm.DB) error {
 			var g model.Group
@@ -114,14 +97,11 @@ func (s *Services) GenerateCodes(adminID uint, in GenerateCodesInput) ([]model.R
 		return codes, nil
 	}
 
-	// 唯一索引冲突时整批回滚，避免生成半截数据。
 	if err := s.DB.Create(&codes).Error; err != nil {
 		return nil, fmt.Errorf("生成兑换码失败: %w", err)
 	}
 	return codes, nil
 }
-
-// RedeemResult 兑换结果。
 
 func (s *Services) ListRedeemCodes(keyword, status, batchNo string, offset, limit int) ([]model.RedeemCode, int64, error) {
 	q := s.DB.Model(&model.RedeemCode{})
@@ -143,7 +123,6 @@ func (s *Services) ListRedeemCodes(keyword, status, batchNo string, offset, limi
 	return list, total, err
 }
 
-// SetRedeemCodeStatus 禁用/启用兑换码。
 func (s *Services) SetRedeemCodeStatus(id uint, status string) error {
 	if status != model.RedeemStatusDisabled && status != model.RedeemStatusUnused {
 		return ErrInvalidParam
@@ -158,7 +137,6 @@ func (s *Services) SetRedeemCodeStatus(id uint, status string) error {
 	return nil
 }
 
-// DeleteRedeemCode 删除兑换码（已使用的保留流水，仅删除码本身）。
 func (s *Services) DeleteRedeemCode(id uint) error {
 	res := s.DB.Where("id = ?", id).Delete(&model.RedeemCode{})
 	if res.Error != nil {
@@ -170,7 +148,6 @@ func (s *Services) DeleteRedeemCode(id uint) error {
 	return nil
 }
 
-// ListRedeemRecords 分页查询兑换流水。
 func (s *Services) ListRedeemRecords(userID uint, offset, limit int) ([]model.RedeemRecord, int64, error) {
 	q := s.DB.Model(&model.RedeemRecord{})
 	if userID > 0 {

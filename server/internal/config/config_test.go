@@ -5,13 +5,6 @@ import (
 	"testing"
 )
 
-// 这个包此前没有测试。这里只守一条：**生产环境必须显式配置对外地址**。
-//
-// 为什么值得单独测：没有它，找回密码的重置链接只能从请求的 Host 推断域名，
-// 而 Host 由请求方控制——攻击者提交伪造的 Host，链接就会指向他自己的域名
-// （Host 头投毒）。这类配置缺失在开发环境完全看不出来，只有上线才暴露。
-
-// prodEnv 返回一套「生产环境能启动」的最小配置。
 func prodEnv() map[string]string {
 	return map[string]string{
 		"LT_ENV":                      "production",
@@ -34,10 +27,6 @@ func setEnv(t *testing.T, kv map[string]string) {
 	}
 }
 
-// TestLoadRequiresPublicURLInProduction 断言缺配置时**启动即失败**。
-//
-// 失败比「启动成功但发出的链接指向攻击者域名」好得多：前者一眼可见，
-// 后者要等用户点了邮件里的链接才发现。
 func TestLoadRequiresPublicURLInProduction(t *testing.T) {
 	env := prodEnv()
 	env["LT_USER_PUBLIC_URL"] = ""
@@ -52,7 +41,6 @@ func TestLoadRequiresPublicURLInProduction(t *testing.T) {
 	}
 }
 
-// TestLoadAcceptsProductionWithPublicURL 覆盖反面：配齐了就能启动。
 func TestLoadAcceptsProductionWithPublicURL(t *testing.T) {
 	setEnv(t, prodEnv())
 
@@ -68,9 +56,7 @@ func TestLoadAcceptsProductionWithPublicURL(t *testing.T) {
 	}
 }
 
-// TestValidateCIDRList 直接覆盖白名单校验本身。
 func TestValidateCIDRList(t *testing.T) {
-	// 空列表合法：含义是「未启用白名单」。
 	if err := validateCIDRList("LT_ADMIN_ALLOW_CIDR", nil); err != nil {
 		t.Fatalf("未配置白名单不该报错: %v", err)
 	}
@@ -101,12 +87,6 @@ func TestValidateCIDRList(t *testing.T) {
 	}
 }
 
-// TestLoadRejectsInvalidAllowCIDR 覆盖「白名单写错」必须在启动时就暴露。
-//
-// 两类后果都必须等到线上才看得出来，而它们的方向完全相反：
-//
-//	管理白名单解析失败 → 集合为空 → 被当成「不限制」→ 公网谁都能进后台；
-//	插件白名单解析失败 → 集合为空 → 所有回调被拒 → 隧道全部无法上线。
 func TestLoadRejectsInvalidAllowCIDR(t *testing.T) {
 	cases := []struct {
 		name string
@@ -133,8 +113,6 @@ func TestLoadRejectsInvalidAllowCIDR(t *testing.T) {
 		})
 	}
 
-	// 开发环境同样拦住：这类配置错误与运行环境无关，
-	// 而「开发时能启动、上线才静默失效」正是最难查的那种。
 	t.Run("开发环境也不放行", func(t *testing.T) {
 		setEnv(t, map[string]string{
 			"LT_ENV":              "development",
@@ -147,10 +125,6 @@ func TestLoadRejectsInvalidAllowCIDR(t *testing.T) {
 	})
 }
 
-// TestLoadWarnsWhenPublicURLMissingInDev 覆盖开发环境：不阻断启动，但必须提示。
-//
-// 不提示的话，用户点了「忘记密码」什么都不会发生（运行时不再从请求头推断），
-// 而管理员完全不知道原因。
 func TestLoadWarnsWhenPublicURLMissingInDev(t *testing.T) {
 	setEnv(t, map[string]string{
 		"LT_ENV":             "development",

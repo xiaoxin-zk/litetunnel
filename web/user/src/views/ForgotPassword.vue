@@ -34,7 +34,6 @@
           />
         </el-form-item>
 
-        <!-- 站点启用邮件：用一次性验证码证明身份 -->
         <el-form-item v-if="mailEnabled" label="邮箱验证码" prop="email_code">
           <el-input v-model="form.email_code" size="large" maxlength="6" placeholder="6 位验证码">
             <template #append>
@@ -45,7 +44,6 @@
           </el-input>
         </el-form-item>
 
-        <!-- 站点未启用邮件：用当前密码证明身份 -->
         <el-form-item v-else label="当前密码" prop="old_password">
           <el-input
             v-model="form.old_password"
@@ -97,9 +95,7 @@ const router = useRouter()
 const formRef = ref()
 const loading = ref(false)
 const error = ref('')
-// 倒计时在组件卸载时自动清理（见 useCountdown）。
 const { countdown, start: startCountdown } = useCountdown()
-// null 表示尚未探测出来，避免首屏闪烁
 const mailEnabled = ref(null)
 const statusLoading = ref(false)
 const statusError = ref('')
@@ -143,12 +139,10 @@ async function sendCode() {
     return
   }
   try {
-    // scene=reset：无论邮箱是否注册过都返回成功，避免这个接口变成账号枚举工具
     await authApi.sendEmailCode({ email: account, scene: 'reset' })
     ElMessage.success('找回请求已受理；若长时间未收到验证码，请稍后重新申请')
     startCountdown()
   } catch {
-    // 失败提示由响应拦截器统一处理
   }
 }
 

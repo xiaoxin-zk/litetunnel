@@ -2,8 +2,6 @@ package config
 
 import "testing"
 
-// LT_FRPS_API_ADDR 写错时，采集与断流会在运行期持续失败，而启动日志里
-// 看不出来。这里守住「必须在启动时就拒绝」的那几种写法。
 func TestValidateNumericEnvsRejectsMalformedAddr(t *testing.T) {
 	cases := []struct {
 		name string
@@ -32,7 +30,6 @@ func TestValidateNumericEnvsRejectsMalformedAddr(t *testing.T) {
 	}
 }
 
-// 端口类变量必须落在 1-65535：只校验「能 Atoi」会放过 0 与 70000。
 func TestValidateNumericEnvsRejectsOutOfRangePort(t *testing.T) {
 	t.Setenv("LT_GATEWAY_PORT", "70000")
 	if err := validateNumericEnvs(); err == nil {

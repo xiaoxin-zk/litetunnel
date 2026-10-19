@@ -6,11 +6,6 @@ import (
 	"time"
 )
 
-// TestGroupReqDistinguishesMissingAndNull 覆盖「清空有效期」的请求解析。
-//
-// 管理页把有效期留空时发的是 "expire_at": null，而字段缺失表示「这次不改」。
-// 两者都被解成 nil 的话，「清空」会退化成空操作：旧到期时间残留，到期调度
-// 随后把刚改派的用户迁回默认分组。这里钉住三态的区分。
 func TestGroupReqDistinguishesMissingAndNull(t *testing.T) {
 	cases := []struct {
 		name    string

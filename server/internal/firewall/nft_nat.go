@@ -2,8 +2,6 @@ package firewall
 
 import "encoding/json"
 
-// nftNATRuleSafe 仅证明端口不匹配或规则没有改写/丢包动作，不求值任意 nft 表达式。
-// 调用方仅遍历 PREROUTING 经 jump/goto 可达的链，不包含独立出站链。
 type nftTarget struct {
 	port  int
 	proto string

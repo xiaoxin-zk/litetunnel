@@ -2,14 +2,6 @@ package service
 
 import "testing"
 
-// TestIsProxyOnline 覆盖 frps 管理接口返回的 phase 取值。
-//
-// 这条测试对应的真实故障：代理已经注册成功、端口已经在监听，但面板把它
-// 算成离线，客户端据此一直显示「连接中」。根因是状态采集只认 "running"，
-// 而 frps v0.71 的管理接口返回的是 "online"。
-//
-// 为什么之前没被发现：CI 里没有 frps，collectTraffic 从来没跑过真实数据，
-// 所以这个取值只可能在真机上暴露。因此这里把两个版本的值都钉住。
 func TestIsProxyOnline(t *testing.T) {
 	cases := []struct {
 		phase string

@@ -61,7 +61,6 @@
       <template #empty><el-empty description="暂无管理员" /></template>
     </el-table>
 
-    <!-- 新建 -->
     <el-dialog v-model="createVisible" title="新建管理员" width="480px">
       <el-form :model="createForm" :rules="createRules" ref="createRef" label-width="100px">
         <el-form-item label="登录账号" prop="username">
@@ -87,7 +86,6 @@
       </template>
     </el-dialog>
 
-    <!-- 编辑 -->
     <el-dialog v-model="editVisible" title="编辑管理员" width="460px">
       <el-form :model="editForm" label-width="100px">
         <el-form-item label="登录账号">
@@ -125,7 +123,6 @@
       </template>
     </el-dialog>
 
-    <!-- 改密 -->
     <el-dialog v-model="passwordVisible" title="重置登录密码" width="440px">
       <el-form label-width="100px">
         <el-form-item label="登录账号">

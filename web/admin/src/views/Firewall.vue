@@ -1,6 +1,5 @@
 <template>
   <div v-loading="loading">
-    <!-- ============ 状态总览 ============ -->
     <div class="lt-card">
       <div class="lt-card-title">
         <span>防火墙状态</span>
@@ -38,8 +37,6 @@
         description="云服务器安全组不受本功能影响，仍需在云控制台单独放行。"
       />
 
-      <!-- 状态查询失败：以前这个字段后端一直在传，界面却从不显示，
-           于是「没查到」与「一切正常」在页面上长得一模一样 -->
       <el-alert
         v-if="fw.error"
         type="warning"
@@ -58,8 +55,6 @@
         </el-descriptions-item>
         <el-descriptions-item label="后端">{{ fw.backend || '-' }}</el-descriptions-item>
         <el-descriptions-item label="规则生效">
-          <!-- 查询失败时显示「未知」：显示成「未生效」会让管理员去排查
-               一个并不存在的问题（实际只是这次没读到） -->
           <el-tag
             :type="fw.active_unknown ? 'warning' : (fw.active ? 'success' : 'info')"
             size="small"
@@ -83,8 +78,6 @@
       />
     </div>
 
-    <!-- ============ 重试与失败 ============ -->
-    <!-- 有待重试或已终止的记录才显示这一块：平时不占版面 -->
     <div
       v-if="(fw.pending_ops?.length || 0) + (fw.failed_ops?.length || 0) > 0"
       class="lt-card"
@@ -137,12 +130,9 @@
       </template>
     </div>
 
-    <!-- ============ 端口池 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">端口池使用情况</div>
 
-      <!-- 配置诊断：端口池配错不会在启动时报错，只在用户建隧道时
-           表现为「连不上」，所以把关键判断前置到这里 -->
       <el-alert
         v-for="(tip, i) in pool.advice || []"
         :key="i"
@@ -169,7 +159,6 @@
         </el-descriptions-item>
         <el-descriptions-item label="总容量">{{ pool.total || 0 }}</el-descriptions-item>
         <el-descriptions-item label="可用">
-          <!-- 读库失败时空闲量无法计算：显示「未知」而不是一个偏高的数字 -->
           <span v-if="pool.free_unknown" class="lt-muted">未知</span>
           <span v-else>{{ pool.free || 0 }}</span>
         </el-descriptions-item>
@@ -185,7 +174,6 @@
         <div class="seg reserved" :style="{ width: pct(poolSeg.reserved) }" />
         <div class="seg system" :style="{ width: pct(poolSeg.listening) }" />
         <div class="seg allocated" :style="{ width: pct(poolSeg.allocated) }" />
-        <!-- 空闲量未知时不画这一段：按 0 画会与「已占满」混为一谈 -->
         <div v-if="!pool.free_unknown" class="seg free" :style="{ width: pct(poolSeg.free) }" />
       </div>
       <div class="legend">
@@ -224,12 +212,9 @@
       </el-collapse>
     </div>
 
-    <!-- ============ 规则 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>放行规则</span>
-        <!-- 未启用防火墙控制时不显示：面板没有写能力，
-             点了也只会得到一句「未启用」的错误 -->
         <el-button
           v-if="fw.enabled"
           type="primary"
@@ -296,7 +281,6 @@
       </el-tabs>
     </div>
 
-    <!-- ============ 监听端口 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>
@@ -326,7 +310,6 @@
       </el-table>
     </div>
 
-    <!-- ============ 手工放行 ============ -->
     <el-dialog v-model="openVisible" title="手工放行端口" width="440px">
       <el-alert
         type="warning"
@@ -369,17 +352,12 @@ const fw = ref({})
 const pool = ref({})
 const openForm = reactive({ port: null, proto: 'tcp' })
 
-// 各分段宽度按端口池总量归一化，直观反映占用比例
 function pct(n) {
   const total = pool.value.total || 1
   const v = ((n || 0) / total) * 100
   return `${Math.max(v, v > 0 ? 1 : 0)}%`
 }
 
-// 端口可能同时属于多个类别（既被保留、又在监听、还被分配）。色段必须按
-// 「互斥」拆分，否则各段相加会超过总量、图示比例失真（后端算 Free 时
-// 就是按集合去重的，两边口径要一致）：
-//   保留 → 系统占用（去掉保留）→ 已分配（去掉前两者）→ 空闲
 const poolSeg = computed(() => {
   const reserved = new Set(pool.value.reserved || [])
   const listening = new Set((pool.value.system_listening || []).filter((p) => !reserved.has(p)))
@@ -396,8 +374,6 @@ const poolSeg = computed(() => {
     listening: listening.size,
     allocated: allocated.size,
     free: Math.max((pool.value.total || 0) - used.size, 0),
-    // 有重叠时图例要说明「同一端口只计入靠前的一类」，否则数字对不上会让
-    // 管理员以为统计出错了。
     overlap: raw > used.size,
   }
 })
@@ -440,9 +416,6 @@ async function closePort(row) {
   await load()
 }
 
-// 终态失败的「补做」：走手工放行/关闭路径——那是管理员明确点的按钮，
-// 成功失败都会如实反馈，不会像自动路径那样静默跳过。
-// 成功后顺手清掉这条终态记录：意图已经由管理员亲手完成了。
 async function retryFailed(row) {
   acting.value = true
   try {
@@ -460,7 +433,6 @@ async function retryFailed(row) {
   }
 }
 
-// 只清记录、不动规则：管理员确认「这件事不需要面板再惦记」时用。
 async function clearFailed(row) {
   await ElMessageBox.confirm(
     `清除 ${row.port}/${row.proto} 的失败记录后，面板不再提示这个端口。` +

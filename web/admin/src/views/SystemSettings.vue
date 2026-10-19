@@ -18,7 +18,6 @@
     />
 
     <el-tabs v-model="tab">
-      <!-- ============ 站点 ============ -->
       <el-tab-pane label="站点" name="site">
         <el-form label-width="140px" style="max-width: 720px">
           <el-form-item label="站点名称">
@@ -58,7 +57,6 @@
         </el-form>
       </el-tab-pane>
 
-      <!-- ============ 注册与准入 ============ -->
       <el-tab-pane label="注册与准入" name="register">
         <el-form label-width="140px" style="max-width: 780px">
           <el-form-item label="开放注册">
@@ -138,7 +136,6 @@
         </el-form>
       </el-tab-pane>
 
-      <!-- ============ 邮件 ============ -->
       <el-tab-pane label="邮件" name="smtp">
         <el-form label-width="140px" style="max-width: 720px">
           <el-form-item label="启用邮件">
@@ -182,7 +179,6 @@
         </el-form>
       </el-tab-pane>
 
-      <!-- ============ 支付 ============ -->
       <el-tab-pane label="支付" name="payment">
         <el-alert
           type="warning"
@@ -234,17 +230,12 @@
         </el-form>
       </el-tab-pane>
 
-      <!-- ============ 登录安全 ============ -->
       <el-tab-pane label="登录安全" name="security">
         <el-form label-width="160px" style="max-width: 720px">
           <el-form-item label="失败几次后要验证码">
             <el-input-number v-model="numForm['login.captcha_after_failures']" :min="0" :max="20" />
             <span class="hint">0 表示始终不要求；默认 3</span>
           </el-form-item>
-          <!--
-            多实例这条必须写在界面上：阈值「共享」与硬锁「不共享」是两个不同
-            的层次，运维只看到这个输入框时很容易以为整层防护都跨实例。
-          -->
           <div class="hint" style="margin: -8px 0 18px 160px; line-height: 1.8">
             计数存在数据库表 <code>lt_login_fail_counters</code>（30 分钟窗口，登录成功即清零），
             因此多实例部署共用一个数据库时该阈值仍然成立。但「账号 + IP」的登录硬锁仍在各实例进程内，
@@ -277,7 +268,6 @@
         </div>
       </el-tab-pane>
 
-      <!-- ============ 端口与防火墙 ============ -->
       <el-tab-pane label="端口与防火墙" name="port">
         <el-alert
           type="warning"
@@ -358,7 +348,6 @@ import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { settingsApi } from '../api'
 
-// 与后端 service.SecretMask 保持一致：原样提交表示「不修改此项」
 const SECRET_MASK = '__UNCHANGED__'
 
 const BOOL_KEYS = [
@@ -398,7 +387,6 @@ const testTo = ref('')
 const form = reactive({})
 const boolForm = reactive({})
 const numForm = reactive({})
-// 记录服务端返回的敏感字段状态，用于判断「留空 = 不修改」
 const secretLoaded = reactive({})
 
 const secretPlaceholder = (key) =>
@@ -439,7 +427,6 @@ const payload = computed(() => {
   const out = {}
   Object.keys(form).forEach((k) => {
     if (SECRET_KEYS.includes(k)) {
-      // 留空且原本已配置 → 提交占位符表示保持原值
       out[k] = form[k] === '' && secretLoaded[k] ? SECRET_MASK : form[k]
       return
     }
@@ -490,7 +477,6 @@ onMounted(load)
   line-height: 1.7;
 }
 
-/* 表名/键名用等宽字体，避免和中文说明糊在一起看不清边界。 */
 code {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;

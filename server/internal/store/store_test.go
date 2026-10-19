@@ -26,16 +26,10 @@ func newTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("取数据库连接失败: %v", err)
 	}
-	// 先关连接再让 t.TempDir 清理（Windows 上文件仍被占用会清理失败）。
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	return db
 }
 
-// TestMailIDIsUniquePerCredential 覆盖「一封邮件只能激活出一条凭据」。
-//
-// 多实例并发激活同一封邮件时，两边的「已激活」检查可能都落空，各插一条相同
-// 验证码；而校验只消费命中的那一条，另一条仍然可用——一次性语义就没了。
-// 代码里的领取已经避免这种并发，唯一索引是最后一道保险。
 func TestMailIDIsUniquePerCredential(t *testing.T) {
 	db := newTestDB(t)
 
@@ -55,7 +49,6 @@ func TestMailIDIsUniquePerCredential(t *testing.T) {
 		t.Fatal("同一封邮件不得激活出第二条验证码（一次性语义会被破坏）")
 	}
 
-	// mail_id 为 0 的记录（历史数据/手工插入）不受约束。
 	if err := db.Create(&model.EmailCode{
 		Email: "legacy@example.com", Scene: "reset", CodeHash: "h3",
 		ExpireAt: time.Now().Add(time.Hour),
@@ -64,14 +57,9 @@ func TestMailIDIsUniquePerCredential(t *testing.T) {
 	}
 }
 
-// TestDedupeMailCredentials 覆盖「旧版本留下的重复凭据」。
-//
-// 同一封邮件激活出多条验证码时，未使用的那些**仍然可用**——一次性语义已经破了。
-// 只告警不清理的话，唯一索引也建不上，等于漏洞一直开着。
 func TestDedupeMailCredentials(t *testing.T) {
 	db := newTestDB(t)
 
-	// 模拟旧数据：先去掉唯一索引，才能插进重复行。
 	if err := db.Exec(`DROP INDEX IF EXISTS idx_lt_email_codes_mail_uniq`).Error; err != nil {
 		t.Fatalf("删索引失败: %v", err)
 	}
@@ -105,29 +93,21 @@ func TestDedupeMailCredentials(t *testing.T) {
 		t.Fatalf("应保留最新的一条（id 最大），实际 %q", rows[0].CodeHash)
 	}
 
-	// 清理之后唯一索引应能建起来。
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_email_codes_mail_uniq
 		 ON lt_email_codes(mail_id) WHERE mail_id > 0`).Error; err != nil {
 		t.Fatalf("清理后应能建立唯一索引: %v", err)
 	}
 
-	// 幂等：再跑一次不该报错。
 	if err := dedupeMailCredentials(db); err != nil {
 		t.Fatalf("重复清理应幂等: %v", err)
 	}
 }
 
-// TestOpenRefusesWhenCredentialCleanupFails 覆盖「清理不掉还照常启动」。
-//
-// 建不起唯一索引时，旧库里同一封邮件对应的多条未使用凭据仍然可用，
-// 而运行期不会有任何报错。与其带着这个洞跑，不如让启动失败、先修数据。
 func TestOpenRefusesWhenCredentialCleanupFails(t *testing.T) {
 	dsn := filepath.Join(t.TempDir(), "dirty.db")
 	cfg := &config.Config{DBDriver: "sqlite", DBDSN: dsn}
 
-	// 先手工造一个「有重复凭据、且删不掉」的库：用一个拒绝删除的触发器模拟
-	// 清理失败（真实原因可能是权限或数据损坏）。
 	raw, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("打开数据库失败: %v", err)
@@ -158,11 +138,6 @@ func TestOpenRefusesWhenCredentialCleanupFails(t *testing.T) {
 	}
 }
 
-// TestPurgeLegacyMailDrafts 覆盖「升级遗留的草稿邮件」。
-//
-// 旧版本用 draft 表示「已写好、待复核额度」：进程若在复核与释放之间崩溃，
-// 库里会留下这种行。正文与参数里是**明文验证码/重置链接**，而清理任务只回收
-// failed / sent——不处理的话这些内容会永久留在库里，还会被发信额度统计进去。
 func TestPurgeLegacyMailDrafts(t *testing.T) {
 	db := newTestDB(t)
 
@@ -195,7 +170,6 @@ func TestPurgeLegacyMailDrafts(t *testing.T) {
 			got.Body, got.Payload)
 	}
 
-	// 幂等：再跑一次不该报错，也不该改动别的行。
 	other := &model.MailOutbox{
 		To: "normal@example.com", Subject: "s", Kind: model.MailKindResetLink,
 		Status: model.MailPending, NextAt: time.Now(),

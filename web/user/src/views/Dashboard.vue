@@ -59,9 +59,6 @@
             <span>可用协议</span>
             <b>{{ (profile?.group?.allow_protocols || '-').toUpperCase() }}</b>
           </div>
-          <!-- 余额只在站点启用了支付后展示。
-               没开支付就没有充值入口，此时恒为 0 的余额只会让人困惑
-               「这钱哪来的、怎么用、为什么充不了」。 -->
           <div v-if="paymentEnabled" class="quota-row">
             <span>余额</span>
             <b>¥ {{ ((profile?.balance || 0) / 100).toFixed(2) }}</b>
@@ -84,7 +81,6 @@ const loading = ref(false)
 const stats = ref({})
 const series = ref([])
 const chartRef = ref()
-// 站点是否启用了支付。未启用时不展示任何与余额/充值相关的入口。
 const paymentEnabled = ref(false)
 let chart = null
 
@@ -109,7 +105,6 @@ const cards = computed(() => {
       color: '#059669'
     }
   ]
-  // 余额卡片同样受支付开关控制：没有充值入口时它没有意义。
   if (paymentEnabled.value) {
     list.push({
       label: '账户余额',
@@ -185,7 +180,6 @@ async function loadSettings() {
     const s = await publicApi.settings()
     paymentEnabled.value = !!s?.payment_enabled
   } catch {
-    // 探测失败时按「未启用支付」处理：少显示总比误导用户去充值好。
     paymentEnabled.value = false
   }
 }

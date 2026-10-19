@@ -12,17 +12,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 这个文件守两件与「发信额度」有关的事：
-//
-//  1. 额度复核必须发生在**写入之前**：先写再查的话，一批并发请求会各自
-//     留下记录、各自超限，而这些失败记录还会继续占额度，把当日额度耗光。
-//  2. 找回密码链接也要按收件地址限流——按 IP 的令牌桶挡不住分布式来源
-//     对同一个邮箱持续排队。
-
-// TestEnqueueMailRejectsBeforeWrite 覆盖「超限时不写任何记录」。
-//
-// 这是并发突发的关键：如果先写再查，10 个并发请求会留下 10 条失败记录，
-// 而额度统计会把它们算进去，用户当天再也发不出去。
 func TestEnqueueMailRejectsBeforeWrite(t *testing.T) {
 	svc := newTestServices(t, nil)
 	enableTestMail(t, svc)
@@ -36,7 +25,6 @@ func TestEnqueueMailRejectsBeforeWrite(t *testing.T) {
 	if _, err := svc.enqueueMail(to, "s", "body", model.MailKindEmailCodeRegister, payload, quota); err != nil {
 		t.Fatalf("第一封应入队成功: %v", err)
 	}
-	// 冷却窗口内再来一封：拒绝，且**不留记录**。
 	_, err := svc.enqueueMail(to, "s", "body", model.MailKindEmailCodeRegister, payload, quota)
 	if !errors.Is(err, errMailQuotaCooldown) {
 		t.Fatalf("冷却窗口内应返回 errMailQuotaCooldown，实际 %v", err)
@@ -51,19 +39,12 @@ func TestEnqueueMailRejectsBeforeWrite(t *testing.T) {
 		t.Fatalf("被拒绝的请求不该留下任何记录（否则失败记录会吃掉额度），实际 %d 条", rows)
 	}
 
-	// 正常入队的那封会被发出去。
 	svc.processMailOutbox(context.Background())
 	if got := sender.sentCount(); got != 1 {
 		t.Fatalf("应发出 1 封，实际 %d 封", got)
 	}
 }
 
-// TestClaimMailPreventsDoubleSend 覆盖「多实例重复发信」。
-//
-// 每个实例都有自己的发件协程。直接读 pending 就发的话，同一行会被两个实例
-// 各发一次（收件人收到两封、凭据被激活两次）。领取是条件更新：
-// 只有 RowsAffected=1 的实例继续发。实例在发送途中崩溃时，租约到期后
-// 另一个实例可以接手。
 func TestClaimMailPreventsDoubleSend(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -83,7 +64,6 @@ func TestClaimMailPreventsDoubleSend(t *testing.T) {
 		t.Fatal("租约内不该被再次领取（多实例会重复发信）")
 	}
 
-	// 租约到期：崩溃恢复，允许重新领取（把 next_at 拨回过去模拟租约过期）。
 	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
 		Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
 		t.Fatal(err)
@@ -92,7 +72,6 @@ func TestClaimMailPreventsDoubleSend(t *testing.T) {
 		t.Fatal("租约到期后应可重新领取（实例崩溃恢复）")
 	}
 
-	// 已作废的邮件不该被领取。
 	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
 		Updates(map[string]any{"status": model.MailFailed, "next_at": time.Now().Add(-time.Second)}).Error; err != nil {
 		t.Fatal(err)
@@ -102,10 +81,6 @@ func TestClaimMailPreventsDoubleSend(t *testing.T) {
 	}
 }
 
-// TestClaimMailTokenGuardsWriteBack 覆盖「旧持有者的回写被拒绝」。
-//
-// 租约过期后另一个实例接手，旧持有者的失败回写若不带令牌校验，就会把
-// 新持有者刚领取的行改回待发（甚至把已作废的邮件重新排队，发一封空信）。
 func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -123,7 +98,6 @@ func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
 		t.Fatal("第一次领取应成功")
 	}
 
-	// 模拟租约过期、另一实例接手。
 	if err := svc.DB.Model(&model.MailOutbox{}).Where("id = ?", row.ID).
 		Update("next_at", time.Now().Add(-time.Second)).Error; err != nil {
 		t.Fatal(err)
@@ -133,7 +107,6 @@ func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
 		t.Fatal("租约到期后应可接手")
 	}
 
-	// 旧持有者的失败回写：必须被拒绝。
 	svc.failMail(*row, oldToken, errors.New("smtp 失败"))
 
 	var after model.MailOutbox
@@ -146,10 +119,6 @@ func TestClaimMailTokenGuardsWriteBack(t *testing.T) {
 	}
 }
 
-// TestActivatingMailRecoversAfterLeaseExpiry 覆盖「激活到一半进程崩了」。
-//
-// worker 若只扫 delivered，领取为 activating 后崩溃的那条记录就永远卡住：
-// 用户手里的验证码在库里根本不存在，谁也没法救。租约到期后必须能被重新扫到。
 func TestActivatingMailRecoversAfterLeaseExpiry(t *testing.T) {
 	svc := newTestServices(t, nil)
 	enableTestMail(t, svc)
@@ -165,7 +134,6 @@ func TestActivatingMailRecoversAfterLeaseExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 一条「领取后崩溃」的记录：状态 activating，租约已过期。
 	row := &model.MailOutbox{
 		To: email, Subject: "s", Kind: model.MailKindEmailCodeRegister,
 		Payload: string(payload), Status: model.MailActivating,
@@ -194,12 +162,6 @@ func TestActivatingMailRecoversAfterLeaseExpiry(t *testing.T) {
 	}
 }
 
-// TestCheckMailQuotaCountsFailedAttempts 覆盖「额度约束请求而不是投递结果」。
-//
-// 失败的信同样是一次真实的发送请求：SMTP 故障期间若不计入额度，
-// 分散来源可以无限重新排队，把队列与重试都打满。
-// 「失败记录吃掉额度」的问题由「先复核、后写入」解决——配额不足的请求
-// 根本不会留下记录。
 func TestCheckMailQuotaCountsFailedAttempts(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -222,10 +184,6 @@ func TestCheckMailQuotaCountsFailedAttempts(t *testing.T) {
 	}
 }
 
-// TestCheckMailQuotaDailyLimitIsExclusive 钉住「不含自己」的口径。
-//
-// 复核发生在写入之前，所以「已有 N 条」时，N == limit 就该拒绝；
-// 口径写成 inclusive 会每天多放一封。
 func TestCheckMailQuotaDailyLimitIsExclusive(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -250,17 +208,13 @@ func TestCheckMailQuotaDailyLimitIsExclusive(t *testing.T) {
 		t.Fatalf("未达上限应放行，实际 %v", err)
 	}
 
-	mk() // 达到 5 条
+	mk()
 	if err := checkMailQuota(svc.DB, to, model.MailKindResetLink,
 		mailQuota{dailyLimit: 5}); !errors.Is(err, errMailQuotaDaily) {
 		t.Fatalf("达到上限应拒绝，实际 %v", err)
 	}
 }
 
-// TestResetLinkRateLimitedPerEmail 覆盖「按邮箱的找回链接限流」。
-//
-// 同一邮箱连续请求：冷却窗口内的第二封直接被拒（不写记录）；
-// 当日数量达到上限时同样拒绝。响应本身始终一致，不泄露账号状态。
 func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 	svc := newTestServices(t, nil)
 	enableTestMail(t, svc)
@@ -275,11 +229,9 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	// 第一次：正常排队。
 	if err := svc.requestPasswordReset(u.Username, "1.1.1.1", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码失败: %v", err)
 	}
-	// 第二次（立刻，换个 IP 也绕不过）：冷却窗口内，静默拒绝且不写记录。
 	if err := svc.requestPasswordReset(u.Username, "2.2.2.2", "https://panel.example.com"); err != nil {
 		t.Fatalf("找回密码不该报错（会泄露账号状态）: %v", err)
 	}
@@ -294,7 +246,6 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 		t.Fatalf("冷却窗口内的第二次请求不该留下记录，实际共 %d 条", rows)
 	}
 
-	// 当日上限：把这封推到冷却窗口之外，再补到上限。
 	nowTs := time.Now()
 	dayStart := time.Date(nowTs.Year(), nowTs.Month(), nowTs.Day(), 0, 0, 0, 0, nowTs.Location())
 	old := nowTs.Add(-10 * time.Minute)
@@ -330,7 +281,6 @@ func TestResetLinkRateLimitedPerEmail(t *testing.T) {
 			resetLinkDailyPerEmail, after)
 	}
 
-	// 只有第一封会被真正发出去。
 	svc.processMailOutbox(context.Background())
 	if got := sender.sentCount(); got != 1 {
 		t.Fatalf("被限流的请求不该真的发信，实际发了 %d 封", got)

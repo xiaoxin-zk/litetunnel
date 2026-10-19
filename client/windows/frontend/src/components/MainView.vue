@@ -1,6 +1,5 @@
 <template>
   <div class="layout">
-    <!-- 顶栏 -->
     <header class="header card">
       <div class="status">
         <span class="dot" :class="dotClass"></span>
@@ -15,13 +14,6 @@
       </div>
 
       <div class="actions">
-        <!-- 这里刻意没有「启动连接」按钮：连接由每条隧道自己的开关驱动，
-             开关打开着的隧道在接入时就会自动连上。再放一个全局按钮只会
-             制造状态不一致——「开关是开的，但还得再点一次才连上」。 -->
-        <!-- 与下面开关、删除按钮一致：任何命令执行期间一律禁用。
-             退出登录会去停进程、清凭据、清配置，连点两次会发出两个并发
-             请求，第二个多半以「正在同步隧道，请稍后再退出登录」失败，
-             用户看到的是自己没法退出——而这个报错其实是自己造成的。 -->
         <button
           class="btn-ghost"
           :disabled="busy"
@@ -33,8 +25,6 @@
       </div>
     </header>
 
-    <!-- 账户信息。连上之后应当一眼看到「我是谁、什么分组、还剩多少」，
-         而不是只能从隧道列表里反推。 -->
     <div class="account card">
       <div class="acc">
         <span>账号</span>
@@ -66,7 +56,6 @@
         <span>流量</span>
         <b :class="{ 'acc-err': state.exceeded }">{{ trafficText }}</b>
       </div>
-      <!-- 余额与支付开关绑定：没有充值入口时显示它只会造成困惑 -->
       <div v-if="state.payment_enabled" class="acc">
         <span>余额</span>
         <b>¥ {{ ((state.balance_cents || 0) / 100).toFixed(2) }}</b>
@@ -74,15 +63,12 @@
     </div>
 
     <div v-if="message" class="banner" :class="messageType">{{ message }}</div>
-    <!-- 本地配置损坏：客户端会以「未登录」启动，必须说清原因，
-         否则用户只会以为凭据莫名其妙丢了。 -->
     <div v-if="state.config_error" class="banner warn">{{ state.config_error }}</div>
     <div v-if="!state.frpc_found" class="banner warn">
       未找到 frpc 可执行文件。请将 <b>frpc.exe</b> 放到程序同目录后重新打开客户端。
     </div>
 
     <div class="body">
-      <!-- 隧道列表 -->
       <section class="card tunnels">
         <div class="card-head">
           <span>隧道（{{ state.tunnels.length }}）</span>
@@ -100,7 +86,6 @@
           流量额度已用尽，隧道无法建立新连接。可使用兑换码增加额度，或联系管理员。
         </div>
 
-        <!-- 分组限制提示：提前告知，避免用户填完表单才被拒 -->
         <div v-if="groupHint" class="muted" style="margin-bottom: 10px">{{ groupHint }}</div>
 
         <div v-if="!state.tunnels.length" class="empty">
@@ -120,8 +105,6 @@
               {{ t.type.toUpperCase() }}
               <template v-if="t.bandwidth_limit_str"> · 限速 {{ t.bandwidth_limit_str }}</template>
             </div>
-            <!-- frpc 自己报的错。没有它的话，隧道一直停在「连接中」，
-                 而用户无从判断是凭据失效、地址写错还是网络不通。 -->
             <div v-if="t.last_error" class="tunnel-err">
               {{ t.last_error }}
               <template v-if="t.last_error_at"> · {{ fmtTime(t.last_error_at) }}</template>
@@ -131,8 +114,6 @@
           <div class="tunnel-addr">
             <span class="mono">{{ t.public_addr || '—' }}</span>
             <button v-if="t.public_addr" class="btn-ghost mini" @click="copy(t.public_addr)">复制</button>
-            <!-- 开关就是「这条隧道要不要连出去」：打开即拉起它自己的 frpc
-                 进程，关掉即停掉该进程并让服务端收回端口。 -->
             <button
               class="tunnel-toggle"
               :class="{ on: t.running }"
@@ -147,7 +128,6 @@
         </div>
       </section>
 
-      <!-- 日志 -->
       <section class="card logs">
         <div class="card-head">
           <span>运行日志</span>
@@ -164,7 +144,6 @@
       </section>
     </div>
 
-    <!-- ============ 新建隧道 ============ -->
     <div v-if="createOpen" class="modal" @click.self="createOpen = false">
       <div class="modal-card">
         <div class="modal-title">{{ createMode === 'batch' ? '批量新建隧道' : '新建隧道' }}</div>
@@ -174,8 +153,6 @@
             <input type="radio" value="single" v-model="createMode" />
             <span>单条</span>
           </label>
-          <!-- 批量创建是按端口展开的，而 HTTP/HTTPS 隧道没有公网端口、
-               靠域名区分，展开不了——因此这两类只提供单条创建。 -->
           <label v-if="!isWebType" :class="{ on: createMode === 'batch' }">
             <input type="radio" value="batch" v-model="createMode" />
             <span>批量（一串端口）</span>
@@ -221,9 +198,6 @@
           </em>
         </label>
 
-        <!-- 从本机监听的服务里点选。
-             多数用户并不知道自己的服务跑在哪个端口，让他们去查
-             是把程序该解决的问题推给了用户。 -->
         <div class="scan-wrap">
           <button class="btn-ghost mini" :disabled="scanning" @click="toggleScan">
             {{ scanning ? '正在扫描本机服务…' : showScan ? '收起服务列表' : '从本机服务中选择' }}
@@ -261,8 +235,6 @@
           <em class="muted">通常填 127.0.0.1；服务在别的机器上时填它的局域网 IP</em>
         </label>
 
-        <!-- HTTP/HTTPS 类隧道没有公网端口，靠域名区分。
-             服务端在域名与二级域名都为空时会直接拒绝，所以这个字段必须给。 -->
         <template v-if="isWebType">
           <label class="field">
             <span>二级域名</span>
@@ -276,7 +248,6 @@
           </div>
         </template>
 
-        <!-- 远程端口默认自动分配，放在「高级」里避免干扰 -->
         <label class="switch-line">
           <input type="checkbox" v-model="showAdvanced" />
           <span>我想指定公网端口</span>
@@ -298,7 +269,6 @@
       </div>
     </div>
 
-    <!-- ============ 兑换码 ============ -->
     <div v-if="redeemOpen" class="modal" @click.self="redeemOpen = false">
       <div class="modal-card">
         <div class="modal-title">使用兑换码</div>
@@ -326,14 +296,8 @@
       </div>
     </div>
 
-    <!-- 底部 -->
     <footer class="footer">
-      <!-- 这里曾经有个「启动客户端后自动连接」勾选框。它已经没有意义：
-           连接与否完全由每条隧道自己的开关决定（开关状态存在服务端），
-           客户端一打开就会跟上。留着只会让人以为「不勾就不会连」。 -->
       <div class="footer-right">
-        <!-- 版本号常驻显示：出问题时第一件事就是确认「跑的是哪个版本」，
-             藏进关于页反而多一步。 -->
         <span class="muted mono" v-if="state.version">{{ state.version }}</span>
         <span class="muted mono" v-if="state.config_path">{{ state.config_path }}</span>
         <button class="btn-ghost mini" @click="handleOpenDataDir">打开数据目录</button>
@@ -349,12 +313,7 @@ import { api } from '../bridge'
 const props = defineProps({
   state: { type: Object, required: true },
   logs: { type: Array, default: () => [] },
-  // 主进程推送的轻提示，例如「检测到配置变更，已自动同步并重新连接」
   notice: { type: Object, default: null },
-  // 这两个动作由 App 执行，以函数 prop 传入而不是 emit：
-  //   - 清空日志：只有 App 同时持有主进程缓冲、页面数组与待合并队列；
-  //   - 打开数据目录：后端会返回失败原因（没有文件管理器、被策略禁用）。
-  // 用 emit 的话拿不到返回值，失败原因就丢在半路，界面只能假装成功。
   clearLogs: { type: Function, required: true },
   openDataDir: { type: Function, required: true }
 })
@@ -365,7 +324,6 @@ const message = ref('')
 const messageType = ref('ok')
 const logBox = ref()
 
-// ---- 新建隧道 ----
 const createOpen = ref(false)
 const showAdvanced = ref(false)
 const dialogError = ref('')
@@ -379,7 +337,6 @@ const form = ref({
   subdomain: ''
 })
 
-/** 是否为 HTTP/HTTPS 类隧道。这两类没有公网端口，靠域名区分。 */
 const isWebType = computed(() => form.value.type === 'http' || form.value.type === 'https')
 
 const subdomainPlaceholder = computed(() => {
@@ -387,7 +344,6 @@ const subdomainPlaceholder = computed(() => {
   return d ? `例如 mc（访问地址将是 mc.${d}）` : '例如 mc'
 })
 
-/** 实时预览访问地址，让用户填之前就知道会得到什么。 */
 const subdomainPreview = computed(() => {
   const s = (form.value.subdomain || '').trim().toLowerCase()
   if (!s) return '（填写后显示）'
@@ -395,24 +351,13 @@ const subdomainPreview = computed(() => {
   return d ? `https://${s}.${d}` : `https://${s}`
 })
 
-// 切成 HTTP/HTTPS 时强制回到单条模式：批量是按端口展开的，
-// 而这两类隧道没有公网端口。
 watch(isWebType, (web) => {
   if (web) createMode.value = 'single'
 })
 
-// 'single' 单条 | 'batch' 批量（一串连续端口，游戏服常见）
 const createMode = ref('single')
-// 与服务端 MaxBatchTunnels 保持一致。前端提前告知，避免用户填了
-// 40 个端口、点提交才被拒。
 const MAX_BATCH = 20
 
-/**
- * 解析批量端口输入：支持范围、逗号、空格、换行。
- *
- * 范围展开要设护栏：用户手滑写成 1-65535 的话，不拦就会生成
- * 一个六万多元素的数组，并且把它发到服务端。
- */
 function parsePorts(text) {
   const out = []
   const seen = new Set()
@@ -438,7 +383,6 @@ function parsePorts(text) {
   return out
 }
 
-// ---- 本机服务探测 ----
 
 const showScan = ref(false)
 const scanning = ref(false)
@@ -446,10 +390,6 @@ const scanErr = ref('')
 const scanFilter = ref('')
 const services = ref([])
 
-/** 过滤后的服务列表。
- *
- * 不筛选时也截断：一台跑了一阵的机器上系统服务可能上百条，
- * 全部铺出来反而找不到自己要的那个。 */
 const filteredServices = computed(() => {
   const q = scanFilter.value.trim().toLowerCase()
   if (!q) return services.value.slice(0, 60)
@@ -464,8 +404,6 @@ async function toggleScan() {
     return
   }
   showScan.value = true
-  // 已经扫过就直接复用：反复扫描会启动 netstat 与 tasklist 两个进程，
-  // 在慢机器上有可见的卡顿。
   if (!services.value.length) {
     await scanServices()
   }
@@ -483,10 +421,7 @@ async function scanServices() {
   }
 }
 
-/** 选中一个服务，把端口、协议、监听地址一并带入表单。 */
 function pickService(s) {
-  // 批量模式下是「加入列表」而不是「替换」，否则选第二个服务时
-  // 会把第一个覆盖掉——而用户显然是想一次选好几个。
   if (createMode.value === 'batch') {
     const cur = parsePorts(form.value.portsText)
     if (cur.includes(s.port)) {
@@ -504,14 +439,10 @@ function pickService(s) {
 
   form.value.localPort = s.port
 
-  // 协议必须跟着服务走。选到 UDP 服务却建了 TCP 隧道是最典型的踩坑，
-  // 而现象是「隧道建好了但连不上」，用户基本不可能自己想到原因。
   if (allowedProtocols.value.includes(s.proto)) {
     form.value.type = s.proto
   }
 
-  // 监听在具体地址（非通配）上的服务，把地址也带过去；
-  // 否则会在隧道里填 127.0.0.1，而服务其实绑在局域网 IP 上，照样连不通。
   if (s.addr && s.addr !== '0.0.0.0' && s.addr !== '::') {
     form.value.localIp = s.addr === '::1' ? '127.0.0.1' : s.addr
   }
@@ -520,11 +451,9 @@ function pickService(s) {
   flash(`已选择 ${s.process || '服务'}（${s.port}/${s.proto.toUpperCase()}）`)
 }
 
-// ---- 兑换码 ----
 const redeemOpen = ref(false)
 const redeemCode = ref('')
 
-/** 分组允许的协议。服务端没下发分组时按全放行处理（老版本服务端的兼容）。 */
 const allowedProtocols = computed(() => {
   const raw = props.state.group?.allow_protocols
   if (!raw) return ['tcp', 'udp', 'http', 'https']
@@ -533,41 +462,29 @@ const allowedProtocols = computed(() => {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
 
-  // HTTPS 隧道与 HTTP 隧道的入口不是同一条：HTTP 走平台的 443（Caddy 终止
-  // TLS 后转发），HTTPS 需要平台在独立端口上做 SNI 透传，而那条入口只在
-  // 端到端模式下存在。没有入口时就把选项拿掉——留着它，用户只会建出一条
-  // 永远打不开的隧道，然后去查自己的证书和防火墙。
-  //
-  // 只在服务端明确下发 false 时才过滤：老版本服务端没有这个字段，
-  // 那时按原来的行为处理，不能因为字段缺失就把选项吃掉。
   if (props.state.group && props.state.group.https_tunnel_enabled === false) {
     return list.filter((p) => p !== 'https')
   }
   return list
 })
 
-/** HTTPS 隧道的公网入口（host:port），没有入口时为空。 */
 const httpsEntry = computed(() => props.state.group?.https_entry || '')
 
 const protocolLabel = (p) => ({ tcp: 'TCP', udp: 'UDP', http: 'HTTP（网站）', https: 'HTTPS（网站）' }[p] || p.toUpperCase())
 
-/** 可用协议的展示文案。 */
 const protocolText = computed(() => allowedProtocols.value.map((p) => p.toUpperCase()).join(' / '))
 
-/** 隧道数上限。0 表示不限，此时不显示分母。 */
 const maxTunnels = computed(() => {
   const n = props.state.group?.max_tunnels
   return n && n > 0 ? n : 0
 })
 
-/** 流量用量文案：有配额时显示「已用 / 配额」。 */
 const trafficText = computed(() => {
   const used = fmtBytes(props.state.traffic_used)
   const quota = Number(props.state.traffic_quota || 0)
   return quota > 0 ? `${used} / ${fmtBytes(quota)}` : used
 })
 
-/** 分组限制提示。为空表示不限，不显示。 */
 const groupHint = computed(() => {
   const g = props.state.group
   if (!g) return ''
@@ -578,7 +495,6 @@ const groupHint = computed(() => {
   return `当前分组「${g.name || '默认'}」：${parts.join('，')}`
 })
 
-/** 是否已达隧道数量上限。提前禁用按钮，避免用户填完才被拒。 */
 const atTunnelLimit = computed(() => {
   const max = props.state.group?.max_tunnels
   if (!max || max <= 0) return false
@@ -590,7 +506,6 @@ function openCreate() {
   showAdvanced.value = false
   createMode.value = 'single'
   scanFilter.value = ''
-  // 协议默认选分组允许的第一个，避免默认值恰好不被允许
   form.value = {
     name: '',
     type: allowedProtocols.value[0] || 'tcp',
@@ -603,12 +518,6 @@ function openCreate() {
   createOpen.value = true
 }
 
-/** 校验隧道名/名称前缀。
- *
- * 规则必须与服务端 normalizeInput 完全一致：1-32 位、仅字母数字与下划线、
- * 不能以 lt 开头。此前这里允许连字符、长度放到 64，于是用户按提示
- * 填「mc-server」会被服务端拒绝——提示与实际规则不符是最难自己
- * 搞明白的一类问题。 */
 function nameError(name) {
   if (!/^[A-Za-z0-9_]{1,32}$/.test(name)) {
     return '名称仅允许 1-32 位字母、数字或下划线（不支持连字符）'
@@ -640,9 +549,6 @@ async function submitCreate() {
     return
   }
 
-  // HTTP/HTTPS 必须有二级域名（服务端两者都为空时会直接拒绝）。
-  // 没填就用隧道名兜底：隧道名的字符集与二级域名完全一致，
-  // 而且这样用户少填一个字段就能建好，比报错让他重填更省事。
   if (isWebType.value && !(f.subdomain || '').trim()) {
     f.subdomain = name.toLowerCase()
   }
@@ -654,7 +560,6 @@ async function submitCreate() {
 
   busy.value = true
   try {
-    // remotePort 不填就不传（0 = 交给服务端自动分配）
     const next = await api.createTunnel(
       f.name.trim(),
       f.type,
@@ -673,10 +578,7 @@ async function submitCreate() {
   }
 }
 
-/** 批量创建。prefix 是名称前缀，端口从 portsText 解析。 */
 async function submitBatch(prefix) {
-  // 前缀上限 24 而不是 32：最终名字是「前缀_端口」，端口部分最多
-  // 5 位加分隔符共 6 位，要给它留位置。
   if (prefix.length > 24) {
     dialogError.value = '批量创建时名称前缀不能超过 24 位（需为端口部分留出位置）'
     return
@@ -708,8 +610,6 @@ async function submitBatch(prefix) {
     emit('update', next)
     createOpen.value = false
 
-    // 有失败时必须逐条说明。只说「创建完成」会让用户以为全都建好了，
-    // 而他会在一段时间之后才发现少了几条——那时更难回溯。
     const failed = res?.failures || []
     if (failed.length) {
       const detail = failed.map((x) => `${x.local_port}: ${x.reason}`).join('；')
@@ -727,9 +627,6 @@ async function submitBatch(prefix) {
 async function toggleTunnel(t) {
   busy.value = true
   try {
-    // 开关同时决定两件事：本机是否拉起这条隧道的 frpc 进程，
-    // 以及服务端是否把它算作「启用」（启用会开放端口，停用会收回）。
-    // 两者必须一起变，否则会出现「界面显示开着、实际连不上」。
     const next = t.running ? await api.stopTunnel(t.id) : await api.startTunnel(t.id)
     emit('update', next)
     flash(t.running ? `隧道「${t.name}」已断开，端口已收回` : `隧道「${t.name}」已连接，正在建立通道…`)
@@ -775,8 +672,6 @@ async function submitRedeem() {
     const [msg, next] = await api.redeem(code)
     emit('update', next)
     redeemOpen.value = false
-    // 服务端返回的文案已经区分了类型（流量 / 余额 / 分组），直接用它，
-    // 在客户端里猜类型容易说错。
     flash(msg || '兑换成功')
   } catch (e) {
     dialogError.value = typeof e === 'string' ? e : e?.message || '兑换失败，请检查兑换码'
@@ -788,16 +683,11 @@ async function submitRedeem() {
 
 
 const statusText = computed(() => {
-  // 顶部文案说的是「连上没有」，所以要用**已注册/在线**的条数，而不是
-  // 「进程起没起」：frpc 进程起来了、代理还在握手时，行内标签是「连接中」，
-  // 顶部若按进程数显示「已连接」就自相矛盾了。
   const tunnels = props.state.tunnels || []
   const connected = tunnels.filter((t) => t.status === 'active' && (t.registered || t.online)).length
   const started = tunnels.filter((t) => t.running).length
 
   if (connected > 0) {
-    // 进程数多于已连接数时说明还有隧道在握手，一并说明，避免用户以为
-    // 「顶部说连上了、为什么行内还在转」。
     if (started > connected) {
       return `已连接 ${connected} 条，${started - connected} 条连接中`
     }
@@ -808,7 +698,6 @@ const statusText = computed(() => {
   return '未连接'
 })
 
-/** 同步状态文案。让用户确信「网页端改的东西客户端已经跟上了」。 */
 const syncText = computed(() => {
   if (props.state.sync_err) return `自动同步异常：${props.state.sync_err}`
   if (!props.state.last_sync_at) return '尚未同步'
@@ -818,8 +707,6 @@ const syncText = computed(() => {
   return `每 20 秒自动同步 · 上次 ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 })
 
-// 自动同步在配置变化时会重启 frpc，必须让用户知道原因，
-// 否则「连接闪了一下」会被当成故障。
 watch(
   () => props.notice,
   (n) => {
@@ -828,9 +715,6 @@ watch(
 )
 
 const dotClass = computed(() => {
-  // 与顶部文案同源：绿点 = 至少有一条隧道真正连上了；黄点 = 进程起来了
-  // 但还在握手；红点 = 流量用尽。只看 state.running 的话，进程刚起来、
-  // 代理还没注册时会显示绿灯，与行内的「连接中」矛盾。
   const tunnels = props.state.tunnels || []
   if (tunnels.some((t) => t.status === 'active' && (t.registered || t.online))) return 'on'
   if (tunnels.some((t) => t.running)) return 'warn'
@@ -840,26 +724,14 @@ const dotClass = computed(() => {
 
 function tagText(t) {
   if (t.status !== 'active') return '已停用'
-  // running 是本机视角（进程在不在），online 是服务端视角（frps 有没有
-  // 收到这条代理），registered 是本机从 frpc 输出里读到的「代理已注册」。
-  // 三者分开说，用户才能区分「我没开」「开了还没通」「已经通了」。
   if (!t.running) return '未连接'
-  // registered 与 online 等效，但它**先到**：服务端的 online 要等采集
-  // （30 秒一轮）加客户端同步（20 秒一轮），等它的话用户会盯着「连接中」
-  // 等一整轮，误以为连不上。frpc 报告成功后标签立即翻转，服务端采集值
-  // 继续用于后续校准（掉线、被停用等情况仍以它为准）。
   if (t.registered || t.online) return '运行中'
-  // 有错误就不是「还在连」，而是「连不上」。这两者要给不同的提示：
-  // 前者让用户等，后者让用户去查（凭据、地址、网络）。
   if (t.last_error) return '连接失败'
-  // 带上已等待时长：frpc 活着却迟迟没注册成功时，只写「连接中」用户
-  // 分不清是刚起步还是卡了很久。
   const waited = Number(t.pending_seconds || 0)
   if (waited > 0) return `连接中 · ${fmtWaited(waited)}`
   return '连接中'
 }
 
-/** 把秒数格式化成「12 秒 / 3 分 5 秒」，用于连接耗时展示。 */
 function fmtWaited(sec) {
   if (sec < 60) return `${sec} 秒`
   const m = Math.floor(sec / 60)
@@ -873,13 +745,6 @@ function tagClass(t) {
   return t.last_error ? 'tag-err' : 'tag-warn'
 }
 
-/**
- * 状态标签的悬停说明。
- *
- * 主要是解释「本机已注册、服务端状态还没跟上」这一种：标签已经是
- * 「运行中」，而服务端采集值可能还是上一轮的 false，管理员在后台看到
- * 的会略滞后。说清楚就不必去猜哪个才准。
- */
 function tagHint(t) {
   if (t.status !== 'active') return '这条隧道已在控制台停用'
   if (!t.running) return '本机没有为这条隧道运行 frpc'
@@ -888,8 +753,6 @@ function tagHint(t) {
   }
   if (t.online) return '服务端已确认这条代理在线'
   if (t.last_error) return '最近一次错误：' + t.last_error
-  // 长时间没连上又没有报错：给出排查方向，而不是让用户干等。
-  // 注意不在这里重启进程——frpc 自己还在重连，打断反而更慢。
   const waited = Number(t.pending_seconds || 0)
   if (waited >= 60) {
     return `已等待 ${fmtWaited(waited)}，仍未见注册成功。请检查服务端地址是否可达、` +
@@ -898,7 +761,6 @@ function tagHint(t) {
   return waited > 0 ? `正在连接，已等待 ${fmtWaited(waited)}` : '正在连接'
 }
 
-/** 把时间戳格式化成 HH:MM:SS，用于「最后一次失败发生在什么时候」。 */
 function fmtTime(value) {
   if (!value) return ''
   const d = new Date(value)
@@ -932,8 +794,6 @@ async function run(fn, successText) {
   busy.value = true
   try {
     const next = await fn()
-    // 只有真的返回了新状态才派发。像「打开数据目录」这类动作没有状态可更新，
-    // 无条件派发会让 App 收到 undefined 再白跑一次 loadState。
     if (next !== undefined) emit('update', next)
     if (successText) flash(successText)
   } catch (e) {
@@ -943,20 +803,10 @@ async function run(fn, successText) {
   }
 }
 
-// 曾经有个「立即同步」按钮，现已移除：自动同步每 20 秒跑一次，
-// 手动触发最快也只是省下这几秒，却要用户理解「为什么还需要点它」。
-// 后端接口保留（api.refresh 仍可用），需要时能随时加回入口。
 const logout = () => run(() => api.logout())
 
-// 交给 App 处理：它同时持有主进程缓冲、页面数组与待合并队列三份状态，
-// 只在这里调 api.clearLogs() 的话，页面上的旧行会留在原地。
-//
-// 但「提示成功」必须等它真的清完：以前是先 flash 再 emit，清空过程中
-// 一旦出错，用户看到的仍是一句「日志已清空」——看起来像成功，实则没有。
 const handleClearLogs = () => run(props.clearLogs, '日志已清空')
 
-// 打开目录可能失败（没有文件管理器、被组策略禁用、数据目录不存在），
-// 后端把原因放在 error 里带回来，这里原样提示给用户。
 const handleOpenDataDir = () => run(props.openDataDir)
 
 async function copy(text) {
@@ -968,7 +818,6 @@ async function copy(text) {
   }
 }
 
-// 日志自动滚到底部。
 watch(
   () => props.logs.length,
   async () => {
@@ -1018,7 +867,6 @@ watch(
   box-shadow: 0 0 0 4px rgba(203, 213, 225, 0.2);
 }
 
-/* 进程已启动、代理还在握手：与行内「连接中」的黄色标签保持一致。 */
 .dot.warn {
   background: #f59e0b;
   box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.18);
@@ -1124,8 +972,6 @@ watch(
   margin-bottom: 4px;
 }
 
-/* frpc 的报错原文。用等宽字体并允许换行：里面常常是英文错误串，
-   截断掉关键部分（比如状态码）反而没用。 */
 .tunnel-err {
   margin-top: 4px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1178,7 +1024,6 @@ watch(
 .footer {
   display: flex;
   align-items: center;
-  /* 只剩右侧一组内容了，靠右对齐 */
   justify-content: flex-end;
   flex-shrink: 0;
   padding: 0 4px;
@@ -1196,7 +1041,6 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* ---- 账户信息条 ---- */
 
 .account {
   display: flex;
@@ -1230,18 +1074,14 @@ watch(
   user-select: text;
 }
 
-/* 流量超额时用红色点出来——这是最需要用户立刻知道的一件事 */
 .acc-err {
   color: #b91c1c;
 }
 
-/* 同步异常时用暖色提示，但不用红色报错样式：
-   网络抖动是常态，每 20 秒闪一次红色会让人以为坏了。 */
 .sync-warn {
   color: #b45309;
 }
 
-/* ---- 本机服务选择 ---- */
 
 .scan-wrap {
   margin: -6px 0 14px;
@@ -1260,7 +1100,6 @@ watch(
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   overflow-y: auto;
-  /* 系统服务可能有上百条，限高避免把对话框撑到屏幕外 */
   max-height: 230px;
   background: #fff;
 }
@@ -1340,7 +1179,6 @@ watch(
   line-height: 1.7;
 }
 
-/* ---- 弹层（新建隧道 / 兑换码）---- */
 
 .modal {
   position: fixed;
@@ -1417,8 +1255,6 @@ watch(
   border-color: #2563eb;
 }
 
-/* HTTPS 自动签发说明。用中性偏正面的样式而不是警告色：
-   这是一件好事（用户不用配证书），不该看起来像风险提示。 */
 .https-note {
   margin: -4px 0 14px;
   padding: 9px 12px;
@@ -1430,7 +1266,6 @@ watch(
   color: #166534;
 }
 
-/* ---- 单条 / 批量 切换 ---- */
 
 .mode-switch {
   display: flex;
@@ -1480,8 +1315,6 @@ watch(
   cursor: pointer;
 }
 
-/* 弹层内的错误提示。用后代选择器限定作用域，
-   避免与页面其他位置的 .error 互相影响。 */
 .modal-card .error {
   background: #fee2e2;
   color: #b91c1c;
@@ -1501,15 +1334,11 @@ watch(
   background: #fef2f2;
 }
 
-/* 隧道地址行最多有四个控件（复制/开关/删除 + 地址），
-   窄窗口下允许换行，避免把地址挤没。 */
 .tunnel-addr {
   flex-wrap: wrap;
   justify-content: flex-end;
 }
 
-/* 隧道开关。用按钮而不是 checkbox：它表达的是一个动作
-   （拉起/停掉这条隧道的进程），不是一个会被表单提交的选项。 */
 .tunnel-toggle {
   position: relative;
   width: 40px;

@@ -1,10 +1,3 @@
-// Package localsvc 枚举本机正在监听的服务，供用户在建隧道时点选。
-//
-// 独立成子包而不是放在 main 里：main 包有 `//go:embed frontend/dist`，
-// 没构建前端就无法编译，也就无法运行测试。而这里最容易坏掉的恰好是
-// 解析逻辑——netstat 与 tasklist 的输出格式一旦变化，解析会静默地
-// 返回错误结果（少了几个条目、进程名串行），不会报任何错。
-// 解析能单测，这类问题才有机会被拦住。
 package localsvc
 
 import (
@@ -13,30 +6,15 @@ import (
 	"strings"
 )
 
-// Service 是本机一个正在监听的服务。
-//
-// 存在的理由：用户往往**不知道自己的服务监听在哪个端口**。
-// 让他手填端口，等于要求他先学会用 netstat——这是把一个
-// 本该由程序解决的问题推给了用户。
 type Service struct {
-	Port  int    `json:"port"`
-	Proto string `json:"proto"`
-	// Addr 是监听地址（0.0.0.0 / 127.0.0.1 / ::）。空表示通配。
-	Addr string `json:"addr"`
-	// PID 与 Process 一起用于让用户辨认「这是哪个程序」。
-	// 端口数字对多数用户没有意义，进程名才有。
-	PID     int    `json:"pid"`
-	Process string `json:"process"`
-	// Recommended 表示这个端口看起来像是用户自己跑的服务（而非系统组件）。
-	//
-	// 判据刻意保守，只用于**排序靠前**，不用于过滤——
-	// 猜错了顶多排序不理想，而过滤错了会让用户找不到自己的服务。
-	Recommended bool `json:"recommended"`
+	Port        int    `json:"port"`
+	Proto       string `json:"proto"`
+	Addr        string `json:"addr"`
+	PID         int    `json:"pid"`
+	Process     string `json:"process"`
+	Recommended bool   `json:"recommended"`
 }
 
-// SplitHostPort 拆解 netstat 输出的 Local Address 列。
-//
-// 取值形如：0.0.0.0:135 / 127.0.0.1:25565 / [::]:135 / [::1]:25565
 func SplitHostPort(s string) (host string, port int, ok bool) {
 	i := strings.LastIndexByte(s, ':')
 	if i < 0 {
@@ -53,12 +31,6 @@ func SplitHostPort(s string) (host string, port int, ok bool) {
 	return host, p, true
 }
 
-// ParseNetstat 解析 `netstat -ano` 的输出。
-//
-// 两种行的列数不同，不能按固定下标取：
-//
-//	TCP  0.0.0.0:135  0.0.0.0:0  LISTENING  1234     ← 5 列
-//	UDP  0.0.0.0:500  *:*                   9012     ← 4 列（UDP 没有状态列）
 func ParseNetstat(out string) []Service {
 	seen := make(map[string]bool)
 	list := make([]Service, 0, 32)
@@ -80,8 +52,6 @@ func ParseNetstat(out string) []Service {
 
 		var pid int
 		if proto == "tcp" {
-			// 只收 LISTENING：ESTABLISHED 是「连出去」的连接，
-			// 把它们列出来会让用户误以为那是可以映射的本机服务。
 			if len(f) < 5 || !strings.EqualFold(f[3], "LISTENING") {
 				continue
 			}
@@ -90,15 +60,6 @@ func ParseNetstat(out string) []Service {
 			pid, _ = strconv.Atoi(f[3])
 		}
 
-		// 去重键必须带上绑定地址与 PID。
-		//
-		// 只按「协议 + 端口」去重会把**真实存在**的不同绑定合并掉：同一个
-		// 端口可能同时被两个进程监听在不同地址上（例如 127.0.0.1:8080 是
-		// 用户的开发服务器、192.168.x.x:8080 是另一份实例），只留一条会让
-		// 用户看不到自己想映射的那个。
-		//
-		// 但 0.0.0.0 与 :: 是同一份「监听所有地址」在 v4/v6 下的两种写法，
-		// 必须归一成同一类，否则又是两份一模一样的条目。
 		key := proto + "|" + strconv.Itoa(port) + "|" + strconv.Itoa(pid) + "|" + addrClass(host)
 		if seen[key] {
 			continue
@@ -116,10 +77,6 @@ func ParseNetstat(out string) []Service {
 	return list
 }
 
-// addrClass 把绑定地址归一成去重用的类别。
-//
-// 空串（netstat 的 0.0.0.0）、0.0.0.0、:: 都是「全部地址」，归为 any；
-// 其余保留原值，从而区分回环、具体网卡地址等真实不同的绑定。
 func addrClass(host string) string {
 	switch host {
 	case "", "0.0.0.0", "::", "[::]":
@@ -128,22 +85,18 @@ func addrClass(host string) string {
 	return host
 }
 
-// LooksUserService 猜测这个端口是不是用户自己跑的服务。
 func LooksUserService(port int, host string) bool {
-	// 系统组件极少绑在回环地址上，而用户自己的服务基本都是。
 	if host == "127.0.0.1" || host == "::1" || host == "localhost" {
 		return true
 	}
-	// 高位端口：用户服务最集中的区间
 	if port >= 10000 {
 		return true
 	}
 	switch port {
-	case 135, 139, 445, 5040, 5357, 7680, // Windows 系统组件
-		1900, 3702, 5353, 5355: // 各种服务发现协议
+	case 135, 139, 445, 5040, 5357, 7680,
+		1900, 3702, 5353, 5355:
 		return false
 	}
-	// 常见数据库与 Web 服务的默认端口，多半是用户自己装的
 	switch port {
 	case 3306, 5432, 6379, 27017, 8080, 8443, 8000, 9000:
 		return true
@@ -151,11 +104,6 @@ func LooksUserService(port int, host string) bool {
 	return false
 }
 
-// ParseTasklist 解析 `tasklist /FO CSV /NH`。
-//
-// 每行形如（引号是 CSV 的，不属于数据）：
-//
-//	"svchost.exe","1234","Services","0","12,345 K"
 func ParseTasklist(out string) map[int]string {
 	names := make(map[int]string, 128)
 	for _, line := range strings.Split(out, "\n") {
@@ -163,8 +111,6 @@ func ParseTasklist(out string) map[int]string {
 		if line == "" {
 			continue
 		}
-		// 按 `","` 切分而不是按逗号：内存占用那列本身含逗号（"12,345 K"），
-		// 按逗号切会把它拆成两列，后续字段全部错位。
 		parts := strings.Split(line, `","`)
 		if len(parts) < 2 {
 			continue
@@ -183,7 +129,6 @@ func ParseTasklist(out string) map[int]string {
 	return names
 }
 
-// Sort 排序：推荐的在最前，然后按端口升序。
 func Sort(list []Service) {
 	sort.SliceStable(list, func(i, j int) bool {
 		if list[i].Recommended != list[j].Recommended {

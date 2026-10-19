@@ -10,19 +10,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 这个文件守两件事：
-//
-//  1. 删除分组不得留下「无法兑换」的升级码——GenerateCodes 允许生成指向
-//     现存分组的码，分组一删这些码就在兑换时报「无效」，用户拿着永远
-//     用不掉的码。必须在删除前拦下。
-//  2. 批次号在同一秒内两次生成不得撞号——管理页按批次号筛选，
-//     撞号的两批码在批次维度就失去了意义。
-
-// TestGroupCodeRefusedWhenMembershipExpired 覆盖「分组码对已过期用户白烧」。
-//
-// 分组码只切换分组、不带时长；而分组已过期时用户此刻实际按默认分组生效。
-// 这时若照常写入 group_id，到期调度马上会把它迁回默认组——码被核销、
-// 界面还提示「升级成功」。所以要在核销之前拒绝，让用户先兑换时长码。
 func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -53,8 +40,6 @@ func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
 	if err == nil {
 		t.Fatal("分组有效期已过时兑换分组码应被拒绝（否则码被核销、用户仍被回落默认组）")
 	}
-	// 必须是业务错误：普通 error 会掉进统一错误处理的 500 分支，
-	// 用户看到「服务内部错误」而不是「先兑换时长码」。
 	if !errors.Is(err, ErrMembershipExpired) {
 		t.Fatalf("应返回 ErrMembershipExpired（映射为 400），实际: %v", err)
 	}
@@ -62,7 +47,6 @@ func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
 		t.Fatalf("错误信息应说明有效期已过，实际: %v", err)
 	}
 
-	// 关键：码不能被核销，用户先兑换时长码之后还能用它。
 	var after model.RedeemCode
 	if err := svc.DB.First(&after, code.ID).Error; err != nil {
 		t.Fatal(err)
@@ -79,11 +63,6 @@ func TestGroupCodeRefusedWhenMembershipExpired(t *testing.T) {
 	}
 }
 
-// TestDurationThenGroupCodeApplies 覆盖「先时长码、再分组码」的完整流程。
-//
-// 这是「分组码 + 时长码分开兑换」模型下用户应当走的路径：
-// 过期用户先买时长（把有效期续上），再兑换分组码切换分组；
-// 期间到期调度不得把刚升上去的分组迁回默认组。
 func TestDurationThenGroupCodeApplies(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -120,7 +99,6 @@ func TestDurationThenGroupCodeApplies(t *testing.T) {
 	if _, err := svc.Redeem(u.ID, dur.Code, "127.0.0.1"); err != nil {
 		t.Fatalf("兑换时长码失败: %v", err)
 	}
-	// 到期调度此时不该迁走用户（有效期已在未来）。
 	svc.refreshGuardDue()
 
 	if _, err := svc.Redeem(u.ID, grp.Code, "127.0.0.1"); err != nil {
@@ -129,7 +107,6 @@ func TestDurationThenGroupCodeApplies(t *testing.T) {
 	svc.refreshGuardDue()
 
 	var got model.User
-	// 必须预加载分组：EffectiveGroup 读的是关联对象，没预加载会回落到默认分组。
 	if err := svc.DB.Preload("Group").First(&got, u.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +143,6 @@ func TestDeleteGroupRefusedWhileUnusedGroupCodesExist(t *testing.T) {
 	if !strings.Contains(err.Error(), "升级码") {
 		t.Fatalf("错误信息应指出升级码问题，实际: %v", err)
 	}
-	// 分组必须还在：拒绝删除不是走个过场。
 	var cnt int64
 	if err := svc.DB.Model(&model.Group{}).Where("id = ?", g.ID).Count(&cnt).Error; err != nil {
 		t.Fatal(err)
@@ -175,8 +151,6 @@ func TestDeleteGroupRefusedWhileUnusedGroupCodesExist(t *testing.T) {
 		t.Fatal("分组不应被删除")
 	}
 
-	// 码用尽之后（状态变 used_up）就可以删了：
-	// 已用尽的码不能再兑换，指向已删除分组对它没有影响。
 	code.Status = model.RedeemStatusUsedUp
 	if err := svc.DB.Save(code).Error; err != nil {
 		t.Fatalf("核销码失败: %v", err)
@@ -203,10 +177,6 @@ func TestDeleteGroupRefusedWhileGroupHasUsers(t *testing.T) {
 	}
 }
 
-// TestGenerateCodesBatchNoUniqueWithinSameSecond 覆盖批次号撞号。
-//
-// 原实现只用秒级时间戳：同一秒点两次「生成」，两批码共用一个批次号，
-// 管理页按批次筛选时混在一起。这里在无 sleep 的连续调用下断言两批不同。
 func TestGenerateCodesBatchNoUniqueWithinSameSecond(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -226,13 +196,11 @@ func TestGenerateCodesBatchNoUniqueWithinSameSecond(t *testing.T) {
 	if first[0].BatchNo == second[0].BatchNo {
 		t.Fatalf("同一秒内两批的批次号不应相同，实际均为 %s", first[0].BatchNo)
 	}
-	// 批次号仍应以 B + 时间开头：按时间前缀筛选的用法不能被破坏。
 	if !strings.HasPrefix(first[0].BatchNo, "B") || len(first[0].BatchNo) < 15 {
 		t.Fatalf("批次号格式异常: %s", first[0].BatchNo)
 	}
 }
 
-// TestGenerateCodesValueCapRejected 覆盖生成侧的面值上限。
 func TestGenerateCodesValueCapRejected(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -256,11 +224,6 @@ func TestGenerateCodesValueCapRejected(t *testing.T) {
 	}
 }
 
-// TestRedeemOverflowRejected 覆盖兑换侧的溢出兜底。
-//
-// 生成侧的面值上限管不住已存在的老数据：直接往库里塞一张超上限的码
-// （绕过 GenerateCodes 的校验，模拟历史数据），兑换必须拒绝，
-// 且码不能被核销——事务回滚后它还得能正常兑换。
 func TestRedeemOverflowRejected(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -282,7 +245,6 @@ func TestRedeemOverflowRejected(t *testing.T) {
 		t.Fatalf("溢出兑换应被拒绝，实际 %v", err)
 	}
 
-	// 拒绝后码必须原样保留：核销随事务回滚。
 	var after model.RedeemCode
 	if err := svc.DB.First(&after, code.ID).Error; err != nil {
 		t.Fatal(err)
@@ -299,11 +261,6 @@ func TestRedeemOverflowRejected(t *testing.T) {
 	}
 }
 
-// TestRedeemDurationStacksSequentially 覆盖时长码的顺延。
-//
-// 顺延基于「现有到期时间」：第二张必须从第一张的结果继续叠加，
-// 而不是各自从当前时间起算。行锁保证并发兑换时读到的也是前一张
-// 提交后的值（并发本身无法在 SQLite 单连接下复现，这里守住语义）。
 func TestRedeemDurationStacksSequentially(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -332,14 +289,12 @@ func TestRedeemDurationStacksSequentially(t *testing.T) {
 	if err := svc.DB.First(&got, u.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	// 10 天 + 30 + 30，允许几秒的时钟误差。
 	want := base.AddDate(0, 0, 60)
 	if diff := got.GroupExpireAt.Sub(want); diff > 2*time.Minute || diff < -2*time.Minute {
 		t.Fatalf("到期时间应顺延到 %v，实际 %v", want, *got.GroupExpireAt)
 	}
 }
 
-// TestAdminSetUserGroupWithMissingGroupFails 覆盖「分配时分组已不存在」。
 func TestAdminSetUserGroupWithMissingGroupFails(t *testing.T) {
 	svc := newTestServices(t, nil)
 

@@ -18,8 +18,6 @@
             </el-form-item>
 
             <el-form-item label="邮箱" prop="email">
-              <!-- 启用邮件后邮箱只读：换地址要走「验证新邮箱」的流程，
-                   否则拿到被盗会话的人可以先把邮箱改成自己的，再用找回密码接管账号 -->
               <el-input v-model="form.email" :disabled="mailEnabled" placeholder="选填，用于后续找回账号" />
               <div class="lt-muted hint">
                 <template v-if="mailEnabled">邮箱用于找回密码。更换需要验证新地址，请点右侧「更换邮箱」。</template>
@@ -59,7 +57,6 @@
             <el-descriptions-item label="分组到期">
               {{ profile?.group_expire_at ? formatTime(profile.group_expire_at) : '长期有效' }}
             </el-descriptions-item>
-            <!-- 余额只在站点启用支付后展示：没有充值入口时它没有任何操作意义 -->
             <el-descriptions-item v-if="paymentEnabled" label="账户余额">
               ¥ {{ ((profile?.balance || 0) / 100).toFixed(2) }}
             </el-descriptions-item>
@@ -144,10 +141,7 @@ import { useCountdown } from '../composables/useCountdown'
 
 const props = defineProps({ profile: Object })
 const router = useRouter()
-// 站点是否启用支付。未启用时不展示余额（没有充值入口，显示它只会造成困惑）。
 const paymentEnabled = ref(false)
-// 站点是否启用邮件。启用后邮箱能用来找回密码，因此**不能**直接改，
-// 必须走「验证新地址」的流程（服务端同样会拒绝直接改）。
 const mailEnabled = ref(false)
 
 onMounted(async () => {
@@ -171,10 +165,8 @@ const deleteVisible = ref(false)
 const deletePassword = ref('')
 const deleting = ref(false)
 
-// 更换邮箱（两步：发码到新地址 → 带码换绑）。
 const emailVisible = ref(false)
 const emailForm = reactive({ email: '', password: '', code: '' })
-// 倒计时在组件卸载时自动清理（见 useCountdown）。
 const { countdown: emailCountdown, start: startEmailCountdown, stop: stopEmailCountdown } = useCountdown()
 const sendingEmail = ref(false)
 const confirmingEmail = ref(false)
@@ -259,7 +251,6 @@ const pwdRules = {
   ]
 }
 
-// 资料加载完成后回填表单。
 watch(
   () => props.profile,
   (p) => {

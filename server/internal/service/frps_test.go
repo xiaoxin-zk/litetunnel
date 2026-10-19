@@ -15,7 +15,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 )
 
-// newTestFrps 起一个假的 frps 管理接口，返回指向它的客户端。
 func newTestFrps(t *testing.T, handler http.HandlerFunc) *FrpsClient {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -27,19 +26,10 @@ func newTestFrps(t *testing.T, handler http.HandlerFunc) *FrpsClient {
 	})
 }
 
-// frpsOK 按 frps v0.71 的**真实**成功响应包一层。
-//
-// 成功码是 200，不是 0。这个细节必须由 fixture 如实反映：上一版实现按
-// `code != 0` 判错，而 fixture 又全用 `code:0`，于是「把成功当失败」这个
-// 缺陷被测试完美地掩盖了——测试全绿，线上一条隧道也显示不了在线。
 func frpsOK(data string) string {
 	return `{"code":200,"msg":"success","data":` + data + `}`
 }
 
-// TestListProxiesParsesFrpsV071Response 是本组测试的主用例。
-//
-// fixture 逐字来自线上 frps v0.71 的实测响应：成功码 200，分页对象包在
-// data 里，代理名带 user 前缀，状态在 status.phase。
 func TestListProxiesParsesFrpsV071Response(t *testing.T) {
 	const body = `{"code":200,"msg":"success","data":{"total":1,"page":1,"pageSize":200,"items":[{"name":"lt_u1.mc","status":{"phase":"online"}}]}}`
 
@@ -61,7 +51,6 @@ func TestListProxiesParsesFrpsV071Response(t *testing.T) {
 	if proxies[0].Name != "lt_u1.mc" {
 		t.Errorf("代理名 = %q，期望 lt_u1.mc", proxies[0].Name)
 	}
-	// 这一条就是客户端「运行中/连接中」的来源。
 	if !IsProxyOnline(proxies[0].Status.Phase) {
 		t.Errorf("phase=%q 应判为在线", proxies[0].Status.Phase)
 	}
@@ -70,7 +59,6 @@ func TestListProxiesParsesFrpsV071Response(t *testing.T) {
 	}
 }
 
-// TestListProxiesParsesFullProxyFields 覆盖代理对象的各个字段。
 func TestListProxiesParsesFullProxyFields(t *testing.T) {
 	body := frpsOK(`{"total":2,"page":1,"pageSize":200,"items":[
 		{"name":"lt_u1.mc","user":"lt_u1","clientID":"2cf2d682ced5530b",
@@ -103,9 +91,6 @@ func TestListProxiesParsesFullProxyFields(t *testing.T) {
 	}
 }
 
-// TestListProxiesAcceptsSuccessCodeWithoutMsg 覆盖成功码 + 缺 msg。
-//
-// msg 只是给人看的字符串，缺失不影响成功判定；code 缺失才致命。
 func TestListProxiesAcceptsSuccessCodeWithoutMsg(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"code":200,"data":{"total":0,"page":1,"pageSize":200,"items":[]}}`))
@@ -119,10 +104,6 @@ func TestListProxiesAcceptsSuccessCodeWithoutMsg(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsMalformedResponses 覆盖所有「读不懂响应」的情况。
-//
-// 共同要求只有一条：**返回错误，而不是空列表**。返回空列表会让采集器
-// 把所有隧道判成离线——那正是这次故障的表现，而且日志里毫无线索。
 func TestListProxiesRejectsMalformedResponses(t *testing.T) {
 	cases := []struct {
 		name string
@@ -130,11 +111,8 @@ func TestListProxiesRejectsMalformedResponses(t *testing.T) {
 	}{
 		{"非成功码（401）", `{"code":401,"msg":"unauthorized","data":null}`},
 		{"非成功码但带 data", `{"code":1001,"msg":"invalid token","data":{"total":0,"items":[]}}`},
-		// 曾经把 code 解成普通 int，缺字段默认成 0；如果 data 恰好合法
-		// 就会被当成成功放行，而我们对这份响应其实一无所知。
 		{"缺 code 但有合法 data", `{"msg":"success","data":{"total":0,"items":[]}}`},
 		{"code 为 null", `{"code":null,"data":{"total":0,"items":[]}}`},
-		// frps 的成功码是 200，0 不是成功码。
 		{"code 为 0", `{"code":0,"msg":"","data":{"total":0,"items":[]}}`},
 		{"缺 data", `{"code":200,"msg":"success"}`},
 		{"data 为 null", `{"code":200,"msg":"success","data":null}`},
@@ -159,7 +137,6 @@ func TestListProxiesRejectsMalformedResponses(t *testing.T) {
 	}
 }
 
-// TestListProxiesNonOKStatusIsError 覆盖 HTTP 层错误。
 func TestListProxiesNonOKStatusIsError(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -170,10 +147,6 @@ func TestListProxiesNonOKStatusIsError(t *testing.T) {
 	}
 }
 
-// TestListProxiesEmptyListIsValid 是上面那组用例的反面。
-//
-// 「合法但为空」必须与「读不懂」区分开：前者意味着 frps 明确告诉我们
-// 当前没有任何代理（所有客户端都停了），此时把隧道判为离线才是对的。
 func TestListProxiesEmptyListIsValid(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(frpsOK(`{"total":0,"page":1,"pageSize":200,"items":[]}`)))
@@ -187,9 +160,6 @@ func TestListProxiesEmptyListIsValid(t *testing.T) {
 	}
 }
 
-// TestListProxiesFollowsPagination 覆盖分页：代理数超过一页时必须继续取。
-//
-// 漏掉后续页的表现是「部分隧道显示离线」，比全空更难发现。
 func TestListProxiesFollowsPagination(t *testing.T) {
 	var mu sync.Mutex
 	var pages []string
@@ -222,9 +192,6 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	// 3 次 = 第 1 页 + 第 2 页 + 收尾复检第 1 页（见 recheckFirstPage）。
-	// 复检是缺陷 10 的修复：分页接口没有稳定快照，不复核第一页就发现不了
-	// 「删一条 + 加一条、total 不变」的错位。它只加一次请求、与页数无关。
 	if len(pages) != 3 {
 		t.Fatalf("请求了 %d 页，期望 3 次（2 页 + 1 次复检），实际序列 %v", len(pages), pages)
 	}
@@ -236,17 +203,10 @@ func TestListProxiesFollowsPagination(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsShortPageWithRemainingTotal 覆盖「短页但 total 未满足」。
-//
-// frps 报 total=350 却在第 100 条处提前结束：短页原先会被当成「读完了」，
-// 没读到的 250 条凭空消失，采集器把那些隧道判成离线。必须报错，
-// 让调用方保住上一轮的在线状态。
 func TestListProxiesRejectsShortPageWithRemainingTotal(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		items := make([]string, 0, 100)
 		for i := 0; i < 100; i++ {
-			// 名字必须互不相同：重复项属于另一类「结果不可信」，
-			// 本用例要验证的是短页判定，别让重复检测抢先命中。
 			items = append(items, fmt.Sprintf(`{"name":"lt_u1.x%d","status":{"phase":"online"}}`, i))
 		}
 		fmt.Fprintf(w, `{"code":200,"msg":"success","data":{"total":350,"page":1,"pageSize":200,"items":[%s]}}`,
@@ -264,11 +224,6 @@ func TestListProxiesRejectsShortPageWithRemainingTotal(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsMissingTotalWithEmptyItems 覆盖「缺 total + 空 items」。
-//
-// total 解成普通 int 时缺字段会默认 0，配上空 items 就成了「frps 明确告诉我们
-// 没有任何代理」——采集器据此把所有隧道判成离线，而真实情况是我们没读懂响应。
-// 必须与「total: 0 且 items 为空」区分开。
 func TestListProxiesRejectsMissingTotalWithEmptyItems(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"code":200,"msg":"success","data":{"page":1,"pageSize":200,"items":[]}}`))
@@ -285,10 +240,6 @@ func TestListProxiesRejectsMissingTotalWithEmptyItems(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsMissingTotalWithShortPage 覆盖「total 缺失 + 短页」。
-//
-// total 缺失会被解码成 0，任何短页原先都「满足完成条件」。
-// 除「total=0 且整页为空」这个明确的空列表外，一律不采信。
 func TestListProxiesRejectsMissingTotalWithShortPage(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"code":200,"msg":"success","data":{"page":1,"pageSize":200,"items":[{"name":"lt_u1.mc","status":{"phase":"online"}}]}}`))
@@ -298,11 +249,6 @@ func TestListProxiesRejectsMissingTotalWithShortPage(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsOversizedTotalReport 覆盖「对端报了荒谬的 total」。
-//
-// 上限本身按 total 推算（默认 500 页 × 200 条 = 10 万），超过就提前报错，
-// 不必真的翻满 500 页。旧实现是写死 50 页：代理数一过一万，采集就永久失败，
-// 而表现只是「在线状态停在旧值」。
 func TestListProxiesRejectsOversizedTotalReport(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -337,10 +283,6 @@ func TestListProxiesRejectsOversizedTotalReport(t *testing.T) {
 	}
 }
 
-// TestListProxiesSupportsManyPages 覆盖「代理数超过旧的一万条上限」。
-//
-// 页数必须按 total 推算：12000 条（60 页）应当能完整取回。
-// 旧实现取满 50 页就报错，规模一过线采集永久失效。
 func TestListProxiesSupportsManyPages(t *testing.T) {
 	const total = 12000
 
@@ -368,11 +310,6 @@ func TestListProxiesSupportsManyPages(t *testing.T) {
 	}
 }
 
-// TestListProxiesRejectsDuplicateNames 覆盖「同一代理在两页里各出现一次」。
-//
-// 重复项不能「尽力去重」了事：runtime 是按条累加流量的，同一条代理出现两次
-// 就会把同一段流量计两遍。整轮结果一律作废（重取一次后仍重复就报错），
-// 调用方保住上一轮的在线状态与采样基线。
 func TestListProxiesRejectsDuplicateNames(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		page := r.URL.Query().Get("page")
@@ -396,10 +333,6 @@ func TestListProxiesRejectsDuplicateNames(t *testing.T) {
 	}
 }
 
-// TestListProxiesDetectsTotalChangeMidPagination 覆盖「翻页期间 total 变了」。
-//
-// 说明这两页看到的不是同一份集合：可能漏、也可能重。整轮作废重取，
-// 仍然不稳定就报错（宁可这一轮不采，也不能拿它去重建在线状态）。
 func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -407,16 +340,14 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 	c := newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		requests++
-		round := (requests - 1) / 2 // 每轮两页
+		round := (requests - 1) / 2
 		mu.Unlock()
 
 		page := r.URL.Query().Get("page")
-		// 第一页说 201 条，第二页却说 202 条：这两页看到的不是同一份集合。
 		total := 201
 		if page == "2" {
 			total = 202
 		}
-		// 名字按轮次+页次区分，避免「重复」抢先命中。
 		items := make([]string, 0, frpsPageSize)
 		count := frpsPageSize
 		if page == "2" {
@@ -447,26 +378,6 @@ func TestListProxiesDetectsTotalChangeMidPagination(t *testing.T) {
 	}
 }
 
-// TestListProxiesDetectsCollectionChangeWithSameTotal 覆盖「删一条 + 加一条、
-// total 不变」这种最隐蔽的分页错位。
-//
-// 分页接口没有稳定快照：frps 按 (type, name) 排序后切片，翻页期间有人删了一条
-// 又加了一条，total 自始至终不变，但删除点之后的页整体错位一格——被跳过的那条
-// 旧代理不在结果里（随后被判离线），新加的那条被多读一次（随后被判在线）。
-// 条数校验、total 校验、重复校验**全部发现不了**，只有翻页结束后复检第 1 页
-// 才能看出来（见 recheckFirstPage）。
-//
-// 构造：两页都必须是**满页**（frpsPageSize 条），否则实现会在「短页且 total
-// 未满足」处提前报「列表不完整」，根本走不到复检——那就测不到缺陷 10 了。
-//
-// 每轮的请求序列是 [第 1 页, 第 2 页, 复检第 1 页]（见 recheckFirstPage）：
-//
-//	第 1 轮：a0..a199 / b0..b199 / 复检时 a1..a200  ← 集合变了
-//	第 2 轮：同上（重取一次仍然不稳定，才应该最终报错）
-//
-// 用 (n-1)%3 == 2 认「复检」而不是写死 n>=3：ListProxies 会在不稳定时整轮
-// 重取一次（frpsListAttempts=2），只让第 1 轮失败的话第 2 轮会成功返回，
-// 测试就变成「复检生效但重取兜住了」，断言 err != nil 直接挂掉。
 func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -483,8 +394,6 @@ func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 		items := make([]string, 0, frpsPageSize)
 		switch page {
 		case "1":
-			// 每轮的第 3 次请求是复检：整体后移一位（a0 消失、a200 出现），
-			// 条数与 total 都不变，只有集合变了。
 			base := 0
 			if (n-1)%3 == 2 {
 				base = 1
@@ -508,18 +417,11 @@ func TestListProxiesDetectsCollectionChangeWithSameTotal(t *testing.T) {
 	if proxies != nil {
 		t.Fatal("结果不稳定时不应返回代理列表：错位的条目会让人被判离线、让新代理被多计流量")
 	}
-	// 错误信息里要能看出「总量没变但集合变了」——只写「列表不稳定」的话，
-	// 运维无法区分这是分页错位还是 frps 返回了残缺响应，两者要查的东西不同。
 	if !strings.Contains(err.Error(), "集合变了") {
 		t.Fatalf("错误信息应说明集合发生变化，实际: %v", err)
 	}
 }
 
-// TestListProxiesRechecksFirstPageOnlyWhenPaginated 覆盖「单页不做复检」。
-//
-// 单页时 total 与 items 出自 frps 的同一次请求（同一个切片算出来的），本身就是
-// 一致快照，再复检一次只是白花一个往返。健康检查与采集是高频路径，这个开销必须
-// 省掉。
 func TestListProxiesRechecksFirstPageOnlyWhenPaginated(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -546,24 +448,11 @@ func TestListProxiesRechecksFirstPageOnlyWhenPaginated(t *testing.T) {
 	}
 }
 
-// TestCloseUserProxiesStopsWhenStatusChanges 覆盖「断流途中账号被重新启用」。
-//
-// 禁用流程在放掉用户锁之后才断流（断流可能十几秒）。这段时间里管理员可以把
-// 账号重新启用，客户端随即重连并建立新代理——继续按几秒前那份列表往下关，
-// 关的就是刚放行的人。代次一变，本次断流必须停手。
-//
-// fixture 必须给每条代理一个可判定的实例身份（clientID 或 lastStartAt）：
-// 两者都缺失时实现会按「身份不可判定」跳过关闭（见问题 9），这样构造的用例
-// 连一条代理都不会关，测的就不再是代次守卫了。真实 frps 的管理接口总会带上
-// lastStartAt，所以这里用 lastStartAt 是更贴近现实的构造。
 func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	svc := newTestServices(t, nil)
 	t.Cleanup(svc.Close)
 
 	const userID = 7
-	// 代理的启动时间必须在两次列表调用之间保持不变：实现会用它对齐「同一个
-	// 代理实例」，若每次列表都重新取 time.Now()，跨过一个整秒边界就会对不上，
-	// 用例随机失败。
 	startedAt := time.Now().Add(-time.Minute).Unix()
 	var (
 		mu     sync.Mutex
@@ -581,7 +470,6 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 		case r.Method == http.MethodDelete:
 			mu.Lock()
 			closed = append(closed, r.URL.Query().Get("name"))
-			// 第一次关闭生效期间，管理端把账号重新启用：代次推进。
 			if !bumped {
 				bumped = true
 				svc.bumpUserStatusGen(userID)
@@ -603,20 +491,11 @@ func TestCloseUserProxiesStopsWhenStatusChanges(t *testing.T) {
 	}
 }
 
-// TestCloseUserProxiesHoldsUserLockWhileClosing 覆盖「复查之后、请求之前」的窄窗口。
-//
-// 只复查代次是不够的：检查通过到请求真正发出之间，管理端仍可能完成一次
-// 重新启用，那条刚建立的代理照样会被关掉。所以复查与关闭必须在同一把
-// 用户锁内——关的时候别人改不了状态。
-//
-// fixture 带 lastStartAt：双空身份会被判成「身份不可判定」而跳过关闭，
-// 那样 DELETE 根本不会发生，这条用例就测不到锁了。
 func TestCloseUserProxiesHoldsUserLockWhileClosing(t *testing.T) {
 	svc := newTestServices(t, nil)
 	t.Cleanup(svc.Close)
 
 	const userID = 9
-	// 同上：启动时间在整个用例内固定，否则列表快照与复查快照对不上。
 	startedAt := time.Now().Add(-time.Minute).Unix()
 	var lockHeld int32 = 1
 	svc.Frps = newTestFrps(t, func(w http.ResponseWriter, r *http.Request) {
@@ -646,21 +525,11 @@ func TestCloseUserProxiesHoldsUserLockWhileClosing(t *testing.T) {
 	}
 }
 
-// TestCloseUserProxiesSkipsProxiesStartedAfterDisable 覆盖跨实例的最后一跳竞态。
-//
-// 锁与代次都只能覆盖本实例：另一台实例上的启用可以正好插在查库之后、
-// 关闭请求到达 frps 之前。frps 记录的 lastStartAt 是这种情形下唯一可信的
-// 判据——重新注册过的代理一定晚于禁用时刻启动，关它等于把刚放行的人
-// 又踢下线。
 func TestCloseUserProxiesSkipsProxiesStartedAfterDisable(t *testing.T) {
 	svc := newTestServices(t, nil)
 	t.Cleanup(svc.Close)
 
 	const userID = 11
-	// 两条代理的启动时间在整个用例内固定（而不是每次列表都重取 time.Now()）：
-	// 实现会用 lastStartAt 对齐「还是不是同一个代理实例」，跨过一个整秒边界
-	// 就会对不上而跳过关闭，用例随机失败。取值本身仍保持原语义——
-	// old 早于禁用时刻，new 晚于禁用时刻。
 	now := time.Now().Unix()
 	var (
 		mu     sync.Mutex

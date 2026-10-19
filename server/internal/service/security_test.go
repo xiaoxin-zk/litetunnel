@@ -18,21 +18,8 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
 )
 
-// 这个文件守的都是同一类缺陷：**一处改了、另一处没跟上**。
-//
-// 单看任何一处代码都是对的，只有把数据库、运行态内存与采集循环串起来
-// 才会暴露。所以这些用例都起真实的 sqlite 库与真实服务集合，
-// 而不是把函数拆出来单独喂参数。
-
-// markTrafficBaselineReady 声明「采样基线已经建立」。
-//
-// collectTraffic 每次取得采集租约都会重读一次基线；没有这个标记时，
-// loadTrafficBaseline 会把它当成**首次迁移**（只记基线、不计增量），
-// 于是首轮采集不记账——这些用例要测的是记账，所以先落下标记。
 func markTrafficBaselineReady(t *testing.T, svc *Services) {
 	t.Helper()
-	// 两个迁移标记都要落：基线就绪与「清零代次标记已初始化」是独立状态，
-	// 缺任一个首轮都只记基线、不计增量。
 	if err := svc.Settings.SetInternal(map[SettingKey]string{
 		KeyTrafficBaselineReady:  "1",
 		KeyTrafficResetMarkReady: "1",
@@ -64,9 +51,6 @@ func newTestServices(t *testing.T, cfg *config.Config) *Services {
 	if err != nil {
 		t.Fatalf("取数据库连接失败: %v", err)
 	}
-	// 先关连接再让 t.TempDir 清理：否则临时目录里的 sqlite 文件仍被占用，
-	// 清理会失败（Windows 上尤其明显）。Cleanup 是后进先出，
-	// 这里注册的比 TempDir 的晚，所以会先执行。
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	return New(db, cfg)
 }
@@ -93,7 +77,6 @@ func loadAdmin(t *testing.T, svc *Services, id uint) model.Admin {
 	return a
 }
 
-// newSuperAdmin 造一个启用的超级管理员。
 func newSuperAdmin(t *testing.T, svc *Services, name string) *model.Admin {
 	t.Helper()
 	a := &model.Admin{
@@ -106,7 +89,6 @@ func newSuperAdmin(t *testing.T, svc *Services, name string) *model.Admin {
 	return a
 }
 
-// countActiveSupers 数一下还剩几个可用的超级管理员。
 func countActiveSupers(t *testing.T, svc *Services) int64 {
 	t.Helper()
 	var n int64
@@ -118,7 +100,6 @@ func countActiveSupers(t *testing.T, svc *Services) int64 {
 	return n
 }
 
-// enableTestMail 打开测试用的邮件配置，并确认 MailEnabled 成立。
 func enableTestMail(t *testing.T, svc *Services) {
 	t.Helper()
 	if err := svc.Settings.SetMany(map[SettingKey]string{
@@ -136,7 +117,6 @@ func enableTestMail(t *testing.T, svc *Services) {
 	}
 }
 
-// fakeMailer 是可控的发信替身：用它把「投递成功」与「投递失败」变成确定性的。
 type fakeMailer struct {
 	mu   sync.Mutex
 	fail bool
@@ -165,7 +145,6 @@ func (f *fakeMailer) sentCount() int {
 	return len(f.sent)
 }
 
-// newMailTestServices 构造一个邮件已启用、发信器可替换的服务集合。
 func newMailTestServices(t *testing.T) (*Services, *fakeMailer) {
 	t.Helper()
 	svc := newTestServices(t, nil)
@@ -175,12 +154,10 @@ func newMailTestServices(t *testing.T) (*Services, *fakeMailer) {
 	return svc, fm
 }
 
-// deliverAll 驱动一次发件箱处理（正常路径由后台协程做，这里直接调用以便断言）。
 func deliverAll(svc *Services) {
 	svc.processMailOutbox(context.Background())
 }
 
-// enableTestFirewall 打开测试用的防火墙配置并指向假 helper。
 func enableTestFirewall(t *testing.T, svc *Services, helper *fakeFirewallHelper) {
 	t.Helper()
 	if err := svc.Settings.SetMany(map[SettingKey]string{
@@ -193,20 +170,12 @@ func enableTestFirewall(t *testing.T, svc *Services, helper *fakeFirewallHelper)
 	}
 }
 
-// fakeFirewallHelper 冒充宿主机上的 lt-fw helper，记录收到的关端口请求。
-//
-// 面板自身没有任何防火墙写能力（全部转发给 helper），所以这里假的是 helper，
-// 而不是「防火墙」——这样测到的就是真实那条转发链路。
 type fakeFirewallHelper struct {
 	*httptest.Server
 
-	// failCloses / failOpens 为 true 时对应操作一律失败，用于模拟 helper 暂时不可用。
 	failCloses atomic.Bool
 	failOpens  atomic.Bool
 
-	// closeEntered / closeGate 用于把「关端口」这一步卡住：
-	// 进入处理时向 closeEntered 发信号，然后等 closeGate 才返回。
-	// 用来在「重试执行到一半」时插入别的操作，验证临界区。
 	closeEntered chan struct{}
 	closeGate    chan struct{}
 
@@ -238,8 +207,6 @@ func newFakeFirewallHelper(t *testing.T) *fakeFirewallHelper {
 				<-f.closeGate
 			}
 			if f.failCloses.Load() {
-				// 模拟 helper 暂时不可用：面板必须把这次失败记下来重试，
-				// 而不是只写一行日志就当成关掉了。
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -285,10 +252,6 @@ func (f *fakeFirewallHelper) openedPorts() []string {
 	return out
 }
 
-// backdateSession 把某条会话的活跃时间往前拨，用于确定性地制造「久未活动」。
-//
-// 不用「GC(0)」这种把截止时刻设成现在的写法：它依赖两次 time.Now()
-// 之间有可分辨的间隔，时钟粒度不足时会随机失败。
 func backdateSession(t *testing.T, r *Runtime, runID string, by time.Duration) {
 	t.Helper()
 	r.mu.Lock()
@@ -301,7 +264,6 @@ func backdateSession(t *testing.T, r *Runtime, runID string, by time.Duration) {
 	r.sessions[runID] = s
 }
 
-// backdateTouchAt 把某条心跳节流记录的时间往前拨。
 func backdateTouchAt(t *testing.T, r *Runtime, runID string, by time.Duration) {
 	t.Helper()
 	r.mu.Lock()
@@ -313,12 +275,9 @@ func backdateTouchAt(t *testing.T, r *Runtime, runID string, by time.Duration) {
 	r.touchAt[runID] = at.Add(-by)
 }
 
-// fakeFrpsTraffic 是只上报一条代理的假 frps，累计流量可改。
 type fakeFrpsTraffic struct {
 	*httptest.Server
-	total atomic.Int64
-	// absent 为真时这一轮列表里没有该代理：模拟客户端重连、或分页期间
-	// 一删一增造成的短暂缺席。
+	total  atomic.Int64
 	absent atomic.Bool
 }
 

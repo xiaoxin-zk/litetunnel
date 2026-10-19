@@ -19,7 +19,6 @@
       />
 
       <el-tabs v-model="tab" class="tabs">
-        <!-- ============ 登录 ============ -->
         <el-tab-pane label="登录" name="login">
           <el-form :model="form" :rules="rules" ref="formRef" label-position="top" @submit.prevent>
             <el-form-item label="账号" prop="username">
@@ -45,7 +44,6 @@
               />
             </el-form-item>
 
-            <!-- 双因素：默认收起，后端要求时自动展开 -->
             <el-form-item v-if="totpVisible" label="动态口令" prop="totp_code">
               <el-input
                 v-model="form.totp_code"
@@ -57,7 +55,6 @@
               />
             </el-form-item>
 
-            <!-- 验证码：账号连续失败较多后才要求（代替硬锁，避免被恶意锁死） -->
             <el-form-item v-if="loginCaptcha && captcha" :label="`验证码：${captcha.question}`" prop="captcha_answer">
               <el-input
                 v-model="form.captcha_answer"
@@ -88,7 +85,6 @@
           </el-form>
         </el-tab-pane>
 
-        <!-- ============ 注册 ============ -->
         <el-tab-pane v-if="site.register_enabled" label="注册" name="register">
           <el-form :model="reg" :rules="regRules" ref="regRef" label-position="top" @submit.prevent>
             <el-form-item label="用户名" prop="username">
@@ -108,7 +104,6 @@
               />
             </el-form-item>
 
-            <!-- 站点启用邮件后，注册必须通过邮箱一次性验证码 -->
             <el-form-item v-if="requireEmail" label="邮箱验证码" prop="email_code">
               <el-input v-model="reg.email_code" size="large" maxlength="6" placeholder="6 位验证码">
                 <template #append>
@@ -148,7 +143,6 @@
       <div v-if="site.icp" class="icp">{{ site.icp }}</div>
     </div>
 
-    <!-- 条款 -->
     <el-dialog v-model="termsVisible" title="服务条款与禁止滥用规定" width="620px">
       <pre class="terms">{{ site.terms || '暂无条款内容' }}</pre>
       <template #footer>
@@ -167,8 +161,6 @@ import { User, Lock, Key, Refresh } from '@element-plus/icons-vue'
 import { authApi, publicApi, sessionApi, TOKEN_KEY } from '../api'
 import { useCountdown } from '../composables/useCountdown'
 
-// 管理端是独立 SPA，与用户端同源，因此 localStorage 共享：
-// 管理员登录成功后把令牌写到管理端的键上，直接跳转即可，无需跨页传参。
 const ADMIN_TOKEN_KEY = 'lt_admin_token'
 
 const router = useRouter()
@@ -177,7 +169,6 @@ const site = ref({})
 const captcha = ref(null)
 const totpVisible = ref(false)
 const termsVisible = ref(false)
-// 账号连续失败较多时后端会要求验证码，而不是把账号锁死
 const loginCaptcha = ref(false)
 
 const formRef = ref()
@@ -198,12 +189,9 @@ const reg = reactive({
   agreed: false
 })
 
-// 站点启用邮件后，注册强制验证邮箱（可在管理端关闭该要求）
 const requireEmail = computed(
   () => !!site.value.mail_enabled && !!site.value.register_require_email
 )
-// 验证码重发倒计时
-// 倒计时在组件卸载时自动清理（见 useCountdown）。
 const { countdown, start: startCountdown } = useCountdown()
 
 async function sendEmailCode() {
@@ -217,7 +205,6 @@ async function sendEmailCode() {
     ElMessage.success('验证码已发送，请查收')
     startCountdown()
   } catch {
-    // 失败提示由响应拦截器统一处理
   }
 }
 
@@ -281,7 +268,6 @@ async function submit() {
     })
 
     if (data.role === 'admin') {
-      // 管理员：写管理端令牌后整页跳转（跨 SPA，必须用 location 而非 router）
       localStorage.setItem(ADMIN_TOKEN_KEY, data.token)
       ElMessage.success('登录成功，正在进入管理后台')
       window.location.href = data.redirect || '/lt-console/'
@@ -297,8 +283,6 @@ async function submit() {
       totpVisible.value = true
       error.value = '该账号已启用双因素认证，请输入动态口令'
     } else if (body?.data?.captcha_required) {
-      // 连续失败较多：后端不再硬锁账号，而是要求人机验证。
-      // 这样账号真正的所有者随时能登录进来，而脚本无法继续爆破。
       loginCaptcha.value = true
       error.value = body?.message || '请输入验证码后重试'
       await loadCaptcha()
@@ -349,7 +333,6 @@ async function submitRegister() {
     tab.value = 'login'
   } catch (e) {
     regError.value = e?.response?.data?.message || '注册失败'
-    // 验证码是一次性的，无论成败都要换一张
     await loadCaptcha()
   } finally {
     regLoading.value = false

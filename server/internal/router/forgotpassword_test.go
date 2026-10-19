@@ -22,17 +22,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/store"
 )
 
-// 这一组守的是「重置链接的地址只能由服务端配置决定」。
-//
-// 找回密码的邮件里带着一个能改密码的令牌，而链接的域名以前是从请求的 Host
-// 与 X-Forwarded-Proto 推断的——这两个头完全由请求方控制。攻击者往本接口
-// 提交伪造的 Host，服务端就会把「指向攻击者域名」的链接发到用户邮箱里，
-// 用户一点，令牌就交出去了（Host 头投毒）。
-//
-// 用例走的是真实路由 + 真实数据库，只把 SMTP 指向一个不会被真正使用的配置：
-// 这里关心的是**链接怎么拼**，不是能不能发出去。
-
-// newForgotPasswordStack 起一套真实栈，返回路由、服务集合与一个已绑定邮箱的用户。
 func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *service.Services, *model.User) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -51,7 +40,6 @@ func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *servi
 		GatewayPort: 7001,
 		AdminPath:   "/admin-console",
 
-		// 这正是被测的配置项。
 		UserPublicURL: publicURL,
 	}
 
@@ -67,7 +55,6 @@ func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *servi
 
 	svc := service.New(db, cfg)
 
-	// 打开邮件开关：否则接口会因为「未配置邮件」提前返回，根本走不到拼接链接。
 	if err := svc.Settings.SetMany(map[service.SettingKey]string{
 		service.KeySMTPEnabled:  "true",
 		service.KeySMTPHost:     "smtp.example.com",
@@ -83,10 +70,9 @@ func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *servi
 	}
 
 	u := &model.User{
-		Username: "forgotuser",
-		Password: "not-used-in-this-test",
-		Email:    "forgot@example.com",
-		// 已验证：找回密码只认已验证的邮箱（未验证的地址从没证明过归属）。
+		Username:      "forgotuser",
+		Password:      "not-used-in-this-test",
+		Email:         "forgot@example.com",
 		EmailVerified: true,
 		Status:        model.UserStatusActive,
 	}
@@ -103,14 +89,12 @@ func newForgotPasswordStack(t *testing.T, publicURL string) (*gin.Engine, *servi
 	return engine, svc, u
 }
 
-// forgotPassword 带一个**伪造的 Host** 调用找回密码接口。
 func forgotPassword(t *testing.T, engine *gin.Engine, host, account string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	body := fmt.Sprintf(`{"account":%q}`, account)
 	req := httptest.NewRequest(http.MethodPost, "/api/user/auth/forgot-password", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	// 攻击者能完全控制这两个值，正是漏洞的入口。
 	req.Host = host
 	req.Header.Set("X-Forwarded-Proto", "https")
 
@@ -119,11 +103,6 @@ func forgotPassword(t *testing.T, engine *gin.Engine, host, account string) *htt
 	return rec
 }
 
-// TestForgotPasswordDoesNotTrustRequestHost 覆盖「未配置对外地址时退化为请求头」。
-//
-// 退化的结果是攻击者用伪造 Host 就能决定邮件里的链接指向哪里。正确行为是
-// **不发这封信**：链接生成不出来就不发，而不是拿一个不可信的地址凑数。
-// 对外仍返回统一提示——配置问题不该从响应里被看出来，更不能因此区分账号是否存在。
 func TestForgotPasswordDoesNotTrustRequestHost(t *testing.T) {
 	engine, svc, u := newForgotPasswordStack(t, "")
 
@@ -141,9 +120,6 @@ func TestForgotPasswordDoesNotTrustRequestHost(t *testing.T) {
 	}
 }
 
-// TestForgotPasswordLinkUsesConfiguredURL 覆盖反面：配了对外地址时链接用配置值。
-//
-// 断言正文里出现配置的域名、且**不出现**请求头里的 Host——后者就是投毒的痕迹。
 func TestForgotPasswordLinkUsesConfiguredURL(t *testing.T) {
 	const publicURL = "https://panel.example.com"
 	engine, svc, u := newForgotPasswordStack(t, publicURL)

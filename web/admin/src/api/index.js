@@ -2,7 +2,6 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
-// 管理后台只访问管理域接口，且默认部署在仅本机可达的端口上。
 const http = axios.create({
   baseURL: '/api/admin',
   timeout: 20000
@@ -43,13 +42,10 @@ http.interceptors.response.use(
 
 export default http
 
-// 登录已合并到 /api/auth/login（见用户控制台的 sessionApi），
-// 管理端不再提供独立登录接口。
 export const authApi = {
   profile: () => http.get('/profile'),
   updateProfile: (data) => http.put('/profile', data),
   changePassword: (data) => http.put('/profile/password', data),
-  // 已启用双因素时属于「换绑」，需要带上当前设备的动态口令。
   totpSetup: (code) => http.post('/profile/totp/setup', { code: code || '' }),
   totpEnable: (code) => http.post('/profile/totp/enable', { code }),
   totpDisable: (password) => http.post('/profile/totp/disable', { password })
@@ -104,13 +100,6 @@ export const adminApi = {
 
 export const clientPkgApi = {
   list: () => http.get('/client-packages'),
-  /**
-   * 上传安装包。
-   *
-   * 探针：包体近 30 MB，必须放开默认超时并回调进度——
-   * 否则大文件会在中途被 axios 超时切断，而界面上看不出任何原因。
-   * 不手动设置 Content-Type：浏览器需要自己补 multipart 的 boundary。
-   */
   upload: (file, onProgress) => {
     const fd = new FormData()
     fd.append('file', file)
@@ -125,8 +114,6 @@ export const clientPkgApi = {
 }
 
 export const monitorApi = {
-  // 服务器运行指标：latest（当前值）与 series（最近一段时间的采样序列）一起返回。
-  // limit 控制点数，不传则由服务端返回全部（最多由环形缓冲容量决定）。
   system: (limit) => http.get('/system/metrics', { params: limit ? { limit } : {} })
 }
 
@@ -135,7 +122,6 @@ export const firewallApi = {
   rescan: () => http.post('/firewall/rescan'),
   open: (port, proto) => http.post('/firewall/ports', { port, proto }),
   close: (port, proto) => http.delete('/firewall/ports', { data: { port, proto } }),
-  // 清除一条重试已终止的失败记录：只在管理员人工处理完之后用。
   clearFailed: (port) => http.post('/firewall/failed/clear', { port })
 }
 
@@ -145,15 +131,8 @@ export const settingsApi = {
   testMail: (to) => http.post('/settings/test-mail', { to })
 }
 
-// 域名与证书。
-//
-// 与 settingsApi 的分工：settingsApi 只是「把值存下来」，
-// 而 domainApi.apply 会让宿主机上的 lt-config 重新渲染 Caddyfile / frps.toml
-// 并重建 caddy 与 frps 容器——那是会短暂影响线上的操作，因此单独成一步。
 export const domainApi = {
-  // 宿主机配置服务健康度 + Caddy 证书 + 默认要检查的域名。
   status: () => http.get('/domain/status'),
-  // apply 为 false 时只渲染与校验，不动容器。
   apply: (apply = true) => http.post('/domain/apply', { apply }),
   dnsCheck: () => http.post('/domain/dns-check')
 }

@@ -7,15 +7,10 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/config"
 )
 
-// domainReject 返回域名准入的直接拒绝原因（nil 表示不拒）。
 func domainReject(svc *Services, email string) error {
 	return svc.emailDomainVerdictFor(email).Reject
 }
 
-// TestParseEmailDomainRules 覆盖写法归一与去重。
-//
-// 关键点：@qq.com 与 qq.com 必须等价（否则管理员按截图填 @qq.com 会得到
-// 一条永远匹配不上任何邮箱的规则），全角逗号也要能切开。
 func TestParseEmailDomainRules(t *testing.T) {
 	rules, bad := ParseEmailDomainRules(" @qq.com, 163.com ,*.edu.cn，mailinator.com，QQ.COM ")
 	if len(bad) != 0 {
@@ -35,11 +30,6 @@ func TestParseEmailDomainRules(t *testing.T) {
 	}
 }
 
-// TestEmailDomainRuleMatch 覆盖精确匹配与通配的边界。
-//
-// @qq.com 绝不能放行 s.qq.com：那类子域不属于 QQ 官方，白名单一旦自动包含
-// 子域，「只允许 qq.com」就变成了「允许任何 s.qq.com」。要放行子域必须显式
-// 写 *.qq.com。
 func TestEmailDomainRuleMatch(t *testing.T) {
 	suffix := EmailDomainRule{Suffix: "qq.com"}
 	if !suffix.Match("qq.com") || !suffix.Match("QQ.COM") {
@@ -56,16 +46,11 @@ func TestEmailDomainRuleMatch(t *testing.T) {
 	if !wildcard.Match("s.qq.com") || !wildcard.Match("a.mail.qq.com") {
 		t.Error("*.qq.com 应匹配子域")
 	}
-	// 与 sub2api 一致：*.domain 连本域一起覆盖。
 	if !wildcard.Match("qq.com") {
 		t.Error("*.qq.com 应同时匹配 qq.com 本身")
 	}
 }
 
-// TestParseEmailDomainRulesRejectsGarbage 覆盖「静默丢弃」这个旧毛病。
-//
-// 以前解析不了的项会被悄悄扔掉，界面上看着保存成功、实际不生效。
-// 现在必须把原始项交回给调用方，由保存路径报错。
 func TestParseEmailDomainRulesRejectsGarbage(t *testing.T) {
 	rules, bad := ParseEmailDomainRules("http://qq.com, qq.com:8080, localhost, *, @, qq.com/path")
 	if len(rules) != 0 {
@@ -76,10 +61,6 @@ func TestParseEmailDomainRulesRejectsGarbage(t *testing.T) {
 	}
 }
 
-// TestRegistrationDomainKey 覆盖「子域绕过单域名限额」。
-//
-// 直接按完整域名计数时，a.qq.com 与 b.qq.com 各算一份额度，换几个前缀就能
-// 把「每域名每天 5 条」变成无限条。
 func TestRegistrationDomainKey(t *testing.T) {
 	cases := map[string]string{
 		"a@mail.qq.com":        "qq.com",
@@ -96,7 +77,6 @@ func TestRegistrationDomainKey(t *testing.T) {
 	}
 }
 
-// TestCheckEmailDomainAdmissionWhitelistOnly 覆盖端到端的白名单判定。
 func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 	svc := newTestServices(t, nil)
 	if err := svc.Settings.SetMany(map[SettingKey]string{
@@ -109,7 +89,6 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 	if err := domainReject(svc, "a@qq.com"); err != nil {
 		t.Fatalf("白名单域名应放行: %v", err)
 	}
-	// 白名单只写 @qq.com 时，s.qq.com 这类子域必须拒绝。
 	if err := domainReject(svc, "a@s.qq.com"); !errors.Is(err, ErrDomainNotTrusted) {
 		t.Fatalf("未写 *.qq.com 时子域应被拒，实际 %v", err)
 	}
@@ -117,7 +96,6 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 		t.Fatalf("非白名单域名应被拒，实际 %v", err)
 	}
 
-	// 显式写 *.qq.com 之后，子域才被放行，而 qq.com 本身反而不在范围内。
 	if err := svc.Settings.SetMany(map[SettingKey]string{
 		KeyRegisterAllowDomains: "*.qq.com",
 	}); err != nil {
@@ -130,7 +108,6 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 		t.Fatalf("*.qq.com 应同时放行 qq.com 本身: %v", err)
 	}
 
-	// 黑名单优先级更高：即使关掉白名单模式，命中黑名单也必须拒绝。
 	if err := svc.Settings.SetMany(map[SettingKey]string{
 		KeyRegisterBlockDomains:  "mail.qq.com",
 		KeyRegisterWhitelistOnly: "false",
@@ -142,10 +119,6 @@ func TestCheckEmailDomainAdmissionWhitelistOnly(t *testing.T) {
 	}
 }
 
-// TestSendEmailCodeRejectsNonWhitelistedDomain 覆盖「发码就拦」。
-//
-// 只在校验注册时才判断的话，用户要填完密码才被告知域名不允许，
-// 看起来就像白名单没有生效。
 func TestSendEmailCodeRejectsNonWhitelistedDomain(t *testing.T) {
 	svc, fm := newMailTestServices(t)
 	if err := svc.Settings.SetMany(map[SettingKey]string{
@@ -166,7 +139,6 @@ func TestSendEmailCodeRejectsNonWhitelistedDomain(t *testing.T) {
 	}
 }
 
-// TestUpdateSettingsRejectsBadDomainItem 覆盖保存阶段的严格校验。
 func TestUpdateSettingsRejectsBadDomainItem(t *testing.T) {
 	svc := newTestServices(t, nil)
 	err := svc.UpdateSettings(map[SettingKey]string{
@@ -180,10 +152,6 @@ func TestUpdateSettingsRejectsBadDomainItem(t *testing.T) {
 	}
 }
 
-// TestNonWhitelistQuota 覆盖「白名单外域名按累计名额放量」。
-//
-// 这是 sub2api「非白名单域名限量注册」的等价物：名额 0 直接拒绝，
-// 名额 N 给每个外部主域留 N 个账号（累计，不按天重置）。
 func TestNonWhitelistQuota(t *testing.T) {
 	svc := newTestServices(t, nil)
 	if err := svc.Settings.SetMany(map[SettingKey]string{
@@ -207,7 +175,6 @@ func TestNonWhitelistQuota(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("首个白名单外账号应注册成功: %v", err)
 	}
-	// 同主域的第二个账号：名额已用尽（虽然是另一个 IP、另一天口径）。
 	if _, err := svc.Register(RegisterInput{
 		Username: "quotatwo", Password: "Passw0rd123",
 		Email: "second@qq.com", AgreedTerms: true, IP: "10.0.0.2",
@@ -216,7 +183,6 @@ func TestNonWhitelistQuota(t *testing.T) {
 	}
 }
 
-// TestGatewayEndpointPrefersSettings 覆盖「接入信息能在后台改」。
 func TestGatewayEndpointPrefersSettings(t *testing.T) {
 	svc := newTestServices(t, &config.Config{GatewayHost: "gw.example.com", GatewayPort: 7001})
 	if h, p := svc.GatewayEndpoint(); h != "gw.example.com" || p != 7001 {

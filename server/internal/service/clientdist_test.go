@@ -6,12 +6,10 @@ import (
 	"testing"
 )
 
-// TestSanitizeClientFileNameNormlizes 验证正常文件名被正确归一化。
 func TestSanitizeClientFileNameNormalizes(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"LiteTunnel-windows-amd64.zip", "LiteTunnel-windows-amd64.zip"},
 		{"  app.exe  ", "app.exe"},
-		// Windows 客户端上传时可能带完整路径，必须剥掉
 		{`C:\Users\me\Desktop\LiteTunnel.exe`, "LiteTunnel.exe"},
 		{"/tmp/build/pkg.deb", "pkg.deb"},
 		{"pkg-1.0.tar.gz", "pkg-1.0.tar.gz"},
@@ -28,16 +26,6 @@ func TestSanitizeClientFileNameNormalizes(t *testing.T) {
 	}
 }
 
-// TestSanitizeClientFileNameNeverEscapes 验证归一化结果永远落在目标目录内。
-//
-// 这是这个函数存在的**唯一理由**，也是唯一值得断言的安全属性：
-// 文件名来自客户端、完全不可信，不处理就能写到任意系统目录。
-//
-// 注意「路径穿越」的两种正确处理方式都算通过：
-//   - 归一化掉前缀（../../etc/x.zip → x.zip）
-//   - 或者直接拒绝
-//
-// 唯一不可接受的是**结果逃出目标目录**。
 func TestSanitizeClientFileNameNeverEscapes(t *testing.T) {
 	dir := "/var/lib/litetunnel/clients"
 
@@ -54,7 +42,7 @@ func TestSanitizeClientFileNameNeverEscapes(t *testing.T) {
 	for _, in := range inputs {
 		got, err := SanitizeClientFileName(in)
 		if err != nil {
-			continue // 被拒绝同样可接受
+			continue
 		}
 		full := filepath.Join(dir, got)
 		if got != filepath.Base(got) {
@@ -68,7 +56,6 @@ func TestSanitizeClientFileNameNeverEscapes(t *testing.T) {
 	}
 }
 
-// TestSanitizeClientFileNameRejects 验证各类非法输入被拒绝。
 func TestSanitizeClientFileNameRejects(t *testing.T) {
 	bad := []struct{ in, why string }{
 		{"", "空文件名"},
@@ -88,10 +75,6 @@ func TestSanitizeClientFileNameRejects(t *testing.T) {
 	}
 }
 
-// TestSanitizeClientFileNameKeepsExtension 验证常见安装包扩展名都在白名单内。
-//
-// 少一个扩展名就意味着某个平台的用户拿不到客户端，而这类问题
-// 不会在编译期暴露——只能靠这条断言。
 func TestSanitizeClientFileNameKeepsExtension(t *testing.T) {
 	for _, name := range []string{
 		"a.zip", "a.exe", "a.dmg", "a.deb", "a.rpm", "a.gz", "a.tar", "a.apk",

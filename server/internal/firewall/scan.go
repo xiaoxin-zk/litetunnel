@@ -10,19 +10,6 @@ import (
 	"strings"
 )
 
-// LocalPortRange 读取内核分配给**出站连接**的本地源端口范围
-// （即 net.ipv4.ip_local_port_range，默认 32768-60999）。
-//
-// # 为什么隧道端口池要避开它
-//
-// frps 监听端口时，若该端口正被一条出站连接当作源端口占用，绑定会失败
-// （EADDRINUSE）。Linux 分配临时端口时会避开已被监听的端口，但反过来
-// 不成立——监听方后绑定就会撞上。
-//
-// 这类失败是偶发的、随机的，且只在隧道建立时才暴露，排查成本极高。
-// 与其等它发生，不如在配置阶段就提示管理员避开。
-//
-// 读取不需要任何特权：这是个普通的可读 sysctl。
 func LocalPortRange() (start, end int, err error) {
 	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
 	if err != nil {
@@ -40,31 +27,16 @@ func LocalPortRange() (start, end int, err error) {
 	return lo, hi, nil
 }
 
-// ListeningPort 描述一个正在被监听的端口。
 type ListeningPort struct {
-	Port  int    `json:"port"`
-	Proto string `json:"proto"`
-	// Addr 是监听地址，如 0.0.0.0 / 127.0.0.1 / ::
-	Addr string `json:"addr"`
-	// Exposed 表示监听在通配地址上，即对外可达
-	Exposed bool `json:"exposed"`
+	Port    int    `json:"port"`
+	Proto   string `json:"proto"`
+	Addr    string `json:"addr"`
+	Exposed bool   `json:"exposed"`
 }
 
-// procNetFiles 是要扫描的内核网络状态文件。
-//
-// 直接解析 /proc 而不是调用 ss / netstat：
-//   - 容器镜像里不保证装了 iproute2 或 net-tools
-//   - /proc 在所有 Linux 上都存在，且读取不需要任何特权
-//   - 避免为一次端口扫描引入外部依赖
 type procNetFile struct {
-	path  string
-	proto string
-	// required 标记「这张表读不到就不能下结论」。
-	//
-	// IPv6 的表可以缺失：内核编译时没开 IPv6 时 /proc/net/tcp6 就不存在，
-	// 那与「没有 IPv6 监听」是同一件事。而 tcp / udp 是排除端口的唯一依据，
-	// 读不到就意味着「系统占用」整块信息缺失——继续按空集合处理，会把
-	// 系统正在监听的端口分配给用户隧道（frpc 绑不上，面板却显示正常）。
+	path     string
+	proto    string
 	required bool
 }
 
@@ -75,18 +47,7 @@ var procNetFiles = []procNetFile{
 	{"/proc/net/udp6", "udp", false},
 }
 
-// ScanListening 扫描当前主机正在监听的端口。
-//
-// 用途有二：
-//  1. 端口池分配时排除已被其他服务占用的端口，避免把 3306 这类端口分给用户隧道；
-//  2. 管理页展示「哪些端口被系统占了」，让管理员一眼看清可用区间。
-//
-// 关键表（tcp / udp）读取失败时返回错误，而不是「没扫到端口」：调用方据此
-// 排除端口与计算空闲量，一个空集合会把系统占用的端口发出去，也会让管理页
-// 显示一个偏高的可用数。错误必须被调用方当回事。
 func ScanListening() ([]ListeningPort, error) {
-	// /proc 是 Linux 专有接口。其他平台（本地开发、跑测试）没有这份数据，
-	// 返回空集合是唯一合理的语义——不能因此让端口分配整体不可用。
 	if runtime.GOOS != "linux" {
 		return nil, nil
 	}
@@ -100,7 +61,6 @@ func ScanListening() ([]ListeningPort, error) {
 			if f.required {
 				return nil, fmt.Errorf("读取 %s 失败: %w", f.path, err)
 			}
-			// 可选表（IPv6）读不到不影响结论
 			continue
 		}
 		for _, p := range ports {
@@ -115,9 +75,6 @@ func ScanListening() ([]ListeningPort, error) {
 	return out, nil
 }
 
-// ListeningPortSet 返回「协议|端口」集合，供端口池快速排除。
-//
-// 返回错误时集合为 nil：调用方不能把 nil 当成「没有任何端口被占用」。
 func ListeningPortSet() (map[string]bool, error) {
 	ports, err := ScanListening()
 	if err != nil {
@@ -130,14 +87,6 @@ func ListeningPortSet() (map[string]bool, error) {
 	return set, nil
 }
 
-// parseProcNet 解析 /proc/net/{tcp,tcp6,udp,udp6}。
-//
-// 每行格式（空白分隔）：
-//
-//	sl  local_address  rem_address  st  ...
-//	0:  00000000:1F90  00000000:0000  0A  ...
-//
-// local_address 是「十六进制IP:十六进制端口」，st 是套接字状态。
 func parseProcNet(path, proto string) ([]ListeningPort, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -147,7 +96,7 @@ func parseProcNet(path, proto string) ([]ListeningPort, error) {
 
 	var out []ListeningPort
 	scanner := bufio.NewScanner(f)
-	scanner.Scan() // 跳过表头
+	scanner.Scan()
 
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -169,19 +118,15 @@ func parseProcNet(path, proto string) ([]ListeningPort, error) {
 
 		addr := decodeHexIP(ipHex, strings.HasSuffix(path, "6"))
 		out = append(out, ListeningPort{
-			Port:  int(port),
-			Proto: proto,
-			Addr:  addr,
-			// 通配地址意味着对所有网卡开放，即真正对外可达
+			Port:    int(port),
+			Proto:   proto,
+			Addr:    addr,
 			Exposed: addr == "0.0.0.0" || addr == "::",
 		})
 	}
 	return out, scanner.Err()
 }
 
-// isListeningState 判断套接字状态是否代表「正在监听」。
-//
-// TCP_LISTEN = 0A；UDP 无连接概念，07（UDP_CLOSE）即已绑定端口的空闲状态。
 func isListeningState(state, proto string) bool {
 	state = strings.ToUpper(state)
 	if proto == "tcp" {
@@ -190,7 +135,6 @@ func isListeningState(state, proto string) bool {
 	return state == "07"
 }
 
-// splitHexAddr 拆出「十六进制IP」与「十六进制端口」。
 func splitHexAddr(s string) (ip, port string, ok bool) {
 	i := strings.LastIndex(s, ":")
 	if i <= 0 || i == len(s)-1 {
@@ -199,7 +143,6 @@ func splitHexAddr(s string) (ip, port string, ok bool) {
 	return s[:i], s[i+1:], true
 }
 
-// decodeHexIP 把内核的小端十六进制地址还原成可读 IP。
 func decodeHexIP(h string, v6 bool) string {
 	b, err := hex.DecodeString(h)
 	if err != nil {
@@ -209,20 +152,17 @@ func decodeHexIP(h string, v6 bool) string {
 		if len(b) != 4 {
 			return h
 		}
-		// /proc 中 IPv4 按小端存储，需要反转
 		return strconv.Itoa(int(b[3])) + "." + strconv.Itoa(int(b[2])) + "." +
 			strconv.Itoa(int(b[1])) + "." + strconv.Itoa(int(b[0]))
 	}
 	if len(b) != 16 {
 		return h
 	}
-	// IPv6 在 /proc 中按 4 字节一组、组内小端存储
 	parts := make([]string, 0, 8)
 	for i := 0; i < 16; i += 4 {
 		parts = append(parts, hex.EncodeToString([]byte{b[i+3], b[i+2], b[i+1], b[i]}))
 	}
 	ip := strings.Join(parts, ":")
-	// 压缩全零段，便于阅读
 	ip = strings.Replace(ip, "0000:0000:0000:0000:0000:0000:0000:0000", "::", 1)
 	return ip
 }

@@ -18,37 +18,18 @@ import (
 )
 
 const (
-	// emailCodeTTL 是验证码有效期。过长会放大邮件被转发/截图带来的风险。
-	emailCodeTTL = 10 * time.Minute
-	// emailCodeMaxAttempts 是单个验证码允许的校验失败次数。
-	// 6 位数字有 100 万种可能，5 次上限把暴力枚举的期望成功率压到百万分之五。
-	emailCodeMaxAttempts = 5
-	// emailCodeResendCooldown 是同一邮箱同一场景的重发间隔。
+	emailCodeTTL            = 10 * time.Minute
+	emailCodeMaxAttempts    = 5
 	emailCodeResendCooldown = 60 * time.Second
-	// emailCodeDailyPerEmail 是同一邮箱每日可发送的验证码数量上限。
-	emailCodeDailyPerEmail = 10
+	emailCodeDailyPerEmail  = 10
 )
 
-// 验证码场景。
 const (
-	// EmailSceneRegister 注册邮箱验证：要求邮箱未被占用。
 	EmailSceneRegister = "register"
-	// EmailSceneReset 找回密码：绝不暴露邮箱是否注册过。
-	EmailSceneReset = "reset"
-	// EmailSceneChange 更换邮箱：验证码发到**新地址**，同样要求未被他人占用。
-	//
-	// 为什么必须单独一个场景而不是复用 register：两者的限流冷却、
-	// 旧码作废范围都按场景划分；混用会让「换个邮箱」和「注册」互相
-	// 作废对方的验证码。
-	EmailSceneChange = "change"
+	EmailSceneReset    = "reset"
+	EmailSceneChange   = "change"
 )
 
-// SendEmailCode 发送一次性邮箱验证码。
-//
-// 三层限流叠加，缺任何一层都会让「拿别人的邮箱反复触发发送」成为骚扰手段：
-//  1. 同邮箱重发冷却（60 秒）
-//  2. 同邮箱每日上限（10 条）
-//  3. 路由层的 IP 令牌桶
 func (s *Services) SendEmailCode(email, scene, ip string) error {
 	if scene != EmailSceneReset {
 		return s.sendEmailCode(email, scene, ip)
@@ -63,7 +44,6 @@ func (s *Services) SendEmailCode(email, scene, ip string) error {
 	return s.enqueueRecovery(recoveryRequest{account: email, ip: truncate(ip, 64), emailCode: true})
 }
 
-// sendEmailCode 在后台处理找回请求，其他场景保持同步入发件箱。
 func (s *Services) sendEmailCode(email, scene, ip string) error {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" || !IsValidEmail(email) {
@@ -78,22 +58,12 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		return ErrMailDisabled
 	}
 
-	// 注册与换绑：域名准入提前到**发码这一步**。
-	//
-	// 只在 Register 里判断的话，用户要走完「填邮箱 → 收验证码 → 填密码」才被
-	// 告知域名不允许，体验上就像限制没有生效。找回密码不查域名——那条路径对
-	// 任何域名都必须给出同样的结果，否则会变成账号枚举工具。
 	if scene == EmailSceneRegister || scene == EmailSceneChange {
-		// 只判「直接拒绝」；配额是累计账号数，留到注册时再算——发码阶段
-		// 就把人挡掉的话，名额还没用满的用户会莫名收不到信。
 		if v := s.emailDomainVerdictFor(email); v.Reject != nil {
 			return v.Reject
 		}
 	}
 
-	// 找回场景只认「已验证」的邮箱：未验证的地址从来没证明过归属，
-	// 不能当作恢复凭据（见 ForgotPassword 的同一条规则）。
-	// 用 lower() 比较：老库里可能存着大小写混写的地址。
 	userQuery := s.DB.Model(&model.User{}).Where("lower(email) = ?", email)
 	if scene == EmailSceneReset {
 		userQuery = userQuery.Where("email_verified = ? AND status = ?", true, model.UserStatusActive)
@@ -103,8 +73,6 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		return err
 	}
 
-	// 注册与换绑场景：邮箱已被占用必须明确告知，否则用户无法继续。
-	// 找回场景：**绝不能**暴露邮箱是否注册过，否则本接口会退化成账号枚举工具。
 	if (scene == EmailSceneRegister || scene == EmailSceneChange) && exists > 0 {
 		return ErrEmailTaken
 	}
@@ -117,22 +85,11 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		kind = model.MailKindEmailCodeChange
 	}
 
-	// 找回场景且邮箱不存在：不真的发信，但仍返回成功。
 	if scene == EmailSceneReset && exists == 0 {
 		log.Printf("[emailcode] 找回密码请求的邮箱未注册，已静默忽略")
 		return nil
 	}
 
-	// 找回场景额外记下当前的令牌版本：验证码是送达后才创建的，改密时
-	// 撤销不到它；激活时比对版本才能拦住「改密后旧码仍可用」。
-	//
-	// 读不到版本就**不入队**：没有快照的载荷在激活时无法证明「期间没改过
-	// 密码」，而放它过去等于给这条恢复通道留一个永久的绕过口。宁可让用户
-	// 稍后重试一次，也不能发出一封无法校验的找回邮件。
-	//
-	// 但对外仍返回成功：这里若把错误抛出去，攻击者就能用「已注册邮箱 +
-	// 触发一次读库失败」把「已注册」与「未注册」（后者静默成功）区分开，
-	// 找回接口立刻退化成账号枚举工具。内部记日志，用户稍后再点一次即可。
 	var resetVersion *int
 	if scene == EmailSceneReset {
 		var u model.User
@@ -150,10 +107,6 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 
 	code, err := newNumericCode(6)
 	if err != nil {
-		// 找回场景同样不能把错误抛出去：未注册邮箱在这之前已经静默成功，
-		// 这里返回错误就能把「已注册」区分出来（随机数生成失败虽然罕见，
-		// 但接口层会把它转成一次失败响应）。注册/换绑场景必须如实报错——
-		// 用户需要知道验证码没发出去，而且那里本来就要告知邮箱占用。
 		if scene == EmailSceneReset {
 			s.recordRecoveryFailure()
 			log.Printf("[emailcode] 生成找回验证码失败，本次不发送（对外仍返回成功）: %v", err)
@@ -169,35 +122,21 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 	}
 	subject := fmt.Sprintf("【%s】邮箱验证码", siteName)
 
-	// 只写发件箱，**不建验证码记录**：记录等这封信真的送达之后再创建
-	// （见 applyMailAction）。这样投递失败时用户手上的旧码依然可用，
-	// 而不是「新码没到、旧码已废」。
-	//
-	// 投递走异步队列：SMTP 往返可能耗时数秒，
-	// 同步发送会让「邮箱是否存在」通过响应时间泄露出去。
 	_, err = s.enqueueMail(email, subject,
 		emailCodeMailBody(siteName, code, int(emailCodeTTL.Minutes())),
 		kind, emailCodePayload{
-			Email:    email,
-			Scene:    scene,
-			CodeHash: hex.EncodeToString(sum[:]),
-			// 存 TTL 而不是绝对时间：有效期从**送达时刻**起算。
-			// 存绝对时间的话，发件箱重试（1/2/4/8 分钟）加上积压，很容易让
-			// 用户收到一个已经过期的码——邮件正文写着「10 分钟内有效」，
-			// 实际上一到手就失效了。
-			TTLSeconds: int(emailCodeTTL.Seconds()),
-			IP:         truncate(ip, 64),
-			// 仅找回场景有值：激活时用它复核期间是否改过密码。
+			Email:        email,
+			Scene:        scene,
+			CodeHash:     hex.EncodeToString(sum[:]),
+			TTLSeconds:   int(emailCodeTTL.Seconds()),
+			IP:           truncate(ip, 64),
 			TokenVersion: resetVersion,
 		}, mailQuota{
-			cooldown:   emailCodeResendCooldown,
-			dailyLimit: emailCodeDailyPerEmail,
-			// 与原先一致：同一地址的验证码总数（不分注册/找回/换绑）受限。
+			cooldown:      emailCodeResendCooldown,
+			dailyLimit:    emailCodeDailyPerEmail,
 			dailyAllKinds: true,
 		})
 	if err != nil {
-		// 找回场景必须保持「不暴露账号是否存在、是否被限流」：这里已经走完了
-		// 账号判断，返回错误会让「已注册 + 入队失败」与「未注册」变得可区分。
 		if scene == EmailSceneReset {
 			if !errors.Is(err, errMailQuotaCooldown) && !errors.Is(err, errMailQuotaDaily) {
 				s.recordRecoveryFailure()
@@ -211,17 +150,12 @@ func (s *Services) sendEmailCode(email, scene, ip string) error {
 		case errors.Is(err, errMailQuotaDaily):
 			return ErrEmailCodeTooMany
 		default:
-			// 注册场景可以直接告知失败：邮箱是用户自己填的，不存在枚举问题。
 			return err
 		}
 	}
 	return nil
 }
 
-// voidMail 作废一封尚未办结的邮件：不再发送、不再激活，正文与参数一并清掉。
-//
-// 条件更新（pending / sending / activating）：只改还在这三个状态的行；
-// 已送达或已办结的不动。清掉领取令牌之后，旧持有者的回写也会被拒绝。
 func (s *Services) voidMail(id uint, reason string) {
 	if err := s.DB.Model(&model.MailOutbox{}).
 		Where("id = ? AND status IN ?", id,
@@ -237,10 +171,6 @@ func (s *Services) voidMail(id uint, reason string) {
 	}
 }
 
-// VerifyEmailCode 校验并消费邮箱验证码。
-//
-// 一次性：校验通过即标记 used_at。失败累计到上限则整条作废，
-// 防止 6 位码被暴力枚举。
 func (s *Services) VerifyEmailCode(email, scene, code string) error {
 	rec, err := s.checkEmailCode(s.DB, email, scene, code)
 	if err != nil {
@@ -249,14 +179,6 @@ func (s *Services) VerifyEmailCode(email, scene, code string) error {
 	return s.consumeEmailCode(s.DB, rec.ID)
 }
 
-// checkEmailCode **只校验、不消费**，返回命中的验证码记录。
-//
-// 拆成「校验」与「消费」两步，是为了让调用方能自己决定消费发生在哪个事务里：
-// 密码重置要把「消费验证码」和「更新密码」放进同一个事务，失败时一起回滚
-// （否则验证码被标记已用、密码却没改，用户只能等冷却后重新申请）。
-//
-// 校验失败的计数（attempts）在这里就地累加，且**刻意不放进调用方的事务**：
-// 它是防暴力枚举的关键，必须在校验失败后立即生效，不能跟着回滚。
 func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*model.EmailCode, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	code = strings.TrimSpace(code)
@@ -284,29 +206,14 @@ func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*mode
 	ok := subtle.ConstantTimeCompare(
 		[]byte(hex.EncodeToString(sum[:])), []byte(rec.CodeHash)) == 1
 	if !ok {
-		// 失败计数用**带条件的**自增，而不是「先读上限、再无条件 +1」。
-		//
-		// 后者在并发下会漏：多个请求同时读到「还没到上限」的旧值，各自继续
-		// 校验，同一个 6 位码就能被猜超过规定的次数。带条件时数据库保证只有
-		// 一个能把它从「未达上限」推到下一格，推不动就说明已经到顶了。
-		//
-		// 用 s.DB 而不是传入的 db：即使调用方的事务随后回滚，这次失败也要留下。
 		res := s.DB.Model(&model.EmailCode{}).
 			Where("id = ? AND attempts < ?", rec.ID, emailCodeMaxAttempts).
 			Update("attempts", gorm.Expr("attempts + 1"))
 		if res.Error != nil {
-			// 计数没记上就**不能**当成普通的「验证码错误」返回。
-			//
-			// 否则只要让写库持续失败（打满连接池、把磁盘写满……），攻击者就能
-			// 无限次猜码：每次失败都不计数，上限永远不会到。这里是拒绝继续
-			// 校验、如实报服务错误，让用户稍后重试。
-			//
-			// 不把底层错误拼进对外消息（会泄露实现细节），只写日志。
 			log.Printf("[emailcode] 记录失败次数出错，拒绝继续校验: %v", res.Error)
 			return nil, ErrEmailCodeCheckFailed
 		}
 		if res.RowsAffected == 0 {
-			// 条件没命中：并发请求已经把它顶到上限了。
 			return nil, ErrEmailCodeAttempts
 		}
 		return nil, ErrEmailCodeWrong
@@ -314,14 +221,6 @@ func (s *Services) checkEmailCode(db *gorm.DB, email, scene, code string) (*mode
 	return &rec, nil
 }
 
-// consumeEmailCode 消费一条验证码（标记已使用）。
-//
-// 条件里带上「未使用 + 未过期 + 未达尝试上限」：校验与消费之间可能插进别的
-// 请求（并发猜测、或恰好跨过过期时刻），只按 id 更新会把这些检查绕过去
-// ——一个已经该作废的验证码仍然能被用掉。
-//
-// 并发下也只有一个请求能把 used_at 从 NULL 改成功，另一个拿到 0 行并得到
-// 「验证码不正确」：同一个码不能被用两次。
 func (s *Services) consumeEmailCode(db *gorm.DB, id uint) error {
 	res := db.Model(&model.EmailCode{}).
 		Where("id = ? AND used_at IS NULL AND expire_at > ? AND attempts < ?",
@@ -336,11 +235,6 @@ func (s *Services) consumeEmailCode(db *gorm.DB, id uint) error {
 	return nil
 }
 
-// newNumericCode 生成指定长度的数字验证码。
-//
-// 用 crypto/rand 而不是 math/rand：后者可预测，攻击者观察到几个码就能推出后续值。
-// 逐位取随机数而不是对单字节取模，是为了避免取模偏置（256 不是 10 的整数倍，
-// 直接 %10 会让 0-5 比 6-9 更容易出现）。
 func newNumericCode(n int) (string, error) {
 	var sb strings.Builder
 	for i := 0; i < n; i++ {
@@ -353,9 +247,6 @@ func newNumericCode(n int) (string, error) {
 	return sb.String(), nil
 }
 
-// emailCodeMailBody 生成验证码邮件正文。
-//
-// 刻意采用内联样式的简单 HTML：邮件客户端对外部样式表支持极差。
 func emailCodeMailBody(siteName, code string, ttlMinutes int) string {
 	return fmt.Sprintf(`<!doctype html>
 <html><body style="margin:0;padding:24px;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;">

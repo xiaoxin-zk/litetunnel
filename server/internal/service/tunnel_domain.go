@@ -8,7 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// normalizeInput 统一校验并清洗入参。
 func (s *Services) normalizeInput(u *model.User, g *model.Group, in TunnelInput) (model.Tunnel, error) {
 	var out model.Tunnel
 
@@ -16,7 +15,6 @@ func (s *Services) normalizeInput(u *model.User, g *model.Group, in TunnelInput)
 	if len(name) < 1 || len(name) > 32 || !IsSafeName(name) {
 		return out, fmt.Errorf("%w: 隧道名称需为 1-32 位字母、数字或下划线", ErrInvalidParam)
 	}
-	// 名称会拼进 frp 的 proxy 名（形如 {user}.{name}），前缀保留给系统使用。
 	if strings.HasPrefix(strings.ToLower(name), "lt") {
 		return out, fmt.Errorf("%w: 隧道名称不能以 lt 开头", ErrInvalidParam)
 	}
@@ -32,13 +30,6 @@ func (s *Services) normalizeInput(u *model.User, g *model.Group, in TunnelInput)
 		return out, ErrProtocolDenied
 	}
 
-	// HTTPS 隧道与 HTTP 隧道的入口不是同一条：HTTP 走 Caddy 的 443，
-	// 由 Caddy 用泛域名证书终止 TLS 后转发给 frps；HTTPS 则由 frps 在独立
-	// 端口上按 SNI 透传原始 TLS 连接，证书留在本地网站——而那条入口只在
-	// 端到端模式下存在。
-	//
-	// 不拦的话，用户会创建一个永远打不开的隧道，然后去查本地网站的配置、
-	// 防火墙、证书，一路查到最后才发现是平台根本不提供这条入口。
 	if ptype == model.ProxyTypeHTTPS && !s.HTTPSProxyEntryEnabled() {
 		return out, ErrNoHTTPSProxyEntry
 	}
@@ -78,7 +69,6 @@ func (s *Services) normalizeInput(u *model.User, g *model.Group, in TunnelInput)
 	return out, nil
 }
 
-// normalizeDomain 处理 HTTP/HTTPS 的域名或二级域名。
 func (s *Services) normalizeDomain(g *model.Group, in TunnelInput) (domain, sub string, err error) {
 	domain = strings.ToLower(strings.TrimSpace(in.Domain))
 	sub = strings.ToLower(strings.TrimSpace(in.Subdomain))
@@ -93,11 +83,6 @@ func (s *Services) normalizeDomain(g *model.Group, in TunnelInput) (domain, sub 
 		if !isValidHostname(domain) {
 			return "", "", fmt.Errorf("%w: 域名格式不正确", ErrInvalidParam)
 		}
-		// 自定义域名必须落在平台泛域名之下，防止用户劫持他人域名。
-		//
-		// 用 TunnelDomain() 而不是 Cfg.TunnelDomain：管理员在「域名与证书」
-		// 里改完域名后，面板容器不会重启，照 Cfg 判权会让「新域名的子域
-		// 被拒绝、旧域名的子域被放行」——而渲染出的 Caddyfile 里只有新域名。
 		td := s.TunnelDomain()
 		if td != "" && !strings.HasSuffix(domain, "."+td) && domain != td {
 			return "", "", fmt.Errorf("%w: 仅允许使用 *.%s 下的域名", ErrDomainDenied, td)

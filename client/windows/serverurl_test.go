@@ -2,9 +2,6 @@ package main
 
 import "testing"
 
-// 地址校验只负责格式与协议白名单。HTTP 在无域名证书的部署下可用，
-// 但会明文传输长期 API Key，因此界面与文档必须明确提示风险。
-
 func TestCheckServerURLAllowsRemoteHTTPWithWarning(t *testing.T) {
 	for _, raw := range []string{"http://panel.example.com", "http://203.0.113.10:7848", "http://[2001:db8::1]:7848"} {
 		if _, err := checkServerURL(raw, false); err != nil {
@@ -24,7 +21,6 @@ func TestCheckServerURLAllowsHTTPSForRemoteHosts(t *testing.T) {
 }
 
 func TestCheckServerURLAllowsLoopbackPlaintextOnlyForDebug(t *testing.T) {
-	// 本地调试：链路不出本机，允许 http。
 	for _, raw := range []string{
 		"http://127.0.0.1:7848",
 		"http://localhost:7848",
@@ -41,7 +37,6 @@ func TestCheckServerURLAllowsLoopbackPlaintextOnlyForDebug(t *testing.T) {
 }
 
 func TestCheckServerURLNormalizesAndRejectsGarbage(t *testing.T) {
-	// 没写协议时按 https 补全：默认走加密，而不是默认走明文。
 	got, err := checkServerURL("panel.example.com", false)
 	if err != nil {
 		t.Fatalf("未写协议时应按 https 处理: %v", err)
@@ -50,7 +45,6 @@ func TestCheckServerURLNormalizesAndRejectsGarbage(t *testing.T) {
 		t.Fatalf("应补成 https://，得到 %q", got)
 	}
 
-	// 结尾斜杠去掉：否则拼出来的路径会多一层。
 	if got, _ := checkServerURL("https://panel.example.com/", false); got != "https://panel.example.com" {
 		t.Fatalf("结尾斜杠应被去掉，得到 %q", got)
 	}
@@ -70,8 +64,6 @@ func TestCheckServerURLNormalizesAndRejectsGarbage(t *testing.T) {
 	}
 }
 
-// TestServerBaseAcceptsStoredPlaintextURL 覆盖无证书部署：早期版本禁止把
-// http:// 公网地址存进本地配置，现在必须允许，否则这类部署完全无法接入。
 func TestServerBaseAcceptsStoredPlaintextURL(t *testing.T) {
 	if defaultServerURL() != "" {
 		t.Skip("当前构建注入了服务端地址，本用例需要自己控制配置")
@@ -85,7 +77,6 @@ func TestServerBaseAcceptsStoredPlaintextURL(t *testing.T) {
 		t.Fatalf("HTTP 地址也应当能取到凭据: %v", err)
 	}
 
-	// 本机调试地址同样可用。
 	debug := &App{cfg: &Config{APIKey: "lt_test_key", ServerURL: "http://127.0.0.1:7848"}}
 	if got := debug.serverBase(); got != "http://127.0.0.1:7848" {
 		t.Fatalf("本机调试地址应当可用，得到 %q", got)

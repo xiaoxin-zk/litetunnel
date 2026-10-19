@@ -75,7 +75,6 @@ async function onCommand(cmd) {
     try {
       await authApi.logout()
     } catch {
-      // 登出失败不影响本地清理
     }
     localStorage.removeItem(TOKEN_KEY)
     router.push('/login')

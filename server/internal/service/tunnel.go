@@ -15,7 +15,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// TunnelInput 隧道创建/更新入参。
 type TunnelInput struct {
 	Name           string `json:"name"`
 	Type           string `json:"type"`
@@ -29,44 +28,13 @@ type TunnelInput struct {
 	UseCompression bool   `json:"use_compression"`
 }
 
-// ListTunnels 返回用户全部隧道。
 func (s *Services) ListTunnels(userID uint) ([]model.Tunnel, error) {
 	list, _, _, err := s.ListTunnelsPage(userID, 0, 0)
 	return list, err
 }
 
-// ListTunnelsPage 按游标分页取某用户的隧道：返回 id < beforeID 的记录，
-// beforeID 为 0 表示从最新一条开始；limit<=0 表示不分页（全部）。
-//
-// 为什么要分页：客户端接入信息接口原先一次返回该账号的全部隧道，
-// 隧道一多响应就能顶到客户端 4 MiB 的读取上限，截断后 JSON 解析失败，
-// 表现为「同步一直失败、界面上什么都没变」。分页后单页大小可控。
-//
-// 为什么用游标而不是 offset：分页期间发生增删时，offset 会错位——
-// 删掉一条之后下一页的 offset 越过了本来该出现的那条，或新增一条
-// 导致下一页重复返回。客户端拿到漏项的清单，会把漏掉的隧道当成
-// 「服务端已删除」而停掉本机进程、删掉本地配置。游标只依赖 id 的
-// 单调性，增删都不会让分页错位。
-//
-// 同时返回总数与**清单版本**：只比条数会漏过「数量相抵」的并发变更
-// （分页期间删掉一条已取到的、同时新增一条 id 更大的：总数不变，但
-// 新隧道落在游标之前，永远取不到）。版本连「启用切停用」「改端口/域名」
-// 这类不增删记录的变更也要反映，见 tunnelListVersionTx。
-//
-// 版本与页面数据在**同一个事务、同一个快照**里读：跨页比对版本能发现
-// 期间的变化，最坏只是多重取一轮。
 func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []model.Tunnel, total int64, version string, err error) {
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
-		// 版本与页面数据必须来自**同一个快照**。
-		//
-		// 反过来（先算版本、再读页面）时，两条语句之间提交的变更会让这一页
-		// 出现「旧版本 + 新数据」：客户端跨页比对版本时看到各页一致，就把
-		// 这组页面当成一致清单接受——最后一页更是没有后续页可以对照，
-		// 那份不一致会一直留到下一轮同步。
-		//
-		// SQLite 只有一条连接、整个事务共用同一个快照；PostgreSQL 默认
-		// READ COMMITTED 是逐语句快照，所以这里显式提到 REPEATABLE READ。
-		// 语句必须是事务里的第一条，因此放在这里、任何查询之前。
 		if tx.Dialector.Name() == "postgres" {
 			if err := tx.Exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").Error; err != nil {
 				return err
@@ -84,8 +52,6 @@ func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []mod
 			return err
 		}
 
-		// 先读页面、再读版本：即使某个驱动上快照隔离没生效，这个顺序也只
-		// 会让版本比页面「更新」（客户端重取一轮），不会出现「页面新、版本旧」。
 		v, n, verr := s.tunnelListVersionTx(tx, userID)
 		if verr != nil {
 			return verr
@@ -99,18 +65,6 @@ func (s *Services) ListTunnelsPage(userID, beforeID uint, limit int) (list []mod
 	return list, total, version, nil
 }
 
-// tunnelListVersionTx 取用户隧道清单的版本与总数。
-//
-// 版本 = 总数 : 修订号。修订号由数据库触发器在「对账相关字段」变化时与
-// 数据变更**同事务**递增（见 model.TunnelListRev 与 store 里的
-// ensureTunnelListRevTriggers），所以这里只是一次主键读。
-//
-// 旧实现是把该用户全部隧道读出来逐行哈希：隧道数为 N 时，一次分页同步
-// 会对同一批行重复扫描 ceil(N/200) 次，代价随 N 线性放大；而现在的读法
-// 与 N 无关（总数那一次 count 走 user_id 索引，只做计数不取行）。
-//
-// 版本里仍然拼上总数：万一某条写路径绕过了触发器（例如有人手工改表），
-// 增删至少还能让客户端发现一部分变化。
 func (s *Services) tunnelListVersionTx(tx *gorm.DB, userID uint) (string, int64, error) {
 	var revs []int64
 	if err := tx.Model(&model.TunnelListRev{}).
@@ -129,7 +83,6 @@ func (s *Services) tunnelListVersionTx(tx *gorm.DB, userID uint) (string, int64,
 	return fmt.Sprintf("%d:%d", total, rev), total, nil
 }
 
-// GetTunnel 按 ID 与归属校验后取隧道。
 func (s *Services) GetTunnel(userID, id uint) (*model.Tunnel, error) {
 	var t model.Tunnel
 	err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error
@@ -142,7 +95,6 @@ func (s *Services) GetTunnel(userID, id uint) (*model.Tunnel, error) {
 	return &t, nil
 }
 
-// FindTunnelByName 按用户与隧道名定位，供 frps 插件回调校验使用。
 func (s *Services) FindTunnelByName(userID uint, name string) (*model.Tunnel, error) {
 	var t model.Tunnel
 	err := s.DB.Where("user_id = ? AND name = ?", userID, name).First(&t).Error
@@ -155,25 +107,11 @@ func (s *Services) FindTunnelByName(userID uint, name string) (*model.Tunnel, er
 	return &t, nil
 }
 
-// CreateTunnel 校验分组权限并创建隧道。
-//
-// 全程持有该用户的锁：与「删除该用户」互斥（见 userLock）。
 func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, error) {
 	lock := s.userLock(u.ID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 自动分配端口时，唯一索引仍可能在并发下拒绝其中一个：两个请求恰好
-	// 随机到同一个端口（概率很低，但会发生）。这是可重试的——换一个随机
-	// 端口，把整条建隧道流程重来一次即可。
-	//
-	// 重试放在**这里**而不是事务内部，是为了让每次尝试都是一次完整的
-	// createTunnelLocked：它拿到的端口锁会随这次调用返回而释放，重试时
-	// 重新取新端口的锁。放在事务内部的话，上一把锁只能靠 defer 释放最后
-	// 那一把，旧端口上的防火墙操作会从此卡死。
-	//
-	// 用户自己指定端口时不重试：那是他明确要的端口，冲突应当如实报错，
-	// 而不是悄悄换一个给他。
 	attempts := 1
 	if in.RemotePort == 0 {
 		attempts = portAllocAttempts
@@ -193,19 +131,9 @@ func (s *Services) CreateTunnel(u *model.User, in TunnelInput) (*model.Tunnel, e
 		}
 		log.Printf("[tunnel] 端口分配撞车（第 %d/%d 次尝试），重新随机分配后重试", attempt, attempts)
 	}
-	// 重试次数用尽仍是端口冲突：如实返回（下面这行对它没有影响）。
 	return nil, describeTunnelWriteError(err)
 }
 
-// reloadUserWithGroupTx 在事务内重读用户行与生效分组，两者都加行锁。
-//
-// handler 传入的 u 是请求开始时加载的快照：管理员改组（AdminSetUserGroup
-// 锁用户行）、调套餐与我们交错时，快照里的协议、隧道数、域名权限都可能
-// 已经过时——按旧套餐建出的隧道会一直带着越权参数跑下去。
-//
-// FOR UPDATE 必须在**事务内**才真正持锁到提交：放在事务外只是一次
-// 立即释放的读，挡不住紧接着提交的改组。锁序「用户行 → 分组行」，
-// 与 Redeem / AdminSetUserGroup / DeleteGroup 一致。
 func (s *Services) reloadUserWithGroupTx(tx *gorm.DB, userID uint) (*model.User, *model.Group, error) {
 	var u model.User
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -222,11 +150,7 @@ func (s *Services) reloadUserWithGroupTx(tx *gorm.DB, userID uint) (*model.User,
 	return &u, g, nil
 }
 
-// effectiveGroupTx 按 EffectiveGroup 的语义取生效分组，但对分组行加锁，
-// 且只使用传入的 tx——SQLite 只开一个连接，事务内再用 s.DB 查询会自己
-// 等死自己。
 func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, error) {
-	// 分组已过期或未绑定：回落默认分组（与 EffectiveGroup 一致）。
 	if u.GroupExpireAt != nil && u.GroupExpireAt.Before(time.Now()) {
 		return s.defaultGroupTx(tx), nil
 	}
@@ -237,7 +161,6 @@ func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, e
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		First(&g, u.GroupID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// 分组刚被并发删除：按未绑定处理，回落默认分组。
 			return s.defaultGroupTx(tx), nil
 		}
 		return nil, err
@@ -245,11 +168,6 @@ func (s *Services) effectiveGroupTx(tx *gorm.DB, u *model.User) (*model.Group, e
 	return &g, nil
 }
 
-// defaultGroupTx 是 defaultGroup 的事务内版本，原因同上。
-//
-// 默认分组同样加行锁：它虽不可删除，但套餐（协议、隧道数、域名权限）
-// 仍可被 UpdateGroup 调整。不加锁的话，回落到默认分组的用户在并发调组
-// 时会按调整前的权限建出隧道——与普通分组路径的锁语义必须一致。
 func (s *Services) defaultGroupTx(tx *gorm.DB) *model.Group {
 	var g model.Group
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -259,32 +177,9 @@ func (s *Services) defaultGroupTx(tx *gorm.DB) *model.Group {
 	return &g
 }
 
-// createTunnelLocked 在**已持有该用户锁**的前提下创建隧道。
-//
-// firewallNow 决定是否在事务提交后立即尝试放行防火墙端口：
-// 单条创建传 true（规则即时生效）；批量创建传 false 并把放行挪到
-// 用户锁之外异步执行——helper 不可达时单次网络调用可达 10 秒，
-// 串行二十条会把同一用户的其他操作全部卡在锁上（见 CreateTunnelsBatch）。
-// 无论哪种，放行失败都会进重试队列兜底。
 func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow bool) (*model.Tunnel, error) {
 	var created model.Tunnel
 
-	// # 先定端口、先加锁，再开事务
-	//
-	// 锁序固定为「用户锁 → 端口锁 → 数据库事务」。
-	//
-	// 为什么不能在事务里等端口锁：SQLite 上数据库只有**一条**连接
-	// （store.Open 里 SetMaxOpenConns(1)），事务会一直占着它。在事务内等
-	// 端口锁就是「持有唯一连接 → 等端口锁」，而手工关闭端口
-	// （FirewallManualClose：端口锁内统计活跃隧道）与待办重试是
-	// 「持有端口锁 → 查库」，两边都不超时，直接死锁。
-	// 手工关闭一个空闲端口、恰好有人把隧道建到该端口，就能稳定触发。
-	//
-	// 所以端口必须在事务**开始之前**定下来并加锁：
-	//   - 指定端口：直接用它，进事务后复核是否已被占用；
-	//   - 自动分配：先在事务外读一次当前占用（不持锁的普通查询）挑一个
-	//     候选，拿到候选端口的锁之后再进事务复核。候选被别人抢走的窗口
-	//     由 CreateTunnel 的「撞车重试」换个端口重来兜底。
 	port := 0
 	if isPortTunnelType(in.Type) {
 		port = in.RemotePort
@@ -297,7 +192,6 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 		}
 	}
 
-	// 事务结束（无论成败）后释放；防火墙放行也在这把锁之内（见函数末尾）。
 	var portUnlock func()
 	if port > 0 {
 		pl := s.portLock(port)
@@ -311,9 +205,6 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 	}()
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		// 用户与生效分组在事务内重读并加行锁（见 reloadUserWithGroupTx）：
-		// 数量上限、协议、域名权限都以**此刻**的套餐为准，而不是请求
-		// 开始时的快照。
 		u, g, err := s.reloadUserWithGroupTx(tx, u.ID)
 		if err != nil {
 			return err
@@ -327,7 +218,6 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 			return err
 		}
 
-		// 数量上限校验放在事务内，避免并发绕过限制。
 		var count int64
 		if err := tx.Model(&model.Tunnel{}).Where("user_id = ?", u.ID).Count(&count).Error; err != nil {
 			return err
@@ -347,9 +237,6 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 					return ErrPortLimit
 				}
 			}
-			// 端口已在事务外选定并加锁（见函数开头的说明），这里只复核
-			// 它确实还空着：候选端口是加锁之前读到的，别的事务可能刚把
-			// 它占掉。撞车时返回 ErrPortInUse，交给 CreateTunnel 换个端口重来。
 			if err := s.assertPortFree(tx, port); err != nil {
 				return err
 			}
@@ -363,13 +250,6 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 		if err := tx.Create(&normalized).Error; err != nil {
 			return err
 		}
-		// 把写入后的结果带出去（含自增 ID 与分配到的公网端口）。
-		//
-		// 少了这一步，CreateTunnel 会返回一个**零值隧道**：上面的
-		// tx.Create 填的是 normalized，而不是外面声明的 created。
-		// 这个错误长期没被发现，是因为调用方大多紧接着重新拉一次列表，
-		// 拿到的是真实数据；但直接读接口返回值的人（包括新加的批量创建）
-		// 会拿到一个 id=0、name 为空的对象。
 		created = normalized
 		return nil
 	})
@@ -377,31 +257,14 @@ func (s *Services) createTunnelLocked(u *model.User, in TunnelInput, firewallNow
 		return nil, err
 	}
 
-	// 隧道建好后按需在主机防火墙上放行端口。
-	// 失败不影响隧道本身——管理员仍可去云安全组手工放行，
-	// 而把建隧道整体失败掉会让用户完全无从下手。
-	//
-	// 用 Locked 版本：该端口的锁已经拿到了（见函数开头），
-	// 这里再调一次会重复加锁、直接死锁。
-	//
-	// 锁一直持有到放行结束，跨过事务提交：一条「收回 20001」的待办重试
-	// 会先查库确认这个端口确实不该开着。若提交后才放锁，它可能在本事务
-	// 提交前查不到新隧道、判定该关，然后在放行之后把端口关掉——新隧道
-	// 刚建好就连不上。现在它只能在「提交 + 放行」整段结束之后才动得了。
 	if firewallNow && created.RemotePort > 0 {
 		if _, ferr := s.applyPortIntentLocked(created.RemotePort, ProtoOfTunnel(created.Type), true); errors.Is(ferr, ErrFirewallQueueFull) || errors.Is(ferr, ErrFirewallQueueUnavailable) {
-			// 隧道已在服务端建好，但防火墙放行既没成功、也没能进入重试队列：
-			// 这条隧道会一直「连不上」，而管理页上没有任何待办提示。必须明确
-			// 报错让用户知道需要管理员介入；隧道对象仍一并返回，避免「报失败
-			// 却已创建」的困惑。
 			return &created, fmt.Errorf("隧道已创建，但防火墙放行失败且无法自动重试：%w", ferr)
 		}
 	}
 	return &created, nil
 }
 
-// isPortTunnelType 判断协议是否占用公网端口（TCP/UDP）。
-// 入参按 normalizeInput 的口径处理：小写、去掉首尾空白。
 func isPortTunnelType(tunnelType string) bool {
 	switch strings.ToLower(strings.TrimSpace(tunnelType)) {
 	case model.ProxyTypeTCP, model.ProxyTypeUDP:
@@ -410,27 +273,7 @@ func isPortTunnelType(tunnelType string) bool {
 	return false
 }
 
-// UpdateTunnel 更新隧道。端口与协议不可变更，避免影响已下发的客户端配置。
-//
-// # 为什么不能整行 Save
-//
-// Save(t) 会把**整条记录**写回去，而采集器（见 runtime.go）正并发更新同一条
-// 记录的流量与在线时间：编辑读到旧快照、采集器写入新值、Save 再用旧快照
-// 覆盖回去——流量凭空缩水。同理，并发停用写回的「停用」状态也会被编辑
-// 快照里的「启用」改回去。
-//
-// 更糟的是删除竞态：删除先完成后，GORM 的 Save 在更新影响行数为零时会
-// 回退为插入——已删除的隧道被这次「编辑」复活，且防火墙意图不会跟着
-// 这次复活重新应用。
-//
-// 因此只更新本次允许修改的字段（状态、端口、流量等一概不碰），
-// 用 id + user_id 圈定目标并检查影响行数：删掉了就返回 NotFound，
-// 绝不重新插入。编辑与删除、状态变更共用用户锁（userLock），
-// 同一用户的这三类操作只能先后发生。
 func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.Tunnel, error) {
-	// 与「删除该用户」「删除隧道」「启停隧道」互斥（见 userLock）：
-	// 这些操作都以「读状态 → 改数据」的模式工作，交错时各自的读
-	// 都可能过时。
 	lock := s.userLock(u.ID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -451,9 +294,6 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 		return nil, fmt.Errorf("%w: 本地地址格式不正确", ErrInvalidParam)
 	}
 
-	// 用户与生效分组在事务内重读并加行锁：编辑 HTTP/HTTPS 隧道时的域名
-	// 权限按**此刻**的套餐判定，而不是请求开始时的快照（见
-	// reloadUserWithGroupTx）。
 	if err := s.DB.Transaction(func(tx *gorm.DB) error {
 		u, g, err := s.reloadUserWithGroupTx(tx, u.ID)
 		if err != nil {
@@ -486,8 +326,6 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			// 记录在编辑期间被删除（或从未属于该用户）：如实报不存在。
-			// 这里绝不能像 Save 的零行回退那样把它重新插回去。
 			return ErrNotFound
 		}
 		return nil
@@ -497,39 +335,16 @@ func (s *Services) UpdateTunnel(u *model.User, id uint, in TunnelInput) (*model.
 	return s.GetTunnel(u.ID, id)
 }
 
-// DeleteTunnel 删除隧道并释放端口。
-//
-// 全程持有该用户的锁：与「编辑隧道」「启停隧道」共用（见 UpdateTunnel）。
-// 删除是「读状态 → 删记录 → 收端口」三步，中间插进一次编辑或状态切换，
-// 那次操作的副作用（比如按启用状态放行的端口）会建立在已被删除的记录上。
-//
-// # 为什么删记录与「收回端口的意图」必须在同一个事务里
-//
-// 以前是「事务提交后再登记待办」（见 outbox.go 开头的说明）：提交与善后之间
-// 进程若被 kill/OOM/滚动重启，隧道记录已经没了、端口号再也查不回来，而宿主机
-// 上的放行规则还在。启动时的规则对齐刻意只补放行、不回收，所以这条规则会一直
-// 留到有人手工清，面板上也没有任何东西提示它。
-//
-// 现在把意图与 DELETE 写进同一个事务：提交点之前任何一步失败都整体回滚，
-// 提交之后意图一定已经在库里，进程无论何时死掉，重启后的后台 worker 都能捡到。
-//
-// 返回值是结构化的（见 TunnelMutationResult）：数据库改成功但规则没跟上时，
-// 调用方仍应报成功、并把 Warning 透给前端——把它压成 error 会让管理员重试删除
-// 并得到「隧道不存在」，以为系统坏了。
 func (s *Services) DeleteTunnel(userID, id uint) error {
 	_, err := s.DeleteTunnelResult(userID, id)
 	return err
 }
 
-// DeleteTunnelResult 是 DeleteTunnel 的结构化版本，供 handler 把「规则待处理」
-// 透给前端（见 TunnelMutationResult）。
 func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, error) {
 	lock := s.userLock(userID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 先取出端口信息：记录删掉之后就查不到了，
-	// 而防火墙需要它才能收回对应的放行规则。
 	var t model.Tunnel
 	if err := s.DB.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -538,10 +353,6 @@ func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, er
 		return TunnelMutationResult{}, err
 	}
 
-	// 事务内：删记录 + 登记收回端口的意图。
-	//
-	// 取号与写待办都在 tx 上做，不自己开事务（SQLite 单写者，嵌套事务会
-	// 把自己锁死，见 nextFirewallGenTx 的说明）。
 	var intents []portIntent
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Tunnel{})
@@ -556,8 +367,6 @@ func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, er
 		}
 		gen, err := firewallIntentTx(tx, t.RemotePort, ProtoOfTunnel(t.Type), false)
 		if err != nil {
-			// 意图写不进去就让整个删除回滚：宁可这次删除失败让用户重试，
-			// 也不能留下「隧道没了、端口还开着、没有任何待办」的状态。
 			return err
 		}
 		intents = append(intents, portIntent{
@@ -569,19 +378,8 @@ func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, er
 		return TunnelMutationResult{}, err
 	}
 
-	// 提交之后再执行（不能放事务里：helper 调用最长几秒，占着事务会阻塞
-	// 所有写者；而且执行失败要留下已提交的待办，回滚会把它一起抹掉）。
 	pending, fatal, warnings := s.executePortIntentsAfterCommit(intents)
 	if fatal != nil {
-		// 连重试队列都没进去：没有任何人会再尝试收回这个端口。删除已经提交
-		// （隧道记录没了），所以不能返回 error 让用户重试——那只会得到
-		// 「隧道不存在」。但必须在 Warning 里写清楚「端口可能还开着、需要人工
-		// 处理」，否则管理员以为一切正常。
-		//
-		// 用 warnings 而不是 intents 拼端口号：fatal 只在真的处理过某个端口时
-		// 才非空，而 warnings 与它一一对应，避免依赖「intents 一定非空」这个
-		// 隐含前提（t.RemotePort<=0 时 intents 为空、fatal 也必然为 nil，
-		// 但让两者解耦更安全）。
 		res := tunnelMutationResult(pending, warnings)
 		res.Warning = "隧道已删除，但端口规则未能收回且无法自动重试（" +
 			fatal.Error() + "），请手工关闭对应端口"
@@ -590,17 +388,11 @@ func (s *Services) DeleteTunnelResult(userID, id uint) (TunnelMutationResult, er
 	return tunnelMutationResult(pending, warnings), nil
 }
 
-// SetTunnelStatus 启用/停用隧道。
-//
-// 这里只负责「按用户圈定目标」；状态切换本身走 setTunnelStatus——管理员那条
-// 路径也要用同一套检查，两处各写一份迟早会分叉（见 assertTunnelCanEnable）。
 func (s *Services) SetTunnelStatus(userID, id uint, status string) error {
 	_, err := s.SetTunnelStatusResult(userID, id, status)
 	return err
 }
 
-// SetTunnelStatusResult 是 SetTunnelStatus 的结构化版本，供 handler 把
-// 「数据库已更新、规则待处理」透给前端（见 TunnelMutationResult）。
 func (s *Services) SetTunnelStatusResult(userID, id uint, status string) (TunnelMutationResult, error) {
 	if status != model.TunnelStatusActive && status != model.TunnelStatusDisabled {
 		return TunnelMutationResult{}, ErrInvalidParam
@@ -616,13 +408,6 @@ func (s *Services) SetTunnelStatusResult(userID, id uint, status string) (Tunnel
 	return s.setTunnelStatusResult(&t, status)
 }
 
-// assertTunnelCanEnable 是「把隧道切到启用」的唯一前置检查。
-//
-// 只检查启用方向的 HTTPS：平台切回边缘模式后，那条隧道在 Caddy 与 frps 上
-// 都没有对应入口了。此时「停用 → 切模式 → 启用」会绕开创建时的检查，得到一条
-// 状态为运行中、实际永远连不上的隧道——用户只会看到连不上，界面却一切正常。
-//
-// 用户侧与管理员侧都必须走它。分开写的话，先漏掉的一定是后来新增的那条路径。
 func (s *Services) assertTunnelCanEnable(t *model.Tunnel, status string) error {
 	if status != model.TunnelStatusActive || t.Type != model.ProxyTypeHTTPS {
 		return nil
@@ -633,42 +418,16 @@ func (s *Services) assertTunnelCanEnable(t *model.Tunnel, status string) error {
 	return nil
 }
 
-// setTunnelStatus 是「启用/停用隧道」的唯一实现。
-//
-// 状态切换的副作用不止改一行数据库：还要校验 HTTPS 入口、联动防火墙。
-// 这些必须与状态变更保持同一份代码，否则新增一条入口（管理员批量操作、
-// 命令行工具）就会漏掉其中一项。
-//
-// 保留 error 签名作为薄包装（测试与既有调用点继续用它）；需要把「规则待处理」
-// 透给前端的那几条路径改调 setTunnelStatusResult（见 TunnelMutationResult）。
 func (s *Services) setTunnelStatus(t *model.Tunnel, status string) error {
 	_, err := s.setTunnelStatusResult(t, status)
 	return err
 }
 
-// setTunnelStatusResult 是 setTunnelStatus 的结构化版本。
-//
-// # 为什么状态变更与防火墙意图必须同事务
-//
-// 以前是「UPDATE 提交之后再 applyPortIntent」。停用这条路径当时连返回值都
-// 不看（只写日志），于是 helper 不可用、队列满、数据库写待办失败时，数据库
-// 说「已停用」、端口却一直开着，而且没有任何地方会再尝试收回——这正是
-// outbox.go 开头描述的提交后崩溃窗口的近亲：原因不是进程死掉，而是失败被
-// 吞掉了。
-//
-// 现在把 UPDATE 与意图写进同一个事务：写不进去就整体回滚，接口如实报错让
-// 用户重试；写进去了则提交之后立刻尝试执行，失败留给后台 worker。
 func (s *Services) setTunnelStatusResult(t *model.Tunnel, status string) (TunnelMutationResult, error) {
-	// 与编辑、删除互斥（见 UpdateTunnel 的说明）：这些都是「读状态 → 改数据」
-	// 的操作，交错时各自的读都可能过时。锁按隧道**归属者**取，
-	// 用户侧与管理员侧两条路径共用，谁也不会漏。
 	lock := s.userLock(t.UserID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 锁内重读：调用方的读发生在取锁之前，删除可能已经先拿到锁并完成。
-	// 不重读的话，随后的零行更新会被当成成功——接口返回 200，
-	// 状态根本没改，用户看到「已停用」的隧道实际还在跑。
 	var cur model.Tunnel
 	if err := s.DB.First(&cur, t.ID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -682,10 +441,6 @@ func (s *Services) setTunnelStatusResult(t *model.Tunnel, status string) (Tunnel
 		return TunnelMutationResult{}, err
 	}
 
-	// 事务内：改状态 + 登记防火墙意图。
-	//
-	// 零行更新同样不能当成功：重读到更新之间没有数据库级互斥
-	// （用户锁只拦本进程），这条兜底把残余竞态也如实暴露出来。
 	var intents []portIntent
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.Tunnel{}).Where("id = ?", t.ID).Update("status", status)
@@ -701,8 +456,6 @@ func (s *Services) setTunnelStatusResult(t *model.Tunnel, status string) (Tunnel
 		open := status == model.TunnelStatusActive
 		gen, err := firewallIntentTx(tx, t.RemotePort, ProtoOfTunnel(t.Type), open)
 		if err != nil {
-			// 意图写不进去就让状态变更回滚：否则数据库说「已停用」、
-			// 端口却还开着，且没有任何待办会再尝试收回。
 			return err
 		}
 		intents = append(intents, portIntent{
@@ -714,30 +467,17 @@ func (s *Services) setTunnelStatusResult(t *model.Tunnel, status string) (Tunnel
 		return TunnelMutationResult{}, err
 	}
 
-	// 提交之后再执行。启用与停用的失败语义不同：
-	//   - 启用：隧道连不上，用户必须知道（但仍按 pending/fatal 区分——
-	//     入了重试队列的会在几十秒内自动恢复，不算失败）；
-	//   - 停用：只是规则没收回，进队列即可，接口报成功。
 	pending, fatal, warnings := s.executePortIntentsAfterCommit(intents)
 	res := tunnelMutationResult(pending, warnings)
 	if status != model.TunnelStatusActive {
 		return res, nil
 	}
 	if fatal != nil {
-		// 连重试队列都没进去：这条放行永远不会有第二次尝试。状态已经改成
-		// 启用，隧道会一直连不上，必须如实报错（与修改前一致）。
 		return res, fmt.Errorf("隧道已启用，但防火墙放行失败且无法自动重试：%w", fatal)
 	}
 	return res, nil
 }
 
-// truncate 按字节上限截断，但绝不切断多字节字符。
-//
-// 输入是用户填的备注、错误信息这类文本，中文一个字占三个字节：直接按
-// 字节切片的话，切点落在字符中间，存进库的是一段以替换字符收尾的乱码
-// ——界面上看起来像数据损坏。这里从上限处向前回退到最近的 UTF-8
-// 字符起始字节，最多回退 3 个字节（UTF-8 单字符最长 4 字节，回退
-// 已覆盖所有合法前缀）。入参本身仍是字节上限，调用方的约束不变。
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {

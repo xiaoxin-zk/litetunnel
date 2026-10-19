@@ -47,7 +47,6 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-/* 统一表格与表单观感 */
 .el-table th.el-table__cell {
   background: #f9fafb !important;
   font-weight: 600;

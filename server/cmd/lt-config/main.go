@@ -1,42 +1,3 @@
-// Command lt-config 是运行在**宿主机**上的域名与证书配置服务。
-//
-// # 它做什么
-//
-// 面板上的「域名与证书」页保存配置后，由本服务：
-//
-//  1. 把配置合并进部署目录的 .env（只有白名单里的键能被覆盖）；
-//  2. 用 deploy 目录下的模板渲染 Caddyfile 与 frps.toml；
-//  3. 用**将要上线的那个镜像**校验渲染结果，不通过就不写盘；
-//  4. 写入文件并重建 caddy / frps 容器。
-//
-// # 为什么校验和应用必须放在宿主机
-//
-// 面板容器是 read_only 的，只挂载了 /data：它既写不了部署目录，
-// 也没有 docker socket。把「改 Caddy 配置 + 重建容器」交给它，等于
-// 把一个能操纵宿主机的入口放到公网路径上。这与防火墙写操作交给
-// lt-fw 的取舍完全一致（见 cmd/lt-fw 的包注释）。
-//
-// # 权限边界
-//
-// 即使面板被完全控制，攻击者能做的也只有：
-//
-//   - 修改白名单内的域名 / DNS 服务商 / DNS 凭据；
-//   - 触发重新渲染与重建 caddy、frps 两个容器；
-//
-// frps token、端口池范围、面板监听地址、数据库路径都不在白名单内，
-// 校验器也会拒绝产出一份 Caddy 加载不了的配置。
-//
-// # 为什么 Caddy 的管理 API 仍然保持关闭
-//
-// Caddy 自身的 admin API 能直接改运行时配置，把它开放（哪怕只对回环）
-// 就等于多了一条「不改文件也能改路由」的路径，而面板与 Caddy 并不在同一
-// 个网络命名空间里，放开就意味着要把它暴露到某个可被面板触达的地址上。
-// 所以这里走「校验 → 写文件 → 重建容器」：慢几秒，但每一条生效的路由
-// 都能在磁盘上找到对应的那一行。
-//
-// # 部署
-//
-// 见 deploy/systemd/lt-config.service 与 README 的「域名与证书」一节。
 package main
 
 import (
@@ -105,18 +66,7 @@ func main() {
 
 	p := newPaths(*deployDir, *envFile, *composeFile, *caddyTpl, *caddyOut, *frpsTpl, *frpsOut, *caddyData)
 
-	// 校验用的 frps 镜像必须与 Compose 实际启动的一致。两边各自可配，
-	// 只改一边时「校验通过」就只对另一个镜像成立——镜像里有没有 verify
-	// 子命令、支持哪些字段都可能不同，这种校验比没有更误导人。
-	//
-	// 只在启用 frps 校验时检查：校验关闭时镜像不会被用于 verify，也就没有
-	// 「校验镜像与实际运行镜像不同」这回事。启用时读不到 / 解析不了 Compose
-	// 里的镜像必须**阻断启动**，而不是退回默认值——拿一个可能错误的镜像去
-	// 校验，等于为一个根本不会上线的镜像背书，还让「校验通过」看起来一切正常。
 	if *validateFrps {
-		// 先让 Compose 自己解析（--format json）：它把 env-file、插值、锚点
-		// 全处理完，结果就是容器实际会用的镜像名。拿不到时退回手写解析，
-		// 那条路径仍然要读 .env 做插值（见 composeEnvLookup）。
 		resolved, ok := composeServiceImageViaDocker(p.composeFile, p.envFile, "frps")
 		if !ok {
 			img, err := composeServiceImage(p.composeFile, "frps")
@@ -132,19 +82,10 @@ func main() {
 				"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
 		}
 	}
-	// 路径策略必须**在清理之前**跑完：清理会按配置的目录去读、删临时文件与
-	// 备份。若路径配错（两个输出指向同一文件、指向符号链接、用了事务保留名），
-	// 先清理就等于在一个语义未定义的目标上动手——错删的文件不会因为后面
-	// 的校验失败而回来。
 	if err := validateManagedPaths(p); err != nil {
 		log.Fatalf("[lt-config] %v", err)
 	}
 
-	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
-	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。
-	//
-	// 清理不掉的目录会被记住，之后拒绝一切写盘操作：那里的记录与备份是
-	// 唯一还能修复磁盘的东西，被一次新的应用覆盖就彻底没了。
 	blockedDirs := cleanupLeftovers(p)
 	for _, dir := range blockedDirs {
 		log.Printf("[lt-config] 警告：%s 存在未能自动收敛的配置现场（批次记录/备份与目标内容无法对齐）。"+
@@ -172,28 +113,18 @@ func main() {
 	mux.HandleFunc("/dns/check", srv.handleDNSCheck)
 	mux.HandleFunc("/certs", srv.handleCerts)
 
-	// 进程级根上下文：收到 SIGINT/SIGTERM 时取消。所有请求的 context 都由它
-	// 派生（见 BaseContext），于是停服务时在途的 docker 校验/重建也会一并被打断，
-	// 而不是让 docker 子进程在容器重建到一半时被父进程带着硬停。
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	httpSrv := &http.Server{
-		Addr:    *addr,
-		Handler: srv.auth(mux),
-		// 请求 context 从根上下文派生：停服务时取消在途的 docker 操作。
-		BaseContext: func(net.Listener) context.Context { return rootCtx },
-		// 渲染要等 docker 校验，读超时给足；写超时同理。
+		Addr:              *addr,
+		Handler:           srv.auth(mux),
+		BaseContext:       func(net.Listener) context.Context { return rootCtx },
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      writeTimeout,
 	}
 
-	// 收到退出信号后优雅关闭：先停接收新连接，再等已取消的在途请求收尾。
-	//
-	// 进程必须**等到 Shutdown 返回**再退出：在途请求可能正在做回滚（用独立的
-	// 3 分钟预算，不受根上下文取消影响）。ListenAndServe 一返回就结束进程的话，
-	// 文件可能停在「内容已换新、容器仍是旧版」的中间态——而这正是回滚要避免的。
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -212,21 +143,10 @@ func main() {
 		log.Fatalf("[lt-config] 服务退出: %v", err)
 	}
 	if errors.Is(err, http.ErrServerClosed) {
-		// 只有收到退出信号时才有这个错误；等收尾完成再返回。
 		<-shutdownDone
 	}
 }
 
-// composeEnvLookup 返回按 Compose 语义查插值变量的函数。
-//
-// Compose 做 ${VAR} 插值时，来源优先级是「进程环境变量 > --env-file 指定的
-// .env 文件」。这里原先直接用 os.Getenv：变量只写在 .env 里时（本仓库推荐的
-// 做法——值留在部署目录、由 --env-file 传进去）取不到值，于是镜像被判成
-// 「无法解析」或「与校验镜像不一致」并**阻断启动**。那条错误与实际部署毫无
-// 关系，排查时只能看到「镜像名对不上」，很难想到是解析来源不同。
-//
-// 读失败不在这里 fatal：变量全在进程环境里的部署（例如由 systemd
-// Environment= 提供）仍然可用；真解析不出来时上层会给出「无法解析」的错误。
 func composeEnvLookup(envPath string) func(string) string {
 	vars := map[string]string{}
 	if _, parsed, err := readEnvFile(envPath); err != nil {
@@ -235,8 +155,6 @@ func composeEnvLookup(envPath string) func(string) string {
 		vars = parsed
 	}
 	return func(name string) string {
-		// 进程环境优先：与 Compose 的优先级一致，也保证「同一个变量在两处
-		// 都设了值」时，本程序与 Compose 得出同一个结论。
 		if v, ok := os.LookupEnv(name); ok && strings.TrimSpace(v) != "" {
 			return v
 		}
@@ -245,30 +163,17 @@ func composeEnvLookup(envPath string) func(string) string {
 }
 
 const (
-	// writeTimeout 必须覆盖「镜像校验 → 写盘 → compose 重建 → 稳定检查 →
-	// 失败回滚重建」的最坏链路。
-	//
-	// 服务端在到达 WriteTimeout 时会断开连接，但**不会**停止正在跑的处理：
-	// 前端看到超时后重试，就会叠加出第二个事务——而第一个仍在改盘。4 分钟
-	// 覆盖不了「回滚重建」的 3 分钟预算，所以这里放宽到 10 分钟，并配合
-	// applyMu 的 TryLock（并发请求直接 409，而不是排队）。
 	writeTimeout = 10 * time.Minute
 
-	// shutdownTimeout 是优雅关闭等待在途请求的上限。
-	//
-	// 必须大于 rollbackTimeout：关闭信号到达时，某个请求可能正在用独立预算
-	// 做回滚重建。提前退出进程会把它截断在「磁盘新、容器旧」的中间态。
 	shutdownTimeout = 4 * time.Minute
 )
 
-// addWarn 记一条要随本次响应返回给面板的警告。
 func (s *service) addWarn(msg string) {
 	s.warnMu.Lock()
 	defer s.warnMu.Unlock()
 	s.pendingWarns = append(s.pendingWarns, msg)
 }
 
-// takeWarns 取走并清空待回传警告。
 func (s *service) takeWarns() []string {
 	s.warnMu.Lock()
 	defer s.warnMu.Unlock()
@@ -280,7 +185,6 @@ func (s *service) takeWarns() []string {
 	return out
 }
 
-// paths 是全部会被本服务读写的路径，启动时统一解析与校验。
 type paths struct {
 	deployDir   string
 	envFile     string
@@ -337,10 +241,6 @@ func newPaths(deployDir, envFile, composeFile, caddyTpl, caddyOut, frpsTpl, frps
 	return p
 }
 
-// validateConfig 在启动阶段把配置问题全部挡掉。
-//
-// 这类问题拖到运行期的表现是「面板说保存成功，但配置没变、容器也没重启」，
-// 排查成本极高。宁可启动失败。
 func validateConfig(addr, token string, p paths) error {
 	if strings.TrimSpace(token) == "" {
 		return errors.New("必须设置 LT_CFG_TOKEN：没有令牌的话，本机任何进程都能让它改 Caddy 配置并重启容器")
@@ -349,7 +249,6 @@ func validateConfig(addr, token string, p paths) error {
 		return errors.New("LT_CFG_TOKEN 太短，请使用至少 16 字符的随机值")
 	}
 
-	// 只允许回环：绑到 0.0.0.0 等于把「重写 TLS 配置」的接口送给整个网段。
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("监听地址非法: %w", err)
@@ -362,11 +261,6 @@ func validateConfig(addr, token string, p paths) error {
 		return err
 	}
 
-	// 多态判定（见 statcheck.go）：Stat 失败可能是「没这个文件」，也可能是
-	// 「读不了」；路径是目录同样不是「文件就绪」。前者报成「缺少必需文件」
-	// 会让管理员去补一个其实还在的文件，后者若只看存在性会等渲染才崩——
-	// 而真正要修的是权限、挂载或目录被误替换。启动阶段的错误信息是唯一
-	// 线索，不能含糊。
 	for _, f := range []string{p.caddyTpl, p.frpsTpl, p.composeFile} {
 		state, err := statRegularFileState(f)
 		switch state {
@@ -386,7 +280,6 @@ func validateConfig(addr, token string, p paths) error {
 	case fileNotRegular:
 		return fmt.Errorf(".env（%s）不是普通文件（可能是目录）：请检查权限与挂载", p.envFile)
 	}
-	// 产物目录必须可写，否则会在「校验都过了、写盘才失败」这一步才暴露。
 	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {
 		if err := writable(filepath.Dir(f)); err != nil {
 			return fmt.Errorf("目录不可写 %s: %w", filepath.Dir(f), err)
@@ -409,21 +302,8 @@ type service struct {
 	token string
 	paths paths
 
-	// applyMu 把「渲染 → 写盘 → 重建容器」整段串行化。
-	//
-	// 两个并发的 /render 会交错读 .env、写三个文件并各自触发一次容器重建：
-	// 磁盘上的配置可能来自两次请求的混合，容器则被重建两轮。而 /apply
-	// （只用磁盘上的文件重建）与 /render 并发时，容器甚至可能重建在
-	// 「文件只替换了一半」的瞬间。
-	//
-	// 面板通常只有一个页面在调它，但接口的安全性不该建立在调用方克制上。
 	applyMu sync.Mutex
 
-	// warnMu 保护 pendingWarns：校验阶段产生、但要随本次响应返回给面板的
-	// 非致命问题（主要是临时目录清理失败）。
-	//
-	// 只写日志是不够的：那些目录里可能有 DNS 凭据，管理员在界面上看到
-	// 「应用成功」就不会再关注日志，而残留的凭据目录会一直躺在部署根下。
 	warnMu       sync.Mutex
 	pendingWarns []string
 
@@ -432,42 +312,22 @@ type service struct {
 	validateFrps bool
 	allowApply   bool
 
-	// validateFn 是容器校验的替身钩子，正式运行时为 nil（走真实的 caddy / frps
-	// 校验）。测试里起不了 docker，而「校验阶段不许改活动文件」这条性质必须被
-	// 守住——没有这个钩子就只能靠人眼盯着，而那正是它上次被漏掉的原因。
 	validateFn func(caddyText, caddyImage, frpsText string, vars map[string]string) (string, error)
 
-	// blockedDirs 是启动时无法自动收敛的目录（见 cleanupLeftovers）。
-	//
-	// 这些目录里留着批次记录与备份，是修复「新旧混合」的唯一依据。此时再写盘
-	// 会把它们覆盖掉，所以整个进程拒绝写操作——宁可让管理员手动处理一次，
-	// 也不能让一次自动应用把还能修的现场变成无迹可寻。
 	blockedDirs []string
 	blockedMu   sync.RWMutex
 
-	// dockerProbe 缓存 /health 的 docker 可用性探测结果（见 dockerStatus）。
-	// 放在 service 上而不是包级变量：测试要能各自独立地拿到一份空缓存。
-	dockerProbe dockerProbeCache
-	// dockerProbeFn 是探测的替身钩子，正式运行时为 nil（走真实的 docker info
-	// 加 compose 探测）。测试环境里没有 docker，而「命令在 ≠ 宿主可用」这条
-	// 判定必须能被覆盖。
-	dockerProbeFn func() dockerProbeResult
-	// composeProbeFn 只替换 compose 那一段探测，正式运行时为 nil。
-	//
-	// 与 dockerProbeFn 分开的理由：整份替身会让「daemon 可用 → 接着探
-	// compose」这条串接逻辑无法被测到，而那正是缺陷 9 的落点。有了这个钩子，
-	// 用真实 probeDockerHost 的结果也能验证 compose 的判定与原因分离。
+	dockerProbe    dockerProbeCache
+	dockerProbeFn  func() dockerProbeResult
 	composeProbeFn func() composeProbeResult
 }
 
-// blockedDirsSnapshot 返回阻断目录的副本，供 health 响应使用。
 func (s *service) blockedDirsSnapshot() []string {
 	s.blockedMu.RLock()
 	defer s.blockedMu.RUnlock()
 	return append([]string(nil), s.blockedDirs...)
 }
 
-// auth 校验 Bearer token，用常量时间比较避免逐字节试探。
 func (s *service) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -508,10 +368,6 @@ func envBool(key string, def bool) bool {
 	return b
 }
 
-// atoiOr 把 .env 里的端口字符串转成整数，非法值返回默认值。
-//
-// 不报错是有意的：健康检查只是把端口显示出来，
-// 一个写错的端口不该让整页状态变成「不可用」。
 func atoiOr(s string, def int) int {
 	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
 		return n

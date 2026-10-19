@@ -7,47 +7,38 @@ import (
 	"testing"
 )
 
-// TestParseSelfStatHandlesCommWithSpaces 验证进程名含空格与括号时不会错位。
-//
-// /proc/self/stat 的第 2 个字段是进程名，被括号包裹且**可以包含空格与括号**。
-// 直接用 strings.Fields 切分会让其后的 utime / stime / rss 全部错位——
-// 而错位后仍能解析出数字，只是数字来自别的字段，不会报错。
-// 所以这条必须有测试守着。
 func TestParseSelfStatHandlesCommWithSpaces(t *testing.T) {
-	// 构造一条真实格式的 stat：comm 里带空格和括号。
-	// 括号后共 22 个字段（state 到 rss），这里只填充必要的几个。
 	rest := []string{
-		"S",    // 1  state
-		"1",    // 2  ppid
-		"0",    // 3  pgrp
-		"0",    // 4  session
-		"0",    // 5  tty_nr
-		"0",    // 6  tpgid
-		"0",    // 7  flags
-		"0",    // 8  minflt
-		"0",    // 9  cminflt
-		"0",    // 10 majflt
-		"0",    // 11 cmajflt
-		"120",  // 12 utime
-		"80",   // 13 stime
-		"0",    // 14 cutime
-		"0",    // 15 cstime
-		"20",   // 16 priority
-		"0",    // 17 nice
-		"4",    // 18 num_threads
-		"0",    // 19 itrealvalue
-		"1000", // 20 starttime
-		"9999", // 21 vsize
-		"500",  // 22 rss（页）
+		"S",
+		"1",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"120",
+		"80",
+		"0",
+		"0",
+		"20",
+		"0",
+		"4",
+		"0",
+		"1000",
+		"9999",
+		"500",
 	}
 	raw := "1234 (my (weird) process name) " + strings.Join(rest, " ")
 
 	cpu, rss := parseSelfStat(raw)
 
-	if cpu != 200 { // 120 + 80
+	if cpu != 200 {
 		t.Errorf("CPU 时间解析错误：got %d, want 200", cpu)
 	}
-	// rss 单位是页，需乘页面大小，所以只校验「非零且是页面大小的整数倍」。
 	if rss == 0 {
 		t.Fatal("RSS 不应为 0")
 	}
@@ -56,7 +47,6 @@ func TestParseSelfStatHandlesCommWithSpaces(t *testing.T) {
 	}
 }
 
-// TestParseSelfStatRejectsShortInput 验证字段不足时安全返回 0。
 func TestParseSelfStatRejectsShortInput(t *testing.T) {
 	for _, in := range []string{"", "no-parens", "1 (x) S", "1 (x) S 1 2"} {
 		if cpu, rss := parseSelfStat(in); cpu != 0 || rss != 0 {
@@ -65,11 +55,6 @@ func TestParseSelfStatRejectsShortInput(t *testing.T) {
 	}
 }
 
-// TestCPUPercent 验证使用率的计算与边界。
-//
-// 这里最容易错的是 iowait 的归属：iowait 期间 CPU 实际空闲，
-// 若不算进 idle，磁盘等待会被误报成 CPU 繁忙（做 IO 的机器上能差出几十个百分点）。
-// readCPUCounters 已把 iowait 累加进 idle，本函数只负责算比例。
 func TestCPUPercent(t *testing.T) {
 	cases := []struct {
 		name                string
@@ -82,7 +67,6 @@ func TestCPUPercent(t *testing.T) {
 		{"全闲", 1000, 500, 2000, 1500, 0},
 		{"计数器未推进", 1000, 500, 1000, 500, 0},
 		{"计数器回绕", 2000, 1000, 1000, 500, 0},
-		// 异常输入：idle 增量大于总增量（内核读数的瞬时不一致）
 		{"idle 超过 total 时钳制", 1000, 500, 1100, 900, 0},
 	}
 	for _, tc := range cases {
@@ -93,14 +77,6 @@ func TestCPUPercent(t *testing.T) {
 	}
 }
 
-// TestSelfCPUPercent 验证面板进程自身的 CPU 占用算法。
-//
-// 这里最容易错的是分母：必须用同一段时间里的**系统**总增量。曾经传的是
-// 「进程增量 / 进程增量」——只要进程用了一点 CPU 就恒等于 100%，
-// 管理页上那个长期不变的 100% 就是这么来的。
-//
-// 期望值按「100% = 占满一个核」计算：进程增量 / 系统增量 × 核数 × 100。
-// 系统增量在这段时间内恒等于 elapsed×cores×HZ，所以不必知道 HZ。
 func TestSelfCPUPercent(t *testing.T) {
 	cases := []struct {
 		name                string
@@ -109,16 +85,12 @@ func TestSelfCPUPercent(t *testing.T) {
 		cores               int
 		want                float64
 	}{
-		// 2 核 5 秒：系统增量 1000 jiffies（假设 HZ=100），进程用了 50 jiffies。
 		{"2 核上占 10% 单核", 0, 50, 0, 1000, 2, 10},
-		// 进程吃满一个核：500 jiffies / 1000 × 2 × 100 = 100%。
 		{"占满一个核", 0, 500, 0, 1000, 2, 100},
-		// 多核并行可以超过 100%。
 		{"占满两个核", 0, 1000, 0, 1000, 2, 200},
 		{"完全空闲", 100, 100, 1000, 2000, 4, 0},
 		{"系统计数器未推进", 0, 50, 1000, 1000, 2, 0},
 		{"进程计数器回绕", 100, 50, 1000, 2000, 2, 0},
-		// 读数异常时钳制到 cores×100，不在界面上显示 800%。
 		{"越界时钳制", 0, 5000, 0, 1000, 2, 200},
 		{"核数非法时按 1 核", 0, 500, 0, 1000, 0, 50},
 	}
@@ -130,13 +102,7 @@ func TestSelfCPUPercent(t *testing.T) {
 	}
 }
 
-// TestParseCPUStatCountsHostCores 验证核数取自 cpuN 行，且 guest 不重复累加。
-//
-// 核数必须来自同一份 /proc/stat：cpu 汇总行是**宿主机**口径（procfs 的 CPU
-// 计数不受 cgroup 限制），而 runtime.NumCPU() 在设了 cpuset 的容器里返回的
-// 是可用核数。混用会让进程 CPU 偏低、管理页用过小的核数判断宿主机负载。
 func TestParseCPUStatCountsHostCores(t *testing.T) {
-	// guest / guest_nice（最后两列）已包含在 user / nice 里，不能再加一遍。
 	stat := strings.Join([]string{
 		"cpu  100 0 100 800 0 0 0 0 50 50",
 		"cpu0 50 0 50 400 0 0 0 0 50 50",
@@ -152,11 +118,9 @@ func TestParseCPUStatCountsHostCores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	// user+nice+system+idle+iowait+irq+softirq+steal = 100+0+100+800 = 1000
 	if total != 1000 {
 		t.Errorf("总量错误：got %d, want 1000（guest 不得重复累加）", total)
 	}
-	// idle + iowait = 800
 	if idle != 800 {
 		t.Errorf("空闲量错误：got %d, want 800（iowait 计入空闲）", idle)
 	}
@@ -165,12 +129,10 @@ func TestParseCPUStatCountsHostCores(t *testing.T) {
 	}
 }
 
-// TestParseCPUStatRejectsMissingSummary 验证没有汇总行时报错而不是给假 0。
 func TestParseCPUStatRejectsMissingSummary(t *testing.T) {
 	if _, _, _, err := parseCPUStat(strings.NewReader("intr 1\nctxt 2\n")); err == nil {
 		t.Fatal("缺少 cpu 汇总行时应返回错误")
 	}
-	// 只有汇总行、没有 cpuN：核数退回运行时值，但不该是 0。
 	total, _, cores, err := parseCPUStat(strings.NewReader("cpu 10 0 10 80 0 0 0 0\n"))
 	if err != nil || total == 0 {
 		t.Fatalf("汇总行应能解析：total=%d err=%v", total, err)
@@ -180,10 +142,6 @@ func TestParseCPUStatRejectsMissingSummary(t *testing.T) {
 	}
 }
 
-// TestNewNormalizesDiskPath 验证磁盘统计路径的默认值。
-//
-// 容器里 / 是镜像 overlay，所以路径必须可配（LT_MONITOR_DISK_PATH）；
-// 配了空值/空白时退回根分区，而不是去 Statfs("")。
 func TestNewNormalizesDiskPath(t *testing.T) {
 	for _, in := range []string{"", "   "} {
 		if got := New(in).diskPath; got != "/" {
@@ -195,10 +153,6 @@ func TestNewNormalizesDiskPath(t *testing.T) {
 	}
 }
 
-// TestRateOfHandlesCounterReset 验证计数器回绕时返回 0 而不是负速率。
-//
-// 网卡重置、容器重启都会让累计计数器归零。若直接相减会得到巨大的负值，
-// 图表上表现为一根向下的尖刺，管理员会以为出了故障。
 func TestRateOfHandlesCounterReset(t *testing.T) {
 	if got := rateOf(100, 200, 10); got != 10 {
 		t.Errorf("正常增量：got %v, want 10", got)

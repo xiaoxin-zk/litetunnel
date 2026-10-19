@@ -1,15 +1,5 @@
 package service
 
-// 这个文件守的是「账号生命周期的最后一公里」：
-//
-//   - 删号/注销之后，frps 上已经建立的代理必须被主动关掉，而不是等客户端自己退出；
-//   - 禁用账号时，数据库里的会话必须在**同一个事务**里置为离线，否则别的实例
-//     仍会按 online=true 的会话放行新连接；
-//   - 代理缺少实例身份字段（clientID / lastStartAt 都为空）时宁可跳过，
-//     也不能按名字盲关——那会误杀客户端刚重建的同名代理。
-//
-// 全部离线运行：假 frps 用 httptest，数据库用临时 sqlite（见 newTestServices）。
-
 import (
 	"context"
 	"errors"
@@ -29,23 +19,14 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// fakeFrpsProxies 是一个可断言、可注入故障的假 frps 管理接口。
-//
-// 只实现断流用到的两个动作：GET 列表与 DELETE 关闭。items 是列表里各条代理的
-// JSON 片段（原样拼进去），使每个用例都能精确控制「frps 报告了哪些代理、
-// 它们带哪些身份字段」。
 type fakeFrpsProxies struct {
-	mu     sync.Mutex
-	items  []string
-	closed []string
-	// lists 是成功返回的列表请求次数，用来断言「一次批量列表替代了 N 次全量拉取」。
-	lists int
-	// failAll 为真时所有请求都返回 500，模拟 frps 管理接口不可用。
-	failAll bool
-	// onDelete 在每次收到关闭请求时被调用，用来断言「关代理时账号已经不在库里」。
+	mu       sync.Mutex
+	items    []string
+	closed   []string
+	lists    int
+	failAll  bool
 	onDelete func(name string)
-	// srv 是背后的 httptest 服务，install 时用它拼 FrpsClient。
-	srv *httptest.Server
+	srv      *httptest.Server
 }
 
 func newFakeFrpsProxies(t *testing.T, items ...string) *fakeFrpsProxies {
@@ -60,7 +41,6 @@ func newFakeFrpsProxies(t *testing.T, items ...string) *fakeFrpsProxies {
 		}
 		switch r.Method {
 		case http.MethodGet:
-			// total 必须如实等于条数：分页完整性只认 total，少报会被判成残缺响应。
 			f.lists++
 			body := fmt.Sprintf(`{"total":%d,"page":1,"pageSize":200,"items":[%s]}`,
 				len(f.items), strings.Join(f.items, ","))
@@ -81,7 +61,6 @@ func newFakeFrpsProxies(t *testing.T, items ...string) *fakeFrpsProxies {
 	return f
 }
 
-// install 把这个假 frps 装到服务集合上。
 func (f *fakeFrpsProxies) install(svc *Services) {
 	svc.Frps = NewFrpsClient(&config.Config{
 		FrpsAPIAddr:     f.srv.URL,
@@ -98,18 +77,12 @@ func (f *fakeFrpsProxies) closedNames() []string {
 	return out
 }
 
-// listCount 返回成功返回的列表请求次数。
-//
-// 用来断言「一轮断流只拉一次批量列表」：缺陷 5 的形态就是每关一条代理重拉
-// 一次全量列表，N 条代理 = N+1 次，frps 稍慢就把 15 秒预算耗在拉列表上。
 func (f *fakeFrpsProxies) listCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lists
 }
 
-// setFailAll / setOnDelete 在锁内改字段：假服务的 handler 跑在另一个 goroutine
-// 里，直接赋值会被 -race 判成数据竞争。
 func (f *fakeFrpsProxies) setFailAll(v bool) {
 	f.mu.Lock()
 	f.failAll = v
@@ -122,18 +95,12 @@ func (f *fakeFrpsProxies) setOnDelete(fn func(name string)) {
 	f.mu.Unlock()
 }
 
-// setItems 替换列表内容。
-//
-// 用来模拟「客户端重连后用同一个名字重新注册」：代理名不变，但 clientID /
-// lastStartAt 已经是新实例。断流的重试若不做意图复核、直接按名字关，
-// 关掉的就是这条新实例。
 func (f *fakeFrpsProxies) setItems(items ...string) {
 	f.mu.Lock()
 	f.items = items
 	f.mu.Unlock()
 }
 
-// proxyJSON 拼一条代理记录。clientID 传空即表示 frps 没有给出该字段。
 func proxyJSON(name, clientID string, lastStartAt int64) string {
 	var b strings.Builder
 	b.WriteString(`{"name":` + strconv.Quote(name))
@@ -144,7 +111,6 @@ func proxyJSON(name, clientID string, lastStartAt int64) string {
 	return b.String()
 }
 
-// newLifecycleUser 造一个启用状态的普通用户。
 func newLifecycleUser(t *testing.T, svc *Services, name string) *model.User {
 	t.Helper()
 	hashed, err := auth.HashPassword("Passw0rd12345")
@@ -158,17 +124,6 @@ func newLifecycleUser(t *testing.T, svc *Services, name string) *model.User {
 	return u
 }
 
-// TestAdminDeleteUserClosesProxies 覆盖「管理员删号后代理还在跑」。
-//
-// 删号只清数据库与内存会话，拦得住新连接；已经在 frps 上转发的数据流不经过
-// 任何准入判断，会一直跑到客户端自己退出。这里断言两件事：
-//
-//  1. 该用户名下的代理被逐个关闭；
-//  2. 关闭动作发生在账号行**已经不存在**之后（事务已提交）。
-//
-// 第 2 点是修复核心：CloseUserProxies 原先靠 users.state_version 做跨实例
-// 见证，账号删掉后那一行就没了，必须有一条「账号已删」的路径，否则删号
-// 永远断不了流。
 func TestAdminDeleteUserClosesProxies(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "delproxy")
@@ -177,12 +132,10 @@ func TestAdminDeleteUserClosesProxies(t *testing.T) {
 	f := newFakeFrpsProxies(t,
 		proxyJSON(FrpUserOf(u.ID)+".mc", "client-a", past),
 		proxyJSON(FrpUserOf(u.ID)+".nas", "client-b", past),
-		// 别的账号的代理：绝对不能碰。
 		proxyJSON(FrpUserOf(u.ID+10000)+".mc", "client-other", past),
 	)
 	f.install(svc)
 
-	// 关代理时必须已经查不到账号：这就是「事务提交之后」的判据。
 	f.setOnDelete(func(name string) {
 		if name == FrpUserOf(u.ID+10000)+".mc" {
 			t.Errorf("关闭了别的账号的代理 %q", name)
@@ -216,10 +169,6 @@ func TestAdminDeleteUserClosesProxies(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountClosesProxies 覆盖自助注销的同一缺陷。
-//
-// 两个删除路径必须给出同一种结果：用户主动「彻底删号」更不该留下还在转发的
-// 隧道。这里同时验证账号行在关代理时已经不在了。
 func TestDeleteAccountClosesProxies(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "selfproxy")
@@ -247,10 +196,6 @@ func TestDeleteAccountClosesProxies(t *testing.T) {
 	}
 }
 
-// TestAdminDeleteUserSucceedsWhenFrpsUnavailable 覆盖「frps 不可用不得让删除失败」。
-//
-// 账号必须删掉。管理端若收到错误去重试，只会得到「用户不存在」；而残留的代理
-// 已经无法再建立新连接（插件找不到账号），靠日志留痕由运维排查。
 func TestAdminDeleteUserSucceedsWhenFrpsUnavailable(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "delnoful")
@@ -274,14 +219,8 @@ func TestAdminDeleteUserSucceedsWhenFrpsUnavailable(t *testing.T) {
 	}
 }
 
-// TestCloseDeletedUserProxiesWithoutStateVersion 覆盖「账号行已不存在」的断流路径。
-//
-// 这是问题 1 的核心：CloseUserProxies 需要 users.state_version 做跨实例见证，
-// 而删号之后那一行没了。CloseDeletedUserProxies 如实退化成「按前缀 + 代理实例
-// 身份尽力关闭」，不查版本、不因账号缺失而放弃。
 func TestCloseDeletedUserProxiesWithoutStateVersion(t *testing.T) {
 	svc := newTestServices(t, nil)
-	// 不建用户：模拟「删除事务已经提交」。
 	const userID = 4242
 	if _, err := svc.userStateVersionFromDB(userID); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("前置条件：账号应不存在，实际 err=%v", err)
@@ -300,15 +239,6 @@ func TestCloseDeletedUserProxiesWithoutStateVersion(t *testing.T) {
 	}
 }
 
-// TestAdminSetUserStatusRevokesDBSessionsInTx 覆盖「跨实例禁用仍能建新连接」。
-//
-// 另一台实例的插件回调走 onNewUserConn → EnsureSessionOnline →
-// FindTrustedClientSession，读的是数据库里的会话行。状态事务里不把 online
-// 置 false 的话，那台实例会一直看到「在线且未过期」的会话，继续放行新连接——
-// 账号明明已禁用，数据连接却照建不误。
-//
-// 这里直接用 FindTrustedClientSession 断言「别的实例会看到什么」：插件在内存
-// 未命中时的唯一回落依据就是它，查不到即拒绝。
 func TestAdminSetUserStatusRevokesDBSessionsInTx(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "crossdisable")
@@ -338,8 +268,6 @@ func TestAdminSetUserStatusRevokesDBSessionsInTx(t *testing.T) {
 		t.Fatal("库里 online 应为 false")
 	}
 
-	// 重新启用不得把已撤销的会话「复活」：重新上线只能通过重新登录
-	// （Login / 凭据复核），否则撤销就形同虚设。
 	if err := svc.AdminSetUserStatus(u.ID, model.UserStatusActive); err != nil {
 		t.Fatalf("启用失败: %v", err)
 	}
@@ -348,11 +276,6 @@ func TestAdminSetUserStatusRevokesDBSessionsInTx(t *testing.T) {
 	}
 }
 
-// TestAdminSetUserStatusRollsBackWhenSessionRevokeFails 覆盖「撤销必须在事务内」。
-//
-// 把会话表删掉让 revoke 必然失败：若撤销在事务之外做，状态更新已经提交、
-// 接口却报错——库里就是「已禁用但会话仍在线」，两个事实互相矛盾。
-// 放进事务里，整笔变更一起回滚，管理员看到错误时数据库没有被改动过。
 func TestAdminSetUserStatusRollsBackWhenSessionRevokeFails(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "revokefail")
@@ -374,20 +297,12 @@ func TestAdminSetUserStatusRollsBackWhenSessionRevokeFails(t *testing.T) {
 	}
 }
 
-// TestCloseUserProxiesSkipsProxyWithoutIdentity 覆盖「双空身份退化成按名字关」。
-//
-// frps 没给 clientID、也没给 lastStartAt 时，这条记录没有任何可用于确认
-// 「还是同一个代理实例」的字段。此时按名字关闭等于赌一把：客户端重连后会用
-// 同一个名字重新注册，赌错就是把刚恢复的用户随机踢下线。
-//
-// 断言：双空的代理跳过；同一轮里带身份的代理照常关闭——跳过一条不能连累其余。
 func TestCloseUserProxiesSkipsProxyWithoutIdentity(t *testing.T) {
 	svc := newTestServices(t, nil)
 	const userID = 77
 	past := time.Now().Add(-time.Minute).Unix()
 
 	f := newFakeFrpsProxies(t,
-		// clientID 与 lastStartAt 都缺失：身份不可判定。
 		`{"name":`+strconv.Quote(FrpUserOf(userID)+".noid")+`,"status":{"phase":"online"}}`,
 		proxyJSON(FrpUserOf(userID)+".identified", "client-a", past),
 	)
@@ -402,10 +317,6 @@ func TestCloseUserProxiesSkipsProxyWithoutIdentity(t *testing.T) {
 	}
 }
 
-// TestCloseUserProxiesClosesProxyWithOnlyClientID 覆盖另一半判据。
-//
-// 双空才跳过；只有 clientID、没有 lastStartAt 时仍要按 clientID 比对后关闭，
-// 否则老版本 frps（不返回 lastStartAt）就完全断不了流。
 func TestCloseUserProxiesClosesProxyWithOnlyClientID(t *testing.T) {
 	svc := newTestServices(t, nil)
 	const userID = 78

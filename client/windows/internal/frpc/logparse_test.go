@@ -2,19 +2,12 @@ package frpc
 
 import "testing"
 
-// 这一组守的是「能不能把 frpc 的报错认出来」。
-//
-// 认不出来的后果不是崩溃，而是界面永远停在「连接中」：用户看不到任何原因，
-// 只能干等或反复重启客户端。所以两类错误（漏认、误认）都要钉住。
-
 func TestStripLogPrefix(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{
 			"15:28:08  Tunnel/mc  [W] [client/control.go:172] start error: boom",
 			"[W] [client/control.go:172] start error: boom",
 		},
-		// frpc 原文里可能自带连续空格，不能被当成前缀分隔符：
-		// 从后面切会把原文截断，而这段原文正是要展示给用户的。
 		{
 			"15:28:08  Tunnel/mc  两段  空格",
 			"两段  空格",
@@ -58,8 +51,6 @@ func TestIsErrorLine(t *testing.T) {
 			false,
 			"启动成功",
 		},
-		// 隧道名是用户自己取的，判定前必须先把前缀剥掉：
-		// 否则一个叫 errorlog 的隧道，它的每一行正常输出都会被当成错误。
 		{
 			"15:28:08  Tunnel/errorlog  [I] [client/service.go:332] login to server success",
 			false,

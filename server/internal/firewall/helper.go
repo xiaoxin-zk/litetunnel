@@ -12,31 +12,14 @@ import (
 	"time"
 )
 
-// helperTimeout 是调用 helper 的超时。
-//
-// 比本地命令超时略长：helper 可能正在等 iptables 锁，
-// 但也不能太长——写操作会阻塞建隧道的请求。
 const helperTimeout = 10 * time.Second
 
-// HelperBackend 通过宿主机上的 lt-fw helper 执行防火墙操作。
-//
-// # 为什么面板要有这样一个「远程」后端
-//
-// 面板容器**不持有任何防火墙写权限**：既没有 NET_ADMIN，也不直接调用
-// iptables。它把写操作转发给宿主机上的 helper，由后者在受控条件下执行。
-//
-// 这样切分之后，即使面板被完全控制，攻击者能做的也只是
-// 「放行/关闭端口池内的端口」——保护端口依然动不了，
-// 更拿不到主机防火墙的完全控制权。
-//
-// 地址通常是 127.0.0.1:7849：面板以 host 网络模式运行，直接可达宿主机回环。
 type HelperBackend struct {
 	base   string
 	token  string
 	client *http.Client
 }
 
-// NewHelperBackend 构造 helper 客户端。base 形如 http://127.0.0.1:7849。
 func NewHelperBackend(base, token string) *HelperBackend {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base != "" && !strings.HasPrefix(base, "http") {
@@ -45,7 +28,6 @@ func NewHelperBackend(base, token string) *HelperBackend {
 	return &HelperBackend{
 		base:  base,
 		token: token,
-		// 不跟随重定向：helper 不该有重定向，跟了反而可能被引到别处。
 		client: &http.Client{
 			Timeout: helperTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -57,28 +39,12 @@ func NewHelperBackend(base, token string) *HelperBackend {
 
 func (h *HelperBackend) Name() string { return "helper" }
 
-// probeCacheTTL 是健康探测结果的缓存时长。
-//
-// 以前每次调用都重新探测，理由是「helper 可能刚被重启，长缓存会让面板
-// 持续报不可达」。但完全不缓存有两个真实代价：
-//
-//   - 同一条调用链上要探两次：FirewallBackend 先 Available() 判断可达，
-//     失败后 Reason() 又探一次——helper 不可达时每次都是两个 10 秒超时；
-//   - 批量建隧道这类连续操作，20 条就是 20 次探测，helper 卡顿时整批
-//     以分钟计。
-//
-// 5 秒的短缓存同时解决两者：helper 重启最多 5 秒内被感知，而一次调用
-// 链、一个批次内不再重复探测。HelperBackend 本身每次调用都会被重建
-// （见 service.FirewallBackend），所以缓存挂在包级、按地址键控。
 const probeCacheTTL = 5 * time.Second
 
 type probeEntry struct {
-	at time.Time
-	ok bool
-	// err 是传输层失败（连不上、超时、非 200）。
-	err error
-	// reason 是 helper 自报的「为什么不可用」（没有可用后端等）。
-	// 传输层没失败但 helper 说不可用时，界面要靠它给出准确原因。
+	at     time.Time
+	ok     bool
+	err    error
 	reason string
 }
 
@@ -87,7 +53,6 @@ var probeCache = struct {
 	m map[string]probeEntry
 }{m: map[string]probeEntry{}}
 
-// probe 探测 helper 健康状态，TTL 内复用上次结果。
 func (h *HelperBackend) probe() (bool, error) {
 	probeCache.Lock()
 	e, hit := probeCache.m[h.base]
@@ -97,9 +62,6 @@ func (h *HelperBackend) probe() (bool, error) {
 	}
 	var out helperHealth
 	err := h.get("/health", &out)
-	// 请求成功不等于 helper 可用：helper 可能在线、但自报没有可用的防火墙
-	// 后端（available=false）。把它当成可用的话，面板会照常派发写操作，
-	// 每次都以 ErrNoBackend 失败，而界面显示的是「后端已接管」。
 	ok := err == nil && out.Available
 	reason := out.Reason
 	if err == nil && !out.Available && reason == "" {
@@ -111,18 +73,12 @@ func (h *HelperBackend) probe() (bool, error) {
 	return ok, err
 }
 
-// probeReason 返回最近一次探测里 helper 给出的原因（没有则空）。
 func (h *HelperBackend) probeReason() string {
 	probeCache.Lock()
 	defer probeCache.Unlock()
 	return probeCache.m[h.base].reason
 }
 
-// Available 判断 helper 是否可达。
-//
-// 这是面板决定「能不能操作防火墙」的唯一依据：
-// helper 没起来时，面板应当明确告诉管理员去检查它，
-// 而不是悄悄退回到「容器内直连 iptables」那条已经废弃的路径。
 func (h *HelperBackend) Available() bool {
 	if h.base == "" {
 		return false
@@ -137,17 +93,11 @@ func (h *HelperBackend) Status() (bool, error) {
 		return false, err
 	}
 	if out.Error != "" {
-		// helper 在线但底层查询失败：这不是「未启用」，必须把错误抛上去，
-		// 让调用方标成「未知」，而不是显示成一个明确的 false。
 		return false, errors.New(out.Error)
 	}
 	return out.Enabled, nil
 }
 
-// ListRules 取回 helper 递归展开后的放行端口。
-//
-// 展开在 helper 侧完成：解析规则需要读 iptables，那是特权操作。
-// 面板拿到的已经是结构化结果，不需要也不应该再自己去读规则集。
 func (h *HelperBackend) ListRules() ([]Rule, error) {
 	var out struct {
 		Rules []Rule `json:"rules"`
@@ -166,7 +116,6 @@ func (h *HelperBackend) RemovePort(port int, proto string) error {
 	return h.postPort("/ports/close", port, proto)
 }
 
-// Reason 返回 helper 配置缺失的原因，供界面提示用。
 func (h *HelperBackend) Reason() string {
 	if h.base == "" {
 		return "未配置宿主机防火墙 helper 地址，请在「系统设置 → 端口与防火墙」中填写"
@@ -174,14 +123,11 @@ func (h *HelperBackend) Reason() string {
 	if h.token == "" {
 		return "未配置 helper 访问令牌，请在「系统设置 → 端口与防火墙」中填写"
 	}
-	// 复用缓存：调用方几乎总是刚调过 Available()，这里不应再探一次。
 	ok, err := h.probe()
 	if err != nil {
 		return fmt.Sprintf("无法连接宿主机 helper（%s），请确认 lt-fw 服务已启动（%v）", h.base, err)
 	}
 	if !ok {
-		// helper 在线但自报不可用：原因由 helper 给出（例如宿主机没有可用的
-		// 防火墙后端），不要用「连不上」这种会把排查方向带错的措辞。
 		if r := h.probeReason(); r != "" {
 			return r
 		}
@@ -195,9 +141,7 @@ type helperHealth struct {
 	Available bool   `json:"available"`
 	Enabled   bool   `json:"enabled"`
 	Reason    string `json:"reason"`
-	// Error 是 helper 读取底层状态失败的原因（例如 iptables 查询失败）。
-	// 它与「未启用」是两回事，必须能传到面板。
-	Error string `json:"error"`
+	Error     string `json:"error"`
 }
 
 func (h *HelperBackend) get(path string, out any) error {
@@ -229,11 +173,6 @@ func (h *HelperBackend) postPort(path string, port int, proto string) error {
 	return h.do(req, nil)
 }
 
-// do 执行请求并统一处理错误。
-//
-// helper 返回的错误信息（例如「端口在保护列表中」）要原样带回去：
-// 那是管理员判断「为什么操作没生效」的唯一线索，
-// 换成笼统的「操作失败」会让排查变成猜谜。
 func (h *HelperBackend) do(req *http.Request, out any) error {
 	resp, err := h.client.Do(req)
 	if err != nil {

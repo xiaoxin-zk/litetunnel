@@ -12,18 +12,9 @@ import (
 	"time"
 )
 
-// TestMain 让测试二进制自己扮演 frpc。
-//
-// Manager 的价值几乎全在「真的起一个进程、读它的输出、按隧道记账、
-// 把它杀掉」这几件事上，把 exec 换成 mock 就等于什么都没测。
-// 所以这里用测试二进制冒充 frpc：Manager 以 `frpc -c <配置>` 的方式
-// 拉起它，它打印一行 frpc 启动成功时会打印的内容，然后一直挂着，
-// 直到被父进程杀掉。
 func TestMain(m *testing.M) {
 	if len(os.Args) >= 2 && os.Args[1] == "-c" {
 		fmt.Println("start proxy success")
-		// 不能写 select{}：整个程序只剩这一个被阻塞的协程时，
-		// Go 运行时会判定死锁并直接 panic。
 		for {
 			time.Sleep(time.Hour)
 		}
@@ -31,12 +22,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestPumpTruncatesLongLineButKeepsReading 覆盖「超长单行不得让读取端停摆」。
-//
-// 旧实现用 bufio.Scanner：超过 1 MiB 的行会让它返回 ErrTooLong 并**停止
-// 读取**，管道再没人消费，写端一满子进程就阻塞在写日志上——它既不退出
-// 也不响应，cmd.Wait 永远不返回，界面一直把这条隧道显示成「运行中」。
-// 现在超限只截断日志内容，读取继续到换行、继续跟进后面的行。
 func TestPumpTruncatesLongLineButKeepsReading(t *testing.T) {
 	m := testManager(t)
 
@@ -63,10 +48,6 @@ func TestPumpTruncatesLongLineButKeepsReading(t *testing.T) {
 	}
 }
 
-// TestPumpReportsReadError 覆盖「读取端真的坏了」时留痕。
-//
-// 这种情况与超长行不同：管道本身出错，读取确实无法继续，必须写一行日志，
-// 否则日志会凭空停在某一行，看起来像「frpc 不再输出了」。
 func TestPumpReportsReadError(t *testing.T) {
 	m := testManager(t)
 
@@ -102,7 +83,6 @@ func testConfig(t *testing.T) string {
 	return path
 }
 
-// collector 收集回调推来的日志行，供断言使用。
 type collector struct {
 	mu    sync.Mutex
 	lines []string
@@ -122,10 +102,6 @@ func (c *collector) snapshot() []string {
 	return out
 }
 
-// waitForLine 等一行同时包含前缀与关键词的日志出现。
-//
-// 子进程的输出是异步到达的，不能用「启动后立刻断言」的方式测——
-// 那会变成一条在快机器上偶发通过的测试。
 func (c *collector) waitForLine(t *testing.T, prefix, want string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -140,10 +116,6 @@ func (c *collector) waitForLine(t *testing.T, prefix, want string) {
 	t.Fatalf("等待日志超时：期望带 %s 前缀且包含 %q 的行，实际日志: %v", prefix, want, c.snapshot())
 }
 
-// TestTunnelProcessesAreIndependent 是这套实现的核心不变式。
-//
-// 曾经的实现是一个进程承载全部隧道：任何一条隧道的改动都要重启整个进程，
-// 其他隧道跟着断一下。这条测试守的就是「不再如此」。
 func TestTunnelProcessesAreIndependent(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -160,7 +132,6 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	if !m.Running(1) || !m.Running(2) {
 		t.Fatal("两条隧道都应处于运行中")
 	}
-	// 同一条隧道不能有两个进程：那会让「关掉一条」变成关不干净。
 	if err := m.Start(1, "mc1", cfg); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("重复启动应返回 ErrAlreadyRunning，实际: %v", err)
 	}
@@ -168,8 +139,6 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	c.waitForLine(t, "Tunnel/mc1", "start proxy success")
 	c.waitForLine(t, "Tunnel/nas", "start proxy success")
 
-	// 名字要在运行期间取得到：隧道在服务端被删掉后，客户端只剩一个 ID，
-	// 「正在断开」这条日志的前缀得靠它还原。
 	if got := m.TunnelName(1); got != "mc1" {
 		t.Fatalf("TunnelName(1) = %q，期望 mc1", got)
 	}
@@ -187,9 +156,6 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 		t.Fatalf("已停止的隧道不应还记着名字: %q", got)
 	}
 
-	// Stop 必须等到进程真的消失才返回。否则紧接着的 Start 会撞上
-	// ErrAlreadyRunning，表现为「关掉再打开就打不开了」——
-	// 这正是旧实现里「自动同步把 frpc 停掉却起不来」的根因。
 	if err := m.Start(1, "mc1", cfg); err != nil {
 		t.Fatalf("重新启动隧道 1 失败: %v", err)
 	}
@@ -205,10 +171,6 @@ func TestTunnelProcessesAreIndependent(t *testing.T) {
 	}
 }
 
-// TestLogLinesCarryTunnelPrefix 保证日志能按隧道分开看。
-//
-// 每条隧道一个进程之后，日志区是多个进程的输出交织在一起，
-// 没有前缀就完全读不出「哪条隧道出了什么问题」。
 func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -230,14 +192,8 @@ func TestLogLinesCarryTunnelPrefix(t *testing.T) {
 	}
 }
 
-// TestLogBufferRespectsByteBudget 覆盖「只限行数挡不住超大日志」。
-//
-// 单行可以留到 1 MiB，500 行就是 500 MiB——而日志洪峰恰恰出现在客户端出
-// 问题的时候。现在按总字节再裁一次，并把单行压到 maxLogLineBytes。
 func TestLogBufferRespectsByteBudget(t *testing.T) {
 	m := testManager(t)
-	// 每行加不同前缀：完全相同的连续行会被合并（见重复行合并），
-	// 那样测不到字节预算这条路径。
 	for i := 0; i < 200; i++ {
 		m.appendLog(1, "mc1", fmt.Sprintf("%d-%s", i, strings.Repeat("x", maxLogLineBytes)))
 	}
@@ -260,7 +216,6 @@ func TestLogBufferRespectsByteBudget(t *testing.T) {
 		t.Fatalf("字节计数必须与日志内容一致：计数 %d，实际 %d", bytes, sum)
 	}
 
-	// 单行超长：截断后仍要留下，且标明截断。
 	m2 := testManager(t)
 	m2.appendLog(1, "mc1", strings.Repeat("y", 4*maxLogLineBytes))
 	logs := m2.Logs()
@@ -275,11 +230,6 @@ func TestLogBufferRespectsByteBudget(t *testing.T) {
 	}
 }
 
-// TestLogMergesRepeatedLines 覆盖「同一条错误刷屏把日志挤满」。
-//
-// 本地服务没起来时，frpc 会为每一次连接失败打一行完全相同的错误；
-// 被扫描或 tcping 时一秒能刷几百行，500 行的缓冲几秒就被同一条占满，
-// 之前真正有用的日志全被挤掉。
 func TestLogMergesRepeatedLines(t *testing.T) {
 	m := testManager(t)
 
@@ -303,10 +253,6 @@ func TestLogMergesRepeatedLines(t *testing.T) {
 	}
 }
 
-// TestLogCallbackSeesMonotonicSeq 覆盖并发输出时的乱序投递。
-//
-// 回调原先在解锁之后执行：两条隧道同时输出时，序号大的可能先被投递，
-// 调用方按序号去重就会把随后迟到的较小序号当成重复丢掉。
 func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
 	m := testManager(t)
 
@@ -330,7 +276,6 @@ func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
 	}
 	wg.Wait()
 
-	// 投递是异步的：等队列排空再断言。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -354,11 +299,6 @@ func TestLogCallbackSeesMonotonicSeq(t *testing.T) {
 	}
 }
 
-// TestLogCallbackCanReenterManager 覆盖「回调里再写日志」。
-//
-// 上层收到 start proxy success 会补一条说明日志（emitTunnelLog → AppendRaw）。
-// 若回调在持锁时执行，这把不可重入的锁会被再次请求，日志、状态查询与隧道
-// 操作会一起卡死。
 func TestLogCallbackCanReenterManager(t *testing.T) {
 	m := testManager(t)
 	m.SetCallbacks(func(_ uint, _ string, _ uint64, line string) {
@@ -380,10 +320,6 @@ func TestLogCallbackCanReenterManager(t *testing.T) {
 	t.Fatal("回调重入 Manager 后未能写入日志（可能已死锁）")
 }
 
-// TestAppendRawSharesHistoryAndSeq 覆盖「客户端自身日志不进历史」。
-//
-// 两条来源必须落进同一份缓冲、共用同一个序号：否则重新加载日志时
-// 客户端说明会消失，而且实时显示的顺序与快照顺序可能不一致。
 func TestAppendRawSharesHistoryAndSeq(t *testing.T) {
 	m := testManager(t)
 	var (
@@ -424,7 +360,6 @@ func TestAppendRawSharesHistoryAndSeq(t *testing.T) {
 	}
 }
 
-// TestClearLogsResetsRepeatState 覆盖「清空后第一条日志被当成重复吞掉」。
 func TestClearLogsResetsRepeatState(t *testing.T) {
 	m := testManager(t)
 	m.appendLog(1, "mc", "same line")
@@ -435,10 +370,6 @@ func TestClearLogsResetsRepeatState(t *testing.T) {
 	}
 }
 
-// TestCloseRejectsNewProcess 覆盖「关停之后不再拉起新进程」。
-//
-// 关闸必须发生在停进程之前：只调 StopAll 的话，与退出并发的一轮同步
-// 可以在 StopAll 之后拿到配置再起一个进程，那个进程就没人管了。
 func TestCloseRejectsNewProcess(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -463,14 +394,6 @@ func TestCloseRejectsNewProcess(t *testing.T) {
 	}
 }
 
-// TestStaleExitCallbackDoesNotOverrideNewProcess 覆盖「停止后立刻重新启动」。
-//
-// 旧实现在 Wait 协程里删掉进程记录、关闭 exitCh 之后才回调上层。
-// close(exitCh) 会让 Stop 立即返回，紧接着的 Start 可能已经登记了新进程，
-// 而旧回调此时才执行——上层据此把「已注册」清成 false，用户看到刚连上的
-// 隧道又变回未连接，要等下一轮同步才纠正。
-//
-// 断言方式：回调执行时如果该隧道已经有进程在跑，就是踩中了这个窗口。
 func TestStaleExitCallbackDoesNotOverrideNewProcess(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -491,7 +414,6 @@ func TestStaleExitCallbackDoesNotOverrideNewProcess(t *testing.T) {
 	if err := m.Start(1, "mc1", cfg); err != nil {
 		t.Fatalf("启动失败: %v", err)
 	}
-	// 反复制造竞态：每次 Stop 返回后立刻 Start，旧回调正好落在窗口里。
 	for i := 0; i < 10; i++ {
 		if err := m.Stop(1); err != nil {
 			t.Fatalf("第 %d 次停止失败: %v", i, err)
@@ -501,7 +423,6 @@ func TestStaleExitCallbackDoesNotOverrideNewProcess(t *testing.T) {
 		}
 	}
 
-	// 退出回调是异步的：留一段时间让它暴露。
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -519,9 +440,6 @@ func TestStaleExitCallbackDoesNotOverrideNewProcess(t *testing.T) {
 	}
 }
 
-// TestStartRejectsMissingConfig 覆盖「配置没写好就起进程」这条错误路径：
-// 不拦的话 frpc 会带着一个不存在的配置启动并立刻失败，
-// 用户只看到「隧道起来了又断」，原因却在日志最前面几行。
 func TestStartRejectsMissingConfig(t *testing.T) {
 	m := testManager(t)
 
@@ -534,15 +452,6 @@ func TestStartRejectsMissingConfig(t *testing.T) {
 	}
 }
 
-// TestWaitCallbacksCoversStopAllReturn 覆盖「StopAll 返回后回调必须仍可被等到」。
-//
-// 退出登录要用 WaitCallbacks 把在途的退出回调挡在「清凭据」之前。它能成立
-// 的前提是：callbackWG 的计数在 close(exitCh) **之前**就已登记——否则
-// StopAll（看到 exitCh 关闭就返回）返回的那一刻计数还是零，Wait 立刻返回，
-// 等待点形同虚设，迟到的回调仍会落到已清理的新账号状态上。
-//
-// 断言方式：让回调故意慢一点；StopAll 返回后立刻 WaitCallbacks，必须为真，
-// 且此时回调用到的计数器已经归零（说明确实等到它执行完，而不是空等）。
 func TestWaitCallbacksCoversStopAllReturn(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -557,7 +466,6 @@ func TestWaitCallbacksCoversStopAllReturn(t *testing.T) {
 		mu.Lock()
 		inExit++
 		mu.Unlock()
-		// 故意慢一点：模拟「回调要发 Wails 事件、而界面线程正忙」。
 		time.Sleep(50 * time.Millisecond)
 		mu.Lock()
 		inExit--
@@ -572,8 +480,6 @@ func TestWaitCallbacksCoversStopAllReturn(t *testing.T) {
 		t.Fatalf("停止全部失败: %v", err)
 	}
 
-	// StopAll 只保证进程退出，回调此刻通常还在跑。这里不等它自己结束，
-	// 直接走生产路径：WaitCallbacks 必须把这段尾巴等干净。
 	if !m.WaitCallbacks(5 * time.Second) {
 		t.Fatal("StopAll 返回后必须能等到在途的退出回调，否则登出会先清凭据再被回调改状态")
 	}
@@ -587,10 +493,6 @@ func TestWaitCallbacksCoversStopAllReturn(t *testing.T) {
 	}
 }
 
-// TestWaitCallbacksReturnsFalseOnTimeout 覆盖「回调卡死也不能把登出卡住」。
-//
-// 等待点必须有上限：回调要发 Wails 事件，界面线程卡住时它可能长时间不返回。
-// 到期必须返回 false 并让调用方继续清理，而不是把「退出登录」挂死。
 func TestWaitCallbacksReturnsFalseOnTimeout(t *testing.T) {
 	m := testManager(t)
 	cfg := testConfig(t)
@@ -616,11 +518,9 @@ func TestWaitCallbacksReturnsFalseOnTimeout(t *testing.T) {
 	if ok {
 		t.Fatal("回调仍卡着时不该报告「已全部落地」")
 	}
-	// 允许一点调度余量，但不该显著超出上限。
 	if elapsed > 2*time.Second {
 		t.Fatalf("等待必须有上限，实际等了 %s", elapsed.Round(time.Millisecond))
 	}
-	// 放行卡住的回调，让 Close（t.Cleanup 里）能正常收尾。
 	close(block)
 	select {
 	case <-exited:

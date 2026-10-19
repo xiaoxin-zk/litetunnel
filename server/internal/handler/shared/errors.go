@@ -1,4 +1,3 @@
-// Package shared 提供处理器层的公共辅助函数。
 package shared
 
 import (
@@ -15,25 +14,8 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// LoginLockScopeUnified 是全站唯一的登录锁定维度。
-//
-// 为什么只剩一个：scope 原本用来让不同入口互不影响（用户侧、管理侧各一份
-// 计数），但每个 scope 实质上是给攻击者的**另一份额度**——在 A 入口撞几次、
-// 再去 B 入口撞几次，两边都不会触发锁定。而「账号 + 密码」只有一个，计数
-// 也就只该有一份。合并入口与桌面端接口、旧密码重置现在共用它。
-//
-// 另一个维度见 CheckLoginCaptcha：它按账号累计失败计数，是分布式来源的
-// 唯一克星（硬锁按 IP 计数，分布式来源每个 IP 各拿一份额度）。
 const LoginLockScopeUnified = "unified"
 
-// CheckLoginLock 检查「账号 + 来源 IP」是否处于登录锁定期。
-//
-// 维度选择说明：锁定按账号与 IP 的组合计数，而不是单纯按账号。
-// 纯账号维度会变成一个廉价的拒绝服务——攻击者知道管理员用户名后，
-// 每隔一段时间发几次错误密码就能让管理员永远登不进来。
-// 组合维度下攻击者只能锁住自己那个 IP，而分布式爆破由验证码兜底。
-//
-// 返回 false 时已写出响应，调用方直接 return。
 func CheckLoginLock(c *gin.Context, g *middleware.LoginGuard, scope, account, ip string) bool {
 	ok, wait := g.Check(scope, account, ip)
 	if ok {
@@ -45,20 +27,14 @@ func CheckLoginLock(c *gin.Context, g *middleware.LoginGuard, scope, account, ip
 	return false
 }
 
-// LoginFailed 记录一次登录失败。
 func LoginFailed(g *middleware.LoginGuard, scope, account, ip string) {
 	g.Fail(scope, account, ip)
 }
 
-// LoginSucceeded 清除该账号在当前 IP 下的失败记录。
 func LoginSucceeded(g *middleware.LoginGuard, scope, account, ip string) {
 	g.Reset(scope, account, ip)
 }
 
-// LoginResultOf 把登录错误归类为日志用的结果码。
-//
-// 归类而非直接记录错误文本，是为了让后台可以按结果聚合统计，
-// 例如「近 24 小时 totp_failed 次数」这类风控视图。
 func LoginResultOf(err error) string {
 	switch {
 	case err == nil:
@@ -72,9 +48,6 @@ func LoginResultOf(err error) string {
 	}
 }
 
-// Fail 把业务错误统一映射为 HTTP 响应。
-//
-// 未识别的错误一律返回 500 且不回显内部细节，避免泄露实现信息。
 func Fail(c *gin.Context, err error) {
 	switch {
 	case err == nil:
@@ -83,8 +56,6 @@ func Fail(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrNotFound):
 		httpx.NotFound(c, err.Error())
 
-	// 校验本身没法完成（例如失败次数写不进库）：这是服务端的问题，不是
-	// 「你填错了」，用 503 让客户端知道可以稍后重试。
 	case errors.Is(err, service.ErrEmailCodeCheckFailed):
 		httpx.Fail(c, http.StatusServiceUnavailable, err.Error())
 
@@ -92,9 +63,6 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrAccountDisabled):
 		httpx.Unauthorized(c, err.Error())
 
-	// 认证类失败：双因素与验证码都算「你没通过验证」，用 401 更贴切。
-	// 漏掉映射的话这些会掉进 default 分支变成 500「服务内部错误」，
-	// 用户看到的是系统故障而不是「验证码填错了」。
 	case errors.Is(err, service.ErrTOTPRequired),
 		errors.Is(err, service.ErrTOTPInvalid),
 		errors.Is(err, service.ErrTOTPReplay),
@@ -107,19 +75,14 @@ func Fail(c *gin.Context, err error) {
 		errors.Is(err, service.ErrEmailTaken):
 		httpx.Conflict(c, err.Error())
 
-	// 限流类：这类提示必须明确告知「稍后再试」，
-	// 混进 400 会让用户以为是自己填错了。
 	case errors.Is(err, service.ErrEmailCodeTooSoon),
 		errors.Is(err, service.ErrEmailCodeTooMany),
 		errors.Is(err, service.ErrEmailCodeAttempts),
 		errors.Is(err, service.ErrRegisterLimited),
 		errors.Is(err, service.ErrDomainRegisterLimited),
-		// 队列满属于「过一会儿再来」，不是用户填错了。
 		errors.Is(err, service.ErrMailQueueFull):
 		httpx.Fail(c, http.StatusTooManyRequests, err.Error())
 
-	// 系统监听端口读不到时无法安全判断端口是否可用：这是服务端暂时性
-	// 故障，既不是用户填错了，也不该让用户去换端口或找管理员。
 	case errors.Is(err, service.ErrPortScanUnavailable):
 		httpx.Fail(c, http.StatusServiceUnavailable, err.Error())
 
@@ -133,16 +96,12 @@ func Fail(c *gin.Context, err error) {
 		httpx.Forbidden(c, err.Error())
 
 	case errors.Is(err, service.ErrInvalidParam),
-		// 这类「选了但本站没有对应能力」的提示要原样返回前端：
-		// 换成笼统的错误，用户只会反复重试同一个选项。
 		errors.Is(err, service.ErrNoHTTPSProxyEntry),
 		errors.Is(err, service.ErrPortInUse),
 		errors.Is(err, service.ErrNoPortAvailable),
 		errors.Is(err, service.ErrCodeInvalid),
 		errors.Is(err, service.ErrCodeUsed),
 		errors.Is(err, service.ErrCodeExpired),
-		// 分组已过期的兑换被拒：用户可自行解决（先兑换时长码），
-		// 必须给出实际原因，不能掉进 500 变成「服务内部错误」。
 		errors.Is(err, service.ErrMembershipExpired),
 		errors.Is(err, service.ErrRegisterClosed),
 		errors.Is(err, service.ErrCaptchaInvalid),

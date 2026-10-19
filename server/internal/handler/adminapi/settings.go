@@ -13,12 +13,10 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// GetSettings 返回全部运行期配置。敏感字段以占位符代替，绝不回传明文。
 func (h *Handler) GetSettings(c *gin.Context) {
 	httpx.OK(c, h.svc.Settings.AllForAdmin())
 }
 
-// UpdateSettings 批量更新运行期配置。
 func (h *Handler) UpdateSettings(c *gin.Context) {
 	var raw map[string]string
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -41,10 +39,6 @@ type testMailReq struct {
 	To string `json:"to" binding:"required"`
 }
 
-// TestMail 用当前配置发送一封测试邮件。
-//
-// 同步发送并如实返回错误：管理员就是要在这一步看到真实的失败原因
-// （授权码错误、端口被封、TLS 协商失败等），静默失败毫无价值。
 func (h *Handler) TestMail(c *gin.Context) {
 	var req testMailReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -68,8 +62,6 @@ func (h *Handler) TestMail(c *gin.Context) {
   <p style="color:#9ca3af;font-size:12px">发送时间：%s</p>
 </div>`, siteName, time.Now().Format("2006-01-02 15:04:05"))
 
-	// 测试发送同样受总预算约束：拨号与会话读写共用一个截止，
-	// 避免「界面报超时、邮件稍后却送到」。
 	sendCtx, cancel := context.WithTimeout(c.Request.Context(), service.MailSendTimeout)
 	defer cancel()
 	if err := h.svc.Mailer().Send(sendCtx, req.To, fmt.Sprintf("【%s】邮件配置测试", siteName), body); err != nil {

@@ -7,17 +7,6 @@ import (
 	"testing"
 )
 
-// 这一组守的是本地凭据文件的两个行为：写入必须是原子的，损坏时必须留下
-// 证据而不是被静默清空。
-//
-// 为什么值得单独测：这两种情况都只在异常路径上出现（写到一半被打断、
-// 文件被别的程序改坏），而它们的后果是「用户发现自己被登出了，且不知道
-// 为什么」——没有任何崩溃、没有任何日志，只靠人工复现几乎抓不到。
-
-// withTempConfigDir 把配置目录指到临时目录。
-//
-// dataDir() 走 os.UserConfigDir()，在 Windows 上就是 %APPDATA%；
-// 这里覆盖环境变量，避免测试碰到真实用户的凭据文件。
 func withTempConfigDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -25,7 +14,6 @@ func withTempConfigDir(t *testing.T) string {
 		t.Setenv("APPDATA", dir)
 		t.Setenv("XDG_CONFIG_HOME", dir)
 	} else {
-		// 兜底：两个都没设时也设上，让 dataDir 落在临时目录里。
 		t.Setenv("APPDATA", dir)
 		t.Setenv("XDG_CONFIG_HOME", dir)
 	}
@@ -36,11 +24,6 @@ func withTempConfigDir(t *testing.T) string {
 	return sub
 }
 
-// TestSaveConfigIsAtomic 断言保存过程中不会在目标路径上出现半截内容。
-//
-// 直接覆盖写的话，写到一半被打断会留下不完整的 JSON；下次启动读不动它，
-// 客户端就会当成「没有配置」。这里能验证的是「先写临时文件再替换」这个
-// 做法本身：替换完成后临时文件不应残留，且内容完整可读。
 func TestSaveConfigIsAtomic(t *testing.T) {
 	dir := withTempConfigDir(t)
 
@@ -62,8 +45,6 @@ func TestSaveConfigIsAtomic(t *testing.T) {
 		t.Fatalf("读回来的配置与写入不一致: %+v", got)
 	}
 
-	// 覆盖写一次：替换已存在的文件在 Windows 上也必须成功
-	// （os.Rename 走 MoveFileEx + MOVEFILE_REPLACE_EXISTING）。
 	cfg.APIKey = "lt_second_key"
 	if err := saveConfig(cfg); err != nil {
 		t.Fatalf("覆盖保存失败: %v", err)
@@ -77,12 +58,11 @@ func TestSaveConfigIsAtomic(t *testing.T) {
 	}
 }
 
-// TestLoadConfigKeepsCorruptFile 断言损坏的配置不会被静默丢弃。
 func TestLoadConfigKeepsCorruptFile(t *testing.T) {
 	dir := withTempConfigDir(t)
 	path := filepath.Join(dir, "config.json")
 
-	corrupt := []byte(`{"api_key": "lt_abc", `) // 半截 JSON
+	corrupt := []byte(`{"api_key": "lt_abc", `)
 	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
 		t.Fatalf("写入损坏配置失败: %v", err)
 	}
@@ -98,7 +78,6 @@ func TestLoadConfigKeepsCorruptFile(t *testing.T) {
 		t.Fatalf("损坏配置不应被解析出内容: %+v", cfg)
 	}
 
-	// 原文件必须被保留下来供人工恢复。
 	backup := path + ".corrupt"
 	saved, rerr := os.ReadFile(backup)
 	if rerr != nil {
@@ -107,19 +86,12 @@ func TestLoadConfigKeepsCorruptFile(t *testing.T) {
 	if string(saved) != string(corrupt) {
 		t.Fatalf("备份内容与原文不一致: %q", string(saved))
 	}
-	// 错误信息要能告诉用户去哪儿找原文件。
 	if !strings.Contains(err.Error(), backup) {
 		t.Errorf("错误信息里应包含备份路径，实际: %v", err)
 	}
 }
 
-// TestLoadConfigNeverReturnsNil 覆盖「配置读不出来时返回 nil」。
-//
-// 调用方会直接把这个返回值存进 App，而渲染状态时无条件读它的字段
-// （ServerURL / APIKey…）。返回 nil 等于在启动路径上埋一个 panic：
-// 用户双击之后什么反应都没有，也没有任何可排查的线索。
 func TestLoadConfigNeverReturnsNil(t *testing.T) {
-	// 构造「配置目录取不到」：清掉两个环境变量，os.UserConfigDir 会失败。
 	t.Setenv("APPDATA", "")
 	t.Setenv("XDG_CONFIG_HOME", "")
 
@@ -132,11 +104,8 @@ func TestLoadConfigNeverReturnsNil(t *testing.T) {
 	}
 }
 
-// TestLoadConfigNonNotExistErrorStillReturnsConfig 覆盖读取失败
-// （非「文件不存在」）的情况。
 func TestLoadConfigNonNotExistErrorStillReturnsConfig(t *testing.T) {
 	dir := withTempConfigDir(t)
-	// 把 config.json 造成一个目录：os.ReadFile 返回的不是 ErrNotExist。
 	if err := os.Mkdir(filepath.Join(dir, "config.json"), 0o700); err != nil {
 		t.Fatalf("构造失败场景失败: %v", err)
 	}
@@ -150,7 +119,6 @@ func TestLoadConfigNonNotExistErrorStillReturnsConfig(t *testing.T) {
 	}
 }
 
-// TestLoadConfigMissingFileIsNotAnError 断言「首次启动」不算异常。
 func TestLoadConfigMissingFileIsNotAnError(t *testing.T) {
 	withTempConfigDir(t)
 
@@ -163,11 +131,6 @@ func TestLoadConfigMissingFileIsNotAnError(t *testing.T) {
 	}
 }
 
-// TestClearConfigRemovesSiblings 覆盖「只删主文件、备份里还留着密钥」。
-//
-// config.json 之外还有两个同类文件里同样存着 API Key：损坏时留下的
-// config.json.corrupt、原子写入失败留下的 config.json.tmp。
-// 只删主文件的话，用户以为「退出登录了」，密钥却还躺在同一个目录里。
 func TestClearConfigRemovesSiblings(t *testing.T) {
 	withTempConfigDir(t)
 
@@ -192,10 +155,6 @@ func TestClearConfigRemovesSiblings(t *testing.T) {
 	}
 }
 
-// TestRemoveFrpcConfigDeletesDir 覆盖「隧道删了、凭据还留在磁盘上」。
-//
-// frpc.toml 里含客户端接入密钥与 frps 全局 token：隧道已经在服务端删掉，
-// 这些文件却仍然可以被任何能读到该目录的进程拿去接入。
 func TestRemoveFrpcConfigDeletesDir(t *testing.T) {
 	withTempConfigDir(t)
 
@@ -217,13 +176,11 @@ func TestRemoveFrpcConfigDeletesDir(t *testing.T) {
 		t.Error("隧道配置目录应被删除（其中含接入密钥）")
 	}
 
-	// 再删一次不应报错：调用方（删除隧道、退出登录）可能重复执行。
 	if err := removeFrpcConfig(7); err != nil {
 		t.Errorf("删除不存在的配置不应报错: %v", err)
 	}
 }
 
-// TestRemoveAllFrpcConfigsDeletesAllTunnels 覆盖登出时的整目录清理。
 func TestRemoveAllFrpcConfigsDeletesAllTunnels(t *testing.T) {
 	withTempConfigDir(t)
 

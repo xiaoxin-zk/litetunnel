@@ -12,7 +12,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// StatsOverview 控制台首页概览。
 func (h *Handler) StatsOverview(c *gin.Context) {
 	uid := middleware.CurrentUserID(c)
 	u, err := h.svc.LoadUser(uid)
@@ -49,7 +48,6 @@ func groupName(g *model.Group) string {
 	return g.Name
 }
 
-// TrafficStats 近 N 天流量曲线。
 func (h *Handler) TrafficStats(c *gin.Context) {
 	uid := middleware.CurrentUserID(c)
 	days := 7

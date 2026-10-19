@@ -10,29 +10,17 @@ import (
 	"unicode/utf8"
 )
 
-// maxLogLines 内存中保留的日志行数。
 const maxLogLines = 500
 
-// maxLogBytes 是内存里保留日志的**总字节**上限。
-//
-// 只限行数不够：单行可以留到 1 MiB（见 pumpLineLimit），500 行就是 500 MiB
-// ——而日志洪峰恰恰出现在客户端出问题的时候，那时最不该把内存吃光。
 const maxLogBytes = 512 * 1024
 
-// maxLogLineBytes 是单行进入日志缓冲时的保留上限。
-//
-// 与 pumpLineLimit 是两件事：后者管「读管道时一行最多吞多少」，这里管
-// 「进日志缓冲时一行最多占多少」。一行 1 MiB 会自己吃掉整个字节预算，
-// 把前面所有有用的行挤出去，而它的信息量并不比前 8 KiB 多。
 const maxLogLineBytes = 8 * 1024
 
-// LogEntry 是一条带序号的日志。
 type LogEntry struct {
 	Seq  uint64
 	Text string
 }
 
-// Logs 返回日志文本快照。
 func (m *Manager) Logs() []string {
 	entries := m.LogEntries()
 	out := make([]string, len(entries))
@@ -42,7 +30,6 @@ func (m *Manager) Logs() []string {
 	return out
 }
 
-// LogEntries 返回带序号的日志快照。
 func (m *Manager) LogEntries() []LogEntry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -51,32 +38,19 @@ func (m *Manager) LogEntries() []LogEntry {
 	return out
 }
 
-// ClearLogs 清空历史缓冲，返回清空时的日志序号。
-//
-// 调用方应记下这个序号：清空前产生、清空后才送达的日志行序号不会大于它，
-// 据此可以把这些「在途旧行」丢掉，而不是让它们重新出现在界面上。
 func (m *Manager) ClearLogs() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// 历史、重复合并状态和待投递队列必须同一把锁下清空：只清 logs 的话，
-	// 已在途的旧批次会在下一次 dispatch 时重新落进新账号/新页面。
 	m.pending = nil
 	m.pendingDropped = 0
 	m.logs = nil
 	m.logBytes = 0
-	// 重复行合并状态也要清：留着的话，清空后的第一条日志如果恰好与
-	// 清空前那条相同，会被当成「重复」直接吞掉，用户以为清空把新日志也弄没了。
 	m.repeatKey = ""
 	m.repeatCount = 0
 	m.repeatAt = time.Time{}
 	return m.logSeq
 }
 
-// pumpLineLimit 是单行日志保留的字节上限，超出的部分截断丢弃。
-//
-// frpc 的正常输出远小于它。超限不是「停止读取」的理由：读取端一旦停摆，
-// 管道写满之后子进程就阻塞在写日志上——它既不退出也不响应，Wait 永远
-// 不返回，界面上那条隧道会一直是「运行中」。
 const pumpLineLimit = 1024 * 1024
 
 func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
@@ -84,17 +58,12 @@ func (m *Manager) pump(tunnelID uint, tunnelName string, r io.Reader) {
 }
 
 func (m *Manager) pumpGen(tunnelID uint, tunnelName string, gen uint64, r io.Reader) {
-	// 用 ReadSlice 而不是 bufio.Scanner：Scanner 遇到超过上限的行会返回
-	// ErrTooLong 并**停止读取**，剩下的输出没人消费，子进程就卡在写管道上。
-	// 这里超限只截断日志内容，读取照常继续到换行、继续跟进后面的行。
 	br := bufio.NewReaderSize(r, 64*1024)
 
 	var (
 		line      []byte
 		truncated bool
 	)
-	// flush 把攒好的一行交出去。超限的标记只加在日志里，不改变「已经读到
-	// 换行」这个事实——后续输出必须继续被消费。
 	flush := func() {
 		text := string(line)
 		if truncated {
@@ -124,10 +93,8 @@ func (m *Manager) pumpGen(tunnelID uint, tunnelName string, gen uint64, r io.Rea
 		case err == nil:
 			flush()
 		case errors.Is(err, bufio.ErrBufferFull):
-			// 还没读到换行：继续取同一行的后续片段。
 			continue
 		case errors.Is(err, io.EOF):
-			// 最后一行没有换行符，同样要记下来。
 			if len(line) > 0 || truncated {
 				flush()
 			}
@@ -136,55 +103,27 @@ func (m *Manager) pumpGen(tunnelID uint, tunnelName string, gen uint64, r io.Rea
 			if len(line) > 0 || truncated {
 				flush()
 			}
-			// 读取失败必须留痕。
-			//
-			// 以前这里什么都不做：日志会凭空停在某一行，看起来像「frpc 不再
-			// 输出了」，而真实原因是我们的读取端坏了（管道错误、卷被卸载）。
-			// 这类现象最容易被归因到 frpc 或服务端，实际上问题在客户端自己。
 			m.appendLogGen(tunnelID, tunnelName, gen, "日志读取中断："+err.Error())
 			return
 		}
 	}
 }
 
-// logRepeatWindow 是同一行连续出现时的合并窗口。
-//
-// 窗口内只计数不落行；窗口外仍在重复时补一条「重复 N 次」再继续，
-// 否则持续压测下日志看起来像停住了。
 const logRepeatWindow = 5 * time.Second
 
-// logEntry 是一条已经带好前缀、等待同时写进缓冲并推给前端的日志。
 type logEntry struct {
 	id   uint
 	name string
 	gen  uint64
 	seq  uint64
 	text string
-	// acct 是产生这一行时所在的**账号代次**（0 表示「不来自某个账号」）。
-	//
-	// 进程输出不带它：那一行的归属由上层按「启动该进程时的账号」反查
-	// （见 App 的日志回调）。只有客户端自己写的说明行（AppendRawAccount）
-	// 需要把代次一路带到投递端——这些行没有进程可反查，而它们恰恰是
-	// 迟到回调最常写出来的东西。
 	acct uint64
 }
 
-// AppendRaw 记录一条由客户端自己格式化好的日志（启动同步、重连说明等）。
-//
-// 走同一条缓冲与同一个序号：这些行过去只进待推送队列，不进历史记录，
-// 于是界面重新加载日志时它们会凭空消失，而它们恰恰是解释「客户端在做什么」
-// 的关键信息。
 func (m *Manager) AppendRaw(line string) {
 	m.AppendRawAccount(0, line)
 }
 
-// AppendRawAccount 记录一条客户端说明行，并带上它所属的**账号代次**。
-//
-// acct 会被一路带到投递回调与待推送队列：没有它，上层无法分辨「这一行是
-// 当前账号刚写的」还是「上一个账号的回调迟到写出来的」——两者的进程代次
-// 都是 0，序号又只能拦住清空点之前产生的行。
-//
-// acct 为 0 表示「不属于任何账号」（未接入时的启动日志），上层按放行处理。
 func (m *Manager) AppendRawAccount(acct uint64, line string) {
 	line = strings.TrimRight(line, "\r\n")
 	line = clipLogLine(line, maxLogLineBytes)
@@ -194,15 +133,10 @@ func (m *Manager) AppendRawAccount(acct uint64, line string) {
 
 	m.mu.Lock()
 	e := logEntry{seq: m.recordTextLocked(line), text: line, acct: acct}
-	// 与 appendLog 同理：加锁入队、解锁后由投递协程按序调用回调。
 	m.enqueueEmitLocked([]logEntry{e})
 	m.mu.Unlock()
 }
 
-// RecordLine 把一行已经格式化好的文本写进历史缓冲并返回它分配的序号，
-// 但**不**触发回调投递。调用方（App 的日志积压提示）自行负责把它推给前端：
-// 它需要与普通日志一样带真实序号，才能受清空点约束，而不是用 seq=0 这种
-// 「永远通过过滤、清空后仍可能回流」的特殊值。
 func (m *Manager) RecordLine(text string) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -214,9 +148,6 @@ func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 }
 
 func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, line string) {
-	// gen 非零表示这行来自某个具体进程。进程已经不是当前进程时直接丢弃：
-	// 退出登录会清空历史日志，而旧进程的管道可能仍在吐字——没有这道过滤，
-	// 它们会在清空之后重新落进缓冲，用户换账号后看到的仍是上一段的输出。
 	if gen != 0 && !m.stillCurrent(tunnelID, gen) {
 		return
 	}
@@ -227,14 +158,10 @@ func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, lin
 	}
 
 	now := time.Now()
-	// 合并键带上进程代次：新旧 frpc 在短时间内输出同一句错误（例如端口
-	// 还没释放）时，不该被合并成一条——「同一个错误出现两次」与「两个进程
-	// 各报一次」在排查时结论完全不同。
 	key := fmt.Sprintf("%d\x00%d\x00%s", gen, tunnelID, line)
 
 	m.mu.Lock()
 	var out []logEntry
-	// 重复窗口结束、或换了一条不同的日志：先把累计的重复次数交代掉。
 	if m.repeatCount > 0 && (key != m.repeatKey || now.Sub(m.repeatAt) >= logRepeatWindow) {
 		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName, m.repeatGen,
 			fmt.Sprintf("（上一条重复 %d 次，已合并）", m.repeatCount), now))
@@ -251,18 +178,12 @@ func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, lin
 	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
 	m.repeatGen = gen
 	out = append(out, m.recordLocked(tunnelID, tunnelName, gen, line, now))
-	// 加锁入队、解锁后投递：既保证调用方按序号收到，又允许回调重入 Manager。
 	m.enqueueEmitLocked(out)
 	m.mu.Unlock()
 }
 
-// maxPendingEmits 是待投递日志的上限。
-//
-// 回调极慢时（例如上层在回调里同步做了别的事）队列会堆积；日志本身已有
-// 行数与字节上限，这里只需要保证内存不失控，丢弃最旧的即可。
 const maxPendingEmits = 4096
 
-// enqueueEmitLocked 在持锁状态下把日志排进投递队列。
 func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 	if len(entries) == 0 || m.emitWake == nil {
 		return
@@ -272,12 +193,6 @@ func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 		m.pending = append(m.pending[:0], m.pending[over:]...)
 		m.pendingDropped += over
 	}
-	// 丢弃提示必须在这里、按正常序号入队。
-	//
-	// 以前是在投递时用 seq=0 现拼一条：前端清空日志是按序号过滤的，
-	// seq=0 永远小于「清空点」，于是一条在清空前产生的提示会在清空之后
-	// 仍然通过过滤，甚至被当成新账号的日志。分配真实序号后，它和普通
-	// 日志一样受清空点约束。
 	if m.pendingDropped > 0 {
 		dropped := m.pendingDropped
 		m.pendingDropped = 0
@@ -288,20 +203,14 @@ func (m *Manager) enqueueEmitLocked(entries []logEntry) {
 	select {
 	case m.emitWake <- struct{}{}:
 	default:
-		// 已有待处理的唤醒信号：投递协程醒来会一次取走全部。
 	}
 }
 
-// dispatchLogs 按入队顺序调用日志回调。
-//
-// 在锁外调用回调是关键：上层收到「start proxy success」会写一条说明日志，
-// 那会再次请求 Manager 的锁；持锁调用就是死锁。
 func (m *Manager) dispatchLogs() {
 	defer m.emitWG.Done()
 	for {
 		select {
 		case <-m.emitQuit:
-			// 退出前把剩余队列排空：进程退出通知产生的收尾日志不该被吞掉。
 			m.emitPending()
 			return
 		case <-m.emitWake:
@@ -310,7 +219,6 @@ func (m *Manager) dispatchLogs() {
 	}
 }
 
-// emitPending 取空当前队列并按序调用回调。
 func (m *Manager) emitPending() {
 	for {
 		m.mu.Lock()
@@ -321,9 +229,6 @@ func (m *Manager) emitPending() {
 		cbAcct := m.onLogAcct
 		m.mu.Unlock()
 
-		// 三选一而不是全调：SetXxxCallbacks 每次都会把另外两个置空，这里按
-		// 「携带信息最多的那个」分派即可。日志行只会被投递一次——同一行
-		// 既进历史又进推送队列，重复回调会让前端看到两遍。
 		switch {
 		case cbAcct != nil:
 			for _, e := range batch {
@@ -348,24 +253,17 @@ func (m *Manager) emitPending() {
 	}
 }
 
-// recordLocked 在已持有锁的前提下写入一行日志，返回可推送的副本。
 func (m *Manager) recordLocked(tunnelID uint, tunnelName string, gen uint64, line string, now time.Time) logEntry {
 	stamped := fmt.Sprintf("%s  %s  %s", now.Format("15:04:05"), logPrefix(tunnelID, tunnelName), line)
-	// 生命周期日志盖的是「这条隧道启动时所属的账号」，不是「现在写到哪一行」。
-	// 二者在登出竞态里恰好不同：登出后旧进程的「已停止」仍会到，若按当前账号
-	// 盖章，这条日志就会出现在新账号的列表里。
 	return logEntry{id: tunnelID, name: tunnelName, gen: gen, seq: m.recordTextLocked(stamped),
 		text: stamped, acct: m.accounts[tunnelID]}
 }
 
-// recordTextLocked 写入一行已经格式化好的文本，并返回它分配的序号。
 func (m *Manager) recordTextLocked(text string) uint64 {
 	m.logSeq++
 	m.logs = append(m.logs, LogEntry{Seq: m.logSeq, Text: text})
 	m.logBytes += len(text)
 
-	// 先按行数裁，再按总字节裁：两个上限针对的是不同的失控方式
-	// （行数爆炸 / 单行过大），只留一个都会被另一个绕过。
 	if over := len(m.logs) - maxLogLines; over > 0 {
 		for i := 0; i < over; i++ {
 			m.logBytes -= len(m.logs[i].Text)
@@ -379,7 +277,6 @@ func (m *Manager) recordTextLocked(text string) uint64 {
 	return m.logSeq
 }
 
-// clipLogLine 把超长的单行截断，且不切断多字节字符。
 func clipLogLine(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -391,10 +288,6 @@ func clipLogLine(s string, max int) string {
 	return s[:cut] + "…（超长，已截断）"
 }
 
-// logPrefix 生成日志行的隧道前缀。
-//
-// 每条隧道一个进程之后，日志区是多个进程输出交织在一起，
-// 没有前缀就完全读不出「哪条隧道出了什么问题」。
 func logPrefix(tunnelID uint, tunnelName string) string {
 	if tunnelName != "" {
 		return "Tunnel/" + tunnelName
@@ -402,18 +295,6 @@ func logPrefix(tunnelID uint, tunnelName string) string {
 	return fmt.Sprintf("Tunnel/#%d", tunnelID)
 }
 
-// StripLogPrefix 去掉日志行上的「时间 + Tunnel/<名字>」前缀，只留原文。
-//
-// 前缀由本包的 appendLog 拼成，格式固定为
-//
-//	<时间>  Tunnel/<名字>  <原文>
-//
-// 调用方需要看 frpc 原文时（例如判断这行是不是报错）必须先把前缀剥掉：
-// 隧道名是用户自己取的，一个叫 errorlog 的隧道不该让它的正常输出被当成错误。
-//
-// 剥离方式是「跳过时间后的第一个双空格，再找下一个双空格」，而不是直接找
-// 最后一个双空格：frpc 自己的输出里也可能出现连续空格，从后面切会把原文
-// 截断（例如把 "[mc] start error: x" 截成 "x"），而这段原文正是要给用户看的。
 func StripLogPrefix(line string) string {
 	afterTime := strings.Index(line, "  ")
 	if afterTime < 0 {
@@ -427,15 +308,6 @@ func StripLogPrefix(line string) string {
 	return rest[afterPrefix+2:]
 }
 
-// IsErrorLine 判断一行 frpc 输出是否表示出错。
-//
-// frpc 的失败输出形如：
-//
-//	[W] [client/control.go:172] [run id] [mc] start error: 隧道不存在…
-//	[E] [client/service.go:312] login to server failed: …
-//
-// 它没有结构化字段可用，只能按关键词识别；error / failed 覆盖了它的全部
-// 失败路径。判定前先剥掉前缀，避免隧道名本身带出误判。
 func IsErrorLine(line string) bool {
 	l := strings.ToLower(StripLogPrefix(line))
 	return strings.Contains(l, "error") || strings.Contains(l, "failed")

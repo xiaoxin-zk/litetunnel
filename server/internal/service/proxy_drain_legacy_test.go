@@ -8,9 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 升级前遗留的断流待办没有账号标识。只要该 ID 上现在有一个已登记标识的
-// 账号，就无法排除「旧账号已删、ID 被复用」——必须停止自动执行并保留记录，
-// 而不是按相同前缀去关代理。
 func TestLegacyPendingWithoutIncarnationMarkedManual(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "legacy-drain")

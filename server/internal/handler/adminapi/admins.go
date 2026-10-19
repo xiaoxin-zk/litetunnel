@@ -13,7 +13,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// adminVO 管理员视图对象。绝不包含口令与 TOTP 密钥。
 func adminVO(a *model.Admin) gin.H {
 	return gin.H{
 		"id":               a.ID,
@@ -29,7 +28,6 @@ func adminVO(a *model.Admin) gin.H {
 	}
 }
 
-// ListAdmins 管理员列表。
 func (h *Handler) ListAdmins(c *gin.Context) {
 	list, err := h.svc.ListAdmins()
 	if err != nil {
@@ -43,7 +41,6 @@ func (h *Handler) ListAdmins(c *gin.Context) {
 	httpx.OK(c, out)
 }
 
-// CreateAdmin 新建管理员。
 func (h *Handler) CreateAdmin(c *gin.Context) {
 	var in service.AdminCreateInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -60,7 +57,6 @@ func (h *Handler) CreateAdmin(c *gin.Context) {
 	httpx.OK(c, adminVO(a))
 }
 
-// UpdateAdmin 修改管理员昵称 / 角色 / 状态。
 func (h *Handler) UpdateAdmin(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -81,7 +77,6 @@ func (h *Handler) UpdateAdmin(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已保存"})
 }
 
-// DeleteAdmin 删除管理员。
 func (h *Handler) DeleteAdmin(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -97,7 +92,6 @@ func (h *Handler) DeleteAdmin(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "管理员已删除"})
 }
 
-// SetAdminPassword 重置指定管理员的登录密码。
 func (h *Handler) SetAdminPassword(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -117,7 +111,6 @@ func (h *Handler) SetAdminPassword(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "密码已重置，该账号所有会话已下线"})
 }
 
-// ClearAdminTOTP 清除指定管理员的双因素绑定（认证器丢失时的救援入口）。
 func (h *Handler) ClearAdminTOTP(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {

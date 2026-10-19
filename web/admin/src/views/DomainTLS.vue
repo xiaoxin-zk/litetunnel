@@ -1,6 +1,5 @@
 <template>
   <div v-loading="loading">
-    <!-- ============ 状态 ============ -->
     <div class="lt-card">
       <div class="lt-card-title">
         <span>下发与证书状态</span>
@@ -38,13 +37,6 @@
         :title="`配置服务不可用`"
         :description="status.helper_reason || '请确认 lt-config 服务已启动、令牌一致、docker 可用。'"
       />
-      <!--
-        helper 本身可用、但宿主机 Docker 不可用（daemon 没起来 / 没有 socket
-        权限）。这一档以前完全没有区分：available 只表示「helper 能读配置、
-        能渲染」，而校验与重建容器都要起容器，那时点「保存并应用」会在写盘
-        之后才失败，磁盘与容器分处两个版本。这里把「能保存」与「能应用」的
-        边界直接画出来。
-      -->
       <el-alert
         v-else-if="!dockerReady"
         type="warning"
@@ -54,16 +46,6 @@
         title="宿主机 Docker 不可用：可以保存，但暂时不能校验或应用"
         :description="dockerDownText"
       />
-      <!--
-        daemon 可用、但 compose 不可用（插件没装 / 只有不兼容的旧版 /
-        路径里没有 docker-compose）。这一档以前和 daemon 不可用混在一起，
-        或者根本没被检查：`docker info` 成功就放行，直到真正 down
-        `docker compose up` 才在「文件已经写盘之后」失败。
-
-        单独一档的理由是处置方式完全不同：daemon 不通要去启动服务、查
-        socket 权限；compose 不在只需要装一个包（docker-compose-plugin）。
-        写成同一句「Docker 不可用」会把管理员引向错误的排查方向。
-      -->
       <el-alert
         v-else-if="!composeReady"
         type="warning"
@@ -102,11 +84,6 @@
           <span v-if="form.mode === 'e2e'" class="lt-muted">（需对公网放行）</span>
           <span v-else class="lt-muted">（仅本机）</span>
         </el-descriptions-item>
-        <!--
-          上面几项是「期望值」（表单里保存的那份），这一项是宿主机上**实际在用**
-          的那份。保存与下发是两步，不做区分的话，「只保存未下发」与「下发失败」
-          在页面上都表现成「已经改了」，而流量还走在旧配置上。
-        -->
         <el-descriptions-item label="宿主机实际在用" :span="2">
           <span class="mono">{{ appliedText }}</span>
         </el-descriptions-item>
@@ -118,7 +95,6 @@
       </el-descriptions>
     </div>
 
-    <!-- ============ 证书 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">Caddy 证书（{{ status.certs?.certs?.length || 0 }}）</div>
 
@@ -163,22 +139,11 @@
       </div>
     </div>
 
-    <!-- ============ 配置 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>域名与证书设置</span>
         <div>
-          <!--
-            「仅保存」只写数据库，不碰宿主机，因此在 Docker 不可用时仍然可用：
-            管理员可以先把配置存下来，等 daemon 修好再下发（见 save 的注释）。
-          -->
           <el-button :loading="saving" @click="save(false)">仅保存</el-button>
-          <!--
-            下面两个按钮都会让 helper 起容器（校验用目标镜像跑一遍、应用要重建
-            caddy/frps），所以必须同时看 DockerReady 与 ComposeReady。只看
-            available 的话，daemon 停着或 compose 没装时按钮仍可点，失败发生
-            在文件已经写盘之后。
-          -->
           <el-tooltip :disabled="!applyBlockedReason" :content="applyBlockedReason" placement="top">
             <span>
               <el-button :loading="saving" :disabled="applyDisabled" @click="save(false, true)">
@@ -294,7 +259,6 @@
       </el-form>
     </div>
 
-    <!-- ============ 下发结果 ============ -->
     <div v-if="result" class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>下发结果</span>
@@ -367,7 +331,6 @@
       </el-collapse>
     </div>
 
-    <!-- ============ DNS 检查 ============ -->
     <div v-if="dns.length" class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">DNS 检查结果</div>
       <el-table :data="dns" size="small" stripe>
@@ -404,10 +367,8 @@ import { ElMessage } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import { domainApi, settingsApi } from '../api'
 
-// 与后端 service.SecretMask 保持一致：留空且原本已配置 → 提交占位符表示不修改
 const SECRET_MASK = '__UNCHANGED__'
 
-// 常见服务商只是候选，允许手填：插件名由镜像决定，硬编码成白名单反而挡住自建镜像。
 const providers = ['cloudflare', 'alidns', 'dnspod', 'route53', 'gandi', 'namecheap', 'porkbun']
 
 const loading = ref(false)
@@ -435,26 +396,13 @@ const secretPlaceholder = (key) =>
 
 const modeText = (m) => (m === 'e2e' ? '端到端' : '边缘')
 
-// helper 可用只说明「它能读配置、能渲染」，不代表宿主机能起容器。
-// 后端把这件事拆成了三层：
-//   - helper.available：helper 自身能不能干活（读配置、渲染）；
-//   - helper.docker_ready：docker 命令存在**且** daemon 可达、当前身份有权限；
-//   - helper.compose_ready：daemon 可用**且** `docker compose`（或独立的
-//     docker-compose）能跑。
-// 前端必须用后两者门控「应用类」操作，否则 daemon 停着、或 compose 插件
-// 没装时按钮仍可点，失败要等到文件写盘之后才发生。
 const dockerReady = computed(() => status.value.helper?.docker_ready === true)
 const composeReady = computed(() => status.value.helper?.compose_ready === true)
 
-// 应用类按钮的禁用状态：helper 不可用、daemon 不可用、或 compose 不可用，
-// 都不允许点。「仅保存」不经过这里，它只写数据库、不碰宿主机（见模板注释）。
 const applyDisabled = computed(
   () => !status.value.helper?.available || !dockerReady.value || !composeReady.value
 )
 
-// 禁用原因：优先用后端给的 docker_err / compose_err（它们带着命令的原始报错，
-// 能直接指向「daemon 未启动 / 无 socket 权限 / 缺 compose 插件」中的哪一种），
-// 缺失时给一句兜底。空串表示不禁用，tooltip 也就不显示。
 const applyBlockedReason = computed(() => {
   if (!status.value.helper?.available) {
     return status.value.helper_reason || '配置服务不可用，无法校验或应用'
@@ -468,11 +416,6 @@ const applyBlockedReason = computed(() => {
   return ''
 })
 
-// 告警里的完整说明：把「保存仍可用」这一点写清楚，否则管理员会以为整页都废了。
-//
-// 末尾提醒手动刷新是有意的：本页只在挂载与保存后拉状态，没有轮询。
-// helper 侧探测缓存是 12 秒，但页面不会自己重新取——写成「稍后自动恢复」
-// 会让管理员盯着一个不会变的界面等下去。
 const dockerDownText = computed(() => {
   const reason = status.value.helper?.docker_err || '未给出原因'
   return (
@@ -483,10 +426,6 @@ const dockerDownText = computed(() => {
   )
 })
 
-// compose 缺失是**另一类**问题：daemon 是好的，只是本服务重建容器唯一会用的
-// 那条命令（docker compose up）跑不起来。处置方式只有装一个包，与「Docker 起
-// 不来」完全不同，所以文案单独写：给出具体的安装包名与验证命令，管理员不必
-// 再去猜。
 const composeDownText = computed(() => {
   const reason = status.value.helper?.compose_err || '未给出原因'
   return (
@@ -498,13 +437,11 @@ const composeDownText = computed(() => {
   )
 })
 
-// 宿主机上实际在用的配置（由后端记录「已下发」的那一份，不是表单里的值）。
 const appliedText = computed(() => {
   const a = status.value.applied || {}
   return `${a.panel || '（未设置面板域名）'} · ${a.tunnel || '（未启用隧道域名）'} · ${modeText(a.https_mode)}`
 })
 
-// 把「期望 → 已生效」的差异写清楚，管理员才知道点一次下发会改掉什么。
 const pendingText = computed(() => {
   const a = status.value.applied || {}
   const d = status.value.desired || {}
@@ -518,10 +455,6 @@ const pendingText = computed(() => {
   if ((d.https_mode || '') !== (a.https_mode || '')) {
     parts.push(`HTTPS 模式 ${modeText(a.https_mode)} → ${modeText(d.https_mode)}`)
   }
-  // pending 也可能是由「不进 DomainAppliedSet」的字段引起的：DNS 服务商、
-  // DNS 参数、凭据、ACME 邮箱都会改变渲染结果，同样需要一次下发才生效。
-  // 此时上面三项完全相同，若只说「待切换」却不列出任何一项，管理员会以为
-  // 是页面误报。
   const detail = parts.length
     ? `待切换：${parts.join('；')}。`
     : '证书相关参数（ACME 邮箱 / DNS 服务商 / 凭据 / 参数）与已生效的那一份不同。'
@@ -576,8 +509,6 @@ async function load() {
     if (statusResult.status === 'fulfilled') {
       status.value = statusResult.value || { helper_configured: false, helper_reason: '配置服务状态未知' }
     } else {
-      // 请求失败时不能继续保留旧的「可用」状态，否则用户会在健康状态未知
-      // 时继续点击保存，得到一个与实际环境不符的结论。
       status.value = {
         ...(status.value || {}),
         helper: { ...(status.value?.helper || {}), available: false },
@@ -591,15 +522,7 @@ async function load() {
   }
 }
 
-// apply：false = 仅保存（或先渲染校验），true = 保存并重建容器。
-//
-// 校验与保存分开是有意的：宿主机上的渲染/校验可能失败（插件没编进镜像、
-// 端口没放行），那时配置值得先存下来，让管理员改完环境再重试下发。
 async function save(apply, validateOnly = false) {
-  // 二次拦截：按钮虽然按 docker_ready + compose_ready 禁用了，但状态可能
-  // 已经过期（页面开着不动、daemon 中途挂掉、compose 插件被卸掉），
-  // 回车/重复点击也不经过按钮。这里直接挡下并说明原因，避免把配置写盘
-  // 之后才在校验/重建那步失败。
   if ((apply || validateOnly) && (!dockerReady.value || !composeReady.value)) {
     ElMessage.warning(applyBlockedReason.value || '宿主机 Docker 或 compose 不可用，无法校验或应用')
     return
@@ -626,8 +549,6 @@ async function save(apply, validateOnly = false) {
   }
 }
 
-// 检查的是「服务端已保存的域名」，因此这里**不重新加载表单**：
-// 管理员可能正改着一半的配置，刷新会把未保存的输入抹掉。
 async function checkDNS() {
   dns.value = []
   const res = await domainApi.dnsCheck()

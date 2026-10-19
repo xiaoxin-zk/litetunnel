@@ -10,18 +10,8 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
-// 这一组守的是「保存并校验」的语义：只校验，不写盘。
-//
-// 背景：Caddyfile、frps.toml 与 .env 都是**容器直接挂载**的活动配置
-// （deploy/docker-compose.yml 挂给 caddy 与 frps，restart 策略是
-// unless-stopped）。校验阶段把它们改掉，之后宿主机或容器只要重启一次，
-// 这份「还没应用」的新配置就会真的生效——而面板侧记录的状态仍是上一份，
-// 两边对不上，也没有任何地方会提示。
-//
-// 断言很直白：Apply=false 时，磁盘上的三个文件一个字节都没变。
-
 const testEnvContent = `# 部署配置
-LT_USER_PUBLIC_URL=https://panel.example.com
+LT_USER_PUBLIC_URL=https:
 LT_USER_PORT=7848
 LT_GATEWAY_PORT=7001
 LT_KCP_PORT=7000
@@ -39,8 +29,6 @@ LT_CADDY_DNS_PROVIDER=cloudflare
 LT_CADDY_DNS_CREDENTIAL=old-credential
 `
 
-// newRenderOnlyService 造一个只差 docker 的 service：模板与部署目录都用临时目录，
-// 容器校验换成必定通过的替身。
 func newRenderOnlyService(t *testing.T) (*service, paths) {
 	t.Helper()
 	dir := t.TempDir()
@@ -61,10 +49,8 @@ func newRenderOnlyService(t *testing.T) (*service, paths) {
 		}
 	}
 	write(p.envFile, testEnvContent)
-	// 活动文件先放上哨兵内容：任何写入都会被发现。
 	write(p.caddyOut, "OLD-CADDYFILE\n")
 	write(p.frpsOut, "OLD-FRPS\n")
-	// 模板用最简内容：本用例关心的是「写不写盘」，不是渲染结果。
 	write(p.caddyTpl, "rendered-caddy\n")
 	write(p.frpsTpl, "rendered-frps\n")
 
@@ -83,8 +69,6 @@ func TestRenderOnlyDoesNotTouchActiveFiles(t *testing.T) {
 			tlscfg.VarUserPublicURL: "https://panel.example.com",
 			tlscfg.VarTunnelDomain:  "tunnel.example.com",
 			tlscfg.VarDNSProvider:   "cloudflare",
-			// 凭据变了。若这里写了盘，被容器挂载的活动 .env 就已经被改掉了，
-			// 下一次容器重启会拿着这份「还没应用」的配置起来。
 			tlscfg.VarDNSCredential: "new-credential",
 		},
 		WriteEnv: true,
@@ -119,7 +103,6 @@ func TestRenderOnlyDoesNotTouchActiveFiles(t *testing.T) {
 		t.Fatal("只校验的请求不该报告为已应用")
 	}
 
-	// 但同时要告诉管理员「点了应用会改哪些文件」，否则这个按钮等于没有反馈。
 	want := map[string]bool{"Caddyfile": true, "frps.toml": true, ".env": true}
 	for _, name := range res.Changed {
 		delete(want, name)
@@ -129,14 +112,9 @@ func TestRenderOnlyDoesNotTouchActiveFiles(t *testing.T) {
 	}
 }
 
-// TestRenderOnlyReportsNoChangeWhenIdentical 覆盖「内容本来就一致」：此时不该
-// 报告任何变化，也不该写盘。
 func TestRenderOnlyReportsNoChangeWhenIdentical(t *testing.T) {
 	s, p := newRenderOnlyService(t)
 
-	// 让两个配置文件的磁盘内容与渲染结果一致，模拟「什么都没改就点了校验」。
-	// .env 不参与：它的文本由 envfile 重新排版，手写的样例必然有格式差异，
-	// 那是另一个话题（写回时的规范化），与「写不写盘」无关。
 	if err := os.WriteFile(p.caddyOut, []byte("rendered-caddy\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

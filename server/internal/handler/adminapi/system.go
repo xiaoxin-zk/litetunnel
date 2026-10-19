@@ -15,7 +15,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// StatsOverview 后台首页概览。
 func (h *Handler) StatsOverview(c *gin.Context) {
 	var (
 		userTotal    int64
@@ -26,11 +25,6 @@ func (h *Handler) StatsOverview(c *gin.Context) {
 	)
 	db := h.svc.DB
 
-	// 每一项都要确认成功。
-	//
-	// 以前只检查第一个查询，后面几项忽略错误——查询失败时那几个数字会是 0，
-	// 而 0 在首页上**看起来完全正常**：管理员会以为「真的没有在线客户端」，
-	// 而不是「数据库出了问题」。把失败当成真实的零值，比直接报错更危险。
 	var totalUsed int64
 	queries := []struct {
 		name string
@@ -66,8 +60,6 @@ func (h *Handler) StatsOverview(c *gin.Context) {
 	}
 	for _, q := range queries {
 		if err := q.run(); err != nil {
-			// 带上是哪一项失败：日志里只有一条 SQL 错误时，
-			// 排查的人还得自己猜是哪块统计出了问题。
 			log.Printf("[admin] 首页统计查询失败（%s）: %v", q.name, err)
 			shared.Fail(c, err)
 			return
@@ -84,50 +76,23 @@ func (h *Handler) StatsOverview(c *gin.Context) {
 	})
 }
 
-// SystemMetrics 返回服务器实时指标与最近的采样序列。
-//
-// latest 与 series 一起返回而不是分两个接口：面板每 5 秒刷新一次，
-// 分两次请求会出现「卡片是新值、图表是旧值」这种对不上的瞬间。
 func (h *Handler) SystemMetrics(c *gin.Context) {
-	// limit 控制返回多少个采样点。0 表示全部（最多由采集器的环形缓冲决定）。
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
 
 	col := h.svc.Monitor
 	httpx.OK(c, gin.H{
-		"latest": col.Latest(),
-		"series": col.Series(limit),
-		// 一并下发采样间隔，让前端自己算出「这批数据覆盖多长时间」，
-		// 不需要在前端再硬编码一份——两处写死迟早会不一致。
+		"latest":          col.Latest(),
+		"series":          col.Series(limit),
 		"sample_interval": int(monitor.SampleInterval.Seconds()),
 		"max_samples":     monitor.MaxSamples,
 		"recovery":        h.svc.RecoveryStats(),
-		// 审计字段写库失败（认证仍通过）的累计次数与最近原因。
-		// 一起下发的理由与 recovery 相同：这类故障不影响功能，只影响事后追查，
-		// 单独开接口的话没人会去看。
-		"audit": h.svc.AuditHealth(),
-		// 断流（删号/禁用后主动断开已建立代理）的两个盲区：
-		//
-		//   drain_fallback —— 意图没能落库、只留在进程内存里的队列。非空或
-		//     dropped 非零说明数据库曾经不可用，且有账号的断流意图一度只存在
-		//     于内存（进程重启就丢）。这是「需要人看一眼」的状态。
-		//   drain_race —— 关闭请求成功后同名代理又以另一个实例身份出现的次数。
-		//     frps 只支持按名字关闭，这个竞态无法消除，只能计数；非零意味着
-		//     有关闭动作的结果无法确认（可能误关了刚重连的新实例）。
-		//
-		// 两者都不影响接口成功与否，正是「不单独开接口就没人会看」的那一类，
-		// 所以跟 recovery/audit 一起下发。
-		"drain_fallback": h.svc.ProxyDrainFallback(),
-		"drain_race":     h.svc.ProxyDrainRaceHealth(),
-		// drain_queue 暴露待办深度与 frps 可用性：frps 不可用时重试循环
-		// 刻意不推进待办，没有这个数字就只能靠翻日志发现「断流一直没做」。
-		"drain_queue": h.svc.ProxyDrainQueueHealth(),
+		"audit":           h.svc.AuditHealth(),
+		"drain_fallback":  h.svc.ProxyDrainFallback(),
+		"drain_race":      h.svc.ProxyDrainRaceHealth(),
+		"drain_queue":     h.svc.ProxyDrainQueueHealth(),
 	})
 }
 
-// ListClientPackages 列出已分发的客户端安装包。
-//
-// 路径用 client-packages 而不是 clients：后者已经被「在线客户端会话」
-// 占用，两个概念完全不同（一个是会话，一个是安装包）。
 func (h *Handler) ListClientPackages(c *gin.Context) {
 	list, err := h.svc.ListClientPackages()
 	if err != nil {
@@ -135,9 +100,7 @@ func (h *Handler) ListClientPackages(c *gin.Context) {
 		return
 	}
 	httpx.OK(c, gin.H{
-		"files": list,
-		// 一并下发两种分发方式的当前状态，管理端才能告诉管理员
-		// 「用户现在实际会从哪里拿到客户端」。
+		"files":        list,
 		"download_url": strings.TrimSpace(h.svc.Settings.Get(service.KeySiteClientDownloadURL)),
 		"dist_dir":     h.svc.Cfg.ClientDistDir,
 		"max_size":     service.MaxClientPackageSize,
@@ -145,16 +108,12 @@ func (h *Handler) ListClientPackages(c *gin.Context) {
 	})
 }
 
-// UploadClientPackage 上传客户端安装包。
-//
-// 仅超管可用：上传的文件会被分发给**所有用户**下载。
 func (h *Handler) UploadClientPackage(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
 		httpx.BadRequest(c, "请选择要上传的文件")
 		return
 	}
-	// 文件名校验必须在打开文件之前完成：它来自客户端，是不可信输入。
 	name, err := service.SanitizeClientFileName(file.Filename)
 	if err != nil {
 		shared.Fail(c, err)
@@ -183,7 +142,6 @@ func (h *Handler) UploadClientPackage(c *gin.Context) {
 	})
 }
 
-// DeleteClientPackage 删除客户端安装包。
 func (h *Handler) DeleteClientPackage(c *gin.Context) {
 	name := c.Param("name")
 	if err := h.svc.DeleteClientPackage(name); err != nil {
@@ -194,7 +152,6 @@ func (h *Handler) DeleteClientPackage(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已删除"})
 }
 
-// FirewallStatus 返回防火墙运行态与端口池使用情况。
 func (h *Handler) FirewallStatus(c *gin.Context) {
 	httpx.OK(c, gin.H{
 		"firewall": h.svc.FirewallStatusOf(),
@@ -207,7 +164,6 @@ type firewallPortReq struct {
 	Proto string `json:"proto"`
 }
 
-// FirewallOpenPort 手工放行一个端口。
 func (h *Handler) FirewallOpenPort(c *gin.Context) {
 	var req firewallPortReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -217,7 +173,6 @@ func (h *Handler) FirewallOpenPort(c *gin.Context) {
 	if req.Proto == "" {
 		req.Proto = "tcp"
 	}
-	// 走手工路径：必须真的放行，不能像自动放行那样「开关没开就静默跳过」。
 	if err := h.svc.FirewallManualOpen(req.Port, req.Proto); err != nil {
 		shared.Fail(c, err)
 		return
@@ -227,7 +182,6 @@ func (h *Handler) FirewallOpenPort(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "端口已放行"})
 }
 
-// FirewallClosePort 手工关闭一个端口。
 func (h *Handler) FirewallClosePort(c *gin.Context) {
 	var req firewallPortReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -237,7 +191,6 @@ func (h *Handler) FirewallClosePort(c *gin.Context) {
 	if req.Proto == "" {
 		req.Proto = "tcp"
 	}
-	// 走手工路径：护栏（保护端口、池外端口）在服务层内校验。
 	if err := h.svc.FirewallManualClose(req.Port, req.Proto); err != nil {
 		shared.Fail(c, err)
 		return
@@ -247,11 +200,6 @@ func (h *Handler) FirewallClosePort(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "端口已关闭"})
 }
 
-// FirewallClearFailed 清除一条重试已终止的失败记录。
-//
-// 语义是「管理员已经人工处理完了，不再需要界面提醒」，而不是「再试一次」：
-// 后台对终态记录不再自动重试，修好宿主机后想让它补做，用上面的
-// 手工放行/关闭，或重新触发一次隧道状态变更。
 func (h *Handler) FirewallClearFailed(c *gin.Context) {
 	var req firewallPortReq
 	if err := c.ShouldBindJSON(&req); err != nil || req.Port <= 0 {
@@ -267,7 +215,6 @@ func (h *Handler) FirewallClearFailed(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "记录已清除"})
 }
 
-// FirewallRescan 重新扫描端口占用并输出可用区间，供管理页刷新用。
 func (h *Handler) FirewallRescan(c *gin.Context) {
 	httpx.OK(c, gin.H{
 		"firewall": h.svc.FirewallStatusOf(),

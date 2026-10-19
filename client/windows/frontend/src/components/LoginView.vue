@@ -9,7 +9,6 @@
         </div>
       </div>
 
-      <!-- 服务地址：构建注入时只读展示，未注入时允许手填（仅调试构建） -->
       <label class="field">
         <span>服务地址</span>
         <div v-if="state.server_fixed" class="fixed-server">
@@ -30,11 +29,8 @@
 
       <div v-if="notice" class="notice">{{ notice }}</div>
 
-      <!-- 本地配置损坏：这时客户端必然是「未登录」状态，必须说明原因，
-           否则用户只会以为自己被莫名其妙登出了。 -->
       <div v-if="state.config_error" class="notice">{{ state.config_error }}</div>
 
-      <!-- ============ 连接 ============ -->
       <template v-if="mode === 'login'">
         <label class="field">
           <span>API Key</span>
@@ -60,18 +56,15 @@
         <p class="hint muted">
           <a class="link" @click="openReset">忘记密码？</a>
         </p>
-        <!-- 版本号放在登录页：连不上时第一件事就是确认客户端版本 -->
         <p class="hint muted version">{{ state.version }}</p>
       </template>
 
-      <!-- ============ 重置密码 ============ -->
       <template v-else>
         <label class="field">
           <span>用户名或邮箱</span>
           <input v-model="reset.account" placeholder="注册时使用的账号" spellcheck="false" autocomplete="off" />
         </label>
 
-        <!-- 服务端启用了邮件：用一次性验证码证明身份 -->
         <label v-if="mailEnabled" class="field">
           <span>邮箱验证码</span>
           <div class="row">
@@ -89,7 +82,6 @@
           <em class="muted">发送到账号绑定的邮箱</em>
         </label>
 
-        <!-- 服务端未启用邮件：用当前密码证明身份 -->
         <label v-else class="field">
           <span>当前密码</span>
           <input v-model="reset.oldPassword" type="password" placeholder="用于验证身份" autocomplete="off" />
@@ -135,12 +127,6 @@ const loading = ref(false)
 const error = ref('')
 const form = reactive({ server: '', apiKey: '' })
 
-// 请求代次：地址或模式一变就推进，旧响应到达时直接丢弃。
-//
-// 不做这一步的后果很具体：先发的那次请求（例如填错了服务器、或点了重置）
-// 晚到时会把页面状态盖回去——地址已经改了却登录进旧账号，或者切回登录页
-// 之后又弹出上一次重置的结果。请求本身没法取消（Wails 调用没有取消入口），
-// 所以只能在回来时判断「这还是不是当前这一次」。
 let attempt = 0
 
 async function submit() {
@@ -164,40 +150,27 @@ async function submit() {
     if (seq !== attempt) return
     error.value = typeof e === 'string' ? e : e?.message || '连接失败，请检查 API Key 是否正确'
   } finally {
-    // 只有当前这一次能改按钮状态：过期请求若把 loading 关掉，正在等
-    // 的新请求就会失去「加载中」的表象，按钮又能被点第二次。
     if (seq === attempt) loading.value = false
   }
 }
 
-// ---- 重置密码 ----
 
 const mode = ref('login')
 
-// 地址或模式一变，在途请求立即作废。flush: 'sync' 是必须的：默认的批处理
-// 会让回调晚于同一段同步代码执行，刚取到的代次紧跟着被递增作废——
-// 请求会把自己判成过期，页面永远停在「加载中」。
 watch(() => form.server, () => { attempt++ }, { flush: 'sync' })
 watch(mode, () => { attempt++ }, { flush: 'sync' })
 const sending = ref(false)
 const countdown = ref(0)
-// 由服务端决定走哪种验证方式，不在客户端写死
 const mailEnabled = ref(false)
 const notice = ref('')
 const reset = reactive({ account: '', emailCode: '', oldPassword: '', password: '', confirm: '' })
 
-// 表单内容变了也算「另一次尝试」：旧请求回来时不能把结果写进新表单。
-// 只盯服务器地址与模式是不够的——用户改了账号再点发送验证码，前一次
-// 请求的结果仍可能落在新表单上（提示串号、倒计时为另一个账号而走）。
 watch(
   () => [form.apiKey, reset.account, reset.emailCode, reset.oldPassword, reset.password, reset.confirm],
   () => { attempt++ },
   { flush: 'sync' }
 )
 
-// 倒计时定时器必须能在「重新发送」与「组件卸载」时被清掉：
-// 反复进入找回密码页会各起一个 setInterval，旧定时器在组件卸载后仍在修改
-// 已销毁组件的状态。统一收口到 stopCountdown，卸载时一并停掉。
 let countdownTimer = null
 function stopCountdown() {
   if (countdownTimer) {
@@ -207,7 +180,6 @@ function stopCountdown() {
 }
 onUnmounted(stopCountdown)
 
-/** 打开重置面板，并向服务端确认该走验证码还是旧密码。 */
 async function openReset() {
   error.value = ''
   notice.value = ''
@@ -219,8 +191,6 @@ async function openReset() {
     mailEnabled.value = enabled
   } catch {
     if (seq !== attempt) return
-    // 探测失败按「未启用邮件」处理：旧密码模式在任何配置下都能用，
-    // 而验证码模式在未启用邮件时根本无法发送。
     mailEnabled.value = false
   }
 }
@@ -238,7 +208,6 @@ async function sendCode() {
     await api.sendEmailCode(form.server.trim(), account, 'reset')
     if (seq !== attempt) return
     countdown.value = 60
-    // 重新发送前先停掉旧计时器，避免叠起多个 interval。
     stopCountdown()
     countdownTimer = setInterval(() => {
       countdown.value -= 1
@@ -287,12 +256,8 @@ async function submitReset() {
       reset.emailCode.trim(),
       reset.password
     )
-    // 期间换了服务器或退了模式：这次成功属于另一套上下文，不再提示。
     if (seq !== attempt) return
-    // 先关掉加载态：下面清字段会把 attempt 推进（表单 watch），
-    // finally 里就判不出「我还是当前这次」了。
     loading.value = false
-    // 清掉敏感字段，避免残留在界面上
     reset.oldPassword = ''
     reset.emailCode = ''
     reset.password = ''
@@ -307,7 +272,6 @@ async function submitReset() {
   }
 }
 
-// 未注入地址的调试构建下，把上次填过的地址回填出来。
 watch(
   () => props.state?.server_url,
   (v) => {

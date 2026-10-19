@@ -12,7 +12,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// ListRedeemCodes 兑换码列表。
 func (h *Handler) ListRedeemCodes(c *gin.Context) {
 	page, pageSize, offset := httpx.Pagination(c)
 	list, total, err := h.svc.ListRedeemCodes(c.Query("keyword"), c.Query("status"), c.Query("batch_no"), offset, pageSize)
@@ -23,7 +22,6 @@ func (h *Handler) ListRedeemCodes(c *gin.Context) {
 	httpx.PageOK(c, list, total, page, pageSize)
 }
 
-// GenerateRedeemCodes 批量生成兑换码。
 func (h *Handler) GenerateRedeemCodes(c *gin.Context) {
 	var in service.GenerateCodesInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -49,7 +47,6 @@ func (h *Handler) GenerateRedeemCodes(c *gin.Context) {
 	})
 }
 
-// SetRedeemCodeStatus 禁用/启用兑换码。
 func (h *Handler) SetRedeemCodeStatus(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -69,7 +66,6 @@ func (h *Handler) SetRedeemCodeStatus(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "状态已更新"})
 }
 
-// DeleteRedeemCode 删除兑换码。
 func (h *Handler) DeleteRedeemCode(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -84,7 +80,6 @@ func (h *Handler) DeleteRedeemCode(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已删除"})
 }
 
-// ListRedeemRecords 兑换流水。
 func (h *Handler) ListRedeemRecords(c *gin.Context) {
 	page, pageSize, offset := httpx.Pagination(c)
 	userID, _ := strconv.ParseUint(c.Query("user_id"), 10, 64)

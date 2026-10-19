@@ -82,7 +82,6 @@
       />
     </div>
 
-    <!-- 新建用户 -->
     <el-dialog v-model="createVisible" title="新建用户" width="480px">
       <el-form :model="createForm" :rules="createRules" ref="createRef" label-width="90px">
         <el-form-item label="用户名" prop="username">
@@ -109,7 +108,6 @@
       </template>
     </el-dialog>
 
-    <!-- 编辑用户 -->
     <el-dialog v-model="editVisible" title="编辑用户" width="460px">
       <el-form :model="editForm" label-width="90px">
         <el-form-item label="用户名">
@@ -131,7 +129,6 @@
       </template>
     </el-dialog>
 
-    <!-- 流量配额 -->
     <el-dialog v-model="quotaVisible" title="流量限制" width="480px">
       <el-form label-width="110px">
         <el-form-item label="当前已用">
@@ -155,7 +152,6 @@
       </template>
     </el-dialog>
 
-    <!-- 分组 -->
     <el-dialog v-model="groupVisible" title="分组权限" width="440px">
       <el-form label-width="90px">
         <el-form-item label="用户名">
@@ -181,7 +177,6 @@
       </template>
     </el-dialog>
 
-    <!-- 重置密码 -->
     <el-dialog v-model="passwordVisible" title="重置密码" width="420px">
       <el-form label-width="90px">
         <el-form-item label="用户名">

@@ -8,11 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// TestResetClientSecretRevokesSessions 覆盖「轮换凭据后已登录的 frpc 仍被放行」。
-//
-// 插件热路径（onNewUserConn，每次新建用户连接都经过）只查**内存**会话表，
-// 命中后只校验配额就放行，根本不会读数据库。所以只把数据库会话置为离线
-// 是不够的——内存里那份必须一起清。
 func TestResetClientSecretRevokesSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -50,10 +45,6 @@ func TestResetClientSecretRevokesSessions(t *testing.T) {
 	}
 }
 
-// TestPasswordChangeDropsClientSessions 覆盖「改密后 frpc 仍能继续连」。
-//
-// token_version 只让网页 JWT 失效；frpc 用的是 client_secret，不受它影响。
-// 插件热路径又只查内存会话，所以数据库与内存两边都必须处理。
 func TestPasswordChangeDropsClientSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -90,7 +81,6 @@ func TestPasswordChangeDropsClientSessions(t *testing.T) {
 	}
 }
 
-// TestAdminResetPasswordDropsClientSessions 覆盖管理员重置密码的同一问题。
 func TestAdminResetPasswordDropsClientSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -123,7 +113,6 @@ func TestAdminResetPasswordDropsClientSessions(t *testing.T) {
 	}
 }
 
-// TestDropUserSessionsOnlyDropsThatUser 确认清理不会误伤其他账号。
 func TestDropUserSessionsOnlyDropsThatUser(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -142,13 +131,6 @@ func TestDropUserSessionsOnlyDropsThatUser(t *testing.T) {
 	}
 }
 
-// TestAccessGuardIsUnknownUntilLoaded 覆盖「准入状态未知」不能当成「没超额」。
-//
-// 超额与禁用标记只在内存里，由后台采集维护；而采集在数据库不可用、
-// frps 管理 API 不可达、采样基线读不出来时会**整轮跳过**。跳过期间内存里
-// 什么标记都没有，而插件热路径把「查不到」当成「没超额」放行——控制面刚
-// 启动、所有客户端同时重连的那段时间，超额与已禁用账号会被一并放进来。
-// 所以状态必须可查询，且只有整表加载成功才算「已知」。
 func TestAccessGuardIsUnknownUntilLoaded(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -161,7 +143,6 @@ func TestAccessGuardIsUnknownUntilLoaded(t *testing.T) {
 		t.Fatalf("设置配额失败: %v", err)
 	}
 
-	// 刚启动：谁都不知道。
 	if svc.Runtime.AccessGuardReady() {
 		t.Fatal("前置条件：新建的服务不该已经处于「准入状态已知」")
 	}
@@ -169,7 +150,6 @@ func TestAccessGuardIsUnknownUntilLoaded(t *testing.T) {
 		t.Fatal("前置条件：内存里不该有超额标记")
 	}
 
-	// 加载之后：如实反映库里的现状，并把状态翻成「已知」。
 	if !svc.LoadAccessGuard() {
 		t.Fatal("加载准入状态失败")
 	}
@@ -181,10 +161,6 @@ func TestAccessGuardIsUnknownUntilLoaded(t *testing.T) {
 	}
 }
 
-// TestLoadAccessGuardKeepsUnknownOnDBError 覆盖加载失败时不能假装知道。
-//
-// 失败却置位，插件就会按「内存里没有 ⇒ 没超额」放行，准入控制等于关掉；
-// 正确行为是保持未知、让插件显式拒绝，由采集协程重试到数据库恢复。
 func TestLoadAccessGuardKeepsUnknownOnDBError(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -204,13 +180,6 @@ func TestLoadAccessGuardKeepsUnknownOnDBError(t *testing.T) {
 	}
 }
 
-// TestLoginFailureCountsOnlyCredentialGuesses 覆盖计数口径。
-//
-// 三个要点：
-//  1. 只有真正的猜测（密码错、动态口令错）才算；
-//  2. 成功一次就清零——判定的是「连续」失败，否则改对密码的正常用户
-//     会被一直要求验证码；
-//  3. 大小写是同一个账号，否则交替提交就能把计数摊薄。
 func TestLoginFailureCountsOnlyCredentialGuesses(t *testing.T) {
 	svc := newTestServices(t, nil)
 	if err := svc.Settings.SetMany(map[SettingKey]string{KeyLoginCaptchaAfter: "2"}); err != nil {
@@ -222,25 +191,21 @@ func TestLoginFailureCountsOnlyCredentialGuesses(t *testing.T) {
 		svc.RecordLogin(LoginAttempt{Kind: model.LoginKindUser, Username: account, Result: result})
 	}
 
-	// 1) 密码错 + 动态口令错，各一次 → 到阈值。
 	fail(model.LoginResultBadCred)
 	fail(model.LoginResultTOTPFail)
 	if !svc.CaptchaRequired("login", account) {
 		t.Fatal("两次凭据猜测之后应当要求验证码")
 	}
 
-	// 3) 大小写不同也必须是同一个账号。
 	if !svc.CaptchaRequired("login", "ReSet-User") {
 		t.Fatal("计数键必须规范化：换个大小写不能变成另一个账号")
 	}
 
-	// 2) 成功一次即清零。
 	svc.RecordLogin(LoginAttempt{Kind: model.LoginKindUser, Username: account, Result: model.LoginResultSuccess})
 	if svc.CaptchaRequired("login", account) {
 		t.Fatal("成功登录后应清零：判定的是连续失败")
 	}
 
-	// 1) 「要求验证码」与「账号被禁用」都不是密码猜测，不该累计。
 	for i := 0; i < 5; i++ {
 		fail(model.LoginResultLocked)
 		fail(model.LoginResultDisabled)
@@ -250,11 +215,6 @@ func TestLoginFailureCountsOnlyCredentialGuesses(t *testing.T) {
 	}
 }
 
-// TestDeleteAccountDropsRuntimeSessions 覆盖自助注销路径的会话清理。
-//
-// 管理员删除与密码重置都清了内存会话，自助注销曾经漏了：数据库里的会话行
-// 随事务删除，但插件热路径查的是内存会话表，命中后只看配额就放行——
-// 账号都注销了，已连接的 frpc 还能继续建新连接。
 func TestDeleteAccountDropsRuntimeSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -284,11 +244,6 @@ func TestDeleteAccountDropsRuntimeSessions(t *testing.T) {
 	}
 }
 
-// TestRuntimeTouchAtIsPrunedWithSessions 覆盖心跳节流表只增不减。
-//
-// touchAt 按 runID 记录「上次落库时间」。客户端反复重连会产生大量
-// runID，而这些条目既不会被会话清理带走，也不在 GC 的范围内——
-// 长期运行的面板会一直攒着它们。
 func TestRuntimeTouchAtIsPrunedWithSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -301,7 +256,6 @@ func TestRuntimeTouchAtIsPrunedWithSessions(t *testing.T) {
 		t.Fatal("前置条件：首次心跳应允许落库")
 	}
 
-	// 撤销某个用户的会话时，节流记录要一起清。
 	svc.Runtime.DropUserSessions(1)
 	if _, ok := svc.Runtime.touchAt["run-a"]; ok {
 		t.Error("撤销会话后应一并清掉它的心跳节流记录")
@@ -310,12 +264,6 @@ func TestRuntimeTouchAtIsPrunedWithSessions(t *testing.T) {
 		t.Error("不该动其他用户的节流记录")
 	}
 
-	// GC 清理过期会话时同样要清。
-	//
-	// 把时间戳回拨一小时再按 10 分钟窗口清理，而不是用 GC(0)：
-	// GC(0) 的截止时刻就是「现在」，而它依赖两次 time.Now() 之间有可分辨的
-	// 间隔——Windows 上时钟粒度不足时两次调用可能落在同一刻度，
-	// Before 判为 false，测试就会随机失败（我自己写的用例踩过一次）。
 	backdateSession(t, svc.Runtime, "run-b", time.Hour)
 	svc.Runtime.GC(10 * time.Minute)
 
@@ -327,11 +275,6 @@ func TestRuntimeTouchAtIsPrunedWithSessions(t *testing.T) {
 	}
 }
 
-// TestResetPasswordByLinkDropsSessions 覆盖「邮件链接重置密码后旧 frpc 仍可建连」。
-//
-// 链接重置原先只把数据库会话标成离线，没有清本机内存会话；而插件热路径命中
-// 内存会话后只看配额就放行，不会去读数据库——旧 frpc 于是还能继续建立新连接，
-// 而「重置密码」的前提恰恰是账号可能已被他人控制。
 func TestResetPasswordByLinkDropsSessions(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -374,11 +317,6 @@ func TestResetPasswordByLinkDropsSessions(t *testing.T) {
 	}
 }
 
-// TestSessionGuardRevokedWhenUserDeleted 覆盖「账号在别的实例被删」。
-//
-// 用户记录查询失败时若直接返回、保持原判，旧客户端会一直 Ping，本机就一直
-// 留着这个会话，已有隧道继续接受新连接。这里要区分「用户不存在」（立即拒绝）
-// 与「数据库暂时不可用」（保持原判）。
 func TestSessionGuardRevokedWhenUserDeleted(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -400,7 +338,6 @@ func TestSessionGuardRevokedWhenUserDeleted(t *testing.T) {
 		t.Fatal("前置条件：正常账号不该被拦")
 	}
 
-	// 模拟另一个实例删号（只动数据库，本机内存会话还在）。
 	if err := svc.DB.Delete(&model.ClientSession{}, "user_id = ?", u.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +345,6 @@ func TestSessionGuardRevokedWhenUserDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 把快照时间拨回过去，触发一次刷新。
 	svc.Runtime.mu.Lock()
 	s := svc.Runtime.sessions[runID]
 	s.GuardAt = time.Now().Add(-time.Minute)
@@ -421,10 +357,6 @@ func TestSessionGuardRevokedWhenUserDeleted(t *testing.T) {
 	}
 }
 
-// TestSessionGuardSharedByBothPaths 覆盖「代理注册与新连接各查各的」。
-//
-// 两条路径共用同一份会话快照，否则多副本下会出现「配额已放宽仍拒注册」
-// 或「会话已撤销却注册成功、后续连接全被拒」这种自相矛盾的结果。
 func TestSessionGuardSharedByBothPaths(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -441,7 +373,6 @@ func TestSessionGuardSharedByBothPaths(t *testing.T) {
 	}
 }
 
-// TestSessionGuardRefresh 覆盖「别的实例禁用账号后本实例继续放行」。
 func TestSessionGuardRefresh(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -453,7 +384,6 @@ func TestSessionGuardRefresh(t *testing.T) {
 	}
 
 	const runID = "run-guard"
-	// 真实流程里内存会话一定对应一条数据库会话（登录时写入）。
 	if err := svc.DB.Create(&model.ClientSession{
 		UserID: u.ID, Username: u.Username, RunID: runID,
 		Online: true, LastSeenAt: time.Now(),
@@ -471,12 +401,10 @@ func TestSessionGuardRefresh(t *testing.T) {
 		t.Fatalf("正常账号不该被拦：blocked=%v exceeded=%v", sess.Blocked, sess.Exceeded)
 	}
 
-	// 另一个实例把账号禁用（只写库，不碰本实例的内存标记）。
 	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Update("status", model.UserStatusBanned).Error; err != nil {
 		t.Fatalf("禁用失败: %v", err)
 	}
-	// 立刻刷新会被节流，这里把快照时间拨回过去模拟「一个 Ping 周期之后」。
 	svc.Runtime.mu.Lock()
 	s := svc.Runtime.sessions[runID]
 	s.GuardAt = time.Now().Add(-time.Minute)
@@ -490,7 +418,6 @@ func TestSessionGuardRefresh(t *testing.T) {
 		t.Fatal("账号在别的实例被禁用后，本实例的会话快照应在一个刷新周期内变为「已禁用」")
 	}
 
-	// 会话被撤销（重置密码/注销）同理：数据库里已离线，本机内存会话不能继续放行。
 	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Update("status", model.UserStatusActive).Error; err != nil {
 		t.Fatal(err)

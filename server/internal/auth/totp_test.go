@@ -5,11 +5,6 @@ import (
 	"time"
 )
 
-// TestVerifyTOTPStepAcceptsWindowAndReturnsStep 验证窗口容错与步进码回传。
-//
-// 回传的步进码必须准确对应用户提交口令的那个时刻，否则防重放会误伤：
-// 用户在当前步提交口令，若返回的是上一步的步进码，那么他等 30 秒后
-// 用新口令时，服务端算出的当前步恰好等于上次误记的那一步，就会被无故拒绝。
 func TestVerifyTOTPStepAcceptsWindowAndReturnsStep(t *testing.T) {
 	secret, err := GenerateTOTPSecret()
 	if err != nil {
@@ -47,9 +42,6 @@ func TestVerifyTOTPStepAcceptsWindowAndReturnsStep(t *testing.T) {
 	}
 }
 
-// TestVerifyTOTPStepRejectsOutOfWindow 验证窗口之外的步进码被拒绝。
-//
-// 窗口每放宽一步，攻击者可利用的时间就多 30 秒，所以这条边界必须有测试守着。
 func TestVerifyTOTPStepRejectsOutOfWindow(t *testing.T) {
 	secret, err := GenerateTOTPSecret()
 	if err != nil {
@@ -68,7 +60,6 @@ func TestVerifyTOTPStepRejectsOutOfWindow(t *testing.T) {
 	}
 }
 
-// TestVerifyTOTPStepRejectsMalformed 验证畸形输入被安全拒绝。
 func TestVerifyTOTPStepRejectsMalformed(t *testing.T) {
 	secret, err := GenerateTOTPSecret()
 	if err != nil {
@@ -83,10 +74,6 @@ func TestVerifyTOTPStepRejectsMalformed(t *testing.T) {
 	}
 }
 
-// TestGenerateTOTPStableWithinStep 验证同一步进内生成的口令一致。
-//
-// TOTP 的定义就是「一个 30 秒窗口内口令不变」，这条不变量若被破坏，
-// 认证器与服务端会持续错位，表现为用户永远登不进来。
 func TestGenerateTOTPStableWithinStep(t *testing.T) {
 	secret, err := GenerateTOTPSecret()
 	if err != nil {

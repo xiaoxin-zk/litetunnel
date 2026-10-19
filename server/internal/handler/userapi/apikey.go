@@ -8,7 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/middleware"
 )
 
-// GetAPIKey 返回 API Key 的元信息（不含明文）。
 func (h *Handler) GetAPIKey(c *gin.Context) {
 	u, err := h.svc.LoadUser(middleware.CurrentUserID(c))
 	if err != nil {
@@ -22,7 +21,6 @@ func (h *Handler) GetAPIKey(c *gin.Context) {
 	})
 }
 
-// RevealAPIKey 解密回显 API Key 明文，供用户复制到客户端。
 func (h *Handler) RevealAPIKey(c *gin.Context) {
 	u, err := h.svc.LoadUser(middleware.CurrentUserID(c))
 	if err != nil {
@@ -37,7 +35,6 @@ func (h *Handler) RevealAPIKey(c *gin.Context) {
 	httpx.OK(c, gin.H{"api_key": plain})
 }
 
-// RotateAPIKey 重置 API Key，旧 Key 立即失效。
 func (h *Handler) RotateAPIKey(c *gin.Context) {
 	uid := middleware.CurrentUserID(c)
 	plain, prefix, err := h.svc.RotateAPIKey(uid)

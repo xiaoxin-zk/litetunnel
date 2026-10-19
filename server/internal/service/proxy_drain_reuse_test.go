@@ -10,11 +10,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 删号事务必须自己生成围栏令牌。
-//
-// 留空的话，提交后的即时断流读不到凭据，只能重新登记一次待办，用新 fence、
-// 空 targets 覆盖事务里的那份现场。incarnation 有 CASE 保护，但这属于
-// 「靠一列的条件写兜住结构问题」，下一个新增字段就会重演覆盖。
 func TestPurgeIntentsSetsFence(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "purge-fence")
@@ -40,7 +35,6 @@ func TestPurgeIntentsSetsFence(t *testing.T) {
 		t.Fatal("删号事务必须生成围栏令牌，否则即时断流会重写待办")
 	}
 
-	// 即时断流（frps 不可用）必须复用这份围栏，而不是重新登记。
 	svc.Frps = nil
 	svc.CloseDeletedUserProxies(context.Background(), u.ID)
 
@@ -56,12 +50,6 @@ func TestPurgeIntentsSetsFence(t *testing.T) {
 	}
 }
 
-// 删号后的即时断流与后台重试都读不到 users 行。若它们重新登记一次待办，
-// 就会把删除事务里记下的账号标识覆盖成空串——ID 被复用时这条待办再也识别
-// 不出「这是另一个账号」，会按相同前缀关掉新账号的代理。
-//
-// 这个用例走完整链路：删号事务登记 → 即时断流（frps 缺失，走 unknown 分支）
-// → ID 被新账号占用 → 到期待办重试。断言旧待办既不覆盖标识，也不触碰新代理。
 func TestDeletedDrainKeepsIncarnationAndSparesReusedID(t *testing.T) {
 	svc := newTestServices(t, nil)
 	u := newLifecycleUser(t, svc, "reuse-drain")
@@ -91,7 +79,6 @@ func TestDeletedDrainKeepsIncarnationAndSparesReusedID(t *testing.T) {
 		t.Fatal("删除事务内的待办必须记录账号标识")
 	}
 
-	// 即时断流：frps 不可用 → unknown，且**不能**重写待办。
 	svc.Frps = nil
 	svc.CloseDeletedUserProxies(context.Background(), u.ID)
 
@@ -102,7 +89,6 @@ func TestDeletedDrainKeepsIncarnationAndSparesReusedID(t *testing.T) {
 		t.Fatalf("即时断流覆盖了账号标识：%q → %q", oldInc, row.Incarnation)
 	}
 
-	// ID 被新账号占用，并注册了同名代理（新实例身份）。
 	reused := &model.User{ID: u.ID, Username: "reuse-drain-new", Password: "not-used",
 		Status: model.UserStatusActive}
 	if err := svc.DB.Create(reused).Error; err != nil {
@@ -115,7 +101,6 @@ func TestDeletedDrainKeepsIncarnationAndSparesReusedID(t *testing.T) {
 	f := newFakeFrpsProxies(t, proxyJSON(proxy, "client-new", time.Now().Unix()))
 	f.install(svc)
 
-	// 让待办到期，跑一轮后台重试。
 	if err := svc.DB.Model(&model.ProxyDrainPending{}).Where("user_id = ?", u.ID).
 		Update("next_at", time.Now().Add(-time.Minute)).Error; err != nil {
 		t.Fatalf("调整待办时间失败: %v", err)

@@ -9,7 +9,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/firewall"
 )
 
-// failingBackend 模拟「helper 在线、但底层防火墙状态查不到」。
 type failingBackend struct{}
 
 func (failingBackend) Name() string                        { return "iptables" }
@@ -19,7 +18,6 @@ func (failingBackend) ListRules() ([]firewall.Rule, error) { return nil, nil }
 func (failingBackend) AddPort(int, string) error           { return nil }
 func (failingBackend) RemovePort(int, string) error        { return nil }
 
-// newTestHelper 起一个真实的 lt-fw /health 端点，返回面板侧的后端。
 func newTestHelper(t *testing.T, be firewall.Backend) *firewall.HelperBackend {
 	t.Helper()
 	s := &server{token: "test-token", guard: firewall.NewGuard("", 1024, 65535), backend: be}
@@ -30,11 +28,6 @@ func newTestHelper(t *testing.T, be firewall.Backend) *firewall.HelperBackend {
 	return firewall.NewHelperBackend(srv.URL, "test-token")
 }
 
-// TestHealthReportsStatusError 覆盖「底层查询失败被报告成未启用」。
-//
-// helper 进程在线、但 iptables 查询失败时，/health 必须带上可区分的原因；
-// 否则面板拿到的是 enabled=false、err=nil，新增的「未知」状态永远不生效，
-// 界面会把一次查询失败显示成明确的「未生效」。
 func TestHealthReportsStatusError(t *testing.T) {
 	be := newTestHelper(t, failingBackend{})
 
@@ -46,10 +39,6 @@ func TestHealthReportsStatusError(t *testing.T) {
 	}
 }
 
-// TestHealthReportsNoBackend 覆盖「没有可用后端时原因丢失」。
-//
-// None 是占位实现，它的 Available() 恒为 true；但对面板来说「没有可用的
-// 防火墙后端」就是不可用，并且原因要能一路传到界面。
 func TestHealthReportsNoBackend(t *testing.T) {
 	be := newTestHelper(t, firewall.NewNone("宿主机没有可用的防火墙后端"))
 

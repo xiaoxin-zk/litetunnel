@@ -8,17 +8,8 @@ import (
 	"testing"
 )
 
-// TestEmbeddedFrpc 验证内嵌的 frpc 确实是一个完整的 Windows 可执行文件。
-//
-// 为什么需要这条测试：`-tags embedfrpc` 只在发布流程里启用，日常 CI 根本
-// 走不到这条构建路径。而 go:embed 对内容不做任何校验——下载得到的空文件、
-// 代理返回的 HTML 错误页、被截断的 zip，全都能顺利编译进客户端。产物照样
-// 能启动，只有用户点「连接」准备释放内置 frpc 时才失败，而那时发布已经发出去了。
-//
-// 检查项刻意选成「与文件大小无关」的硬证据：PE 头（MZ + e_lfanew 处的
-// PE\0\0）。再加一条体积下限，挡住「头对但内容被截断」的情况。
 func TestEmbeddedFrpc(t *testing.T) {
-	const minSize = 1 << 20 // 1 MiB：官方 frpc.exe 约 14 MB
+	const minSize = 1 << 20
 
 	if len(embeddedFrpc) == 0 {
 		t.Fatal("内嵌 frpc 为空：assets/frpc.exe 不存在或下载失败")
@@ -43,7 +34,6 @@ func TestEmbeddedFrpc(t *testing.T) {
 	}
 }
 
-// firstBytes 返回 b 的前 n 个字节（不足时返回全部），用于错误信息。
 func firstBytes(b []byte, n int) []byte {
 	if len(b) < n {
 		return b

@@ -8,23 +8,6 @@ import (
 	"time"
 )
 
-// 这一组守的是缺陷 9：「daemon 能用」不等于「compose 能用」。
-//
-// 落点：本服务重建容器只用 `docker compose up`（见 compose.go），而早期
-// 探测只跑 `docker info`。daemon 起来了、compose 插件没装（或只有 V1 的
-// 独立二进制）时 docker info 照样成功，面板于是放行到「保存并应用」，
-// 失败发生在文件已经写盘之后——配置与容器分处两个版本。
-//
-// 这里覆盖三件事：
-//  1. 两个结论分别报告，原因不混在一起（daemon 坏 vs compose 坏）；
-//  2. ComposeReady 恒蕴含 DockerReady，反之不成立；
-//  3. 新增的 compose 探测没有破坏缓存与单飞（一次健康检查仍然只跑一轮）。
-
-// TestComposeAfterDockerSkipsProbeWhenDaemonDown：daemon 不可用时**不允许**
-// 再探 compose。
-//
-// 性质是「不调用」，所以只能靠一个会计数的 probeCompose 验证：多起一个进程
-// 只为报一个连带为假的状态，既浪费又是健康检查被高频轮询时的进程浪费。
 func TestComposeAfterDockerSkipsProbeWhenDaemonDown(t *testing.T) {
 	var calls int32
 	res := composeAfterDocker(
@@ -48,8 +31,6 @@ func TestComposeAfterDockerSkipsProbeWhenDaemonDown(t *testing.T) {
 	}
 }
 
-// TestComposeAfterDockerReportsComposeSeparately：daemon 可用、compose 不可用
-// 时，必须能说清是「compose 的问题」而不是「Docker 的问题」。
 func TestComposeAfterDockerReportsComposeSeparately(t *testing.T) {
 	const composeReason = "docker compose 不可用（插件与独立 docker-compose 都没能跑起来）"
 	res := composeAfterDocker(
@@ -66,7 +47,6 @@ func TestComposeAfterDockerReportsComposeSeparately(t *testing.T) {
 		t.Errorf("compose 的失败原因应当原样带出，实际 %q", res.ComposeReason)
 	}
 
-	// 正向对照：两者都可用时都真，且不留旧错误。
 	ok := composeAfterDocker(
 		dockerProbeResult{Found: true, Ready: true},
 		func() composeProbeResult { return composeProbeResult{Ready: true} })
@@ -78,11 +58,7 @@ func TestComposeAfterDockerReportsComposeSeparately(t *testing.T) {
 	}
 }
 
-// TestHealthReportsComposeReadySeparately 覆盖 Health 字段的契约（前端按它
-// 决定按钮能否点）。
 func TestHealthReportsComposeReadySeparately(t *testing.T) {
-	// 场景 A：daemon 可用、compose 缺失。应用类按钮必须被禁用，但「仅保存」
-	// 仍然可用——所以 Available 不能被压成 false。
 	s, _ := newHealthService(t, func() dockerProbeResult {
 		return dockerProbeResult{
 			Found:         true,
@@ -107,8 +83,6 @@ func TestHealthReportsComposeReadySeparately(t *testing.T) {
 		t.Errorf("compose 缺失不该让 helper 自己报不可用（仅保存仍然可用），Reason=%q", h.Reason)
 	}
 
-	// 场景 B：daemon 不可用。compose 结论是连带为假，ComposeErr 必须留空，
-	// 否则界面会把「去启动 docker」写成「去装 compose 插件」。
 	s2, _ := newHealthService(t, func() dockerProbeResult {
 		return dockerProbeResult{Found: true, Reason: "daemon 未启动"}
 	})
@@ -120,7 +94,6 @@ func TestHealthReportsComposeReadySeparately(t *testing.T) {
 		t.Errorf("daemon 不可用时不填 ComposeErr（那是连带结果），实际 %q", h2.ComposeErr)
 	}
 
-	// 场景 C：一切正常。两个 Ready 都为真，两个 Err 都留空。
 	s3, _ := newHealthService(t, func() dockerProbeResult {
 		return dockerProbeResult{Found: true, Ready: true, ComposeReady: true}
 	})
@@ -133,11 +106,6 @@ func TestHealthReportsComposeReadySeparately(t *testing.T) {
 	}
 }
 
-// TestHealthComposeProbeIsCachedAndSingleFlight：新增的 compose 探测不能破坏
-// 「TTL 内只探一次、并发只探一次」。
-//
-// 关键点：缓存的是**整份**结论（daemon + compose 在同一次探测里跑完），所以
-// 断言仍然只数一次调用。
 func TestHealthComposeProbeIsCachedAndSingleFlight(t *testing.T) {
 	var calls int32
 	s, _ := newHealthService(t, func() dockerProbeResult {
@@ -153,7 +121,6 @@ func TestHealthComposeProbeIsCachedAndSingleFlight(t *testing.T) {
 		t.Fatalf("TTL 之内整份探测只应跑一次（含 compose 那一段），实际 %d 次", got)
 	}
 
-	// 并发：仍然只允许一次。
 	var concurrent int32
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -190,12 +157,6 @@ func TestHealthComposeProbeIsCachedAndSingleFlight(t *testing.T) {
 	}
 }
 
-// TestProbeComposeHostIsSymmetric 覆盖真实 compose 探测的两个分支（不依赖本机
-// 是否装了 compose）：要么就绪，要么给出一条可读原因。
-//
-// 与 docker 那个用例同样的对称写法：ubuntu-latest 上装了 docker 但未必装了
-// compose 插件，本机（Windows）也可能没有，硬性要求某一种只会得到一条
-// 与环境相关的失败。
 func TestProbeComposeHostIsSymmetric(t *testing.T) {
 	res := probeComposeHost()
 	if res.Ready {
@@ -212,8 +173,6 @@ func TestProbeComposeHostIsSymmetric(t *testing.T) {
 	}
 }
 
-// TestTruncateRunesStillWorks 保持对新增调用点的约束：compose 的报错同样要
-// 截断，不能整段灌进健康检查响应。
 func TestTruncateRunesStillWorks(t *testing.T) {
 	long := strings.Repeat("x", 500)
 	got := truncateRunes(long, 200)

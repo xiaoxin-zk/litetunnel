@@ -7,7 +7,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/tlscfg"
 )
 
-// baseVars 是一份「最小可用」的变量集合，代表部署目录 .env 里的内容。
 func baseVars() map[string]string {
 	return map[string]string{
 		"LT_GATEWAY_PORT":       "7001",
@@ -26,9 +25,6 @@ func baseVars() map[string]string {
 	}
 }
 
-// TestValidateRejectsOfficialImageWithDNSChallenge 守住最容易踩的那个坑：
-// 配置全对，但镜像是官方的 caddy:2-alpine——Caddy 会以
-// "unrecognized directive: dns" 拒绝加载整份配置，而那时已经写盘并重启过了。
 func TestValidateRejectsOfficialImageWithDNSChallenge(t *testing.T) {
 	s := &service{}
 	vars := baseVars()
@@ -46,7 +42,6 @@ func TestValidateRejectsOfficialImageWithDNSChallenge(t *testing.T) {
 		t.Errorf("错误信息应点明 dns 插件问题，实际: %v", err)
 	}
 
-	// 换成自建镜像后应通过，并提示需要放行的端口。
 	vars["LT_CADDY_IMAGE"] = "litetunnel-caddy:latest"
 	vars["LT_CADDY_DNS_MODULES"] = "cloudflare"
 	res = tlscfg.RenderResult{}
@@ -58,8 +53,6 @@ func TestValidateRejectsOfficialImageWithDNSChallenge(t *testing.T) {
 	}
 }
 
-// TestValidateRejectsMissingTunnelProvider 隧道域名与 DNS 服务商是一对，
-// 缺一个就签不出泛域名证书。
 func TestValidateRejectsMissingTunnelProvider(t *testing.T) {
 	s := &service{}
 	vars := baseVars()
@@ -72,8 +65,6 @@ func TestValidateRejectsMissingTunnelProvider(t *testing.T) {
 	}
 }
 
-// TestValidateAcceptsE2E 端到端模式下证书在本地网站，
-// 入口是 frps 的独立端口，因此必须出现在「需放行」清单里。
 func TestValidateAcceptsE2E(t *testing.T) {
 	s := &service{}
 	vars := baseVars()
@@ -101,11 +92,6 @@ func TestValidateAcceptsE2E(t *testing.T) {
 	}
 }
 
-// TestValidPanelDomainAllowsPort 覆盖「面板保存通过、下发必然失败」的分叉。
-//
-// 面板侧「面板域名」的默认值来自 LT_USER_PUBLIC_URL，可以带端口；helper 若
-// 坚持只收裸域名，同一份配置保存时不报错，点「保存并应用」却报出一个与所填
-// 内容对不上的错误。
 func TestValidPanelDomainAllowsPort(t *testing.T) {
 	for _, ok := range []string{
 		"panel.example.com",

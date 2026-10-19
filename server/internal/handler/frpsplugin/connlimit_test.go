@@ -12,7 +12,6 @@ func fixedClock(start time.Time) (*connLimiter, *time.Time) {
 	return l, &now
 }
 
-// TestConnLimiterAllowsBurstThenRateLimits 覆盖「突发放行、持续超限拒绝」。
 func TestConnLimiterAllowsBurstThenRateLimits(t *testing.T) {
 	l, now := fixedClock(time.Unix(1000, 0))
 	const key = "run|mc"
@@ -26,7 +25,6 @@ func TestConnLimiterAllowsBurstThenRateLimits(t *testing.T) {
 		t.Fatalf("突发耗尽后应拒绝并给出等待时长，实际 ok=%v wait=%v", ok, wait)
 	}
 
-	// 过一秒，按每秒速率补充令牌。
 	*now = now.Add(time.Second)
 	allowed := 0
 	for i := 0; i < connRatePerSec; i++ {
@@ -39,7 +37,6 @@ func TestConnLimiterAllowsBurstThenRateLimits(t *testing.T) {
 	}
 }
 
-// TestConnLimiterTripsAndRecovers 覆盖熔断与恢复。
 func TestConnLimiterTripsAndRecovers(t *testing.T) {
 	l, now := fixedClock(time.Unix(2000, 0))
 	const key = "run|mc"
@@ -47,7 +44,6 @@ func TestConnLimiterTripsAndRecovers(t *testing.T) {
 	for i := 0; i < connBurst; i++ {
 		l.allow(key)
 	}
-	// 继续打到连续拒绝阈值，应触发冷却。
 	for i := 0; i < connBurst; i++ {
 		l.allow(key)
 	}
@@ -55,7 +51,6 @@ func TestConnLimiterTripsAndRecovers(t *testing.T) {
 		t.Fatalf("熔断后应拒绝且等待不超过冷却时长，实际 ok=%v wait=%v", ok, wait)
 	}
 
-	// 冷却期内即使时间只走了一半也仍然拒绝。
 	*now = now.Add(connCooldown / 2)
 	if ok, _ := l.allow(key); ok {
 		t.Fatal("冷却期内不该放行")
@@ -67,10 +62,6 @@ func TestConnLimiterTripsAndRecovers(t *testing.T) {
 	}
 }
 
-// TestConnLimiterTripsOnSustainedSlightOverload 覆盖「略超限时熔断永远不触发」。
-//
-// 流量长期略高于速率上限时，拒绝与成功会交替出现。若每次成功都把拒绝计数
-// 清零，计数器永远攒不满，熔断形同不存在——限流还在，但长期滥用不会被切断。
 func TestConnLimiterTripsOnSustainedSlightOverload(t *testing.T) {
 	l, now := fixedClock(time.Unix(5000, 0))
 	const key = "run|mc"
@@ -79,7 +70,6 @@ func TestConnLimiterTripsOnSustainedSlightOverload(t *testing.T) {
 		l.allow(key)
 	}
 
-	// 之后每秒 310 个请求：约 300 个放行、10 个被拒。
 	tripped := false
 	for sec := 0; sec < 30 && !tripped; sec++ {
 		*now = now.Add(time.Second)
@@ -94,8 +84,6 @@ func TestConnLimiterTripsOnSustainedSlightOverload(t *testing.T) {
 	}
 }
 
-// TestConnLimiterResetsAfterOverloadGap 覆盖反面：超限中断后重新计数，
-// 零星的拒绝不能累计成熔断。
 func TestConnLimiterResetsAfterOverloadGap(t *testing.T) {
 	l, now := fixedClock(time.Unix(6000, 0))
 	const key = "run|mc"
@@ -107,7 +95,6 @@ func TestConnLimiterResetsAfterOverloadGap(t *testing.T) {
 		l.allow(key)
 	}
 
-	// 间隔超过判定阈值后再放行一次：这一轮超限应当被认定结束。
 	*now = now.Add(connOverGap + time.Second)
 	if ok, _ := l.allow(key); !ok {
 		t.Fatal("间隔足够久之后应恢复放行")
@@ -122,7 +109,6 @@ func TestConnLimiterResetsAfterOverloadGap(t *testing.T) {
 	}
 }
 
-// TestConnLimiterIsolatesTunnels 覆盖按隧道独立计数。
 func TestConnLimiterIsolatesTunnels(t *testing.T) {
 	l, _ := fixedClock(time.Unix(3000, 0))
 	for i := 0; i < connBurst; i++ {
@@ -136,7 +122,6 @@ func TestConnLimiterIsolatesTunnels(t *testing.T) {
 	}
 }
 
-// TestConnLimiterSweepsIdleBuckets 覆盖空闲记录清理，避免长期运行后只增不减。
 func TestConnLimiterSweepsIdleBuckets(t *testing.T) {
 	l, now := fixedClock(time.Unix(4000, 0))
 	l.allow("run|mc")

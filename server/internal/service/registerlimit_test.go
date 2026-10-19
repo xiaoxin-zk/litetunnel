@@ -8,18 +8,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 这个文件守的是「先计数、后写入」留下的并发缺口。
-//
-// 注册的 IP / 域名额度，以及发验证码的冷却与每日上限，原先都是「查一次
-// 计数、通过就写」。并发请求会同时读到「还没满」而各自落地；分布式来源
-// 又能绕过单 IP 令牌桶。现在的做法是**预留后复核**：写进去之后把自己也
-// 算上再判一次，超了就把这一笔撤掉。
-
-// TestOverLimitSemantics 钉住两个口径的边界。
-//
-// inclusive 表示统计里包含刚写入的那条：恰好等于上限是正常的，
-// 只有超过才回滚。两者混用会让每天都多放（或误杀）恰好一条记录，
-// 而这种现象只看日志根本发现不了。
 func TestOverLimitSemantics(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -42,15 +30,11 @@ func TestOverLimitSemantics(t *testing.T) {
 	}
 }
 
-// TestRegisterEnforcesDomainLimit 覆盖域名每日额度端到端生效。
-//
-// 同时守住预留口径的反面：库里已经 limit-1 个时注册必须成功
-// （把自己算进去正好等于 limit），不能因为预留复核而误杀。
 func TestRegisterEnforcesDomainLimit(t *testing.T) {
 	svc := newTestServices(t, nil)
 	if err := svc.Settings.SetMany(map[SettingKey]string{
 		KeyRegisterMaxPerDomain: "1",
-		KeyRegisterMaxPerIP:     "0", // 本用例只看域名维度
+		KeyRegisterMaxPerIP:     "0",
 		KeyRegisterCaptcha:      "false",
 	}); err != nil {
 		t.Fatalf("设置限额失败: %v", err)
@@ -71,7 +55,6 @@ func TestRegisterEnforcesDomainLimit(t *testing.T) {
 		t.Fatalf("同域名第二个账号应被拒绝，实际 %v", err)
 	}
 
-	// 被拒绝的那个不能留下半条记录。
 	var n int64
 	if err := svc.DB.Model(&model.User{}).
 		Where("username = ?", "domaintwo").Count(&n).Error; err != nil {
@@ -82,10 +65,6 @@ func TestRegisterEnforcesDomainLimit(t *testing.T) {
 	}
 }
 
-// TestEmailCodeQuotaEnforcedBeforeWrite 覆盖「并发发码绕过冷却」。
-//
-// 冷却与每日上限都在写入**之前**、且在按收件地址加锁的事务里判断，
-// 所以并发请求不会都读到「还没满」，超限的那次也不会留下记录。
 func TestEmailCodeQuotaEnforcedBeforeWrite(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -102,13 +81,11 @@ func TestEmailCodeQuotaEnforcedBeforeWrite(t *testing.T) {
 		}
 	}
 
-	// 场景一：冷却窗口内已经发过一封。
 	mk(now)
 	if err := checkMailQuota(svc.DB, to, model.MailKindEmailCodeReset, quota); !errors.Is(err, errMailQuotaCooldown) {
 		t.Fatalf("冷却窗口内应拒绝，实际 %v", err)
 	}
 
-	// 场景二独立验证每日额度，避免午夜时当天记录无法越过冷却窗口。
 	quota.cooldown = 0
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	old := dayStart.Add(time.Minute)

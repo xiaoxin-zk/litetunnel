@@ -17,7 +17,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// queryCounter 只数 SQL 条数，其余日志行为交给 Discard。
 type queryCounter struct {
 	logger.Interface
 	n *atomic.Int32
@@ -27,16 +26,6 @@ func (q queryCounter) Trace(_ context.Context, _ time.Time, _ func() (string, in
 	q.n.Add(1)
 }
 
-// TestBuildFrpcConfigLogsToConsole 覆盖「frpc 日志写进文件，客户端什么都看不到」。
-//
-// 客户端靠解析 frpc 的输出判断这条隧道到底起来没有：
-//
-//   - `start proxy success` → 界面上补一句「隧道启动成功」+ 可用地址；
-//   - 错误行 → 显示「为什么一直连不上」。
-//
-// 而配置里 log.to 若是文件路径，frpc 的 stdout 永远是空的，上面两条提示
-// **永远不会出现**：用户只看到「已启动 frpc（PID …）」之后就再无下文，
-// 分不清是在连、还是已经连上了。
 func TestBuildFrpcConfigLogsToConsole(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -66,12 +55,6 @@ func TestBuildFrpcConfigLogsToConsole(t *testing.T) {
 	}
 }
 
-// TestFrpcConfigRevTracksEveryInput 覆盖配置摘要的**完整性**。
-//
-// 客户端靠这个摘要跳过没变化的配置请求(见 handler ClientInfo 里的 config_rev)。
-// 摘要若漏掉某个输入,客户端就会一直拿旧配置跑下去——而且没有任何报错,
-// 用户看到的只是「改了配置但不生效」。所以摘要取的是渲染结果本身:
-// 任何影响输出字节的东西变了,它就必须变。
 func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -96,8 +79,6 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 
 	origin := revOf(base)
 
-	// 摘要必须与「完整配置」中的同一条隧道段一致:客户端拿到的
-	// config_rev 描述的正是它随后会下载到的那段字节。
 	full, err := svc.BuildFrpcConfig(u, []model.Tunnel{base})
 	if err != nil {
 		t.Fatalf("生成配置失败: %v", err)
@@ -106,7 +87,6 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 		t.Fatal("单条隧道的渲染结果必须与完整配置里的那一段逐字节相同")
 	}
 
-	// 逐个字段改一遍:任何一个不影响摘要的字段都是漏网的口子。
 	changes := map[string]func(t *model.Tunnel){
 		"停用":    func(t *model.Tunnel) { t.Status = model.TunnelStatusDisabled },
 		"改名":    func(t *model.Tunnel) { t.Name = "mc2" },
@@ -125,8 +105,6 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 		}
 	}
 
-	// 域名与子域名只对 HTTP/HTTPS 隧道渲染(TCP 隧道写进去也没用),
-	// 所以单独覆盖一遍——包括「有域名就不写子域名」这条取值优先级。
 	httpBase := base
 	httpBase.Type = model.ProxyTypeHTTP
 	httpBase.RemotePort = 0
@@ -145,18 +123,11 @@ func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
 		}
 	}
 
-	// 没变就不该变:否则每轮都要重拉,摘要就白设了。
 	if again := revOf(base); again != origin {
 		t.Fatalf("同一个输入算出的摘要必须稳定:第一次 %s,第二次 %s", origin, again)
 	}
 }
 
-// TestEnsureClientSecretConcurrent 覆盖「首次接入并发各自拿到不同密钥」。
-//
-// 无条件写库时，后到的请求会覆盖先到的：先到那个请求已经把密钥写进了响应，
-// 客户端拿它去连却被拒——表现为「第一次接入失败，重试一次就好」，
-// 日志里没有任何异常。条件更新（仅当字段仍为空）之后，所有并发方拿到的
-// 一定是库里最终生效的那一个。
 func TestEnsureClientSecretConcurrent(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -172,7 +143,6 @@ func TestEnsureClientSecretConcurrent(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			// 每个请求持有自己的用户副本（真实路径也是各读各的）。
 			local := *u
 			s, err := svc.EnsureClientSecret(&local)
 			if err != nil {
@@ -199,16 +169,9 @@ func TestEnsureClientSecretConcurrent(t *testing.T) {
 	}
 }
 
-// TestFrpcConfigProxyDoesNotQueryDB 覆盖「每条隧道一次默认分组查询」。
-//
-// 分组过期或未绑定的账号会走 EffectiveGroup → defaultGroup() 的回落路径，
-// 那是**一次数据库查询**。而 /client/info 要为每条隧道算配置摘要，客户端
-// 每 20 秒同步一次——渲染器里再算一遍限速就是 N+1，隧道越多、越持续。
-// 限速改由调用方传入后，渲染本身不该再触碰数据库。
 func TestFrpcConfigProxyDoesNotQueryDB(t *testing.T) {
 	svc := newTestServices(t, nil)
 
-	// 过期时间放在过去：这正是会回落默认分组、每次都要查库的那条分支。
 	past := time.Now().Add(-time.Hour)
 	u := &model.User{
 		Username:      "expiredbw",
@@ -228,7 +191,6 @@ func TestFrpcConfigProxyDoesNotQueryDB(t *testing.T) {
 	var queries atomic.Int32
 	svc.DB = svc.DB.Session(&gorm.Session{Logger: queryCounter{Interface: logger.Discard, n: &queries}})
 
-	// 这一句允许查库（整个请求里只算这一次）。
 	limit := svc.EffectiveBandwidth(u)
 	queries.Store(0)
 
@@ -242,11 +204,6 @@ func TestFrpcConfigProxyDoesNotQueryDB(t *testing.T) {
 	}
 }
 
-// TestQueryInBatchesCoversAllIDs 覆盖「IN (?) 参数上限」的防御。
-//
-// 一次性把在线隧道涉及的用户 ID 展开进 IN (...) 时，绑定参数个数会随规模
-// 增长（SQLite 32766 / PostgreSQL 65535）。撞上限是直接报错，而采集每 30 秒
-// 跑一次——一次失败就丢掉整轮流量。分批之后批数变多但每批参数有限。
 func TestQueryInBatchesCoversAllIDs(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -265,7 +222,7 @@ func TestQueryInBatchesCoversAllIDs(t *testing.T) {
 	}
 
 	old := inQueryBatch
-	inQueryBatch = 2 // 逼出 4 批（2+2+2+1）
+	inQueryBatch = 2
 	t.Cleanup(func() { inQueryBatch = old })
 
 	users, err := queryInBatches[model.User](svc.DB, "id", ids)
@@ -288,20 +245,11 @@ func TestQueryInBatchesCoversAllIDs(t *testing.T) {
 		}
 	}
 
-	// 空集合不该发出任何查询，也不该报错。
 	if got, err := queryInBatches[model.Tunnel](svc.DB, "user_id", nil); err != nil || len(got) != 0 {
 		t.Fatalf("空 id 集合应返回空结果，实际 %d 条 / %v", len(got), err)
 	}
 }
 
-// TestAllocatePortIsRandom 覆盖「端口按固定顺序分配、外部可预测」。
-//
-// 从前的起点由用户 ID 派生、然后顺序向后扫：同一用户每次都拿到池里靠前的
-// 第一个空位，连续建几条隧道就能把用到的整段端口推出来。端口对外就是服务
-// 入口，可预测会明显降低扫描/撞库的成本。
-//
-// 这里不检查分布是否均匀（那是统计问题），只钉住「不是每次都给同一个」——
-// 旧实现下这一条必然失败（空池里恒返回同一个端口）。
 func TestAllocatePortIsRandom(t *testing.T) {
 	const (
 		portStart = 30000
@@ -327,11 +275,6 @@ func TestAllocatePortIsRandom(t *testing.T) {
 	}
 }
 
-// TestIsPortConflict 覆盖「端口撞车后不重试」的判定依据。
-//
-// 两个驱动的报错文本不同，而重试与否全看这个判定：漏判会让一次本来重试就能
-// 成功的创建直接失败（用户看到「创建失败」）；误判则会把真正的错误也重试
-// 几遍（无害，最终仍返回原始错误）。
 func TestIsPortConflict(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -350,7 +293,6 @@ func TestIsPortConflict(t *testing.T) {
 	}
 }
 
-// TestAllocatePortSkipsUsed 覆盖反面：随机起点不能把已占用的端口再分出去。
 func TestAllocatePortSkipsUsed(t *testing.T) {
 	const (
 		portStart = 30000
@@ -362,7 +304,6 @@ func TestAllocatePortSkipsUsed(t *testing.T) {
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
-	// 占掉池里的前四个端口，只剩一个可用。
 	used := map[int]struct{}{}
 	for _, p := range []int{portStart, portStart + 1, portStart + 2, portStart + 3} {
 		tun := model.Tunnel{

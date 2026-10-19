@@ -7,10 +7,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// TestListTunnelsPage 覆盖「隧道清单游标分页与总数」。
-//
-// 客户端接入信息接口按 before_id 游标分页：总数必须不受分页影响
-// （客户端据此做一致性校验），单页内容按 id 倒序与全量顺序一致。
 func TestListTunnelsPage(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -29,7 +25,6 @@ func TestListTunnelsPage(t *testing.T) {
 		}
 	}
 
-	// 不分页：全部返回，总数一致。
 	all, total, version, err := svc.ListTunnelsPage(u.ID, 0, 0)
 	if err != nil {
 		t.Fatalf("取全部失败: %v", err)
@@ -41,7 +36,6 @@ func TestListTunnelsPage(t *testing.T) {
 		t.Fatal("应返回清单版本，供客户端跨页校验")
 	}
 
-	// 第二页：以第一页第 2 条的 id 为游标（id < 游标）。
 	page, total, version2, err := svc.ListTunnelsPage(u.ID, all[1].ID, 2)
 	if err != nil {
 		t.Fatalf("分页失败: %v", err)
@@ -60,7 +54,6 @@ func TestListTunnelsPage(t *testing.T) {
 			page[0].ID, page[1].ID, all[2].ID, all[3].ID)
 	}
 
-	// 游标走到最后一条之后：空列表，总数仍然正确。
 	empty, total, _, err := svc.ListTunnelsPage(u.ID, all[4].ID, 2)
 	if err != nil {
 		t.Fatalf("越界分页失败: %v", err)
@@ -70,11 +63,6 @@ func TestListTunnelsPage(t *testing.T) {
 	}
 }
 
-// TestListTunnelsPageVersionDetectsCompensatingChange 覆盖「数量相抵」的变更。
-//
-// 分页期间删掉一条**已取到**的隧道、同时新增一条 id 更大的：总数不变，
-// 新隧道落在游标之前永远取不到。只比条数发现不了，版本（总数 + 最大 id）
-// 必须变化，客户端据此整轮重取。
 func TestListTunnelsPageVersionDetectsCompensatingChange(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -100,7 +88,6 @@ func TestListTunnelsPageVersionDetectsCompensatingChange(t *testing.T) {
 		t.Fatalf("前置条件不满足：%d 条 / total=%d", len(first), total1)
 	}
 
-	// 数量相抵：删一条已取到的，再新增一条。
 	if err := svc.DB.Delete(&model.Tunnel{}, first[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -123,11 +110,6 @@ func TestListTunnelsPageVersionDetectsCompensatingChange(t *testing.T) {
 	}
 }
 
-// TestListTunnelsPageVersionTracksStatusAndEdit 覆盖「状态/配置变更也进版本」。
-//
-// 只算「总数 + 最大 id」时，启用切停用、改端口/域名都不会改变版本：
-// 多页同步期间状态翻转，各页版本仍然一致，客户端按旧状态启停进程，
-// 直到下一轮同步才纠正。
 func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -154,7 +136,6 @@ func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
 
 	v1 := verOf()
 
-	// 状态变更（启用 → 停用）：必须改变版本。
 	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
 		Update("status", model.TunnelStatusDisabled).Error; err != nil {
 		t.Fatal(err)
@@ -164,7 +145,6 @@ func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
 		t.Fatal("状态变更必须反映到清单版本，否则多页同步会按旧状态对账")
 	}
 
-	// 配置变更（改远程端口）：必须改变版本。
 	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
 		Update("remote_port", 24001).Error; err != nil {
 		t.Fatal(err)
@@ -174,7 +154,6 @@ func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
 		t.Fatal("配置变更必须反映到清单版本")
 	}
 
-	// 流量/在线这类采集字段不影响对账，不应让版本抖动。
 	if err := svc.DB.Model(&model.Tunnel{}).Where("id = ?", tun.ID).
 		Update("traffic_used", 12345).Error; err != nil {
 		t.Fatal(err)
@@ -184,11 +163,6 @@ func TestListTunnelsPageVersionTracksStatusAndEdit(t *testing.T) {
 	}
 }
 
-// TestListTunnelsPageStableUnderDeletion 覆盖「分页期间删除不导致漏项」。
-//
-// offset 分页在删除后会跳过一条：删掉第 1 页的某条之后，第 2 页的
-// offset 越过了一条本来该返回的记录。游标分页只依赖 id 单调性，
-// 删除不会让后面几页漏掉记录。
 func TestListTunnelsPageStableUnderDeletion(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -214,12 +188,10 @@ func TestListTunnelsPageStableUnderDeletion(t *testing.T) {
 		t.Fatalf("第一页应有 2 条，实际 %d", len(first))
 	}
 
-	// 分页期间删掉第一页里的一条（模拟用户同时在网页端删除）。
 	if err := svc.DB.Delete(&model.Tunnel{}, first[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	// 按游标取下一页：剩下的两条都必须取到，不能因为删除而漏项。
 	rest, _, _, err := svc.ListTunnelsPage(u.ID, first[len(first)-1].ID, 2)
 	if err != nil {
 		t.Fatal(err)

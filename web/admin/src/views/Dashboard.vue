@@ -1,6 +1,5 @@
 <template>
   <div v-loading="loading && !hasData">
-    <!-- ============ 系统实时指标 ============ -->
     <div class="lt-card">
       <div class="lt-card-title">
         <span>服务器实时状态</span>
@@ -28,7 +27,6 @@
       </el-row>
     </div>
 
-    <!-- ============ 趋势图 ============ -->
     <el-row :gutter="16" style="margin-top: 16px">
       <el-col :xs="24" :md="12">
         <div class="lt-card">
@@ -64,7 +62,6 @@
       </el-col>
     </el-row>
 
-    <!-- ============ 面板自身开销 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">
         <span>面板进程开销</span>
@@ -114,8 +111,6 @@
         </el-descriptions-item>
         <el-descriptions-item label="最近失败位置">{{ metrics.audit?.last_scope || '无' }}</el-descriptions-item>
       </el-descriptions>
-      <!-- 这类失败不影响登录（认证已通过），所以界面上不出现任何异常；
-           正因如此才需要在这里点名，否则「审计字段一直是旧值」可以几个月无人察觉。 -->
       <div class="lt-muted" style="margin-top: 10px">
         登录、动态口令验证、兑换核销成功时，若审计字段没能写进数据库，认证仍会放行——避免一次数据库抖动把管理员锁在门外。失败次数与最近原因记在这里。
         这些计数是<b>实例级</b>的：只来自当前处理本次请求的进程，重启清零；多实例部署时不能把它们相加当作全局值
@@ -126,7 +121,6 @@
         style="margin-top: 10px" />
     </div>
 
-    <!-- ============ 业务指标 ============ -->
     <div class="lt-card" style="margin-top: 16px">
       <div class="lt-card-title">平台业务数据</div>
       <el-row :gutter="16">
@@ -186,8 +180,6 @@ const memRef = ref()
 const netRef = ref()
 const diskRef = ref()
 
-// 图表实例。放在普通对象里而不是响应式：echarts 实例内部持有大量
-// DOM 引用，被 Vue 代理后既无必要也容易出怪问题。
 const charts = {}
 let timer = null
 
@@ -197,13 +189,11 @@ const latest = computed(() => metrics.value.latest || {})
 
 const fmtBytes = (v) => formatBytes(v)
 
-/** 字节/秒 → 人类可读的速率。 */
 function fmtRate(v) {
   if (!v || v <= 0) return '0 B/s'
   return formatBytes(v) + '/s'
 }
 
-/** 秒 → 「3 天 4 小时」这种可读形式。 */
 function fmtUptime(sec) {
   const s = Number(sec || 0)
   if (s <= 0) return '-'
@@ -235,8 +225,6 @@ const metricCards = computed(() => {
       value: cpu.toFixed(1) + '%',
       sub: `${m.cpu_cores || 0} 核`,
       percent: cpu,
-      // 分级配色：60% 以下绿、80% 以下橙、再高红。
-      // 光看数字很难一眼判断「这算不算高」，颜色能。
       color: cpu >= 80 ? '#dc2626' : cpu >= 60 ? '#d97706' : '#059669'
     },
     {
@@ -250,7 +238,6 @@ const metricCards = computed(() => {
       label: '系统负载',
       value: (m.load1 || 0).toFixed(2),
       sub: `5 分 ${(m.load5 || 0).toFixed(2)} · 15 分 ${(m.load15 || 0).toFixed(2)}`,
-      // 负载除以核数才是「忙不忙」的正确口径：8 核上负载 4 只算半忙。
       color: (m.load1 || 0) > (m.cpu_cores || 1) ? '#dc2626' : '#7c3aed'
     },
     {
@@ -261,14 +248,10 @@ const metricCards = computed(() => {
     }
   ]
 
-  // 磁盘容量读不到时不显示这一项，而不是显示 0 —— 一个假的 0%
-  // 会让管理员以为磁盘空着。
   if (m.disk_total > 0) {
     list.push({
       label: '磁盘',
       value: diskPercent.toFixed(1) + '%',
-      // 带上挂载路径：容器里 / 是镜像的 overlay，/data 才是数据卷，两者
-      // 容量常常不同，不写路径就看不出这个百分比说的是哪块盘。
       sub: `${m.disk_path || '/'} · ${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}`,
       percent: diskPercent,
       color: diskPercent >= 90 ? '#dc2626' : diskPercent >= 75 ? '#d97706' : '#059669'
@@ -294,7 +277,6 @@ const cards = computed(() => [
   { label: '累计流量', value: formatBytes(stats.value.traffic_used_total), color: '#0f172a' }
 ])
 
-/** 采样点的时间轴标签（HH:MM:SS）。 */
 function timeAxis() {
   return series.value.map((s) => {
     const d = new Date(s.at)
@@ -303,20 +285,11 @@ function timeAxis() {
   })
 }
 
-/**
- * 生成一个共用的折线图配置。
- *
- * 四个图的结构完全一致，只有数据与单位不同。抽成一个构造函数，
- * 比复制四份配置更容易保持一致——尤其是 tooltip 与网格边距这类
- * 一旦不一致就会显得「有一个图长得不一样」的细节。
- */
 function lineOption({ names, colors, data, unit, max }) {
   return {
     grid: { left: 58, right: 16, top: 34, bottom: 26 },
     tooltip: {
       trigger: 'axis',
-      // 用 valueFormatter 而不是拼字符串：它能同时作用于所有系列，
-      // 避免每个系列各写一遍 formatter 而漏掉其中一个。
       valueFormatter: unit === 'bytes' ? (v) => fmtRate(v) : (v) => `${Number(v).toFixed(1)}%`
     },
     legend: { data: names, right: 0, top: 0, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
@@ -343,7 +316,6 @@ function lineOption({ names, colors, data, unit, max }) {
       type: 'line',
       smooth: true,
       showSymbol: false,
-      // 单点时 smooth 线画不出来，用一个小圆点表示「只有一个采样」。
       symbolSize: 4,
       lineStyle: { width: 2, color: colors[i] },
       itemStyle: { color: colors[i] },
@@ -378,8 +350,6 @@ function renderCharts() {
       'mem',
       memRef.value,
       {
-        // 内存同样用百分比：绝对值在不同规格的机器上无法横向比较，
-        // 而「还剩多少余量」才是管理员关心的。
         names: ['内存'],
         colors: ['#7c3aed'],
         data: [
@@ -420,8 +390,6 @@ function renderCharts() {
   for (const [key, el, opt] of jobs) {
     if (!el) continue
     if (!charts[key]) charts[key] = echarts.init(el)
-    // notMerge=true：系列数量固定，直接覆盖比合并更省心，
-    // 也避免上一次的 tooltip 状态残留。
     charts[key].setOption(lineOption(opt), true)
   }
 }
@@ -446,8 +414,6 @@ async function load() {
 onMounted(async () => {
   await load()
   window.addEventListener('resize', resizeCharts)
-  // 刷新间隔跟随服务端采样间隔：比它更快只会反复拿到同一个点，
-  // 白白增加请求量。
   const iv = (metrics.value.sample_interval || 5) * 1000
   timer = setInterval(load, iv)
 })
@@ -455,8 +421,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   window.removeEventListener('resize', resizeCharts)
-  // 必须显式 dispose：echarts 实例持有 canvas 与事件监听，
-  // 不释放会在反复进出页面时累积内存。
   Object.values(charts).forEach((c) => c && c.dispose())
 })
 </script>

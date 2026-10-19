@@ -7,29 +7,22 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// 令牌域。用户域与管理域使用不同密钥与不同 aud，互相不可越权使用。
 const (
 	DomainUser  = "user"
 	DomainAdmin = "admin"
 )
 
-// ErrInvalidToken 表示令牌无效或域不匹配。
 var ErrInvalidToken = errors.New("令牌无效或已过期")
 
-// Claims 自定义声明。
 type Claims struct {
 	jwt.RegisteredClaims
 	UserID   uint   `json:"uid"`
 	Username string `json:"uname"`
 	Role     string `json:"role,omitempty"`
 	Domain   string `json:"dom"`
-	// Version 是签发时的令牌版本。JWT 无状态、无法单独吊销，
-	// 因此在账号上维护一个版本号：改密 / 重置密码时自增，
-	// 旧令牌即便未过期也会在下次请求时被拒绝。
-	Version int `json:"ver"`
+	Version  int    `json:"ver"`
 }
 
-// Issue 签发指定域的令牌。
 func Issue(secret, domain string, userID uint, username, role string, version int, ttl time.Duration) (string, time.Time, error) {
 	now := time.Now()
 	expireAt := now.Add(ttl)
@@ -56,7 +49,6 @@ func Issue(secret, domain string, userID uint, username, role string, version in
 	return signed, expireAt, nil
 }
 
-// Parse 解析并校验令牌，强制要求域匹配且签名算法为 HS256。
 func Parse(secret, domain, tokenStr string) (*Claims, error) {
 	claims := &Claims{}
 	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {

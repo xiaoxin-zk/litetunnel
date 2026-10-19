@@ -1,30 +1,3 @@
-// Command lt-fw 是运行在**宿主机**上的防火墙操作 helper。
-//
-// # 为什么需要它
-//
-// 面板容器不应该持有 NET_ADMIN。一旦控制面出现远程代码执行漏洞，
-// 攻击者拿到的就不只是面板，而是整台主机的防火墙控制权——
-// 那比面板本身被攻破严重得多。
-//
-// 把写操作拆出来之后，权限被切成两层：
-//
-//	面板（无任何特权）  ——  只读扫描监听端口（/proc/net/*），
-//	                       写操作一律转发给 helper
-//	lt-fw（宿主机 root）——  只接受回环地址 + Bearer token 的请求，
-//	                       且仍然受保护端口与端口池范围的双重约束
-//
-// 即使面板被完全控制，攻击者能做的也只是「放行/关闭端口池内的端口」，
-// 保护端口（SSH、控制面自身端口等）依然动不了。
-//
-// # 为什么用 systemd 而不是容器
-//
-// 它需要操作宿主机的 nftables/iptables。跑在容器里要么重新引入特权，
-// 要么把宿主机的 netns 与 xtables 锁挂进去——绕了一圈又回到原点。
-// 用 systemd 直接在宿主机上跑，权限边界最清晰。
-//
-// # 部署
-//
-// 见 deploy/systemd/lt-fw.service 与 README 的「防火墙 helper」一节。
 package main
 
 import (
@@ -87,9 +60,8 @@ func main() {
 	mux.HandleFunc("/ports/close", srv.handleClose)
 
 	httpSrv := &http.Server{
-		Addr:    *addr,
-		Handler: srv.auth(mux),
-		// 只服务本机面板，不需要长连接与大量并发。
+		Addr:              *addr,
+		Handler:           srv.auth(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -101,10 +73,6 @@ func main() {
 	}
 }
 
-// validateConfig 在启动阶段就把配置问题挡掉。
-//
-// 这类问题拖到运行期才发现的话，表现是「面板说放行了端口但实际没生效」，
-// 排查成本极高。宁可启动失败。
 func validateConfig(addr, token string, poolStart, poolEnd int) error {
 	if strings.TrimSpace(token) == "" {
 		return errors.New("必须设置 LT_FW_TOKEN：没有令牌的话，本机任何进程都能调用它改防火墙")
@@ -113,7 +81,6 @@ func validateConfig(addr, token string, poolStart, poolEnd int) error {
 		return errors.New("LT_FW_TOKEN 太短，请使用至少 16 字符的随机值")
 	}
 
-	// 只允许监听回环。绑到 0.0.0.0 会让同网段的人直接调用防火墙接口。
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("监听地址非法: %w", err)
@@ -137,9 +104,6 @@ type server struct {
 	backend firewall.Backend
 }
 
-// auth 校验 Bearer token。
-//
-// 用常量时间比较：令牌比较若走短路求值，攻击者可以靠响应时间逐字节试探。
 func (s *server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -159,9 +123,6 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	enabled, statusErr := s.backend.Status()
 	available := s.backend.Available()
 	if _, isNone := s.backend.(*firewall.None); isNone {
-		// None 是占位实现，它的 Available() 恒为 true；但对面板来说
-		// 「没有可用的防火墙后端」就是不可用——否则面板会拿它当正常后端，
-		// 每次操作都以 ErrNoBackend 失败，而不是走「后端不可用」的提示。
 		available = false
 	}
 	resp := map[string]any{
@@ -171,9 +132,6 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"protected": s.guard.Protected(),
 	}
 	if statusErr != nil {
-		// 查询失败不是「未启用」：带上可区分的原因，面板据此把状态标成
-		// 「未知」。丢掉这个错误的话，helper 在线但底层查询失败时，
-		// 面板拿到的仍是 active=false、err=nil，看起来一切正常。
 		resp["enabled"] = false
 		resp["error"] = "读取防火墙状态失败：" + statusErr.Error()
 	}
@@ -183,9 +141,6 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleRules 返回**递归展开后**的放行端口。
-//
-// 这是只读操作：只调用 iptables-save / -S 这类查询命令。
 func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "仅支持 GET"})
@@ -210,8 +165,6 @@ type portReq struct {
 	Proto string `json:"proto"`
 }
 
-// handleOpen 放行端口。仍然要过 Guard：即便面板被攻破，
-// 攻击者也不能借此放行端口池之外或特权端口。
 func (s *server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	req, err := decodePortReq(r)
 	if err != nil {
@@ -230,7 +183,6 @@ func (s *server) handleOpen(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"message": "端口已放行"})
 }
 
-// handleClose 关闭端口。保护端口在这里被硬拦。
 func (s *server) handleClose(w http.ResponseWriter, r *http.Request) {
 	req, err := decodePortReq(r)
 	if err != nil {

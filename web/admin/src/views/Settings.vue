@@ -110,7 +110,6 @@
       </el-col>
     </el-row>
 
-    <!-- 绑定对话框 -->
     <el-dialog
       v-model="setupVisible"
       :title="rebinding ? '换绑认证器' : '绑定认证器'"
@@ -150,7 +149,6 @@
       </template>
     </el-dialog>
 
-    <!-- 换绑第一步：先证明持有当前设备 -->
     <el-dialog v-model="rebindVisible" title="换绑认证器" width="440px">
       <el-alert
         type="info"
@@ -173,7 +171,6 @@
       </template>
     </el-dialog>
 
-    <!-- 关闭对话框 -->
     <el-dialog v-model="disableVisible" title="关闭双因素认证" width="420px">
       <el-alert
         type="warning"
@@ -228,9 +225,6 @@ const qrDataUrl = ref('')
 const disableVisible = ref(false)
 const disablePassword = ref('')
 
-// 换绑流程：先验证当前设备（rebindCode），再走与首次绑定相同的扫码确认。
-// rebinding 只用于文案区分——服务端两处的语义不同（换绑不动现有绑定，
-// 确认之后才切换），提示语要让用户知道这一点。
 const rebindVisible = ref(false)
 const rebindCode = ref('')
 const rebinding = ref(false)
@@ -299,7 +293,6 @@ async function startSetup() {
     rebinding.value = false
     setupSecret.value = data.secret
     setupCode.value = ''
-    // 在本地渲染二维码，密钥不经过任何第三方服务。
     qrDataUrl.value = await QRCode.toDataURL(data.otpauth_url, { width: 220, margin: 1 })
     setupVisible.value = true
   } finally {
@@ -307,10 +300,6 @@ async function startSetup() {
   }
 }
 
-// confirmRebind 换绑第一步：用当前设备的口令换取一把新密钥。
-//
-// 服务端此时只把新密钥**暂存**起来，现有绑定不受影响——所以这一步失败、
-// 或者后面扫码那步被放弃，账号仍然处于双因素保护之下。
 async function confirmRebind() {
   const code = rebindCode.value.trim()
   if (code.length !== 6) {
@@ -341,13 +330,9 @@ async function confirmEnable() {
   totpLoading.value = true
   try {
     await authApi.totpEnable(code)
-    // 先取下来再重置：重置之后文案会走错分支。
     const wasRebinding = rebinding.value
     setupVisible.value = false
     rebinding.value = false
-    // 服务端在启用 / 换绑成功后会撤销该账号的既有会话（第二因素变了，旧会话
-    // 不再可信），所以这里直接引导重新登录。不这样的话，用户刚点完「完成绑定」
-    // 就会被下一次请求的 401 甩出去，只会以为是出了故障。
     ElMessage.success(
       wasRebinding
         ? '已换绑到新设备，请用新设备的口令重新登录'
@@ -370,7 +355,6 @@ async function confirmDisable() {
     await authApi.totpDisable(disablePassword.value)
     disableVisible.value = false
     disablePassword.value = ''
-    // 同 confirmEnable：第二因素变了，服务端会撤销既有会话，这里直接引导重登。
     ElMessage.success('双因素认证已关闭，请重新登录')
     localStorage.removeItem(TOKEN_KEY)
     router.push('/login')

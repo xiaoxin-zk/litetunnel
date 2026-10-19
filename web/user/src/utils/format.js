@@ -1,4 +1,3 @@
-/** 字节数转人类可读体积。 */
 export function formatBytes(bytes) {
   const b = Number(bytes || 0)
   if (!b) return '0 B'
@@ -12,7 +11,6 @@ export function formatBytes(bytes) {
   return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`
 }
 
-/** 时间格式化。 */
 export function formatTime(value) {
   if (!value) return '-'
   const d = new Date(value)
@@ -23,7 +21,6 @@ export function formatTime(value) {
   )}`
 }
 
-/** 端口/地址复制。 */
 export async function copyText(text) {
   if (!text) return false
   try {

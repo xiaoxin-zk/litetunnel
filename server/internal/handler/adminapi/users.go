@@ -15,7 +15,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// ListUsers 用户列表。
 func (h *Handler) ListUsers(c *gin.Context) {
 	page, pageSize, offset := httpx.Pagination(c)
 	groupID, _ := strconv.ParseUint(c.Query("group_id"), 10, 64)
@@ -60,7 +59,6 @@ func (h *Handler) userVO(u *model.User) gin.H {
 	return vo
 }
 
-// CreateUser 管理员建号。
 func (h *Handler) CreateUser(c *gin.Context) {
 	var in service.AdminCreateUserInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -76,7 +74,6 @@ func (h *Handler) CreateUser(c *gin.Context) {
 	httpx.OK(c, h.userVO(u))
 }
 
-// UpdateUser 修改用户基础信息。
 func (h *Handler) UpdateUser(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -96,7 +93,6 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已保存"})
 }
 
-// DeleteUser 删除用户。
 func (h *Handler) DeleteUser(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -115,7 +111,6 @@ type statusReq struct {
 	Status string `json:"status" binding:"required"`
 }
 
-// SetUserStatus 禁用/启用/封禁用户。
 func (h *Handler) SetUserStatus(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -136,11 +131,9 @@ func (h *Handler) SetUserStatus(c *gin.Context) {
 }
 
 type quotaReq struct {
-	// TrafficQuota 单位字节，0 表示回落到分组配额
 	TrafficQuota int64 `json:"traffic_quota"`
 }
 
-// SetUserQuota 设置用户流量配额。
 func (h *Handler) SetUserQuota(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -161,7 +154,6 @@ func (h *Handler) SetUserQuota(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "配额已更新"})
 }
 
-// ResetUserTraffic 清零用户已用流量。
 func (h *Handler) ResetUserTraffic(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -176,12 +168,6 @@ func (h *Handler) ResetUserTraffic(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "已清零"})
 }
 
-// nullableTime 解析可空的时间字段，并区分「字段缺失」与「显式 null」。
-//
-// 管理页把有效期清空时发的是 "expire_at": null，而这个字段缺失表示
-// 「这次不改有效期」。用 *time.Time 解出来的都是 nil，两者无法区分——
-// 于是「清空」会被当成「不修改」，旧到期时间残留，到期调度随后把刚改派的
-// 用户迁回默认分组：管理员看到的是「改好了，过一会儿又自己变回去了」。
 type nullableTime struct {
 	Set   bool
 	Value *time.Time
@@ -206,7 +192,6 @@ type groupReq struct {
 	ExpireAt nullableTime `json:"expire_at"`
 }
 
-// SetUserGroup 调整用户分组。
 func (h *Handler) SetUserGroup(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -231,7 +216,6 @@ type passwordReq struct {
 	Password string `json:"password" binding:"required"`
 }
 
-// ResetUserPassword 重置用户密码。
 func (h *Handler) ResetUserPassword(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -251,7 +235,6 @@ func (h *Handler) ResetUserPassword(c *gin.Context) {
 	httpx.OK(c, gin.H{"message": "密码已重置"})
 }
 
-// ResetUserSecret 重置用户客户端凭据。
 func (h *Handler) ResetUserSecret(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -267,7 +250,6 @@ func (h *Handler) ResetUserSecret(c *gin.Context) {
 	httpx.OK(c, gin.H{"client_secret": secret, "message": "凭据已重置，旧客户端立即失效"})
 }
 
-// ListGroups 分组列表。
 func (h *Handler) ListGroups(c *gin.Context) {
 	list, err := h.svc.ListGroups()
 	if err != nil {
@@ -277,7 +259,6 @@ func (h *Handler) ListGroups(c *gin.Context) {
 	httpx.OK(c, list)
 }
 
-// CreateGroup 新建分组。
 func (h *Handler) CreateGroup(c *gin.Context) {
 	var in service.GroupInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -293,7 +274,6 @@ func (h *Handler) CreateGroup(c *gin.Context) {
 	httpx.OK(c, g)
 }
 
-// UpdateGroup 更新分组。
 func (h *Handler) UpdateGroup(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -314,7 +294,6 @@ func (h *Handler) UpdateGroup(c *gin.Context) {
 	httpx.OK(c, g)
 }
 
-// DeleteGroup 删除分组。
 func (h *Handler) DeleteGroup(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {

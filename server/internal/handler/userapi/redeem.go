@@ -12,7 +12,6 @@ type redeemReq struct {
 	Code string `json:"code" binding:"required"`
 }
 
-// Redeem 兑换码核销。
 func (h *Handler) Redeem(c *gin.Context) {
 	var req redeemReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -27,7 +26,6 @@ func (h *Handler) Redeem(c *gin.Context) {
 	httpx.OK(c, res)
 }
 
-// RedeemRecords 我的兑换记录。
 func (h *Handler) RedeemRecords(c *gin.Context) {
 	page, pageSize, offset := httpx.Pagination(c)
 	list, total, err := h.svc.ListRedeemRecords(middleware.CurrentUserID(c), offset, pageSize)

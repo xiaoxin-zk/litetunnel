@@ -30,8 +30,6 @@ func (s *Services) recordRecoveryFailure() {
 	log.Printf("[recovery] 后台处理失败，请求可能未进入发件箱；用户需要重新申请")
 }
 
-// 请求预处理队列不含凭据，重启前尚未写入发件箱的请求需要用户重新申请。
-// 已写入发件箱的邮件仍由持久化队列保证重试与恢复。
 type recoveryRequest struct {
 	account   string
 	ip        string
@@ -67,7 +65,6 @@ func (s *Services) processRecovery(req recoveryRequest) {
 	}
 }
 
-// StartRecoveryWorker 与 SMTP worker 独立，防止慢投递阻塞请求预处理。
 func (s *Services) StartRecoveryWorker(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {

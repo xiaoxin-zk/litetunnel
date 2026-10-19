@@ -113,7 +113,6 @@ input:focus {
   color: #b45309;
 }
 
-/* 连接失败：与「连接中」区分开。前者要用户去查，后者只需要等。 */
 .tag-err {
   background: #fee2e2;
   color: #b91c1c;

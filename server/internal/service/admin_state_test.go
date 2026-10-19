@@ -11,16 +11,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 这个文件守的是「管理操作与运行时标记的配对生效」：
-// 启用账号不得顺带放行超额用户、并发状态切换不得让内存与数据库背离、
-// 清零撤销与采集提交不得交错、删除账号后遗留凭据不得继续工作。
-
-// TestAdminSetUserGroupClearsExpireAt 覆盖「管理页清空有效期不生效」。
-//
-// 管理页把有效期清空时发的是 "expire_at": null，而字段缺失表示「这次不改」。
-// 只按「非 nil 才更新」处理的话，清空会变成空操作：旧到期时间残留，
-// 到期调度随后把刚改派的用户迁回默认分组——管理员看到的是「改好了，
-// 过一会儿又自己变回去了」。
 func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -37,7 +27,6 @@ func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	// 1) 显式 null：清除。
 	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: nil}); err != nil {
 		t.Fatalf("清空有效期失败: %v", err)
 	}
@@ -49,7 +38,6 @@ func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
 		t.Fatalf("显式 null 必须清除到期时间，实际仍是 %v", got.GroupExpireAt)
 	}
 
-	// 2) 字段缺失：不修改。
 	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: &future}); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +51,6 @@ func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
 		t.Fatal("字段缺失时不该改动到期时间")
 	}
 
-	// 3) 清除之后，到期调度不得再把这名用户迁走。
 	if err := svc.AdminSetUserGroup(u.ID, g.ID, GroupExpiry{Set: true, Value: nil}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,29 +63,18 @@ func TestAdminSetUserGroupClearsExpireAt(t *testing.T) {
 	}
 }
 
-// TestEnableUserKeepsExceededWhenRefreshFails 覆盖「启用失败时不放行超额用户」。
-//
-// 账号启用只是恢复登录资格，并不代表获得额外流量。刷新配额标记失败时
-// 若把标记清成 false，超额用户会被放行到下一轮成功采集为止。
-// 这里让刷新必然失败（去掉分组表，LoadUser 的 Preload 会报错），
-// 同时用户表本身仍可更新——正是「状态改成功、刷新失败」的场景。
 func TestEnableUserKeepsExceededWhenRefreshFails(t *testing.T) {
 	svc := newTestServices(t, nil)
 
-	// GroupID 非零：LoadUser 的 Preload 才会去查分组表，
-	// 否则 GORM 会跳过这次查询，注不进「读取失败」。
 	u := &model.User{Username: "enablefail", Password: "not-used",
 		Status: model.UserStatusDisabled, GroupID: 1}
 	if err := svc.DB.Create(u).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	// 前置：运行时认为该用户已超额。
 	svc.Runtime.BumpGuardVer()
 	svc.Runtime.SetQuotaExceeded(u.ID, true)
 
-	// 去掉分组表：用户表的 UPDATE 照常成功，随后的 LoadUser（Preload）
-	// 必然失败，模拟「配额刷新读取失败」。
 	if err := svc.DB.Migrator().DropTable(&model.Group{}); err != nil {
 		t.Fatalf("删表失败: %v", err)
 	}
@@ -110,7 +86,6 @@ func TestEnableUserKeepsExceededWhenRefreshFails(t *testing.T) {
 	if !svc.Runtime.IsQuotaExceeded(u.ID) {
 		t.Fatal("刷新失败时不得清除原有超额标记：那等于给超额账号放行")
 	}
-	// 数据库里的状态确实已经改了——错误信息里必须点明这一点。
 	var got model.User
 	if err := svc.DB.First(&got, u.ID).Error; err != nil {
 		t.Fatal(err)
@@ -120,10 +95,6 @@ func TestEnableUserKeepsExceededWhenRefreshFails(t *testing.T) {
 	}
 }
 
-// TestAdminSetUserStatusKeepsRuntimeInSync 覆盖「并发状态切换后内存与库一致」。
-//
-// 两笔相反的请求交错时，数据库与内存可能以不同顺序落地：库里是「已启用」，
-// 内存却停在「已封禁」。按用户串行化之后，最终状态在两边必然一致。
 func TestAdminSetUserStatusKeepsRuntimeInSync(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -132,7 +103,6 @@ func TestAdminSetUserStatusKeepsRuntimeInSync(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	// 多轮并发的「禁用 / 启用」对撞。
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		wg.Add(2)
@@ -157,10 +127,6 @@ func TestAdminSetUserStatusKeepsRuntimeInSync(t *testing.T) {
 	}
 }
 
-// TestFlushTrafficRespectsRevokedMark 覆盖「撤销后不再跳过真实增量」。
-//
-// 分录：登记 → 撤销（清零写库失败）→ 采集落增量。撤销之后这一轮
-// 必须正常入账，不能被一个已经作废的标记吞掉。
 func TestFlushTrafficRespectsRevokedMark(t *testing.T) {
 	svc, _, tun := newEditTestTunnel(t)
 
@@ -179,10 +145,6 @@ func TestFlushTrafficRespectsRevokedMark(t *testing.T) {
 	}
 }
 
-// TestFlushTrafficHoldsResetLock 覆盖「采集整轮持有清零协调锁」。
-//
-// 撤销必须等本轮提交完成才能生效：锁被占用期间 flushTraffic 不能开始，
-// 从而不可能出现「校验通过 → 撤销 → 仍按标记跳过」的交错。
 func TestFlushTrafficHoldsResetLock(t *testing.T) {
 	svc, _, tun := newEditTestTunnel(t)
 
@@ -208,11 +170,6 @@ func TestFlushTrafficHoldsResetLock(t *testing.T) {
 	}
 }
 
-// TestAdminResetHoldsResetLock 覆盖「成功清零也在协调区间内」。
-//
-// 只让撤销拿锁不够：采集可能已经取到不含该用户标记的快照，管理员随后
-// 写零，采集再提交那份快照里的旧增量——清零后的用量又被加回。清零的
-// 「登记 + 写库」必须和采集的「快照 → 提交」互斥。
 func TestAdminResetHoldsResetLock(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -244,16 +201,11 @@ func TestAdminResetHoldsResetLock(t *testing.T) {
 	if got.TrafficUsed != 0 {
 		t.Fatalf("清零后用量应为 0，实际 %d", got.TrafficUsed)
 	}
-	// 标记仍在，等待下一轮采集消费（跳过清零前的旧增量）。
 	if taken := svc.Runtime.takePendingTrafficResets(); len(taken) != 1 {
 		t.Fatalf("清零后应留下待协调标记，实际 %v", taken)
 	}
 }
 
-// TestDeleteAccountPurgesCredentials 覆盖「自助注销同样清理凭据与待发邮件」。
-//
-// 管理员删除已经清理了这些数据；自助注销曾经漏掉，注销后队列仍会投递
-// 一封指向不存在账号的重置邮件，验证码也留在库里。
 func TestDeleteAccountPurgesCredentials(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -314,10 +266,6 @@ func TestDeleteAccountPurgesCredentials(t *testing.T) {
 	}
 }
 
-// TestAdminDeleteUserPurgesResetCredentials 覆盖「删除账号后替死凭据一并清理」。
-//
-// 留在库里的重置令牌与待发邮件会让用户点开链接后走到一个不存在的账号，
-// 而删除账号应当让这些路径彻底失效。
 func TestAdminDeleteUserPurgesResetCredentials(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -378,10 +326,6 @@ func TestAdminDeleteUserPurgesResetCredentials(t *testing.T) {
 	}
 }
 
-// TestResetPasswordForDeletedUserIsInvalid 覆盖「账号已删时令牌不再报告成功」。
-//
-// 模拟升级前遗留的令牌：账号已被直接删除，令牌还在。重置必须返回
-// 令牌无效且**不消费**令牌（事务回滚），而不是提交一个空的「重置成功」。
 func TestResetPasswordForDeletedUserIsInvalid(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -399,7 +343,6 @@ func TestResetPasswordForDeletedUserIsInvalid(t *testing.T) {
 	if err := svc.DB.Create(&tok).Error; err != nil {
 		t.Fatal(err)
 	}
-	// 直接删用户行，留下令牌（模拟删除逻辑补全之前的历史数据）。
 	if err := svc.DB.Delete(&model.User{}, u.ID).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -417,10 +360,6 @@ func TestResetPasswordForDeletedUserIsInvalid(t *testing.T) {
 	}
 }
 
-// TestMailActionObsoleteForDeletedUser 覆盖「账号已删时凭据动作作废」。
-//
-// 邮件已入队、账号随后被删：激活时应识别出目标账号不存在，
-// 按已办结处理（不重试、不落一条指向空账号的令牌）。
 func TestMailActionObsoleteForDeletedUser(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -450,7 +389,6 @@ func TestMailActionObsoleteForDeletedUser(t *testing.T) {
 		t.Fatalf("账号已删时应返回「动作作废」，实际 %v", err)
 	}
 
-	// 走完整收尾：按已办结处理，不留下重试。
 	svc.finishMailAction(row, token)
 	var after model.MailOutbox
 	if err := svc.DB.First(&after, row.ID).Error; err != nil {

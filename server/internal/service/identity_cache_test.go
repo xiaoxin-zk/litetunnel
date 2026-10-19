@@ -7,11 +7,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// 这一组守的是「身份缓存不能在失效之后被旧查询重新填回去」：
-// 解析是「读库 → 算状态 → 回填缓存」，中间可能被禁用/改密打断。
-// 若回填不校验代次，旧的有效状态会再住进缓存最多 identityTTL。
-
-// TestIdentityCacheRejectsStaleBackfill 覆盖「旧代次的回填被拒绝」。
 func TestIdentityCacheRejectsStaleBackfill(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -21,16 +16,13 @@ func TestIdentityCacheRejectsStaleBackfill(t *testing.T) {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
-	// 正常解析并缓存。
 	if active, ver := svc.ResolveUserIdentity(u.ID); !active || ver != 1 {
 		t.Fatalf("首次解析应返回有效（active=%v ver=%d）", active, ver)
 	}
 
-	// 模拟在途查询：先取代次，随后账号被禁用（失效 + 代次 +1）。
 	gen := svc.Runtime.IdentityGen(IdentityKindUser, u.ID)
 	svc.Runtime.InvalidateIdentity(IdentityKindUser, u.ID)
 
-	// 那份在途结果（有效、版本 1）不得写回缓存。
 	if ok := svc.Runtime.SetCachedIdentityIfGen(IdentityKindUser, u.ID, true, 1, gen); ok {
 		t.Fatal("旧代次的回填必须被拒绝，否则禁用状态会被旧结果覆盖")
 	}
@@ -38,7 +30,6 @@ func TestIdentityCacheRejectsStaleBackfill(t *testing.T) {
 		t.Fatal("失效之后不应命中缓存")
 	}
 
-	// 禁用之后重新解析，必须看到真实状态。
 	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Update("status", model.UserStatusDisabled).Error; err != nil {
 		t.Fatal(err)
@@ -49,10 +40,6 @@ func TestIdentityCacheRejectsStaleBackfill(t *testing.T) {
 	}
 }
 
-// TestIdentityCacheBumpedOnPasswordReset 覆盖「改密后旧令牌版本不会留在缓存」。
-//
-// 改密会让 token_version 自增，旧令牌必须立即失效；缓存若被在途查询
-// 用旧版本回填，校验会认为旧令牌仍然对得上。
 func TestIdentityCacheBumpedOnPasswordReset(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -66,7 +53,6 @@ func TestIdentityCacheBumpedOnPasswordReset(t *testing.T) {
 	}
 
 	gen := svc.Runtime.IdentityGen(IdentityKindUser, u.ID)
-	// 改密：数据库版本推进，业务层同时失效缓存。
 	if err := svc.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Update("token_version", 4).Error; err != nil {
 		t.Fatal(err)
@@ -81,12 +67,6 @@ func TestIdentityCacheBumpedOnPasswordReset(t *testing.T) {
 	}
 }
 
-// TestIdentityGenNotReusedAfterGC 覆盖「代次被 GC 回收之后不会被复用」。
-//
-// 代次若按「本身份 +1」推进，GC 删掉条目后下一次失效又从 1 开始：一个
-// 还捏着旧代次 1 的在途解析回填时会被判为「代次没变」，把失效前的状态与
-// 旧令牌版本重新写回缓存。解析查询没有硬超时，宽限期保证不了「在途请求
-// 一定已经结束」，所以不能靠宽限期兜底——代次必须永不重复。
 func TestIdentityGenNotReusedAfterGC(t *testing.T) {
 	r := NewRuntime()
 	const (
@@ -101,7 +81,6 @@ func TestIdentityGenNotReusedAfterGC(t *testing.T) {
 	}
 	r.SetCachedIdentity(kind, id, true, 1)
 
-	// 时间推到远超缓存 TTL 与代次宽限期之后，让 GC 把这两个条目都清掉。
 	r.mu.Lock()
 	r.gcIdentitiesLocked(time.Now().Add(identityTTL + identityGenGrace + time.Minute))
 	r.mu.Unlock()
@@ -109,19 +88,16 @@ func TestIdentityGenNotReusedAfterGC(t *testing.T) {
 		t.Fatalf("GC 之后代次条目应已回收，实际 %d", got)
 	}
 
-	// 再次失效：新代次必须是**从未出现过**的值。
 	r.InvalidateIdentity(kind, id)
 	if again := r.IdentityGen(kind, id); again == 0 || again == gen {
 		t.Fatalf("回收后的新代次 %d 与旧代次 %d 相同：在途解析会误以为没发生过失效", again, gen)
 	}
 
-	// 迟到的在途解析拿着旧代次回填，必须被拒绝。
 	if r.SetCachedIdentityIfGen(kind, id, true, 1, gen) {
 		t.Fatal("回收之后用旧代次回填必须被拒绝，否则失效前的状态会被写回缓存")
 	}
 }
 
-// TestAdminIdentityCacheRejectsStaleBackfill 覆盖管理员侧的同一竞态。
 func TestAdminIdentityCacheRejectsStaleBackfill(t *testing.T) {
 	svc := newTestServices(t, nil)
 

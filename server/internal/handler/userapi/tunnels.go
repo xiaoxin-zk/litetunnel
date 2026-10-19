@@ -12,7 +12,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/service"
 )
 
-// ListTunnels 列出当前用户隧道，并附加运行态。
 func (h *Handler) ListTunnels(c *gin.Context) {
 	uid := middleware.CurrentUserID(c)
 	list, err := h.svc.ListTunnels(uid)
@@ -20,8 +19,6 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 		shared.Fail(c, err)
 		return
 	}
-	// 限速来自分组，与隧道条数无关，因此只解析一次。
-	// LoadUser 已预加载 Group，这里不会产生额外查询。
 	u, err := h.svc.LoadUser(uid)
 	if err != nil {
 		shared.Fail(c, err)
@@ -35,12 +32,6 @@ func (h *Handler) ListTunnels(c *gin.Context) {
 	httpx.OK(c, out)
 }
 
-// tunnelVO 组装单条隧道的返回结构。
-//
-// bandwidthLimit 由调用方传入，而不是读 t.BandwidthLimit：
-// 那是建隧道时的快照，可能已经与分组当前值不一致。
-// 由调用方统一解析一次（同一个用户的所有隧道限速必然相同），
-// 既保证与强制下发的值同源，也避免每条隧道各查一次库。
 func (h *Handler) tunnelVO(t *model.Tunnel, bandwidthLimit int64) gin.H {
 	return gin.H{
 		"id":                  t.ID,
@@ -61,13 +52,10 @@ func (h *Handler) tunnelVO(t *model.Tunnel, bandwidthLimit int64) gin.H {
 		"use_compression":     t.UseCompression,
 		"last_online_at":      t.LastOnlineAt,
 		"created_at":          t.CreatedAt,
-		// 地址由 service 统一计算：HTTP 与 HTTPS 的入口不是同一条，
-		// 而这两条规则必须在客户端、用户控制台、管理端之间完全一致。
-		"public_addr": h.svc.TunnelPublicAddr(t),
+		"public_addr":         h.svc.TunnelPublicAddr(t),
 	}
 }
 
-// CreateTunnel 新建隧道。
 func (h *Handler) CreateTunnel(c *gin.Context) {
 	var in service.TunnelInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -87,10 +75,6 @@ func (h *Handler) CreateTunnel(c *gin.Context) {
 	httpx.OK(c, h.tunnelVO(t, h.svc.EffectiveBandwidth(u)))
 }
 
-// CreateTunnelsBatch 批量创建隧道。
-//
-// 与单条创建共用同一套服务层校验与端口分配逻辑，只是逐条循环、
-// 把每条的结果分别收上来——不整体回滚，见 CreateTunnelsBatch 的说明。
 func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
 	var in service.CreateTunnelBatchInput
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -108,8 +92,6 @@ func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
 		return
 	}
 
-	// 返回体里带上已建隧道的完整视图，客户端可以直接渲染列表，
-	// 不需要再为每条隧道单独请求一次。
 	created := make([]gin.H, 0, len(res.Created))
 	bl := h.svc.EffectiveBandwidth(u)
 	for i := range res.Created {
@@ -124,11 +106,6 @@ func (h *Handler) CreateTunnelsBatch(c *gin.Context) {
 	})
 }
 
-// batchMessage 生成一句人话总结。
-//
-// 全部成功、部分失败、全部失败三种情况应当给出不同的措辞——
-// 让用户只看到「创建完成」而漏掉失败的那几条，是最容易积累
-// 「怎么少了几条」这类困惑的地方。
 func batchMessage(ok, failed, fwFailed int) string {
 	var base string
 	switch {
@@ -145,7 +122,6 @@ func batchMessage(ok, failed, fwFailed int) string {
 	return base
 }
 
-// UpdateTunnel 修改隧道。
 func (h *Handler) UpdateTunnel(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -170,10 +146,6 @@ func (h *Handler) UpdateTunnel(c *gin.Context) {
 	httpx.OK(c, h.tunnelVO(t, h.svc.EffectiveBandwidth(u)))
 }
 
-// DeleteTunnel 删除隧道。
-//
-// 用结构化变体取回结果：数据库改成功但防火墙规则没跟上时，接口仍返回成功，
-// 但把「规则待处理」告诉前端（见 service.TunnelMutationResult）。
 func (h *Handler) DeleteTunnel(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {
@@ -197,7 +169,6 @@ type tunnelStatusReq struct {
 	Status string `json:"status" binding:"required"`
 }
 
-// SetTunnelStatus 启用或停用隧道。
 func (h *Handler) SetTunnelStatus(c *gin.Context) {
 	id, err := parseID(c)
 	if err != nil {

@@ -2,7 +2,6 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
-// 用户控制台只访问用户域接口；管理端接口在公网端口上并不存在。
 const http = axios.create({
   baseURL: '/api/user',
   timeout: 20000
@@ -18,12 +17,6 @@ http.interceptors.request.use((cfg) => {
   return cfg
 })
 
-/**
- * 统一的响应拆包与错误提示。
- *
- * redirectOn401 对公共接口要关掉：登录失败本身就是 401，
- * 而那时我们已经在登录页上，再跳转只会造成闪烁。
- */
 function attachResponseHandlers(instance, { redirectOn401 = true } = {}) {
   instance.interceptors.response.use(
     (res) => {
@@ -52,7 +45,6 @@ function attachResponseHandlers(instance, { redirectOn401 = true } = {}) {
 
 attachResponseHandlers(http)
 
-// 公共接口：统一登录、站点信息、验证码。这些在未登录时就要访问。
 const pub = attachResponseHandlers(
   axios.create({ baseURL: '/api', timeout: 20000 }),
   { redirectOn401: false }
@@ -66,7 +58,6 @@ export const publicApi = {
 }
 
 export const sessionApi = {
-  // 统一登录入口：用户与管理员共用，返回值里的 role 决定跳转到哪个控制台
   login: (data) => pub.post('/auth/login', data)
 }
 
@@ -76,7 +67,6 @@ export const authApi = {
   forgotPassword: (account) => http.post('/auth/forgot-password', { account }),
   resetPassword: (data) => http.post('/auth/reset-password', data),
   mailStatus: () => http.get('/auth/mail-status'),
-  // 邮箱一次性验证码：scene 为 register（注册）或 reset（找回密码）
   sendEmailCode: (data) => http.post('/auth/send-email-code', data)
 }
 
@@ -84,11 +74,8 @@ export const profileApi = {
   get: () => http.get('/profile'),
   update: (data) => http.put('/profile', data),
   changePassword: (data) => http.put('/profile/password', data),
-  // 更换邮箱分两步：先给新地址发验证码（需要登录密码），再带验证码换绑。
-  // 直接改 PUT /profile 里的 email 在启用邮件时会被服务端拒绝。
   requestEmailChange: (data) => http.post('/profile/email-code', data),
   confirmEmailChange: (data) => http.post('/profile/email', data),
-  // 注销需要密码二次确认，放在 body 里传递
   deleteAccount: (password) => http.delete('/profile', { data: { password } })
 }
 
@@ -122,7 +109,6 @@ export const statsApi = {
   traffic: (days = 7) => http.get('/stats/traffic', { params: { days } })
 }
 
-/** 触发浏览器下载 frpc.toml。 */
 export async function downloadFrpcConfig() {
   const token = localStorage.getItem(TOKEN_KEY)
   const res = await fetch('/api/user/client/config?download=1', {
@@ -141,7 +127,6 @@ export async function downloadFrpcConfig() {
   URL.revokeObjectURL(url)
 }
 
-/** 触发客户端安装包下载。 */
 export async function downloadClientFile(name) {
   const token = localStorage.getItem(TOKEN_KEY)
   const res = await fetch(`/api/user/client/downloads/${encodeURIComponent(name)}`, {

@@ -149,16 +149,12 @@ const group = computed(() => props.profile?.group)
 const allowedProtocols = computed(() => {
   const raw = group.value?.allow_protocols || 'tcp,udp'
   const list = raw.split(',').map((s) => s.trim()).filter(Boolean)
-  // HTTPS 隧道需要平台在独立端口上做 SNI 透传（端到端模式），而 HTTP 隧道
-  // 由 Caddy 在 443 上提供访客侧 HTTPS——没有那条入口时就把 https 选项拿掉。
-  // 服务端也会拒绝，这里只是别让用户白填一遍表单。
   if (group.value && group.value.https_tunnel_enabled === false) {
     return list.filter((p) => p !== 'https')
   }
   return list
 })
 
-/** 当前隐藏了 https 选项（用于给出解释，而不是让选项「凭空消失」）。 */
 const httpsUnavailable = computed(
   () =>
     (group.value?.allow_protocols || '').includes('https') &&
@@ -262,16 +258,6 @@ async function save() {
   }
 }
 
-// showMutationWarning 展示「数据库已更新、防火墙规则待处理」这类部分成功。
-//
-// 后端在删隧道/启停隧道时返回 { db_updated, firewall_pending, warning }：
-// 数据库已经改成功了（重试同一请求只会得到「隧道不存在」），但宿主机上的
-// 放行/收回规则还没生效，已进入后台重试队列。
-//
-// 为什么必须显示出来而不是一律 success：用户看到「已停用」就以为端口已经
-// 关掉了，实际端口可能还开着——这是安全语义上的错误认知。反过来也不能报
-// 错：报错会让用户重试一个已经成功的操作，只会得到「隧道不存在」。
-// 所以用 warning 级别单独提示，并明确说「后台会自动重试，无需重复操作」。
 function showMutationWarning(res) {
   if (res && res.firewall_pending) {
     ElMessage({
@@ -287,8 +273,6 @@ function showMutationWarning(res) {
 async function toggle(row) {
   const next = row.status === 'active' ? 'disabled' : 'active'
   const res = await tunnelApi.setStatus(row.id, next)
-  // 先提示「规则待处理」（如果后端这么说），否则才是普通的成功提示。
-  // 两者不能都弹：同一个动作弹两条消息，用户会以为发生了两件事。
   if (!showMutationWarning(res)) {
     ElMessage.success(next === 'active' ? '已启用' : '已停用')
   }

@@ -1,10 +1,3 @@
-// Package config 负责集中加载运行期配置。
-//
-// 安全约定：
-//  1. 所有与部署环境相关的值（公网 IP、域名、密钥）一律通过环境变量注入，
-//     源码与默认值中不得出现任何真实地址或可用密钥。
-//  2. 非生产环境缺失密钥时**随机生成**，绝不使用硬编码默认值：
-//     否则源码公开后，任何以默认环境变量启动的实例都能被伪造令牌接管。
 package config
 
 import (
@@ -21,16 +14,6 @@ import (
 
 const placeholderPrefix = "CHANGE_ME"
 
-// localPortRange 读取内核分配给**出站连接**的本地源端口范围
-// （net.ipv4.ip_local_port_range）。
-//
-// 为什么要读真值而不是写死 32768：这个值在容器基础镜像、云厂商镜像上经常被
-// 调过（10240-65000 之类），照默认值判断会让「与临时端口段重叠」这条检查在
-// 最需要它的机器上失效——表现是随机的「隧道建不起来」，日志里只有一次
-// EADDRINUSE。
-//
-// 读不到不是错误路径的失败：Windows/macOS 没有这个文件，容器里也可能没有
-// /proc。返回错误时调用方跳过检查。
 func localPortRange() (lo, hi int, err error) {
 	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
 	if err != nil {
@@ -48,50 +31,27 @@ func localPortRange() (lo, hi int, err error) {
 	return nlo, nhi, nil
 }
 
-// Version 是构建时注入的版本号，用于确认线上跑的是哪个版本。
-//
-// 通过 -ldflags 注入，例如：
-//
-//	go build -ldflags "-X github.com/xiaoxin-zk/litetunnel/server/internal/config.Version=v1.0.0"
-//
-// 未注入时保持 dev，便于区分本地构建产物。
 var Version = "dev"
 
-// Config 为控制面全部可配置项。
 type Config struct {
 	Env      string
 	LogLevel string
 
-	// 存储
-	DBDriver string // sqlite | postgres
+	DBDriver string
 	DBDSN    string
 
-	// Redis 控制面：多实例部署必须配置，用于共享登录失败窗口、撤销版本和分布式租约。
 	RedisAddr     string
 	RedisPassword string
 	RedisDB       int
 	RedisPrefix   string
 
-	// 监听地址：单一入口，用户控制台与管理后台共用同一端口，
-	// 通过路径前缀区分（管理后台挂在 AdminPath 下）。
 	UserAddr      string
 	UserPublicURL string
 
-	// AdminPath 是管理后台的挂载路径。
-	//
-	// 刻意不使用 /admin 这类扫描器字典里的高频路径：管理后台虽然是
-	// 公网可达的（安全由账号锁定 + 限流 + 双因素保证），但把入口藏在
-	// 一个自定义路径下能挡掉绝大部分自动化探测流量。
-	//
-	// 前端采用哈希路由 + 相对资源路径，因此本值可随时修改而无需重新构建镜像。
 	AdminPath string
 
-	// AdminAllowCIDRs 可选的管理后台来源白名单。
-	// 为空表示管理后台同样对公网开放（默认），此时安全性由
-	// 账号锁定 + 限流 + 双因素认证共同保证。
 	AdminAllowCIDRs []string
 
-	// 双域密钥：用户令牌与管理令牌互不通用
 	UserJWTSecret  string
 	AdminJWTSecret string
 	APIKeyEncKey   string
@@ -99,7 +59,6 @@ type Config struct {
 	BootstrapAdminUser     string
 	BootstrapAdminPassword string
 
-	// 隧道网关
 	GatewayHost string
 	GatewayPort int
 
@@ -108,9 +67,6 @@ type Config struct {
 	FrpsAPIUser     string
 	FrpsAPIPassword string
 
-	// FrpsPluginAllowCIDRs 是允许调用服务端插件回调的来源网段。
-	// frp 的 HTTP 插件协议不支持自定义鉴权头，因此改用来源 IP 白名单，
-	// 默认仅允许回环地址（frps 与本服务同机部署）。
 	FrpsPluginAllowCIDRs []string
 
 	PortRangeStart  int
@@ -119,95 +75,45 @@ type Config struct {
 
 	TunnelDomain string
 
-	// VhostHTTPSPort 是 frps 的 HTTPS 隧道入口端口（LT_VHOST_HTTPS_PORT，默认 8444）。
-	//
-	// 面板需要知道它，才能在客户端里显示 HTTPS 隧道的**真实**访问地址：
-	// 端到端模式下那条隧道不在 443 上，地址必须带端口——只给一个裸域名的话，
-	// 用户会拿到 Caddy 的证书并看到「证书不匹配」，然后以为是自己配错了。
-	//
-	// 值来自 .env：面板容器通过 env_file 读到整份 .env，与渲染 frps.toml
-	// 用的是同一个来源，因此不存在「两份数据互相分叉」的问题。
 	VhostHTTPSPort int
 
-	// HTTPSProxyMode 是 HTTPS 隧道模式（LT_HTTPS_TUNNEL_MODE：edge / e2e）。
-	//
-	// 只作为管理端设置的**初始默认值**：运行期以数据库里的设置为准
-	// （管理端改完由 helper 回写 .env，而面板容器不会重启，
-	// 拿这里当运行期真相会让界面与实际配置长期不一致）。
 	HTTPSProxyMode string
 
-	// ClientDistDir 存放对外分发的客户端安装包目录，由控制台列出供下载。
 	ClientDistDir string
 
-	// 两个控制台的前端构建产物目录。目录不存在时服务以纯 API 模式运行（开发用）。
 	UserWebDir  string
 	AdminWebDir string
 
-	// TrustedProxies 是允许其转发头生效的反向代理地址。
-	// 默认为回环地址（反代与本服务同机），避免客户端伪造 X-Forwarded-For 绕过限流。
 	TrustedProxies []string
 
-	// SMTP 邮件发送配置。未配置时找回密码功能自动禁用，接口会明确返回提示。
 	SMTP SMTPConfig
 
 	TrafficPollInterval time.Duration
 
-	// MonitorDiskPath 是管理页「磁盘」指标统计的文件系统路径
-	// （LT_MONITOR_DISK_PATH，默认 /）。
-	//
-	// 为什么要可配：容器里的 / 是镜像自带的 overlay，既不是宿主机根分区，
-	// 也不是数据盘。数据规模真正有意义的那块盘通常挂在 /data（compose 里的
-	// 数据卷），所以 Docker 部署把它指到 /data；裸机部署留默认即可。
 	MonitorDiskPath string
 
 	UserJWTExpire  time.Duration
 	AdminJWTExpire time.Duration
 
-	// ---- 以下字段在 Load 时填充，供 main 输出启动提示 ----
-
-	// GeneratedSecrets 记录本次启动随机生成的密钥名，值为空说明来自环境变量。
-	GeneratedSecrets []string
-	// EphemeralAdminPassword 仅在未提供初始管理员密码时生成，重启即失效。
+	GeneratedSecrets       []string
 	EphemeralAdminPassword bool
-	// Warnings 收集非致命的配置风险提示。
-	Warnings []string
+	Warnings               []string
 }
 
-// SMTPConfig 是邮件发送配置。
-//
-// 以 QQ 邮箱为例（国内服务器最常用的方案）：
-//
-//	LT_SMTP_HOST=smtp.qq.com
-//	LT_SMTP_PORT=465
-//	LT_SMTP_TLS=ssl
-//	LT_SMTP_USER=你的QQ号@qq.com
-//	LT_SMTP_PASS=在QQ邮箱设置里生成的「授权码」（不是登录密码）
-//	LT_SMTP_FROM=LiteTunnel <你的QQ号@qq.com>
-//
-// 注意：国内服务器 25 端口普遍被封，请使用 465(SSL) 或 587(STARTTLS)。
 type SMTPConfig struct {
 	Host     string
 	Port     int
 	User     string
 	Password string
-	// From 是收件人看到的发件人。多数服务商要求它必须与 User 一致。
-	From string
-	// TLS 取值：ssl（隐式 TLS，465）、starttls（587）、none（明文，仅内网调试）。
-	TLS string
-	// SiteName 用于邮件标题与正文中的品牌名。
+	From     string
+	TLS      string
 	SiteName string
 }
 
-// Enabled 表示邮件功能是否可用。
 func (s SMTPConfig) Enabled() bool {
 	return s.Host != "" && s.User != "" && s.Password != ""
 }
 
-// intEnvKeys 是所有按整数解析的环境变量。
-//
-// 集中列出是为了在启动时一次性校验：envInt 在解析失败时会回落到默认值，
-// 而「端口写成了 7O01」这种 typo 回落之后服务仍能起来，只是监听在默认端口
-// 上——管理员看到的是「配置改了却没生效」，日志里一个字都没有。
 var intEnvKeys = []string{
 	"LT_REDIS_DB",
 	"LT_GATEWAY_PORT",
@@ -219,7 +125,6 @@ var intEnvKeys = []string{
 	"LT_TRAFFIC_POLL_INTERVAL",
 }
 
-// validateEnvInts 拒绝无法解析的整数环境变量，而不是静默回落到默认值。
 func validateEnvInts() error {
 	for _, key := range intEnvKeys {
 		v, ok := os.LookupEnv(key)
@@ -228,8 +133,6 @@ func validateEnvInts() error {
 		}
 		v = strings.TrimSpace(v)
 		if v == "" {
-			// 空值与未设置等价：容器编排里常见 `LT_X=` 的写法，按默认值处理
-			// 不会掩盖任何真实配置。
 			continue
 		}
 		if _, err := strconv.Atoi(v); err != nil {
@@ -239,11 +142,6 @@ func validateEnvInts() error {
 	return nil
 }
 
-// numericEnvKeys 是所有按整数解析的环境变量。
-//
-// 单独列出来做一次显式解析，是因为 envInt 在解析失败时只能返回默认值：
-// 那意味着 LT_PORT_RANGE_END=abc 会被当成「没配」，服务带着 30000 起来，
-// 而管理员以为自己限定了端口范围。这类错误必须在启动时暴露。
 var numericEnvKeys = []string{
 	"LT_GATEWAY_PORT", "LT_KCP_PORT", "LT_VHOST_HTTP_PORT", "LT_VHOST_HTTPS_PORT",
 	"LT_USER_PORT", "LT_FRPS_API_PORT",
@@ -251,14 +149,12 @@ var numericEnvKeys = []string{
 	"LT_REDIS_DB",
 }
 
-// portEnvKeys 是其中的「合法端口」子集：必须在 1..65535 之间。
 var portEnvKeys = map[string]bool{
 	"LT_GATEWAY_PORT": true, "LT_KCP_PORT": true, "LT_VHOST_HTTP_PORT": true,
 	"LT_VHOST_HTTPS_PORT": true, "LT_USER_PORT": true, "LT_FRPS_API_PORT": true,
 	"LT_PORT_RANGE_START": true, "LT_PORT_RANGE_END": true,
 }
 
-// validateNumericEnvs 在装载前拒绝「设了但解析不出来」的整数变量。
 func validateNumericEnvs() error {
 	for _, key := range numericEnvKeys {
 		raw, ok := os.LookupEnv(key)
@@ -283,8 +179,6 @@ func validateNumericEnvs() error {
 			return fmt.Errorf("LT_MAX_PORTS_PER_USER=%d 必须大于 0", n)
 		}
 	}
-	// 监听地址里的端口同样要校验：'host:abc' 会让 net.Listen 在启动末尾
-	// 才失败，而那时代码已经做过一轮数据库迁移。
 	for _, key := range []string{"LT_USER_ADDR", "LT_FRPS_API_ADDR"} {
 		raw, ok := os.LookupEnv(key)
 		if !ok || strings.TrimSpace(raw) == "" {
@@ -297,12 +191,6 @@ func validateNumericEnvs() error {
 	return nil
 }
 
-// validateHostPort 严格校验「host:port」形式的监听地址。
-//
-// 只做 SplitHostPort 不够：`http://127.0.0.1:7500`、`user:pass@host:7500`、
-// `host:7500?x=1` 都能被它拆出一段「看起来像端口」的字符串，而 net.Dial /
-// net.Listen 会以完全不同的方式失败。frps 管理接口持续不可用正是最难排查的
-// 一类故障——采集和断流都会静默退化，所以必须在启动时挡住。
 func validateHostPort(key, raw string) error {
 	raw = strings.TrimSpace(raw)
 	switch {
@@ -326,7 +214,6 @@ func validateHostPort(key, raw string) error {
 	return nil
 }
 
-// Load 从环境变量装载配置并做必要校验。
 func Load() (*Config, error) {
 	if err := validateNumericEnvs(); err != nil {
 		return nil, err
@@ -338,12 +225,12 @@ func Load() (*Config, error) {
 		Env:      env("LT_ENV", "development"),
 		LogLevel: env("LT_LOG_LEVEL", "info"),
 
-		DBDriver:     env("LT_DB_DRIVER", "sqlite"),
-		DBDSN:        env("LT_DB_DSN", "./data/litetunnel.db"),
-		RedisAddr:    env("LT_REDIS_ADDR", ""),
+		DBDriver:      env("LT_DB_DRIVER", "sqlite"),
+		DBDSN:         env("LT_DB_DSN", "./data/litetunnel.db"),
+		RedisAddr:     env("LT_REDIS_ADDR", ""),
 		RedisPassword: env("LT_REDIS_PASSWORD", ""),
-		RedisDB:      envInt("LT_REDIS_DB", 0),
-		RedisPrefix:  env("LT_REDIS_PREFIX", "litetunnel:"),
+		RedisDB:       envInt("LT_REDIS_DB", 0),
+		RedisPrefix:   env("LT_REDIS_PREFIX", "litetunnel:"),
 
 		UserAddr:        env("LT_USER_ADDR", "0.0.0.0:7848"),
 		UserPublicURL:   strings.TrimRight(env("LT_USER_PUBLIC_URL", ""), "/"),
@@ -407,13 +294,8 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
-// IsProd 返回是否生产环境。
 func (c *Config) IsProd() bool { return c.Env == "production" }
 
-// fillDefaults 为非生产环境补齐缺失项。
-//
-// 关键点：这里**不使用硬编码密钥**，而是每次启动随机生成。
-// 否则源码公开后，任何用默认环境变量启动的实例都能被伪造令牌接管。
 func (c *Config) fillDefaults() error {
 	if c.IsProd() {
 		return nil
@@ -474,7 +356,6 @@ func (c *Config) validate() error {
 	}
 	c.AdminPath = adminPath
 
-	// 邮件配置校验：只校验「已配置」的情况，未配置时视为禁用该功能。
 	if c.SMTP.Host != "" {
 		switch c.SMTP.TLS {
 		case "ssl", "starttls", "none":
@@ -488,7 +369,6 @@ func (c *Config) validate() error {
 			return errors.New("已配置 LT_SMTP_HOST 但缺少 LT_SMTP_USER 或 LT_SMTP_PASS")
 		}
 		if c.SMTP.From == "" {
-			// 未显式指定发件人时回落到认证账号，这是大多数服务商的要求。
 			c.SMTP.From = c.SMTP.User
 		}
 		if c.IsProd() && c.SMTP.TLS == "none" {
@@ -501,8 +381,6 @@ func (c *Config) validate() error {
 	if c.PortRangeStart < 1024 {
 		return errors.New("端口池起始端口不得低于 1024（禁止占用特权端口）")
 	}
-	// 逐个确认「最终值」落在合法区间，而不只是环境变量能被 Atoi 解析。
-	// 这两个来源不同：struct 也可能被测试/嵌入方直接构造，绕过 Load。
 	for _, item := range []struct {
 		name string
 		val  int
@@ -518,46 +396,20 @@ func (c *Config) validate() error {
 	if c.MaxPortsPerUser < 1 {
 		return fmt.Errorf("LT_MAX_PORTS_PER_USER=%d 必须大于 0", c.MaxPortsPerUser)
 	}
-	// 端口池上限必须低于内核临时端口段：与之重叠会让 frps 偶发绑定失败，
-	// 表现为随机的「隧道建不起来」。
-	//
-	// 这里必须**真的**读一次内核值，而不是照着「32768 是默认值」写死：
-	// ip_local_port_range 在不少机器上被调成 10240-65000 之类（容器基础镜像、
-	// 云厂商镜像都改过），写死的判据在这些机器上等于没有。读不到（非 Linux、
-	// 或 /proc 未挂载）时只记一条提示，不阻断启动——那是开发机与 Windows
-	// 部署的正常情况。
 	if lo, hi, err := localPortRange(); err == nil && c.PortRangeEnd >= lo && c.PortRangeStart <= hi {
 		return fmt.Errorf("端口池 %d-%d 与内核临时端口段 %d-%d 重叠：监听端口撞上出站连接的源端口会导致偶发绑定失败"+
 			"（请把 LT_PORT_RANGE_END 压到 %d 以下）",
 			c.PortRangeStart, c.PortRangeEnd, lo, hi, lo-1)
 	}
 
-	// 转发头信任范围必须显式收窄，否则客户端可伪造来源 IP 绕过限流与白名单。
 	for _, p := range c.TrustedProxies {
 		if isTrustAll(p) {
 			return fmt.Errorf("LT_TRUSTED_PROXIES 不允许配置 %q：那会让任意客户端伪造来源 IP", p)
 		}
-		// 还必须是合法的 IP 或 CIDR。
-		//
-		// 这一步不能省：gin 的 SetTrustedProxies 遇到非法值会解析失败并提前返回，
-		// 而它内部的 trustedCIDRs 会保留构造函数写入的「信任所有」默认值。
-		// 也就是说一个拼错的 CIDR（如 127.0.0.1/33）会让整条信任链失效，
-		// 且失败是静默的。这里提前拦截，让问题在启动时暴露。
 		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
 			return fmt.Errorf("LT_TRUSTED_PROXIES 中的 %q 不是合法的 IP 或 CIDR", p)
 		}
 	}
-	// 两份 CIDR 白名单都必须逐项可解析。
-	//
-	// 为什么要在启动时挡住，而不是留给运行期：解析失败的条目会被静默丢弃，
-	// 而这两处的语义恰好都建立在「列表非空」上——
-	//
-	//	管理白名单：解析结果为空会被当成「不限制」，于是「填了白名单但每项
-	//	            都拼错」不是谁都进不来，而是**公网谁都能进后台**；
-	//	插件白名单：解析结果为空会让所有回调被拒，隧道全部无法上线，
-	//	            而报错只是一个 403 日志，看不出是配置写错了。
-	//
-	// 两种后果都必须等到线上才暴露，代价与「启动失败」完全不成比例。
 	if err := validateCIDRList("LT_ADMIN_ALLOW_CIDR", c.AdminAllowCIDRs); err != nil {
 		return err
 	}
@@ -566,22 +418,17 @@ func (c *Config) validate() error {
 	}
 
 	if !c.IsProd() {
-		// 非生产环境只做风险提示，不阻断启动，便于本地调试。
 		if isPublicBind(c.UserAddr) {
 			c.Warnings = append(c.Warnings,
 				fmt.Sprintf("当前为非生产环境且监听在 %s，任何人都可能访问；请勿用于公网", c.UserAddr))
 		}
 		if c.UserPublicURL == "" {
-			// 这里必须提示：找回密码的重置链接要用它，而运行时不会再从请求头
-			// 推断（那会被 Host 投毒）。不提示的话，用户点了「忘记密码」之后
-			// 什么都不会发生，管理员却不知道原因。
 			c.Warnings = append(c.Warnings,
 				"未配置 LT_USER_PUBLIC_URL，找回密码的邮件不会发出（重置链接无法生成）；本地调试请设为 http://localhost:<端口>")
 		}
 		return nil
 	}
 
-	// ---- 生产环境强制校验，避免带着占位符上线 ----
 	var missing []string
 	require := func(name, v string) {
 		if v == "" || strings.HasPrefix(v, placeholderPrefix) {
@@ -595,12 +442,6 @@ func (c *Config) validate() error {
 	require("LT_GATEWAY_HOST", c.GatewayHost)
 	require("LT_FRPS_TOKEN", c.FrpsToken)
 	require("LT_FRPS_API_PASSWORD", c.FrpsAPIPassword)
-	// 对外地址必须显式配置：找回密码的重置链接要用它。
-	//
-	// 没有它就只能从请求的 Host / X-Forwarded-Proto 推断，而这两个头完全由
-	// 请求方控制——攻击者往找回密码接口提交伪造的 Host，就能让发给用户的邮件
-	// 里的链接指向他自己的域名，用户一点，重置令牌就落到他手里。
-	// 因此生产环境必须配置，运行时也**绝不**再退回到请求头（见 userapi.ForgotPassword）。
 	require("LT_USER_PUBLIC_URL", c.UserPublicURL)
 
 	if len(missing) > 0 {
@@ -618,8 +459,6 @@ func (c *Config) validate() error {
 	if len(c.APIKeyEncKey) != 32 && len(c.APIKeyEncKey) != 64 {
 		return errors.New("LT_APIKEY_ENC_KEY 需为 32 或 64 个字符（AES-128/256 密钥）")
 	}
-	// 管理后台与用户控制台共用公网端口，安全依赖以下三件事，
-	// 缺任何一件都会让公网暴露的后台变成可爆破目标，因此必须显式确认。
 	if len(c.AdminAllowCIDRs) == 0 {
 		c.Warnings = append(c.Warnings,
 			"管理后台当前对公网开放（未配置 LT_ADMIN_ALLOW_CIDR）。"+
@@ -628,14 +467,8 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// reservedPathPrefixes 是管理后台路径不得占用的前缀。
-// 它们被接口、健康检查或静态资源使用，占用会导致路由冲突。
 var reservedPathPrefixes = []string{"/api", "/healthz", "/assets", "/favicon"}
 
-// normalizeAdminPath 规范化并校验管理后台挂载路径。
-//
-// 只接受单层路径（形如 /xxx），字符集限制为字母数字与 - _，
-// 避免出现 /a/b 这类多段路径或包含点号的路径引发路由歧义与目录穿越联想。
 func normalizeAdminPath(p string) (string, error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
@@ -670,8 +503,6 @@ func normalizeAdminPath(p string) (string, error) {
 	return p, nil
 }
 
-// isPublicBind 判断监听地址是否对外暴露。
-// 解析失败一律按「危险」处理，避免畸形地址绕过校验。
 func isPublicBind(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -685,18 +516,11 @@ func isPublicBind(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// 非 IP 的主机名一律视为对外暴露
 		return true
 	}
 	return !ip.IsLoopback()
 }
 
-// validateCIDRList 逐项校验来源白名单：每一项都必须是合法的 IP 或 CIDR，
-// 且不能等价于「信任所有来源」。
-//
-// 空列表是合法的（表示未启用白名单），但列表**里**的空项不是：
-// 它多半来自 "10.0.0.0/8, ,1.2.3.4" 这种手写串，而它同时会让管理员以为
-// 该项已经生效。
 func validateCIDRList(name string, list []string) error {
 	for _, raw := range list {
 		v := strings.TrimSpace(raw)
@@ -713,7 +537,6 @@ func validateCIDRList(name string, list []string) error {
 	return nil
 }
 
-// isTrustAll 判断网段是否等价于「信任所有来源」。
 func isTrustAll(cidr string) bool {
 	cidr = strings.TrimSpace(cidr)
 	switch cidr {

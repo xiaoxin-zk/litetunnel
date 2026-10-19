@@ -15,35 +15,25 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// RegisterInput 注册入参。
 type RegisterInput struct {
 	Username string
 	Password string
 	Email    string
 	IP       string
 
-	// 注册准入校验材料
 	AgreedTerms   bool
 	CaptchaTicket string
 	CaptchaAnswer string
-	// EmailCode 是邮箱一次性验证码。站点启用邮件后为必填。
-	EmailCode string
+	EmailCode     string
 }
 
-// Register 创建用户并绑定默认分组。
-//
-// 注册是最容易被滥用的入口（批量注册、薅资源、拿隧道做跳板），
-// 因此准入校验集中在这里，按「成本从低到高」短路，避免无谓的数据库查询。
 func (s *Services) Register(in RegisterInput) (*model.User, error) {
-	// 1. 注册开关：管理端可一键关闭注册
 	if !s.Settings.Bool(KeyRegisterEnabled) {
 		return nil, ErrRegisterClosed
 	}
-	// 2. 必须显式同意条款（前端勾选），这是禁止滥用条款生效的前提
 	if !in.AgreedTerms {
 		return nil, fmt.Errorf("%w: 请先阅读并同意服务条款与禁止滥用规定", ErrInvalidParam)
 	}
-	// 3. 验证码：由开关控制，默认开启
 	if s.Settings.Bool(KeyRegisterCaptcha) {
 		if !s.CheckCaptcha(in.CaptchaTicket, in.CaptchaAnswer) {
 			return nil, ErrCaptchaInvalid
@@ -56,44 +46,29 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	}
 	in.Username, in.Email = username, email
 
-	// 邮箱验证：站点启用邮件后，注册必须提供邮箱并通过一次性验证码。
-	//
-	// 为什么和邮件开关绑定而不是独立开关：没有邮件通道就无法验证邮箱真实性，
-	// 此时强制要求验证码只会把用户挡在门外。启用邮件意味着运营方愿意承担
-	// 验证成本，邮箱也就从「可选联系方式」升级为「身份凭证」。
 	requireEmail := s.MailEnabled() && s.Settings.Bool(KeyRegisterRequireEmail)
 	if requireEmail && in.Email == "" {
 		return nil, ErrEmailRequired
 	}
 
-	// 4. 邮箱域名准入：黑名单直接拒绝；白名单模式下非白名单域名要么拒绝，
-	// 要么按「每主域 N 个账号」放量（见 emailDomainVerdictFor）。
-	//
-	// 与发验证码共用同一套判断，否则用户要到填完密码才知道域名不允许。
 	verdict := s.emailDomainVerdictFor(in.Email)
 	if verdict.Reject != nil {
 		return nil, verdict.Reject
 	}
 
-	// 限额与额度键统一按公共后缀主域归一：否则换个子域就能绕过「每域名每日上限」。
 	domain := RegistrationDomainKey(in.Email)
 	trusted := s.isTrustedEmailDomain(emailDomain(in.Email))
 
-	// 5. 频率限制。白名单域名可选择跳过：企业自有域名下员工批量注册属正常行为。
 	skipLimits := trusted && s.Settings.Bool(KeyRegisterTrustedSkipLimits)
 	if !skipLimits {
-		// 单 IP 每日上限：拦住同一台机器批量注册
 		if err := s.checkRegisterRate(s.DB, in.IP, false); err != nil {
 			return nil, err
 		}
-		// 单邮箱域名每日上限：拦住用同一邮箱服务商批量注册
 		if err := s.checkDomainRate(s.DB, domain, false); err != nil {
 			return nil, err
 		}
 	}
 
-	// 6. 白名单外域名配额：给每个外部域名留固定几个名额，用完即止。
-	// 与「每日上限」无关——它按累计账号数算，否则每天都能再刷一个。
 	if verdict.Quota > 0 {
 		if err := s.checkNonWhitelistQuota(s.DB, domain, verdict.Quota); err != nil {
 			return nil, err
@@ -104,12 +79,6 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		return nil, err
 	}
 
-	// 邮箱验证码放在最后校验，而且这里**只校验、不消费**。
-	//
-	// 必须等所有无副作用的校验都通过后再做，否则一次「用户名已占用」就会
-	// 白白浪费用户一个验证码。消费则要和写用户放进同一个事务（见下）：
-	// 分开做的话，写库失败或并发注册撞唯一索引时，注册没成功、验证码却已经
-	// 失效了，用户只能重新收信。
 	var codeRec *model.EmailCode
 	if requireEmail {
 		var cerr error
@@ -119,8 +88,6 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 		}
 	}
 
-	// 哈希与密钥生成放在事务**之外**：bcrypt 是刻意设计成慢的，
-	// 占着事务会拉长写锁持有时间。
 	user, err := s.prepareNewUser(in.Username, in.Email, in.Password, in.IP, requireEmail)
 	if err != nil {
 		return nil, err
@@ -128,14 +95,6 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 
 	err = s.DB.Transaction(func(tx *gorm.DB) error {
 		if !skipLimits {
-			// 额度预留：先按**固定顺序**锁住额度键，再统计，再写入。
-			//
-			// 锁必须赶在统计之前拿到。PostgreSQL 默认 READ COMMITTED 下，
-			// 「先数、后插」的两个事务看不到彼此尚未提交的行——两边都会读到
-			// 「还剩最后一个名额」并各自提交，最终超额。锁住同一个键之后，
-			// 后一个事务要等前一个提交，随后的统计才看得到那一条。
-			//
-			// 顺序固定（排序后再取）是为了避免两个并发注册互相等对方的键。
 			keys := make([]string, 0, 2)
 			if in.IP != "" {
 				keys = append(keys, "register:ip:"+in.IP)
@@ -156,8 +115,6 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 				return err
 			}
 		}
-		// 白名单外配额同样要在事务内复核：并发注册时前置检查看到的名额
-		// 是同一个「还剩最后一个」，两边各自提交就会超额。
 		if verdict.Quota > 0 {
 			if err := s.checkNonWhitelistQuota(tx, domain, verdict.Quota); err != nil {
 				return err
@@ -176,15 +133,8 @@ func (s *Services) Register(in RegisterInput) (*model.User, error) {
 	return s.LoadUser(user.ID)
 }
 
-// validateNewUser 校验并清洗新账号资料。只读、无副作用。
-//
-// 抽出来是因为它有两个调用方（公开注册与管理端建号），而两者的**准入策略**
-// 完全不同：注册要过注册开关、条款勾选、验证码、域名黑白名单与每日频率限制；
-// 管理员建号是受信操作，不该受这些约束。校验与写入共用，准入各自处理。
 func validateNewUser(username, email, password string) (string, string, error) {
 	username = strings.TrimSpace(username)
-	// 邮箱统一小写存库：找回密码按邮箱定位账号，大小写混写会让「同一个地址」
-	// 在库里变成两条不同记录（老数据仍有混写，查询侧统一用 lower(email) 兜住）。
 	email = strings.ToLower(strings.TrimSpace(email))
 	if len(username) < 3 || len(username) > 32 {
 		return "", "", fmt.Errorf("%w: 用户名长度需为 3-32 个字符", ErrInvalidParam)
@@ -201,7 +151,6 @@ func validateNewUser(username, email, password string) (string, string, error) {
 	return username, email, nil
 }
 
-// checkUserUnique 校验用户名与邮箱未被占用。
 func (s *Services) checkUserUnique(username, email string) error {
 	var exists int64
 	if err := s.DB.Model(&model.User{}).Where("username = ?", username).Count(&exists).Error; err != nil {
@@ -220,12 +169,6 @@ func (s *Services) checkUserUnique(username, email string) error {
 	return nil
 }
 
-// emailTaken 判断邮箱是否已被其他账号占用（大小写不敏感）。
-//
-// 必须用 lower(email) 比较：早期版本把邮箱按用户输入原样存库，老数据里
-// 可能存在大小写混写的地址；而数据库上的唯一索引是「尽力而为」的
-// （历史重复时建不起来），这条检查就是它缺席时的唯一防线。
-// exceptID 为 0 表示「不与任何账号比较」（注册场景）。
 func (s *Services) emailTaken(email string, exceptID uint) (bool, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
@@ -242,10 +185,6 @@ func (s *Services) emailTaken(email string, exceptID uint) (bool, error) {
 	return n > 0, nil
 }
 
-// insertUser 写入用户记录：密码哈希、初始 API Key、默认分组。
-//
-// ip 与 emailVerified 由调用方决定：公开注册会带上来源 IP 与「邮箱已验证」，
-// 管理端建号两者都没有（管理员填的邮箱没有经过验证码校验，不该标成已验证）。
 func (s *Services) insertUser(username, email, password, ip string, emailVerified bool) (*model.User, error) {
 	user, err := s.prepareNewUser(username, email, password, ip, emailVerified)
 	if err != nil {
@@ -257,18 +196,12 @@ func (s *Services) insertUser(username, email, password, ip string, emailVerifie
 	return s.LoadUser(user.ID)
 }
 
-// prepareNewUser 在事务**之外**完成哈希与密钥生成，返回待写入的用户对象。
-//
-// 拆出来是为了让调用方能把「写入用户」和别的操作（例如消费邮箱验证码）
-// 放进同一个事务，而把 CPU 密集的哈希留在事务外。
 func (s *Services) prepareNewUser(username, email, password, ip string, emailVerified bool) (*model.User, error) {
 	hashed, err := auth.HashPassword(password)
 	if err != nil {
 		return nil, err
 	}
 
-	// 建号即生成 API Key：桌面客户端只用这一把凭据登录，
-	// 用户不必再去控制台点一次「生成」，省掉一个容易卡住的步骤。
 	apiKey, apiPrefix, apiHash, err := auth.GenerateAPIKey()
 	if err != nil {
 		return nil, err
@@ -280,7 +213,6 @@ func (s *Services) prepareNewUser(username, email, password, ip string, emailVer
 	now := time.Now()
 
 	group := s.defaultGroup()
-	// EmailDomain 存主域而不是完整域名：每日限额按公共后缀归一，子域不能各算一份。
 	user := &model.User{
 		Username:        username,
 		Email:           email,
@@ -302,15 +234,8 @@ func (s *Services) prepareNewUser(username, email, password, ip string, emailVer
 	return user, nil
 }
 
-// insertUserTx 在给定事务内写入用户记录。
-//
-// 唯一索引冲突在这里转成友好错误：并发注册时两个请求可能同时通过了
-// 「用户名未占用」的检查，最终由数据库裁决。
 func (s *Services) insertUserTx(db *gorm.DB, user *model.User) error {
 	if err := db.Create(user).Error; err != nil {
-		// 只有唯一约束冲突才映射成「已被占用」：数据库故障、字段超长之类的
-		// 错误必须原样返回，否则用户会得到一个与事实不符的结论（去换用户名），
-		// 而真实原因是服务端故障，怎么改都注册不上。
 		if isUniqueConflict(err) {
 			if strings.Contains(strings.ToLower(err.Error()), "email") {
 				return ErrEmailTaken
@@ -322,10 +247,6 @@ func (s *Services) insertUserTx(db *gorm.DB, user *model.User) error {
 	return nil
 }
 
-// isUniqueConflict 判断错误是否来自唯一约束冲突。
-//
-// 两个驱动的报错文本不同：SQLite 是 UNIQUE constraint failed: ...，
-// PostgreSQL 是 duplicate key value violates unique constraint "..."
 func isUniqueConflict(err error) bool {
 	if err == nil {
 		return false
@@ -334,7 +255,6 @@ func isUniqueConflict(err error) bool {
 	return strings.Contains(msg, "unique") || strings.Contains(msg, "duplicate key")
 }
 
-// emailDomain 从邮箱中取出小写域名，取不到时返回空串。
 func emailDomain(email string) string {
 	email = strings.TrimSpace(email)
 	at := strings.LastIndex(email, "@")
@@ -344,15 +264,6 @@ func emailDomain(email string) string {
 	return strings.ToLower(email[at+1:])
 }
 
-// checkDomainRate 限制单个邮箱域名在自然日内的注册数量。
-//
-// 与「单 IP 上限」互补：IP 上限挡不住换 IP 的批量注册，
-// 但同一批注册往往共用同一个邮箱服务商，按域名计数能兜住。
-//
-// db 由调用方给：前置检查用主连接，事务内复核必须用 tx——
-// SQLite 只开一个连接，事务里再走 s.DB 会自己把自己等死。
-//
-// inclusive 表示统计**包含刚写入的那条**记录，见 overLimit。
 func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) error {
 	if domain == "" {
 		return nil
@@ -368,7 +279,6 @@ func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) e
 	if err := db.Model(&model.User{}).
 		Where("email_domain = ? AND created_at >= ?", domain, dayStart).
 		Count(&n).Error; err != nil {
-		// 统计失败时放行，理由同 checkRegisterRate。
 		return nil
 	}
 	if overLimit(n, limit, inclusive) {
@@ -377,23 +287,10 @@ func (s *Services) checkDomainRate(db *gorm.DB, domain string, inclusive bool) e
 	return nil
 }
 
-// lockRegisterQuota 在事务内按「额度键」加锁，把同键的并发注册串行化。
-//
-// PostgreSQL 用事务级 advisory lock：键相同的事务排队，后一个拿到锁时前一个
-// 已经提交，随后的统计才看得到它。SQLite 不需要——store.Open 里连接池只有
-// 一个连接，事务天然串行。
-//
-// hashtext 有 32 位碰撞可能：撞了只是让两组无关的注册多串行一会儿，
-// 不影响正确性。
 func (s *Services) lockRegisterQuota(tx *gorm.DB, key string) error {
 	return s.lockAdvisory(tx, key)
 }
 
-// overLimit 判断计数是否已超出注册上限。
-//
-// inclusive 表示这次统计把**刚写入的这条记录**也算进去了：预留之后，
-// 恰好等于上限是正常的，只有超过才该回滚。两个口径混用会让每天都多放
-// （或误杀）恰好一条记录——这种偏差只看日志根本发现不了。
 func overLimit(n int64, limit int, inclusive bool) bool {
 	if limit <= 0 {
 		return false
@@ -404,10 +301,6 @@ func overLimit(n int64, limit int, inclusive bool) bool {
 	return n >= int64(limit)
 }
 
-// checkRegisterRate 限制单个 IP 在自然日内的注册数量。
-//
-// 按自然日而不是滑动窗口：口径与运营直觉一致，也便于在管理页解释。
-// db / inclusive 的含义见 checkDomainRate。
 func (s *Services) checkRegisterRate(db *gorm.DB, ip string, inclusive bool) error {
 	limit := s.Settings.Int(KeyRegisterMaxPerIP)
 	if limit <= 0 || ip == "" {
@@ -420,7 +313,6 @@ func (s *Services) checkRegisterRate(db *gorm.DB, ip string, inclusive bool) err
 	if err := db.Model(&model.User{}).
 		Where("register_ip = ? AND created_at >= ?", ip, dayStart).
 		Count(&n).Error; err != nil {
-		// 统计失败时放行：宁可漏拦，也不要因为统计问题挡住正常用户。
 		return nil
 	}
 	if overLimit(n, limit, inclusive) {
@@ -429,13 +321,11 @@ func (s *Services) checkRegisterRate(db *gorm.DB, ip string, inclusive bool) err
 	return nil
 }
 
-// Authenticate 校验用户凭据。
 func (s *Services) Authenticate(username, password, ip string) (*model.User, error) {
 	username = strings.TrimSpace(username)
 	var u model.User
 	err := s.DB.Where("username = ?", username).First(&u).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		// 即使用户不存在也执行一次哈希校验，抹平响应时间差异，避免用户名枚举。
 		auth.VerifyPassword("$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin", password)
 		return nil, ErrBadCredentials
 	}
@@ -450,10 +340,6 @@ func (s *Services) Authenticate(username, password, ip string) (*model.User, err
 	}
 
 	now := time.Now()
-	// 凭据已经校验通过，审计字段写失败不该把用户挡在门外（fail-open）；
-	// 但也不能像以前那样 `_ =` 丢掉错误——否则后台的「最后登录」会长期陈旧
-	// 且没有任何线索可查。这里记一条日志，返回值仍由 LoadUser 重新读库，
-	// 因此接口回显的永远是库里的真实值，不会出现「时间对得上、库里没有」。
 	if err := s.DB.Model(&model.User{}).Where("id = ?", u.ID).
 		Updates(map[string]any{"last_login_at": now, "last_login_ip": ip}).Error; err != nil {
 		log.Printf("[auth] 记录用户 %d 的登录时间/IP 失败（登录已通过，审计字段未更新）: %v", u.ID, err)
@@ -463,7 +349,6 @@ func (s *Services) Authenticate(username, password, ip string) (*model.User, err
 	return s.LoadUser(u.ID)
 }
 
-// LoadUser 载入用户并预加载分组。
 func (s *Services) LoadUser(id uint) (*model.User, error) {
 	var u model.User
 	if err := s.DB.Preload("Group").First(&u, id).Error; err != nil {
@@ -476,7 +361,6 @@ func (s *Services) LoadUser(id uint) (*model.User, error) {
 	return &u, nil
 }
 
-// LoadUserByAPIKey 通过 API Key 明文定位用户。
 func (s *Services) LoadUserByAPIKey(plain string) (*model.User, error) {
 	if plain == "" {
 		return nil, ErrNotFound
@@ -496,10 +380,6 @@ func (s *Services) LoadUserByAPIKey(plain string) (*model.User, error) {
 	return &u, nil
 }
 
-// LoadUserByClientSecret 通过客户端接入凭据定位用户。
-//
-// 桌面客户端只持有该凭据（而非账号密码），既避免本地留存口令，
-// 又支持在服务端单独吊销。
 func (s *Services) LoadUserByClientSecret(secret string) (*model.User, error) {
 	if secret == "" {
 		return nil, ErrNotFound
@@ -518,7 +398,6 @@ func (s *Services) LoadUserByClientSecret(secret string) (*model.User, error) {
 	return &u, nil
 }
 
-// RotateAPIKey 重置 API Key，返回仅此一次可见的明文。
 func (s *Services) RotateAPIKey(userID uint) (plain, prefix string, err error) {
 	plain, prefix, hash, err := auth.GenerateAPIKey()
 	if err != nil {
@@ -530,9 +409,6 @@ func (s *Services) RotateAPIKey(userID uint) (plain, prefix string, err error) {
 	}
 	now := time.Now()
 
-	// 与重置客户端凭据同一套：用户锁 + 行锁串行并发轮换，并校验 RowsAffected。
-	// 否则两个请求都可能返回「成功」，库里却只有最后写入的一份密钥；用户不
-	// 存在时也会静默成功。
 	lock := s.userLock(userID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -566,7 +442,6 @@ func (s *Services) RotateAPIKey(userID uint) (plain, prefix string, err error) {
 	return plain, prefix, nil
 }
 
-// RevealAPIKey 解密回显当前 API Key（供控制台复制）。
 func (s *Services) RevealAPIKey(u *model.User) (string, error) {
 	if u.APIKeyEnc == "" {
 		return "", ErrNotFound
@@ -574,10 +449,6 @@ func (s *Services) RevealAPIKey(u *model.User) (string, error) {
 	return auth.DecryptAPIKey(s.Cfg.APIKeyEncKey, u.APIKeyEnc)
 }
 
-// IsValidEmail 做基础格式校验：恰好一个 @，域名部分为合法主机名。
-//
-// 不做完整 RFC 5322 校验——邮箱的真实性只能靠验证邮件确认，
-// 而本项目暂未实现邮件发送，因此这里只拦截明显错误的输入。
 func IsValidEmail(s string) bool {
 	if s == "" || len(s) > 128 {
 		return false
@@ -596,7 +467,6 @@ func IsValidEmail(s string) bool {
 	return isValidHostname(domain)
 }
 
-// isSafeName 限制用户名可用字符，避免其进入 frp 的 proxy 名前缀时引入注入风险。
 func isSafeName(s string) bool {
 	for _, r := range s {
 		switch {
@@ -611,5 +481,4 @@ func isSafeName(s string) bool {
 	return true
 }
 
-// IsSafeName 导出给处理器复用。
 func IsSafeName(s string) bool { return isSafeName(s) }

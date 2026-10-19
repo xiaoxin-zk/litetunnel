@@ -1,4 +1,3 @@
-// Package store 负责数据库连接、结构迁移与初始数据播种。
 package store
 
 import (
@@ -19,7 +18,6 @@ import (
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
 
-// Open 建立数据库连接并完成迁移。
 func Open(cfg *config.Config) (*gorm.DB, error) {
 	logLevel := logger.Warn
 	if cfg.LogLevel == "debug" {
@@ -41,7 +39,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 				return nil, fmt.Errorf("创建数据目录失败: %w", mkErr)
 			}
 		}
-		// _pragma 参数启用 WAL 与忙等待，显著提升并发读写表现。
 		dsn := cfg.DBDSN
 		if !strings.Contains(dsn, "_pragma") {
 			dsn = dsn + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
@@ -60,8 +57,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 后续任一步失败都关掉连接再返回：否则调用方拿到 nil + error 之后
-	// 没有句柄可以关闭，进程（或测试）会一直占着数据库文件。
 	opened := false
 	defer func() {
 		if !opened {
@@ -69,7 +64,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		}
 	}()
 	if cfg.DBDriver == "sqlite" {
-		// SQLite 单写者模型，连接数过多反而增加锁竞争。
 		sqlDB.SetMaxOpenConns(1)
 		sqlDB.SetMaxIdleConns(1)
 	} else {
@@ -83,8 +77,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.User{},
 		&model.Admin{},
 		&model.Tunnel{},
-		// 隧道清单修订号：客户端分页同步时靠它判断多页之间有没有发生变化。
-		// 由触发器维护，见 ensureTunnelListRevTriggers。
 		&model.TunnelListRev{},
 		&model.RedeemCode{},
 		&model.RedeemRecord{},
@@ -95,40 +87,18 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		&model.PasswordResetToken{},
 		&model.EmailCode{},
 		&model.Setting{},
-		// 待重试的防火墙端口操作：必须落库，否则进程重启后丢失，
-		// 那条本该收回的规则会一直留在宿主机上。
 		&model.FirewallPending{},
-		// 防火墙待办代次的跨实例单调序列：多实例下用落库序列而不是进程内
-		// 计数器，保证代次全局单调。
 		&model.FirewallSeq{},
-		// 流量采样基线：必须落库，否则控制面重启后会把当天已有流量
-		// 重复计入一遍（frps 没重启时它的当日累计值还在）。
 		&model.TrafficBaseline{},
-		// 基线对应的清零代次：与基线同生共死，重启/换手后据此判断
-		// 「期间有没有被清零过」。
 		&model.TrafficResetMark{},
-		// 发件箱：必须落库，否则重启丢信、失败即弃，而验证码与重置链接
-		// 会在「信进队列」时就作废旧凭据——用户就再也找不回账号了。
 		&model.MailOutbox{},
-		// 跨实例租约：多实例部署时用它保证「同一件事只有一个实例在做」
-		// （目前是流量采集）。放在库里而不是内存里，正是为了让别的进程看得见。
 		&model.RuntimeLease{},
-		// 待重试的代理断流：必须落库，否则 frps 临时不可用那一次断流就永久
-		// 丢了——账号已禁用/已删除，数据流却还在转发，且重启后连日志线索
-		// 都没有。删号路径下 users 行已经不存在，所以待办自己存 UserID 与
-		// 前缀，不能靠 join 用户表。
 		&model.ProxyDrainPending{},
-		// 账号级登录失败计数：必须落库，否则多实例部署时同一账号的失败次数
-		// 被负载均衡分散到各实例，验证码阈值按实例数衰减——攻击者拿到 N 倍
-		// 额度，而且没有任何报错。累加走唯一索引上的原子 upsert。
 		&model.LoginFailCounter{},
 	); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
 
-	// 种子：防火墙代次序列。单行（ID=1），Next 从现有待办代次之上起步，
-	// 避免与升级前用进程内计数器写下的旧代次撞车（撞了会让条件写失效）。
-	// OnConflict DoNothing 保证幂等：并发启动 / 重启时只有第一次真正写入。
 	row := db.Model(&model.FirewallPending{}).Select("COALESCE(MAX(generation), 0)").Row()
 	var maxGen int64
 	if err := row.Scan(&maxGen); err != nil {
@@ -141,8 +111,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("初始化防火墙序列失败: %w", err)
 	}
 
-	// 端口唯一性由数据库兜底：并发分配同一端口时会被这里直接拒绝。
-	// 使用部分唯一索引是因为 HTTP/HTTPS 隧道的 remote_port 恒为 0，允许重复。
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_tunnels_remote_port
 		 ON lt_tunnels(remote_port) WHERE remote_port > 0`,
@@ -150,15 +118,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("创建端口唯一索引失败: %w", err)
 	}
 
-	// 邮箱唯一性由数据库兜底：邮箱是「找回密码」的寻址依据，两条记录共用
-	// 同一个邮箱时，验证码可能发到别人手里。
-	//
-	// 索引建在 lower(email) 上，与查账号时的大小写归一一致；
-	// 用部分索引排除空邮箱（允许没填邮箱的账号）。
-	//
-	// 这里是**尽力而为**：老库里可能已经有重复邮箱（早期没有约束），
-	// 建不上只记警告、不阻断启动——否则升级时整个服务起不来。
-	// 注册与换绑路径上都还有代码级检查，正常运行不会产生新的重复。
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_users_email_unique
 		 ON lt_users(lower(email)) WHERE email <> ''`,
@@ -166,19 +125,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		log.Printf("[store] 邮箱唯一索引未建立（历史数据可能存在重复邮箱，请人工清理后重启）：%v", err)
 	}
 
-	// 一封邮件最多激活出一条凭据。
-	//
-	// 多实例并发激活同一封邮件时，两边的「已激活」检查可能都落空，各插一条
-	// 相同验证码；而校验只消费命中的那一条，另一条仍然可用——一次性语义就没了。
-	// 代码里的领取已经避免了这种并发，唯一索引是最后一道保险。
-	//
-	// 建索引前先清掉历史重复：旧版本可能已经留下这种数据，不清的话索引建不上，
-	// 而那些**未使用的重复记录仍然可用**——等于漏洞还在。
-	// 这两步失败一律**拒绝启动**：没有唯一约束时，旧库里同一封邮件对应的
-	// 多条未使用凭据仍然可用（一次性语义已破），而且不会有任何运行期报错。
-	// 与其带着这个洞跑，不如让运维先修数据——消息里写清了要清理哪张表。
-	// 索引已经存在就说明数据是干净的（唯一约束保证不会有重复），
-	// 不必每次启动都分组扫两张表。
 	if !db.Migrator().HasIndex(&model.EmailCode{}, "idx_lt_email_codes_mail_uniq") ||
 		!db.Migrator().HasIndex(&model.PasswordResetToken{}, "idx_lt_reset_tokens_mail_uniq") {
 		if err := dedupeMailCredentials(db); err != nil {
@@ -199,20 +145,14 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("创建重置令牌来源唯一索引失败（请清理 lt_password_reset_tokens 中重复的 mail_id 后重启）: %w", err)
 	}
 
-	// 清理旧版本遗留的邮件草稿，见 purgeLegacyMailDrafts 的说明。
 	if err := purgeLegacyMailDrafts(db); err != nil {
-		// 不阻断启动：这些行最多是「多占一点额度、多留一段敏感内容」，
-		// 而启动失败是整个服务不可用。下次启动会再试一次（幂等）。
 		log.Printf("[store] 清理遗留邮件草稿失败（下次启动重试）：%v", err)
 	}
 
-	// 历史账号补上生命周期标识。必须早于任何「按标识判断待办归属」的读取，
-	// 且幂等：只填空值，失败下次启动重试。
 	if err := model.BackfillIncarnations(db); err != nil {
 		return nil, fmt.Errorf("回填账号生命周期标识失败: %w", err)
 	}
 
-	// 隧道清单修订号由触发器维护，见 ensureTunnelListRevTriggers 的说明。
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {
 		return nil, fmt.Errorf("创建隧道清单修订号触发器失败: %w", err)
 	}
@@ -221,14 +161,6 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	return db, nil
 }
 
-// dedupeMailCredentials 清理「同一封邮件激活出多条凭据」的历史数据。
-//
-// 旧版本在多实例下可能并发激活同一封邮件：两边的「已激活」检查都落空，
-// 各插一条相同验证码/令牌。校验时只消费命中的那一条，其余几条**仍然可用**，
-// 一次性语义已经破了——不只是索引建不上那么简单。
-//
-// 每组只保留 id 最大的一条（与「最新凭据胜出」的口径一致）。已使用过的
-// 重复记录一并删掉：它们不能再被使用，留着只会挡住唯一索引。
 func dedupeMailCredentials(db *gorm.DB) error {
 	tables := []struct{ name, label string }{
 		{"lt_email_codes", "验证码"},
@@ -252,15 +184,6 @@ func dedupeMailCredentials(db *gorm.DB) error {
 	return nil
 }
 
-// purgeLegacyMailDrafts 把旧版本遗留的邮件草稿按失败处理，并清空敏感内容。
-//
-// 某个中间版本用 status='draft' 表示「已写好、待复核额度」：复核通过转
-// pending，超限则作废。进程若在两步之间崩溃，库里就会留下这种行——正文与
-// 参数里是**明文验证码或重置链接**，而清理任务只回收 failed / sent，
-// 这些内容会永久留在库里；同时它们还会被发信额度统计算进去。
-//
-// 现在的流程已不再写 draft（复核在写入之前），所以这是一次性的数据订正：
-// 升级后第一次启动清掉，之后每次启动匹配不到任何行。幂等。
 func purgeLegacyMailDrafts(db *gorm.DB) error {
 	res := db.Exec(
 		`UPDATE lt_mail_outbox
@@ -277,12 +200,6 @@ func purgeLegacyMailDrafts(db *gorm.DB) error {
 	return nil
 }
 
-// tunnelListRevColumns 是参与清单版本的隧道字段，必须与客户端对账时
-// 用到的字段一致（model.Tunnel 里改动这些字段时同步改这里）。
-//
-// 刻意**不含** traffic_used / last_online_at / remark / updated_at：
-// 采集器每轮都写流量与在线时间，把它们计入版本会让客户端的多页同步
-// 被无谓地反复打断。user_id 在列里是为了「隧道改归属」也能被看见。
 var tunnelListRevColumns = []string{
 	"status", "name", "type",
 	"local_ip", "local_port", "remote_port",
@@ -292,15 +209,6 @@ var tunnelListRevColumns = []string{
 	"user_id",
 }
 
-// ensureTunnelListRevTriggers 创建维护 lt_tunnel_list_revs 的触发器。
-//
-// 为什么用触发器而不是在业务代码里递增：写隧道的入口有十来处（建、改、
-// 删、启停、批量、管理员改归属、兑换改套餐、删除用户），漏掉任何一处都
-// 只会让客户端「少发现一次变更」，而且很难测出来。触发器覆盖所有写入
-// （包括将来新增的路径与批量 SQL），且与数据变更在同一个事务里。
-//
-// 两个驱动都不支持对方的触发器语法，所以分驱动写。语句都是幂等的
-// （IF NOT EXISTS / CREATE OR REPLACE + DROP IF EXISTS），每次启动重放无妨。
 func ensureTunnelListRevTriggers(db *gorm.DB, driver string) error {
 	cols := strings.Join(tunnelListRevColumns, ", ")
 
@@ -318,8 +226,6 @@ BEGIN
 	INSERT INTO lt_tunnel_list_revs (user_id, rev) VALUES (NEW.user_id, 1)
 		ON CONFLICT (user_id) DO UPDATE SET rev = rev + 1;
 END`, cols),
-			// 改归属时，旧用户那一侧也要变：否则旧用户的清单版本不动，
-			// 客户端会把「少了一条」当成还没同步完。
 			`CREATE TRIGGER IF NOT EXISTS lt_tunnels_rev_mv AFTER UPDATE OF user_id ON lt_tunnels
 WHEN OLD.user_id <> NEW.user_id
 BEGIN
@@ -372,10 +278,6 @@ $lt$ LANGUAGE plpgsql`,
 	return nil
 }
 
-// Seed 播种默认分组与初始管理员（幂等）。
-//
-// 返回 createdAdmin 表示本次是否真的创建了初始管理员：
-// 只有在首次创建时，调用方才应把初始密码打印出来，否则重启后会打印出无效密码。
 func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, error)) (createdAdmin bool, err error) {
 	var groupCount int64
 	if err := db.Model(&model.Group{}).Count(&groupCount).Error; err != nil {
@@ -388,8 +290,8 @@ func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, er
 				Description:    "默认分组，适合个人测试与轻量使用",
 				MaxTunnels:     2,
 				MaxPorts:       2,
-				TrafficQuota:   20 * 1024 * 1024 * 1024, // 20 GiB
-				BandwidthLimit: 4 * 1024 * 1024,         // 4 Mbps
+				TrafficQuota:   20 * 1024 * 1024 * 1024,
+				BandwidthLimit: 4 * 1024 * 1024,
 				AllowProtocols: "tcp,udp",
 				Priority:       0,
 				IsDefault:      true,
@@ -399,8 +301,8 @@ func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, er
 				Description:         "支持网站与自定义域名",
 				MaxTunnels:          10,
 				MaxPorts:            10,
-				TrafficQuota:        200 * 1024 * 1024 * 1024, // 200 GiB
-				BandwidthLimit:      20 * 1024 * 1024,         // 20 Mbps
+				TrafficQuota:        200 * 1024 * 1024 * 1024,
+				BandwidthLimit:      20 * 1024 * 1024,
 				AllowProtocols:      "tcp,udp,http,https",
 				AllowCustomDomain:   true,
 				AllowPrivilegedPort: false,
@@ -412,7 +314,7 @@ func Seed(db *gorm.DB, cfg *config.Config, hashPassword func(string) (string, er
 				MaxTunnels:          0,
 				MaxPorts:            30,
 				TrafficQuota:        0,
-				BandwidthLimit:      100 * 1024 * 1024, // 100 Mbps
+				BandwidthLimit:      100 * 1024 * 1024,
 				AllowProtocols:      "tcp,udp,http,https",
 				AllowCustomDomain:   true,
 				AllowPrivilegedPort: false,

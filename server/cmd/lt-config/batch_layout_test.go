@@ -7,15 +7,6 @@ import (
 	"testing"
 )
 
-// 默认部署布局的崩溃恢复。
-//
-// 三个受管文件本来就不在同一棵子树下：Caddyfile 在 deploy/caddy、
-// frps.toml 在 deploy/frps、.env 在 deploy 的父目录。批次记录只能放在
-// 其中一个目录里，因此「按目录前缀判断越界」必然误拒正常布局——恢复
-// 失败，目录被永久阻断，之后所有写盘都不可用。
-//
-// 这里模拟一次「文件已全部换新、记录还没落定」的崩溃，断言整批能按记录
-// 回滚，且不产生阻断。
 func TestRecoverBatchAcrossDefaultLayout(t *testing.T) {
 	root := t.TempDir()
 	deploy := filepath.Join(root, "deploy")
@@ -34,7 +25,6 @@ func TestRecoverBatchAcrossDefaultLayout(t *testing.T) {
 	}
 	entries := make([]manifestEntry, 0, len(oldContent))
 	for path, old := range oldContent {
-		// 崩溃现场：备份是旧内容，目标是已换上的新内容。
 		if err := os.WriteFile(path+backupSuffix, []byte(old), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -50,7 +40,6 @@ func TestRecoverBatchAcrossDefaultLayout(t *testing.T) {
 		})
 	}
 
-	// 记录放在第一个文件所在目录，与生产写入路径一致。
 	m := batchManifest{Version: 1, Dir: caddyDir, Files: entries}
 	raw, err := json.Marshal(m)
 	if err != nil {

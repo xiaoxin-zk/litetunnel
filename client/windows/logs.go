@@ -9,10 +9,6 @@ import (
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// shortLine 截断一行文本用于日志展示。
-//
-// 必须按字符边界切：直接 s[:64] 会切在 UTF-8 中间，中文一行 22 个字就到
-// 64 字节，「隧道名 + 中文说明」经常正好落在切口上，显示成半个乱码（�）。
 func shortLine(s string) string {
 	s = strings.TrimSpace(s)
 	const max = 64
@@ -26,23 +22,10 @@ func shortLine(s string) string {
 	return s[:cut] + "…"
 }
 
-// emitLog 往运行日志里追加一行客户端自身的说明（不带隧道前缀）。
-//
-// 走 Manager 的统一缓冲而不是只进推送队列：历史快照与实时推送必须是同一份
-// 数据，否则界面重新加载日志时，启动同步、重连这类说明会凭空消失。
-//
-// 这一版按**调用时刻**的账号代次盖章，只适用于「就在当前账号的同步流程里」
-// 的调用点。异步路径（退出回调、迟到的收尾说明）必须用带 acct 的版本：
-// 它们在跑完之前账号可能已经换了一茬，盖章时再取就盖成了新账号。
 func (a *App) emitLog(msg string) {
 	a.emitLogEpoch(a.captureEpoch(), msg)
 }
 
-// emitLogEpoch 以指定账号代次写一行客户端说明。
-//
-// 代次会在两个地方生效：这里先按它挡一次（不属于当前账号的迟到调用连
-// 日志都不产生），再由投递回调按代次写进待推送队列、由 flush 再挡一次
-// （挡「检查通过之后才发生登出」的那个窗口）。
 func (a *App) emitLogEpoch(acct accountEpoch, msg string) {
 	if a.mgr == nil {
 		return
@@ -53,17 +36,10 @@ func (a *App) emitLogEpoch(acct accountEpoch, msg string) {
 	a.mgr.AppendRawAccount(uint64(acct), time.Now().Format("15:04:05")+"  "+msg)
 }
 
-// emitTunnelLog 往运行日志里追加一行带隧道前缀的说明。
-//
-// 前缀格式与 frpc 子进程的输出一致（Tunnel/<名字>），
-// 这样「客户端说的话」和「frpc 说的话」在日志里能按隧道对齐——
-// 每条隧道一个进程之后，日志是多个进程交织在一起的，
-// 没有前缀就分不出哪一行属于哪条隧道。
 func (a *App) emitTunnelLog(name, msg string) {
 	a.emitTunnelLogEpoch(a.captureEpoch(), name, msg)
 }
 
-// emitTunnelLogEpoch 以指定账号代次写一行隧道说明（语义见 emitLogEpoch）。
 func (a *App) emitTunnelLogEpoch(acct accountEpoch, name, msg string) {
 	if a.mgr == nil {
 		return
@@ -75,67 +51,22 @@ func (a *App) emitTunnelLogEpoch(acct accountEpoch, name, msg string) {
 		fmt.Sprintf("%s  Tunnel/%s  %s", time.Now().Format("15:04:05"), name, msg))
 }
 
-// pendingLog 是一条等待推送的日志。
-//
-// 带序号是为了让「清空」能挡住清空前产生、清空后才入队的在途行。
-//
-// 带账号代次是因为序号挡不住另一半：清空之后才**产生**的旧账号行（迟到
-// 回调写的「隧道已断开」「第 3 次失败」，或旧进程退出的收尾日志）序号比
-// 清空点大，按序号看完全合法，但内容属于上一个账号。代次让这类行在
-// 入队与出队时各被拦一次。
 type pendingLog struct {
 	acct accountEpoch
 	seq  uint64
 	text string
 }
 
-// maxLogBatch 是一批日志的上限。
-//
-// 有上限是为了控制单次事件的大小：一次推几千行会让前端在一次事件处理里
-// 做几千次数组操作，首屏也要等更久才看到第一行。
-//
-// 它同时是**每次 flush 的取出上限**（不只是触发阈值）：只拿它当阈值、
-// flush 时一次取走整个队列的话，积压越久单次事件就越大，正好把这里的
-// 上限意义抵消掉。
 const maxLogBatch = 200
 
-// maxLogQueue 是待推送队列的容量上限。
-//
-// 必须有上限：生产速度超过推送速度时（前端消费慢、frpc 持续刷日志），
-// 队列会无界增长，而这段内存恰好在「日志最多」的时候涨得最快——那正是
-// 出故障、最需要客户端还能响应的时刻。
-//
-// 取 2000：按每 120ms 推 200 行算，约 1.2 秒的缓冲，足够吸收正常抖动；
-// 再大就只是拿内存换更旧的日志。
 const maxLogQueue = 2000
 
-// maxLogQueueBytes 是待推送队列的总字节上限。
-//
-// 只限行数挡不住「每行都很长」：单行在 frpc 那边可以留到 1 MiB，2000 行
-// 就是 2 GiB。两份预算都设，谁先到按谁裁。
 const maxLogQueueBytes = 1024 * 1024
 
-// maxLogBatchBytes 是单次推送事件的总字节上限。
-//
-// 与 maxLogBatch 的关系同理：200 行 × 1 MiB 的事件要序列化、跨进程传、
-// 再在 JS 里处理，会把 Wails 那条桥堵住很久——而桥一堵，后面所有事件
-// （包括界面刷新）都排在它后面。
 const maxLogBatchBytes = 128 * 1024
 
-// logFlushInterval 是日志批量推送的间隔。
-//
-// 取 120ms：略大于人眼能分辨的停顿，日志看起来仍是实时滚动的；而事件数
-// 上限变为约 8 次/秒，无论瞬间涌进多少行。frpc 连接失败时会在一瞬间刷出
-// 上千行错误，逐行推送意味着上千次跨进程调用——前端那边的 200ms 合并渲染
-// 只减少了 DOM 更新，挡不住这层开销，真正被堵住的是这条桥。
 const logFlushInterval = 120 * time.Millisecond
 
-// appendLogLineAcct 把一行日志放进待推送队列，返回是否真的入队。
-//
-// 返回值是「这行仍属于当前账号」的判据：被清空点挡下的行（seq <=
-// logDroppedSeq）来自已经清掉的历史，被代次挡下的行来自上一个账号。
-// 回调必须用它来决定是否允许这行**改动运行态**——日志可以丢，状态
-// 不能被旧行改写。
 func (a *App) appendLogLineAcct(acct accountEpoch, seq uint64, line string) bool {
 	if a.ctx == nil {
 		return false
@@ -144,34 +75,19 @@ func (a *App) appendLogLineAcct(acct accountEpoch, seq uint64, line string) bool
 	if !accepted {
 		return false
 	}
-	// 攒满一批就立刻推，不等下一个时间片：一味等间隔会让日志洪峰时的
-	// 延迟随着挤压行数一起增长（队列越长，轮到它越晚）。
 	if batchReady {
 		select {
 		case a.logKick <- struct{}{}:
 		default:
-			// 推送协程还没处理完上一次通知：它醒来时会取走一批。
 		}
 	}
 	return true
 }
 
-// pushLog 入队一行，按当前账号代次盖章（见 pushLogAcct）。
-//
-// 保留这个签名是给测试与「确实产生于当前账号」的调用方用的。
 func (a *App) pushLog(seq uint64, line string) (accepted, batchReady bool) {
 	return a.pushLogAcct(a.captureEpoch(), seq, line)
 }
 
-// pushLogAcct 入队一行，返回「是否入队」与「是否已经攒够一批可以立刻推送」。
-//
-// 两个返回值必须分开：调用方需要知道这一行是否属于当前账号（据此决定
-// 能否改运行态），而「攒够一批」只是推送时机的提示，不能当作入队与否。
-//
-// 账号代次检查放在加锁之前：epochCurrent 要拿 a.mu，而日志的锁序是
-// logMu → mu（见 currentLogEpoch 的说明），在这里先读、再进 logMu，
-// 与既有顺序一致。检查本身不可能覆盖「读完到入队之间换了号」的窗口，
-// 那一半由 takeLogBatchWithEpoch 在出队时再挡一次。
 func (a *App) pushLogAcct(acct accountEpoch, seq uint64, line string) (accepted, batchReady bool) {
 	if acct.known() && !a.epochCurrent(acct) {
 		return false, false
@@ -180,20 +96,10 @@ func (a *App) pushLogAcct(acct accountEpoch, seq uint64, line string) (accepted,
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 
-	// 清空前产生的行即使晚到也不再入队：它们属于用户已经清掉的那段历史。
 	if seq != 0 && seq <= a.logDroppedSeq {
 		return false, false
 	}
 
-	// 队列满了丢掉**最旧**的一批：日志是有时效的，留下最近的才能解释
-	// 「刚才发生了什么」；丢最新的会让用户盯着一段早已过去的开头，
-	// 而真正触发问题的那些行反而没了。
-	//
-	// 行数与总字节两份预算，谁先到按谁裁：单行可以很长，只数行数的话
-	// 「2000 行 × 1 MiB」照样能把内存吃光。
-	//
-	// 一次丢一批（1/4）而不是逐条丢：逐条丢意味着每来一行都要把剩下的元素
-	// 整体前移，在日志洪峰时这本身就成了新瓶颈——恰恰是这里要避免的事。
 	if len(a.logBuf) >= maxLogQueue || a.logBufBytes >= maxLogQueueBytes {
 		drop := len(a.logBuf) / 4
 		if drop < 1 {
@@ -211,10 +117,6 @@ func (a *App) pushLogAcct(acct accountEpoch, seq uint64, line string) (accepted,
 	return true, len(a.logBuf) >= maxLogBatch
 }
 
-// takeLogBatch 取出一批待推送的日志行；没有内容时返回 nil。
-//
-// 一次最多取 maxLogBatch 行，剩下的留给下一轮：单次事件的尺寸因此有上界，
-// 与积压了多久无关。
 func (a *App) takeLogBatch() []string {
 	items, _ := a.takeLogBatchWithEpoch()
 	out := make([]string, len(items))
@@ -224,11 +126,6 @@ func (a *App) takeLogBatch() []string {
 	return out
 }
 
-// dropForeignLogsLocked 丢掉队列里属于其他账号的行。
-//
-// 调用方必须已持有 logMu。只丢「明确属于别的账号」的行：acct 为
-// noEpoch 的行产生于接入之前，它们不属于任何已结束的会话，没有理由
-// 因为一次登录而被抹掉（那会让「正在接入…」这类诊断行凭空消失）。
 func (a *App) dropForeignLogsLocked(cur accountEpoch) {
 	kept := a.logBuf[:0]
 	for _, it := range a.logBuf {
@@ -241,23 +138,12 @@ func (a *App) dropForeignLogsLocked(cur accountEpoch) {
 	a.logBuf = kept
 }
 
-// takeLogBatchWithEpoch 取出批次，并在**同一把锁内**捕获当时的代次。
-//
-// 分两步（先取批次、再读代次）会有一个窄窗口：清空恰好发生在两步之间时，
-// 清空前的批次会被标成新代次，前端就过滤不掉了。
 func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
-	// 账号代次在进 logMu 之前读：日志的锁序是 logMu → mu（见 pushLogAcct）。
 	acct := a.captureEpoch()
 
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 
-	// 出队前再按账号筛一遍。
-	//
-	// 入队那次检查与登出之间存在一个窗口：行通过了检查、还没进队列时，
-	// 用户点了退出登录并清理了日志——于是这一行带着旧代次躺在队列里。
-	// 队列在清空时是空的，所以它不会被清空拦住；只有这里能挡下它。
-	// 没有这个过滤，换账号后界面仍会先冒出上一段日志。
 	a.dropForeignLogsLocked(acct)
 
 	if len(a.logBuf) == 0 && a.logDropped == 0 {
@@ -269,12 +155,6 @@ func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 		n = maxLogBatch
 	}
 
-	// 再按总字节收一次：行数上限挡不住「每行都很长」，而一次事件过大
-	// 会把 Wails 那条桥堵住——桥一堵，后面所有事件都跟着排队。
-	//
-	// 第一行无条件取（判断条件带 limit > 0）：单行本身就超预算时也得发出去，
-	// 否则这一行永远清不出队列，后面的日志全部堵在它后面。
-	// n == 0 是「只剩一条丢弃提示」的情况，此处不会取行。
 	bytes := 0
 	limit := 0
 	for limit < n {
@@ -287,10 +167,6 @@ func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 	}
 	n = limit
 
-	// 丢弃提示单独占一行插在最前面：静默丢日志比丢日志本身更糟——
-	// 用户会以为自己看到了完整的现场。它必须拿一个真实序号（经 Manager
-	// 分配并进入历史）：seq=0 这个「永远通过过滤」的特殊值会绕开清空点，
-	// 清空后仍可能被当成新账号日志回流。真实序号让它与普通日志一样受约束。
 	batch := make([]pendingLog, 0, n+1)
 	if a.logDropped > 0 {
 		msg := fmt.Sprintf("%s  [客户端] 日志积压，已丢弃 %d 行较早的记录",
@@ -307,33 +183,22 @@ func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 		a.logBufBytes -= len(a.logBuf[i].text)
 	}
 
-	// 从头部截断而不是重新分配：剩下的是「更新的那部分」，顺序不变。
 	a.logBuf = a.logBuf[n:]
 	return batch, a.logEpoch
 }
 
-// currentLogEpoch 返回当前日志代次。
-//
-// 单独抽出来是为了把「怎么加锁」收在一处：GetState 已经持着 a.mu，
-// 不能在那里直接读 a.logEpoch（那是 logMu 的职责，混着读会形成
-// mu → logMu 的锁序）。这个方法的调用方必须**不持** a.mu。
 func (a *App) currentLogEpoch() uint64 {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 	return a.logEpoch
 }
 
-// logBatchEvent 是推送给前端的日志批次。
-//
-// epoch 用来丢弃「清空之前发出、清空之后才到」的旧批次；
-// seqs 用来让前端按序号去重——快照与实时事件可能包含同一行。
 type logBatchEvent struct {
 	Epoch uint64   `json:"epoch"`
 	Seqs  []uint64 `json:"seqs"`
 	Lines []string `json:"lines"`
 }
 
-// flushLogs 把队列里攒下的日志行成批推给前端。
 func (a *App) flushLogs() {
 	if a.ctx == nil {
 		return
@@ -350,10 +215,6 @@ func (a *App) flushLogs() {
 	wailsruntime.EventsEmit(a.ctx, "logs", ev)
 }
 
-// startLogFlusher 启动批量推送协程，进程生命周期内常驻。
-//
-// logKick 为 nil 时这里仍要能工作：nil 通道在 select 里永远不就绪，
-// 于是退化成纯定时推送——不能因为少初始化一个 channel 就让日志彻底不显示。
 func (a *App) startLogFlusher() {
 	a.logWg.Add(1)
 	go func() {
@@ -365,7 +226,6 @@ func (a *App) startLogFlusher() {
 			case <-ticker.C:
 			case <-a.logKick:
 			case <-a.logStop:
-				// 退出前把队列剩下的推出去，别让最后几行收尾日志丢在缓冲区里。
 				a.flushLogs()
 				return
 			}
@@ -374,23 +234,12 @@ func (a *App) startLogFlusher() {
 	}()
 }
 
-// LogSnapshot 是日志快照，连同它所属的代次与每行序号一起返回。
-//
-// 序号是去重的依据：前端加载快照时，可能有同一批日志正通过事件到达，
-// 只比代次会把它们重复追加一次。
 type LogSnapshot struct {
 	Epoch uint64   `json:"epoch"`
 	Seqs  []uint64 `json:"seqs"`
 	Lines []string `json:"lines"`
 }
 
-// GetLogs 返回日志快照。
-//
-// 快照来自 Manager 的统一缓冲，因此 frpc 输出与客户端自身说明都在里面，
-// 顺序也与实时推送一致（两者由同一把锁串行化）。
-//
-// 代次与快照在同一把锁内读取：分开读会让「清空」插在中间，
-// 返回一份代次与内容对不上的快照。
 func (a *App) GetLogs() LogSnapshot {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
@@ -409,20 +258,11 @@ func (a *App) GetLogs() LogSnapshot {
 	return snap
 }
 
-// LogCleared 是清空操作的结果。
 type LogCleared struct {
 	Epoch uint64 `json:"epoch"`
 }
 
-// ClearLogs 清空日志缓冲。
-//
-// 三处状态必须一起清：Manager 的历史、待推送队列、以及代次。
-// 只清历史的话，队列里已经攒下的行会在下一次 flush 时照常出现，
-// 用户看到的就是「点了清空，日志又自己冒回来」。
 func (a *App) ClearLogs() LogCleared {
-	// 整个清理都在 logMu 内完成：GetLogs 也在这把锁内读历史与代次，
-	// 两者因此互斥。分开做的话，并发刷新可能读到「新代次 + 旧历史」
-	// 或反过来，表现为清空后日志短暂恢复、顺序错乱。
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
 

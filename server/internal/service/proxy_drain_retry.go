@@ -422,7 +422,17 @@ const (
 // 「按名字盲关」：状态版本决定要不要动手，notAfter 决定关哪些名字。
 func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrainIntent, bool) {
 	if row.Deleted {
-		// 账号已删：没有「重新启用」这回事，按删号语义继续。
+		// 账号已删：没有「重新启用」这回事，按删号语义继续——
+		// 但必须先排除「这个 ID 已经被另一个账号占用」。导入/恢复流程复用
+		// 自增 ID 时，旧删号待办的前缀与新账号完全相同，照着关就会打掉
+		// 新账号刚建立的代理。此刻用户行存在即说明 ID 已被复用，旧意图作废。
+		if row.Incarnation != "" {
+			if _, inc, err := s.userStateVersionAndIncarnation(row.UserID); err == nil && inc != row.Incarnation {
+				log.Printf("[proxy-drain] 已删账号 %d 的 ID 已被新账号占用（%s ≠ %s），旧删号意图作废",
+					row.UserID, row.Incarnation, inc)
+				return proxyDrainIntentAbandoned, false
+			}
+		}
 		return proxyDrainIntentActive, true
 	}
 	gen, incarnation, err := s.userStateVersionAndIncarnation(row.UserID)

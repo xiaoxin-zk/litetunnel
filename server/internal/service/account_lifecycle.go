@@ -108,7 +108,7 @@ func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) 
 	// 关键：意图必须在删 users 行**之前**、且在同一事务内登记（见缺陷 1）。
 	// 这里失败会让整个事务回滚——宁可这次删除失败让用户重试，也不能留下
 	// 「账号没了、流量还活着、端口还开着、没有任何待办」的状态。
-	intents, err := recordPurgeIntentsTx(tx, userID, ports)
+	intents, err := recordPurgeIntentsTx(tx, userID, u.Incarnation, ports)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +137,7 @@ func accountPurgeTx(tx *gorm.DB, userID uint, verify func(u *model.User) error) 
 // 在事务内随时可读，但把「写意图」放在最后一条 DELETE 之前能让「事务里最后
 // 一个动作是删除」这件事保持直观——真出问题时 binlog/慢日志里看到的顺序
 // 与代码一致。
-func recordPurgeIntentsTx(tx *gorm.DB, userID uint, ports []portProto) ([]portIntent, error) {
+func recordPurgeIntentsTx(tx *gorm.DB, userID uint, incarnation string, ports []portProto) ([]portIntent, error) {
 	// 断流意图：复用既有的 ProxyDrainPending（按用户一条，带围栏令牌）。
 	//
 	// 这里只登记「意图」，真正的关闭动作在提交后由 drainProxies 立即尝试一次，
@@ -145,11 +145,12 @@ func recordPurgeIntentsTx(tx *gorm.DB, userID uint, ports []portProto) ([]portIn
 	// 账号已不存在，走「按前缀 + 实例身份尽力关闭」那条路径。
 	now := time.Now()
 	pending := model.ProxyDrainPending{
-		UserID:    userID,
-		Prefix:    FrpUserOf(userID) + ".",
-		StatusGen: 0, // 删除路径没有状态代次可比（见 StatusGen 的说明）
-		NotAfter:  0, // 删除路径用 IntentAt 作时间水位
-		Deleted:   true,
+		UserID:      userID,
+		Incarnation: incarnation,
+		Prefix:      FrpUserOf(userID) + ".",
+		StatusGen:   0, // 删除路径没有状态代次可比（见 StatusGen 的说明）
+		NotAfter:    0, // 删除路径用 IntentAt 作时间水位
+		Deleted:     true,
 		IntentAt:  now.Unix(),
 		// NextAt 兼作租约到期时间：登记时设成「现在就到期」，
 		// 后台 worker 下一轮就能领到它（提交后立即执行失败时）。
@@ -157,7 +158,7 @@ func recordPurgeIntentsTx(tx *gorm.DB, userID uint, ports []portProto) ([]portIn
 	}
 	if err := tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "user_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"prefix", "status_gen", "not_after", "deleted", "intent_at", "next_at", "attempts", "exhausted", "fence", "last_err"}),
+		DoUpdates: clause.AssignmentColumns([]string{"incarnation", "prefix", "status_gen", "not_after", "deleted", "intent_at", "next_at", "attempts", "exhausted", "fence", "last_err"}),
 	}).Create(&pending).Error; err != nil {
 		// 写不进去就让整个删号回滚：宁可这次删除失败让管理员重试，
 		// 也不能留下「账号没了、流量还活着、没有任何待办」的状态。

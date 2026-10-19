@@ -47,7 +47,7 @@ func selfUpdateEnvEnabled() bool {
 	return false
 }
 
-func dirWritable(dir string) bool {
+func canWriteDir(dir string) bool {
 	f, err := os.CreateTemp(dir, ".lt-write-test-*")
 	if err != nil {
 		return false
@@ -75,7 +75,7 @@ func (s *Services) SelfUpdateState() (bool, string) {
 		// 目前只发布 linux 面板产物；Windows 面板请用镜像或手动替换。
 		return false, "binary"
 	}
-	if !dirWritable(filepath.Dir(exe)) {
+	if !canWriteDir(filepath.Dir(exe)) {
 		return false, "binary"
 	}
 	return true, "binary"

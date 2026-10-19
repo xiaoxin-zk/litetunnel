@@ -786,7 +786,29 @@ func (m *Manager) Closed() bool {
 	return m.closed
 }
 
-// findFrpc 依次在可执行文件目录、当前目录与 PATH 中查找 frpc。
+// strictLookup 表示「只允许程序自带目录里的 frpc」。
+//
+// 由上层在**发布构建**（内嵌 frpc）时打开。开发构建保持宽松：那时 frpc 通常
+// 装在 PATH 里，一刀切会让本地调试直接不可用。
+var strictLookup bool
+
+// SetStrictLookup 设置查找策略。发布构建必须调用 SetStrictLookup(true)，
+// 在 New 之前设置即可（进程内只设置一次）。
+func SetStrictLookup(strict bool) { strictLookup = strict }
+
+// findFrpc 在**程序自身目录**下查找 frpc（bin/、resources/ 是常见打包布局）。
+//
+// 查找范围刻意排除了当前工作目录与 PATH：
+//
+//   - 当前工作目录由**用户**决定（双击时是 exe 所在目录，从命令行启动时可能
+//     是任意目录，甚至是一个下载目录）。在那里放一个 frpc.exe，客户端就会
+//     执行它——这是一条「把可执行文件丢进某个目录就能劫持客户端」的路径，
+//     而用户看不出任何异常：界面照常工作，内嵌的那个反而没用上。
+//   - PATH 同理，且更隐蔽：任何能写入 PATH 中某个目录的程序都能换掉它。
+//
+// 开发构建（没有内嵌资源）仍保留这两条兜底，否则本地调试必须手工拷贝二进制；
+// 发布构建由 SetStrictLookup(true) 关掉它们，找不到就明确报错，而不是
+// 「悄悄执行了别处的 frpc」。
 func findFrpc() string {
 	name := "frpc"
 	if runtime.GOOS == "windows" {
@@ -802,12 +824,18 @@ func findFrpc() string {
 			filepath.Join(dir, "resources", name),
 		)
 	}
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates, filepath.Join(wd, name))
-	}
-
 	for _, c := range candidates {
 		if usableExecutable(c) {
+			return c
+		}
+	}
+	if strictLookup {
+		// 发布构建：不再向外找。空串会让 Start 报出「找不到 frpc」，
+		// 而不是执行一个来源不明的同名程序。
+		return ""
+	}
+	if wd, err := os.Getwd(); err == nil {
+		if c := filepath.Join(wd, name); usableExecutable(c) {
 			return c
 		}
 	}
@@ -822,8 +850,12 @@ func findFrpc() string {
 // 只 Stat 成功就返回，会把目录或符号链接当成 frpc：Start 时报的是
 // 「permission denied」或「is a directory」，用户完全看不出是路径放错了。
 // Windows 没有可执行位，只要求普通文件；其它平台额外要求任一执行位。
+//
+// 用 Lstat 而不是 Stat：符号链接一律拒绝。跟随链接意味着「程序目录里那个
+// 看起来正常的 frpc.exe」可以指向任意位置，包括网络共享与临时目录——那等于
+// 把「只允许程序自带目录」这条限制绕开了一半。
 func usableExecutable(path string) bool {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil || info.IsDir() || !info.Mode().IsRegular() {
 		return false
 	}

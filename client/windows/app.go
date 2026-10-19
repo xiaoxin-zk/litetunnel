@@ -373,6 +373,12 @@ type App struct {
 	// logKick 容量 1 的「立刻推送」信号：攒满一批时用它跳到下一轮推送，
 	// 不排队也不阻塞——推送协程醒来时取走一批（maxLogBatch 行）。
 	logKick chan struct{}
+	// stateKick 是「状态该推一次了」的合并信号（容量 1），见 requestState。
+	//
+	// 日志回调不能直接 emitState：Wails 的 EventsEmit 在 Windows 上是同步的，
+	// UI 线程一卡，日志投递协程就跟着卡住，所有隧道的日志一起停摆。改为投递
+	// 一个信号，由独立协程合并后推送——卡住的只是那个只做推送的协程。
+	stateKick chan struct{}
 	// logStop 在退出时通知日志推送协程停止，避免窗口销毁后它还继续
 	// 调用 EventsEmit；logStopOnce 保证只关闭一次，logWg 让关闭流程
 	// 等到它真正退出再返回（见 startLogFlusher / shutdown）。
@@ -449,6 +455,11 @@ func NewApp() *App {
 		log.Printf("[client] %v，将回退到同目录查找 frpc.exe", err)
 		exePath = ""
 	}
+	// 发布构建（带内嵌 frpc）里不存在「合法的外部 frpc」：一旦内置资源取不到，
+	// 正确的行为是明确报错，而不是去工作目录或 PATH 里捡一个同名程序执行——
+	// 那是把「放个文件到某个目录」变成执行任意程序。
+	// 开发构建（embeddedFrpc 为空）保留宽松查找，否则本地调试必须手工拷二进制。
+	frpc.SetStrictLookup(len(embeddedFrpc) > 0)
 
 	// 同步的根上下文：应用退出时由 shutdown 取消（见 App.syncRoot）。
 	syncCtx, syncCancel := context.WithCancel(context.Background())
@@ -468,6 +479,7 @@ func NewApp() *App {
 		errEmitAt:    map[uint]time.Time{},
 		startGen:     map[uint]uint64{},
 		logKick:      make(chan struct{}, 1),
+		stateKick:    make(chan struct{}, 1),
 		logStop:      make(chan struct{}),
 		startedAt:    time.Now(),
 		http: &http.Client{
@@ -489,6 +501,13 @@ func (a *App) startup(ctx context.Context) {
 	// 日志出的第一行就进批量队列：只要开始产生日志，推送到前端的节奏就
 	// 由推送协程决定，而不是「一行一次 Wails 调用」。
 	a.startLogFlusher()
+	// 状态推送的合并协程：日志回调不再直接 emitState（那会阻塞日志投递）。
+	// 与日志推送共用 logWg/logStop，退出时一起收敛。
+	a.logWg.Add(1)
+	go func() {
+		defer a.logWg.Done()
+		a.stateLoop()
+	}()
 	a.mgr.SetAccountCallbacks(func(acct uint64, id uint, name string, gen uint64, seq uint64, line string) {
 		// 日志回调在 Manager 内排队，旧进程的行可能晚于新进程到达。
 		// 只有当前 generation 才能修改注册、退避和错误状态；旧日志仍保留
@@ -535,8 +554,15 @@ func (a *App) startup(ctx context.Context) {
 		if !a.epochCurrent(epoch) {
 			return
 		}
+		// 判据必须作用在**原始输出**上，不能作用在带前缀的展示行上。
+		//
+		// 回调收到的 line 形如 `15:04:05  Tunnel/<名字>  <frpc 原文>`。直接
+		// Contains 整行的话，隧道名里只要含 "start proxy success"，这条隧道
+		// 的**任何**输出都会被判成连接成功：清错误、清退避、标成已注册。
+		// 而隧道名由服务端下发的代理名派生，用户与管理员都能影响它。
+		body := frpc.StripLogPrefix(line)
 		switch {
-		case strings.Contains(line, "start proxy success"):
+		case strings.Contains(body, "start proxy success"):
 			// frpc 报告代理启动成功时补一条「现在可以用这个地址了」。
 			// 原始输出只有一行 start proxy success，用户看不出这意味着
 			// 「可以把地址发给朋友了」——而那恰恰是他最需要的信息。
@@ -552,8 +578,12 @@ func (a *App) startup(ctx context.Context) {
 			a.setTunnelRegisteredGen(id, gen, true)
 			a.emitTunnelReadyEpoch(epoch, id, name)
 			if a.epochCurrent(epoch) {
-				a.emitState()
+				// 不直接 emitState：这里是日志投递协程，一旦 Wails 事件阻塞，
+				// 全部隧道的日志都会停（见 requestState 的说明）。
+				a.requestState()
 			}
+		// 这里传整行：IsErrorLine 内部会自己剥前缀，而它剥之前要求行是
+		// 「带前缀」的形态——先剥一次再传进去，会在原文自带双空格时被截断。
 		case frpc.IsErrorLine(line):
 			// 记下错误原文并刷新状态，让界面能显示「为什么一直连不上」，
 			// 而不是永远停在一句「连接中」上。
@@ -562,7 +592,9 @@ func (a *App) startup(ctx context.Context) {
 			// 可能瞬间刷出上千行同样的错误，逐行推状态纯属浪费（每推一次都
 			// 要序列化整个状态），而重复的错误对用户没有新信息。
 			if a.recordTunnelErrMsgAcct(id, epoch, gen, line) && a.epochCurrent(epoch) {
-				a.emitStateThrottled(id)
+				// 合并式推送自带限频（stateEmitMinInterval），不需要再按隧道
+				// 各限一次；这里同样不能阻塞日志投递协程。
+				a.requestState()
 			}
 		}
 	}, func(id uint, name string, gen uint64, err error, requested bool) {

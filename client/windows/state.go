@@ -81,6 +81,58 @@ func (a *App) snapshotForEmit() (seq, gen uint64, st State) {
 	return seq, gen, st
 }
 
+// stateEmitMinInterval 是合并状态推送的最小间隔。
+//
+// 100ms 足以把「一次连接失败刷出上千行」压成每秒十次推送，又不会让人眼
+// 察觉到延迟；再大（比如 500ms）就会让用户点开关后觉得界面「卡了一下」。
+const stateEmitMinInterval = 100 * time.Millisecond
+
+// requestState 请求一次状态推送，**不阻塞调用方**。
+//
+// 存在的理由：日志回调原先直接调用 emitState，而 emitState 最终落到
+// wailsruntime.EventsEmit —— 在 Windows 上它是同步的，会一直等到 UI 线程
+// 空闲。于是 UI 卡一秒，日志投递协程就卡一秒：所有隧道的日志一起停摆，
+// 积压到上限后开始丢行，而丢掉的恰恰是解释「为什么卡住」的那些行。
+//
+// 这里只做一次非阻塞发送；真正的序列化与推送在独立的合并协程里完成
+// （见 stateLoop）。通道容量 1 意味着「已经有人排着了」时就合并掉——
+// 状态是快照语义，中间那次推送本来就没有人要。
+func (a *App) requestState() {
+	select {
+	case a.stateKick <- struct{}{}:
+	default:
+	}
+}
+
+// stateLoop 合并状态推送。进程生命周期内常驻，随 logStop 退出。
+//
+// 合并策略是「等到下一次静默」：收到信号后先等 stateEmitMinInterval，把这段
+// 时间里到达的请求全部吸收，再推一次。这既限住了频率，又保证最后一次变化
+// 一定会被推出去（前沿触发会丢掉突变之后的最终状态）。
+func (a *App) stateLoop() {
+	for {
+		select {
+		case <-a.logStop:
+			return
+		case <-a.stateKick:
+		}
+
+		select {
+		case <-a.logStop:
+			return
+		case <-time.After(stateEmitMinInterval):
+		}
+
+		// 把等待期间攒下的信号取走：它们已经由下面这次推送覆盖。
+		select {
+		case <-a.stateKick:
+		default:
+		}
+
+		a.emitState()
+	}
+}
+
 func (a *App) emitNotice(msg string) {
 	if a.ctx == nil {
 		return

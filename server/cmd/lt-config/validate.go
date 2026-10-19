@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -228,7 +229,12 @@ func (s *service) validateCaddy(ctx context.Context, text, image string, vars ma
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = os.RemoveAll(dir) }()
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("[lt-config] 清理 Caddy 校验目录失败（%s），请人工处理: %v", dir, err)
+			s.registerDirtyScene()
+		}
+	}()
 
 	cfg := filepath.Join(dir, "Caddyfile")
 	if err := os.WriteFile(cfg, []byte(text), 0o600); err != nil {
@@ -299,7 +305,12 @@ func (s *service) validateFrpsConfig(ctx context.Context, text string) (string, 
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = os.RemoveAll(dir) }()
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("[lt-config] 清理 frps 校验目录失败（%s），请人工处理: %v", dir, err)
+			s.registerDirtyScene()
+		}
+	}()
 
 	cfg := filepath.Join(dir, "frps.toml")
 	if err := os.WriteFile(cfg, []byte(text), 0o600); err != nil {

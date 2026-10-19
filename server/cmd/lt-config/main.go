@@ -92,6 +92,17 @@ func main() {
 	)
 	flag.Parse()
 
+	if raw := strings.TrimSpace(os.Getenv("LT_CFG_VALIDATE_FRPS")); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			log.Fatalf("LT_CFG_VALIDATE_FRPS 配置无效（%q），请使用 true 或 false: %v", raw, err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("LT_CFG_APPLY")); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			log.Fatalf("LT_CFG_APPLY 配置无效（%q），请使用 true 或 false: %v", raw, err)
+		}
+	}
+
 	p := newPaths(*deployDir, *envFile, *composeFile, *caddyTpl, *caddyOut, *frpsTpl, *frpsOut, *caddyData)
 	// 先清理上次异常退出留下的临时/备份文件（必要时恢复缺失的目标文件），
 	// 再做启动校验：崩溃可能把 .env 留成「缺失 + 备份」，不先恢复会直接报缺少 .env。

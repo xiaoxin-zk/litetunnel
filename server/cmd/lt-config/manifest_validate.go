@@ -46,8 +46,13 @@ func validateManifestForRecovery(dir string, m batchManifest) error {
 				return fmt.Errorf("manifest 临时文件越出部署目录: %s", f.Tmp)
 			}
 		}
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			return fmt.Errorf("manifest 目标是目录: %s", path)
+		if info, err := os.Lstat(path); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("manifest 目标不能是符号链接: %s", path)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("manifest 目标不是普通文件: %s", path)
+			}
 		}
 	}
 	return nil

@@ -109,7 +109,10 @@ func recoverBatch(dir string) bool {
 	failed := rollbackEntries(m.Files)
 	for _, f := range m.Files {
 		if f.Tmp != "" {
-			_ = os.Remove(f.Tmp)
+			if err := os.Remove(f.Tmp); err != nil && !os.IsNotExist(err) {
+				log.Printf("[lt-config] 回滚后清理临时文件失败（%s），保留现场: %v", f.Tmp, err)
+				failed = append(failed, f.Name+" 临时文件")
+			}
 		}
 	}
 

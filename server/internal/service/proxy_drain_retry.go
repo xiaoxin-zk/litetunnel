@@ -562,8 +562,12 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 			return proxyDrainIntentUnverifiable, false
 		}
 		if exists {
-			log.Printf("[proxy-drain] 用户 %d 的删号意图登记后该 ID 上重新出现了账号，跳过自动断流，转人工确认", row.UserID)
-			return proxyDrainIntentManual, false
+			// 判作废而不是转人工：这两种情况的结论都是「这条意图描述的事
+			// 已经不存在」——要么删除回滚了（账号本来就该活着），要么 ID 被
+			// 另一个账号复用。留着人工待办只会让 ID 复用频繁的环境里堆满
+			// 永远没人处理的记录。
+			log.Printf("[proxy-drain] 用户 %d 的删号意图登记后该 ID 上重新出现了账号，旧意图作废", row.UserID)
+			return proxyDrainIntentAbandoned, false
 		}
 		return proxyDrainIntentActive, true
 	}

@@ -42,8 +42,12 @@ func TestProxyDrainIntentAbandonedWhenIncarnationChanged(t *testing.T) {
 	}
 }
 
-// 删号意图同样不能跨生命周期生效：账号已删除，但 ID 被新账号占用时，
-// 按相同前缀关闭代理会误伤新账号。
+// 删号意图只承认「用户行确实已经不存在」。
+//
+// 只比较 incarnation 是不够的：备份恢复、手工导入、迁移回放都可能把同一个
+// 标识原样带回来（model 的钩子对显式赋值保持原值）。那时标识相等，旧删号
+// 意图会被判为有效，然后把现存账号的 lt_u<ID>.* 代理全部关掉。所以这里换
+// 成存在性判据：只要该 ID 上还有账号，旧意图一律作废。
 func TestDeletedDrainIntentAbandonedWhenIDReused(t *testing.T) {
 	svc := newTestServices(t, nil)
 
@@ -58,11 +62,19 @@ func TestDeletedDrainIntentAbandonedWhenIDReused(t *testing.T) {
 		Prefix:      FrpUserOf(u.ID) + ".",
 		Deleted:     true,
 	}
+	// 情况一：ID 被另一个生命周期的账号占用。
 	if intent, asDeleted := svc.proxyDrainIntentState(row); intent != proxyDrainIntentAbandoned || asDeleted {
 		t.Fatalf("ID 已被新账号占用时删号意图必须作废，实际 intent=%v asDeleted=%v", intent, asDeleted)
 	}
 
-	// 确认账号确实不存在时仍按删号语义继续（不能因为校验而放弃断流）。
+	// 情况二：标识完全相同（导入/恢复原样带回）。标识比较在这里失效，
+	// 只有「账号行是否存在」还能分辨。
+	row.Incarnation = u.Incarnation
+	if intent, asDeleted := svc.proxyDrainIntentState(row); intent != proxyDrainIntentAbandoned || asDeleted {
+		t.Fatalf("标识相同但账号仍在时旧意图必须作废，实际 intent=%v asDeleted=%v", intent, asDeleted)
+	}
+
+	// 情况三：账号确实不存在时仍按删号语义继续（不能因为校验而放弃断流）。
 	if err := svc.DB.Delete(&model.User{}, u.ID).Error; err != nil {
 		t.Fatalf("删用户失败: %v", err)
 	}

@@ -108,13 +108,20 @@ func main() {
 	// 校验用的 frps 镜像必须与 Compose 实际启动的一致。两边各自可配，
 	// 只改一边时「校验通过」就只对另一个镜像成立——镜像里有没有 verify
 	// 子命令、支持哪些字段都可能不同，这种校验比没有更误导人。
-	if img, err := composeServiceImage(p.composeFile, "frps"); err != nil {
-		log.Printf("[lt-config] 警告：无法从 Compose 读取 frps 镜像，校验镜像沿用 %q: %v", *frpsImage, err)
-	} else if resolved, ok := resolveComposeImage(img, os.Getenv); !ok {
-		log.Printf("[lt-config] 警告：Compose 的 frps 镜像 %q 含无法解析的变量，跳过一致性检查", img)
-	} else if *frpsImage != resolved {
-		log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
-			"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
+	//
+	// 只在启用 frps 校验时检查：校验关闭时镜像不会被用于 verify，也就没有
+	// 「校验镜像与实际运行镜像不同」这回事。启用时读不到 / 解析不了 Compose
+	// 里的镜像必须**阻断启动**，而不是退回默认值——拿一个可能错误的镜像去
+	// 校验，等于为一个根本不会上线的镜像背书，还让「校验通过」看起来一切正常。
+	if *validateFrps {
+		if img, err := composeServiceImage(p.composeFile, "frps"); err != nil {
+			log.Fatalf("[lt-config] 无法从 Compose 读取 frps 镜像，无法确认校验镜像与实际运行镜像一致: %v", err)
+		} else if resolved, ok := resolveComposeImage(img, os.Getenv); !ok {
+			log.Fatalf("[lt-config] Compose 的 frps 镜像 %q 含无法解析的变量，无法确认校验镜像与实际运行镜像一致", img)
+		} else if *frpsImage != resolved {
+			log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
+				"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
+		}
 	}
 	// 路径策略必须**在清理之前**跑完：清理会按配置的目录去读、删临时文件与
 	// 备份。若路径配错（两个输出指向同一文件、指向符号链接、用了事务保留名），
@@ -319,23 +326,29 @@ func validateConfig(addr, token string, p paths) error {
 		return err
 	}
 
-	// 三态判定（见 statcheck.go）：Stat 失败可能是「没这个文件」，也可能是
-	// 「读不了」。后者报成「缺少必需文件」会让管理员去补一个其实还在的文件，
-	// 而真正要修的是权限或挂载。启动阶段的错误信息是唯一线索，不能含糊。
+	// 多态判定（见 statcheck.go）：Stat 失败可能是「没这个文件」，也可能是
+	// 「读不了」；路径是目录同样不是「文件就绪」。前者报成「缺少必需文件」
+	// 会让管理员去补一个其实还在的文件，后者若只看存在性会等渲染才崩——
+	// 而真正要修的是权限、挂载或目录被误替换。启动阶段的错误信息是唯一
+	// 线索，不能含糊。
 	for _, f := range []string{p.caddyTpl, p.frpsTpl, p.composeFile} {
-		state, err := statFileState(f)
+		state, err := statRegularFileState(f)
 		switch state {
 		case fileMissing:
 			return fmt.Errorf("缺少必需文件 %s：请确认 LT_CFG_DEPLOY_DIR 指向部署目录", f)
 		case fileUnknown:
 			return fmt.Errorf("无法读取必需文件 %s（%v）：请检查部署目录的权限与挂载", f, err)
+		case fileNotRegular:
+			return fmt.Errorf("必需文件 %s 不是普通文件（可能是目录）：请检查部署目录", f)
 		}
 	}
-	switch state, err := statFileState(p.envFile); state {
+	switch state, err := statRegularFileState(p.envFile); state {
 	case fileMissing:
 		return fmt.Errorf("缺少 .env（%s）：请确认 LT_CFG_ENV_FILE", p.envFile)
 	case fileUnknown:
 		return fmt.Errorf("无法读取 .env（%s，%v）：请检查权限与挂载", p.envFile, err)
+	case fileNotRegular:
+		return fmt.Errorf(".env（%s）不是普通文件（可能是目录）：请检查权限与挂载", p.envFile)
 	}
 	// 产物目录必须可写，否则会在「校验都过了、写盘才失败」这一步才暴露。
 	for _, f := range []string{p.caddyOut, p.frpsOut, p.envFile} {

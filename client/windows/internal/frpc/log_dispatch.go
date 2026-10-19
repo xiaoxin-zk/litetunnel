@@ -181,6 +181,16 @@ func (m *Manager) AppendRaw(line string) {
 	m.mu.Unlock()
 }
 
+// RecordLine 把一行已经格式化好的文本写进历史缓冲并返回它分配的序号，
+// 但**不**触发回调投递。调用方（App 的日志积压提示）自行负责把它推给前端：
+// 它需要与普通日志一样带真实序号，才能受清空点约束，而不是用 seq=0 这种
+// 「永远通过过滤、清空后仍可能回流」的特殊值。
+func (m *Manager) RecordLine(text string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.recordTextLocked(text)
+}
+
 func (m *Manager) appendLog(tunnelID uint, tunnelName string, line string) {
 	m.appendLogGen(tunnelID, tunnelName, 0, line)
 }

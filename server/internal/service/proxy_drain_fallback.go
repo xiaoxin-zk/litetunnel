@@ -71,11 +71,12 @@ type proxyDrainFallbackQueue struct {
 	items map[uint]*proxyDrainFallback
 	// dropped 统计因队列满而被丢弃的意图数（暴露给健康检查/管理页）。
 	dropped atomic.Int64
-	// droppedRecent 记录最近被丢弃的用户，供管理页直接点名排查。
+	// droppedItems 保留被淘汰的**完整意图**（有界，最多 droppedRecentMax 条）。
 	//
-	// 只留一个数字的话，管理员只能知道「丢过 3 条」，无法知道是哪些账号的
-	// 代理可能还在跑——而排查需要的正是这份名单。
-	droppedRecent []uint
+	// 只留一个数字或 ID 的话，管理员只能知道「丢过 3 条」，无法自动补偿；
+	// 保留完整意图后，数据库恢复时由 flush 把它们补写回库，重新获得自动
+	// 补偿机会，而不是停在一个人工处理的名单上。
+	droppedItems []proxyDrainFallback
 	// persisted 统计成功补写回库的意图数（说明兜底真的生效过）。
 	persisted atomic.Int64
 	// enqueued 统计进入队列的总数（含后来被覆盖的）。
@@ -106,10 +107,11 @@ func (q *proxyDrainFallbackQueue) enqueue(req proxyDrainRequest) {
 				oldest, oldestAt, first = id, it.at, false
 			}
 		}
+		oldestIt := q.items[oldest]
 		delete(q.items, oldest)
 		q.dropped.Add(1)
-		q.rememberDropped(oldest)
-		log.Printf("[proxy-drain] 补偿队列已满（%d），丢弃用户 %d 的最旧意图（该账号的残留代理失去自动补偿，需人工断流，名单见 drain_fallback.dropped_recent）",
+		q.rememberDropped(*oldestIt)
+		log.Printf("[proxy-drain] 补偿队列已满（%d），丢弃用户 %d 的最旧意图（数据库恢复后自动补写，名单见 drain_fallback.dropped_recent）",
 			proxyDrainFallbackLimit, oldest)
 	}
 	q.items[req.userID] = &proxyDrainFallback{req: req, at: time.Now()}
@@ -142,28 +144,33 @@ func (q *proxyDrainFallbackQueue) putBack(it proxyDrainFallback) {
 	defer q.mu.Unlock()
 	if len(q.items) >= proxyDrainFallbackLimit {
 		q.dropped.Add(1)
-		q.rememberDropped(it.req.userID)
-		log.Printf("[proxy-drain] 补偿队列已满（%d），用户 %d 的断流意图未能放回（需人工断流）",
+		q.rememberDropped(it)
+		log.Printf("[proxy-drain] 补偿队列已满（%d），用户 %d 的断流意图未能放回（数据库恢复后自动补写）",
 			proxyDrainFallbackLimit, it.req.userID)
 		return
 	}
 	q.items[it.req.userID] = &proxyDrainFallback{req: it.req, at: it.at, attempts: it.attempts + 1}
 }
 
-// droppedRecentMax 是保留的「被丢弃用户」名单长度。
+// droppedRecentMax 是保留的「被丢弃意图」名单长度。
 const droppedRecentMax = 16
 
-// rememberDropped 记录一个失去自动补偿机会的用户（调用方持锁）。
-func (q *proxyDrainFallbackQueue) rememberDropped(userID uint) {
-	for _, id := range q.droppedRecent {
-		if id == userID {
-			return
-		}
+// rememberDropped 保留一条因队列满被淘汰的完整意图（调用方持锁）。
+// 它不再是「只留个 ID 等人工」，而是等数据库恢复后被 flush 补写回库。
+func (q *proxyDrainFallbackQueue) rememberDropped(it proxyDrainFallback) {
+	if len(q.droppedItems) >= droppedRecentMax {
+		q.droppedItems = q.droppedItems[1:]
 	}
-	if len(q.droppedRecent) >= droppedRecentMax {
-		q.droppedRecent = q.droppedRecent[1:]
-	}
-	q.droppedRecent = append(q.droppedRecent, userID)
+	q.droppedItems = append(q.droppedItems, it)
+}
+
+// takeDropped 取走被淘汰、等待补写的意图。
+func (q *proxyDrainFallbackQueue) takeDropped() []proxyDrainFallback {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := q.droppedItems
+	q.droppedItems = nil
+	return out
 }
 
 // size 返回当前队列长度（供健康检查/管理页展示）。
@@ -205,7 +212,10 @@ func (s *Services) ProxyDrainFallback() ProxyDrainFallbackStats {
 	}
 	q := s.drainFallback
 	q.mu.Lock()
-	recent := append([]uint(nil), q.droppedRecent...)
+	recent := make([]uint, 0, len(q.droppedItems))
+	for _, it := range q.droppedItems {
+		recent = append(recent, it.req.userID)
+	}
 	q.mu.Unlock()
 	return ProxyDrainFallbackStats{
 		Queued:        q.size(),
@@ -233,6 +243,10 @@ func (s *Services) flushProxyDrainFallback() {
 		return
 	}
 	pending := s.drainFallback.take()
+	// 把此前因队列满被淘汰的意图一并捞回来尝试补写：数据库恢复后，这些
+	// 本已「失去自动补偿」的账号应当重新获得补偿机会，而不是停在一个人工
+	// 名单上。写不进去的会经 putBack 重新回到 droppedItems。
+	pending = append(pending, s.drainFallback.takeDropped()...)
 	if len(pending) == 0 {
 		return
 	}

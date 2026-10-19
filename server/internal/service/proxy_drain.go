@@ -133,7 +133,15 @@ func (s *Services) CloseDeletedUserProxies(ctx context.Context, userID uint) {
 	if found && incarnation == "" {
 		// 升级前遗留的待办没有账号标识。只有当该 ID 上确实存在一个已登记
 		// 标识的账号时才可能误伤（删号后 ID 被复用）；此时交给人工确认。
-		if inc, exists := s.currentIncarnation(userID); exists && inc != "" {
+		inc, exists, err := s.currentIncarnation(userID)
+		if err != nil {
+			// 读不出来不能当成「没有账号」继续按前缀断流：ID 可能已被复用，
+			// 误关新账号的代理是不可见的故障。保留原待办，交给后台重试器
+			// 下一轮再判。
+			log.Printf("[proxy-drain] 读取已删账号 %d 的标识失败，保留原现场并跳过本次断流: %v", userID, err)
+			return
+		}
+		if exists && inc != "" {
 			log.Printf("[proxy-drain] 账号 %d 的断流待办缺少账号标识且该 ID 已被新账号占用，跳过自动断流，需人工确认", userID)
 			return
 		}

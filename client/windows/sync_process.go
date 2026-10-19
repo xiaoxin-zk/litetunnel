@@ -216,12 +216,18 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 // stopTunnelProcess 停掉某条隧道的进程。
 func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
+	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
+	a.setTunnelRegistered(t.ID, false)
+	// 没有进程在跑时不要记停止意图：mgr.Stop 会立刻返回 nil，而意图没有任何
+	// 退出回调来消费它。留着它，同 ID 的下一个新进程自然退出时会被误判成
+	// 「用户主动停止」，跳过退避与自动重试——用户看到的是「隧道掉了但一直不重连」。
+	if !a.mgr.Running(t.ID) {
+		return nil
+	}
 	// 先记意图再停：进程可能在 mgr.Stop 拿到指针之前就自己退出了，那时
 	// quitting 回调带的是 requested=false。没有这个上限为一次的意图，
 	// 用户点「断开」会看到一闪而过的「启动失败」并多等一轮退避。
 	a.markStopIntent(t.ID)
-	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
-	a.setTunnelRegistered(t.ID, false)
 	err := a.mgr.Stop(t.ID)
 	if err != nil {
 		// 停失败时意图不再成立：留到下一次启动会误吞一次真实的失败。

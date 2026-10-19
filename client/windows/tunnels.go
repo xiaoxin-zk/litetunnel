@@ -142,6 +142,13 @@ func (a *App) CreateTunnelsBatch(namePrefix, tunnelType, localIP string, ports [
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return BatchResult{}, a.GetState(), err
 	}
+	// 服务端返回的文案与逐条失败原因都会直接进界面，必须限长（与 Redeem
+	// 的处理一致）：一次异常响应可能带一整段 HTML，随状态事件反复序列化会
+	// 同时放大内存与 IPC。
+	out.Message = clampStatusText(out.Message)
+	for i := range out.Failures {
+		out.Failures[i].Reason = clampStatusText(out.Failures[i].Reason)
+	}
 
 	// 建完立刻同步：新建的隧道会带上下发的公网地址。
 	// 同步失败时不把整体判为失败——隧道其实已经建好了。

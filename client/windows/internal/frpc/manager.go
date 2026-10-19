@@ -656,7 +656,16 @@ func (m *Manager) StopAll() error {
 				firstErr = err
 			}
 		case <-deadline:
-			// 不再等剩余进程：它们的 Stop 自带 5 秒超时，稍后会自行结束。
+			// 到点仍有进程没交回结果。不能直接返回 firstErr——它可能是 nil，
+			// 而调用方（Logout）会据此继续清凭据，残留进程却仍占着端口转发。
+			// 按「表里还有没有进程」决定是否报错：没有了说明只是个别 goroutine
+			// 收尾慢了一点，此时返回已收到的错误即可。
+			if m.AnyRunning() {
+				if firstErr != nil {
+					return fmt.Errorf("停止全部隧道超时，仍有进程未退出: %w", firstErr)
+				}
+				return errors.New("停止全部隧道超时，仍有进程未退出")
+			}
 			return firstErr
 		}
 	}

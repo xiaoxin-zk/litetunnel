@@ -35,6 +35,13 @@ const (
 	// 任何据此推断「文件不在」的动作都必须停下：那不是观察到的结论，
 	// 而是猜的，而猜错的代价是删掉唯一可恢复的那份内容。
 	fileUnknown
+	// fileNotRegular 表示路径存在，但不是普通文件（目录、设备、管道……）。
+	//
+	// 只由 statRegularFileState 返回：它检查的是「这是一个**文件**」，
+	// 而不是「这里有个东西」。路径被替换成目录时，os.Stat 会成功（fileExists），
+	// 但随后的渲染/读文件必然失败——健康检查与启动校验若只看存在性，就会
+	// 通过校验、等写盘/渲染才崩，还把原因报成与真实情况无关。
+	fileNotRegular
 )
 
 // statFileState 把 os.Stat 的结果归成三态。
@@ -47,6 +54,25 @@ func statFileState(path string) (fileState, error) {
 			return fileMissing, nil
 		}
 		return fileUnknown, err
+	}
+	return fileExists, nil
+}
+
+// statRegularFileState 与 statFileState 相同，但额外要求目标是普通文件。
+//
+// 用于「这里必须是文件」的路径（模板、.env、compose）：路径被替换成目录时，
+// 存在性检查会放过它，而实际渲染/读取才失败。单独一个函数而不是改
+// statFileState，是因为后者还被用来判目录（证书目录），不能全局要求普通文件。
+func statRegularFileState(path string) (fileState, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fileMissing, nil
+		}
+		return fileUnknown, err
+	}
+	if !info.Mode().IsRegular() {
+		return fileNotRegular, nil
 	}
 	return fileExists, nil
 }

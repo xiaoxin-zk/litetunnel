@@ -492,7 +492,12 @@ func (a *App) startup(ctx context.Context) {
 		// 状态也不能进日志缓冲——否则用户换了账号，界面上会先冒出上一段
 		// 会话的输出。Manager 已在入队前做过一次同样的过滤，这里是回调
 		// 排队期间又发生切换时的第二道。
-		if !a.mgr.Current(id, gen) {
+		//
+		// 但只对「进程输出」生效：gen=0 是客户端**自己**的说明日志（启动、
+		// 停止、退出诊断），它们不来自任何进程，没有「是不是当前进程」可言。
+		// 用 Current 过滤会把这类行判成无效——于是它们只存在于后续读日志
+		// 快照时，实时推送里却凭空消失，界面表现为「点了启动却没有日志」。
+		if gen != 0 && !a.mgr.Current(id, gen) {
 			return
 		}
 		a.appendLogLine(seq, line)
@@ -645,9 +650,14 @@ func (a *App) startOnce(ctx context.Context) {
 			return
 		}
 
+		// 启动同步在 syncLocked 释放锁之后才写日志/推状态：这期间用户可能
+		// 已经退出登录。旧任务的结果属于旧账号，必须整段放弃。
+		gen := a.currentAuthGen()
 		start := time.Now()
 		if _, err := a.syncLocked(); err != nil {
-			a.emitLog("启动同步失败：" + err.Error())
+			if a.authGenCurrent(gen) {
+				a.emitLog("启动同步失败：" + err.Error())
+			}
 		} else {
 			// 报「几条在跑、几条是关着的、各花了多久」。
 			//
@@ -659,12 +669,16 @@ func (a *App) startOnce(ctx context.Context) {
 			//   - 两个用时把「客户端慢」拆成两段：我们这段（拉清单、取配置、
 			//     起进程）和框架这段（窗口与 WebView 初始化，直到前端能收事件）。
 			//     混在一起就永远说不清慢在谁身上。
-			a.emitLog(fmt.Sprintf("启动同步完成：%d 条隧道运行中（%d 条已停用，用时 %s，自客户端启动 %s）",
-				len(a.mgr.RunningIDs()), a.countDisabledTunnels(),
-				time.Since(start).Round(time.Millisecond),
-				time.Since(a.startedAt).Round(100*time.Millisecond)))
+			if a.authGenCurrent(gen) {
+				a.emitLog(fmt.Sprintf("启动同步完成：%d 条隧道运行中（%d 条已停用，用时 %s，自客户端启动 %s）",
+					len(a.mgr.RunningIDs()), a.countDisabledTunnels(),
+					time.Since(start).Round(time.Millisecond),
+					time.Since(a.startedAt).Round(100*time.Millisecond)))
+			}
 		}
-		a.emitState()
+		if a.authGenCurrent(gen) {
+			a.emitState()
+		}
 	}()
 }
 

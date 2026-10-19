@@ -218,9 +218,30 @@ func (s *Services) UpdateGroup(id uint, in GroupInput) (*model.Group, error) {
 		if res.RowsAffected == 0 {
 			return ErrNotFound
 		}
+		// 快照必须按「生效分组」写，而不是一律写目标分组（与 AdminSetUserGroup
+		// 同一处取舍）：组里已经到期、尚未被迁移调度搬走的用户，运行期实际
+		// 回落默认分组。给这些用户写目标分组的限速，会让界面显示与真实生效
+		// 的限速相反，且不会有后续事件纠正。
+		now := time.Now()
+		if err := tx.Model(&model.Tunnel{}).
+			Where("user_id IN (?)", tx.Model(&model.User{}).
+				Select("id").
+				Where("group_id = ? AND (group_expire_at IS NULL OR group_expire_at > ?)", id, now)).
+			Update("bandwidth_limit", in.BandwidthLimit).Error; err != nil {
+			return err
+		}
+		// 已到期但尚未迁移的用户：生效分组是默认分组，限速跟着默认组走。
+		// 默认组就是本组时（更新的是默认分组），fallback 与 in.BandwidthLimit
+		// 相同，结果不变。
+		fallback := in.BandwidthLimit
+		if dg := s.defaultGroupTx(tx); dg != nil {
+			fallback = dg.BandwidthLimit
+		}
 		return tx.Model(&model.Tunnel{}).
-			Where("user_id IN (?)", tx.Model(&model.User{}).Select("id").Where("group_id = ?", id)).
-			Update("bandwidth_limit", in.BandwidthLimit).Error
+			Where("user_id IN (?)", tx.Model(&model.User{}).
+				Select("id").
+				Where("group_id = ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", id, now)).
+			Update("bandwidth_limit", fallback).Error
 	})
 	if err != nil {
 		return nil, err

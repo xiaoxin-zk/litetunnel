@@ -207,11 +207,18 @@ func (a *App) takeLogBatchWithEpoch() ([]pendingLog, uint64) {
 	n = limit
 
 	// 丢弃提示单独占一行插在最前面：静默丢日志比丢日志本身更糟——
-	// 用户会以为自己看到了完整的现场。它没有序号（seq=0），前端总是显示。
+	// 用户会以为自己看到了完整的现场。它必须拿一个真实序号（经 Manager
+	// 分配并进入历史）：seq=0 这个「永远通过过滤」的特殊值会绕开清空点，
+	// 清空后仍可能被当成新账号日志回流。真实序号让它与普通日志一样受约束。
 	batch := make([]pendingLog, 0, n+1)
 	if a.logDropped > 0 {
-		batch = append(batch, pendingLog{text: fmt.Sprintf("%s  [客户端] 日志积压，已丢弃 %d 行较早的记录",
-			time.Now().Format("15:04:05"), a.logDropped)})
+		msg := fmt.Sprintf("%s  [客户端] 日志积压，已丢弃 %d 行较早的记录",
+			time.Now().Format("15:04:05"), a.logDropped)
+		var seq uint64
+		if a.mgr != nil {
+			seq = a.mgr.RecordLine(msg)
+		}
+		batch = append(batch, pendingLog{seq: seq, text: msg})
 		a.logDropped = 0
 	}
 	for i := 0; i < n; i++ {

@@ -31,7 +31,7 @@ jobs:
 
       - name: Resolve dependencies
         working-directory: server
-        run: go mod tidy
+        run: go mod download
 
       - name: Vet
         working-directory: server
@@ -799,12 +799,14 @@ jobs:
       - name: Install (user)
         if: matrix.app == 'user'
         working-directory: web/user
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+        # npm ci 严格按 package-lock.json 安装：不加的话，install 会随依赖
+        # 解析漂移，同一份源码在不同时间跑出的 dist 可能不同。
+        run: npm ci --no-audit --no-fund --legacy-peer-deps
 
       - name: Install (admin)
         if: matrix.app == 'admin'
         working-directory: web/admin
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Test user UI
         if: matrix.app == 'user'
@@ -834,8 +836,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: client/windows/go.mod
-          # client 模块的 go.sum 尚未入库，先关闭缓存
-          cache: false
+          cache: true
 
       - uses: actions/setup-node@v4
         with:
@@ -853,7 +854,7 @@ jobs:
 
       - name: Resolve dependencies
         working-directory: client/windows
-        run: go mod tidy
+        run: go mod download
 
       # 只测子包，不测 main：main 依赖 //go:embed frontend/dist，
       # 没构建前端就跑不了。而这里最容易坏掉的是解析逻辑

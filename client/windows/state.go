@@ -123,11 +123,19 @@ func (a *App) Refresh() (State, error) {
 	// 与后台自动同步走完全相同的路径，区别只有一点：手工触发时
 	// 把错误直接返回给界面，让用户看到「为什么没同步上」，
 	// 而不是像后台那样只留一个低调的提示。
+	gen := a.currentAuthGen()
 	_, err := a.syncLocked()
 	if err != nil {
-		a.setSyncErr(err)
-		a.emitState()
+		// 同步期间账号已切换时，这个错误属于旧账号，不能写进新账号的
+		// SyncErr；错误仍要返回给触发者（界面），但状态不再发布。
+		if a.authGenCurrent(gen) {
+			a.setSyncErr(err)
+			a.emitState()
+		}
 		return a.GetState(), err
+	}
+	if !a.authGenCurrent(gen) {
+		return a.GetState(), nil
 	}
 	state := a.GetState()
 	a.emitState()

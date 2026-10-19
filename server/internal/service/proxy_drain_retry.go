@@ -449,7 +449,15 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 	// 因此转人工确认。若该 ID 上没有任何账号（删号路径的正常状态），则没有
 	// 可误伤的对象，按删号语义继续。
 	if row.Incarnation == "" {
-		if inc, exists := s.currentIncarnation(row.UserID); exists && inc != "" {
+		inc, exists, err := s.currentIncarnation(row.UserID)
+		if err != nil {
+			// 读不出来 ≠ 账号不存在：ID 可能已经被复用。此时照旧按前缀关代理
+			// 会误伤新账号，保留待办等下一轮再判。
+			log.Printf("[proxy-drain] 用户 %d 的账号标识读取失败，本轮不动手（保留待办继续重试）: %v",
+				row.UserID, err)
+			return proxyDrainIntentUnverifiable, false
+		}
+		if exists && inc != "" {
 			return proxyDrainIntentManual, false
 		}
 	}
@@ -459,10 +467,17 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 		// 自增 ID 时，旧删号待办的前缀与新账号完全相同，照着关就会打掉
 		// 新账号刚建立的代理。此刻用户行存在即说明 ID 已被复用，旧意图作废。
 		if row.Incarnation != "" {
-			if _, inc, err := s.userStateVersionAndIncarnation(row.UserID); err == nil && inc != row.Incarnation {
+			_, inc, err := s.userStateVersionAndIncarnation(row.UserID)
+			if err == nil && inc != row.Incarnation {
 				log.Printf("[proxy-drain] 已删账号 %d 的 ID 已被新账号占用（%s ≠ %s），旧删号意图作废",
 					row.UserID, row.Incarnation, inc)
 				return proxyDrainIntentAbandoned, false
+			}
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				// 读取失败（不是「账号不存在」）：无法排除 ID 复用，不能动手。
+				log.Printf("[proxy-drain] 已删账号 %d 的标识读取失败，本轮不动手（保留待办继续重试）: %v",
+					row.UserID, err)
+				return proxyDrainIntentUnverifiable, false
 			}
 		}
 		return proxyDrainIntentActive, true
@@ -493,15 +508,23 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 }
 
 // currentIncarnation 返回指定 ID 当前账号的生命周期标识，以及该 ID 上有没有账号。
-func (s *Services) currentIncarnation(userID uint) (string, bool) {
+//
+// 第三个返回值是「读不出来」：它与「账号不存在」必须分开——调用方据此决定
+// 是不动手（数据库抖动，保留待办）还是继续。以前把两者都归成 exists=false，
+// 一次读取失败会被当成「ID 上没有账号、可以放心断流」，而 ID 其实可能已经
+// 被复用——正是 fail-open。
+func (s *Services) currentIncarnation(userID uint) (string, bool, error) {
 	if s.DB == nil {
-		return "", false
+		return "", false, errors.New("数据库未初始化")
 	}
 	var u model.User
 	if err := s.DB.Select("id", "incarnation").First(&u, userID).Error; err != nil {
-		return "", false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
 	}
-	return u.Incarnation, true
+	return u.Incarnation, true, nil
 }
 
 // markProxyDrainManual 把一条无法自动核验的遗留待办转成终态。

@@ -65,10 +65,11 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.Available {
 		for _, f := range []string{s.paths.caddyTpl, s.paths.frpsTpl, s.paths.envFile, s.paths.composeFile} {
-			// 这里同样是三态（见 statcheck.go）：Stat 失败不等于「文件不存在」。
-			// 判不出来（权限不足、目录挂载丢了、I/O 出错）时报「缺少文件」会把
-			// 管理员引去补一个其实还在的文件，所以两种情况分开写。
-			state, err := statFileState(f)
+			// 这里同样是多态（见 statcheck.go）：Stat 失败不等于「文件不存在」，
+			// 路径是目录也不等于「文件就绪」。判不出来（权限不足、目录挂载丢了、
+			// I/O 出错）时报「缺少文件」会把管理员引去补一个其实还在的文件；
+			// 路径被替换成目录时若只看存在性，健康检查通过、实际渲染才失败。
+			state, err := statRegularFileState(f)
 			switch state {
 			case fileMissing:
 				h.Available = false
@@ -76,6 +77,9 @@ func (s *service) handleHealth(w http.ResponseWriter, r *http.Request) {
 			case fileUnknown:
 				h.Available = false
 				h.Reason = fmt.Sprintf("无法读取 %s（%v）：请检查部署目录的权限与挂载", f, err)
+			case fileNotRegular:
+				h.Available = false
+				h.Reason = fmt.Sprintf("%s 不是普通文件（可能是目录）：请检查部署目录", f)
 			}
 			if !h.Available {
 				break

@@ -72,6 +72,11 @@ func (a *App) startAutoSync(ctx context.Context) {
 // 失败只记录不弹窗：网络抖动是常态，每 20 秒弹一次错误会把人逼疯。
 // 错误信息通过 State.SyncErr 呈现为一个低调的提示。
 func (a *App) autoSyncOnce() {
+	// 先记下这一轮所属的账号代次。syncLocked 内部会释放同步锁，之后写
+	// SyncErr / 推状态都发生在锁外：这期间可能已完成一次退出登录（代次
+	// 前进）。旧任务若照常发布结果，会把上一个账号的同步错误写进新账号。
+	gen := a.currentAuthGen()
+
 	a.mu.RLock()
 	apiKey := a.cfg.APIKey
 	a.mu.RUnlock()
@@ -82,11 +87,17 @@ func (a *App) autoSyncOnce() {
 
 	changed, err := a.syncLocked()
 	if err != nil {
-		a.setSyncErr(err)
-		a.emitState()
+		if a.authGenCurrent(gen) {
+			a.setSyncErr(err)
+			a.emitState()
+		}
 		return
 	}
 
+	if !a.authGenCurrent(gen) {
+		// 同步期间账号已切换：这一轮的结果属于旧账号，整段丢弃。
+		return
+	}
 	if changed {
 		// 明确告知用户「列表变了、已自动跟上」，否则他会疑惑
 		// 为什么隧道列表自己动了、某条隧道为什么闪了一下。

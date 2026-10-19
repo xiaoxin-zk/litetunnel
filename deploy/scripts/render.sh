@@ -446,7 +446,13 @@ commit_all() {
   return 0
 }
 
-backup_targets || exit 1
+if ! backup_targets; then
+  # 还没提交任何文件，备份纯属冗余副本：清掉，别在部署目录里留 .bak。
+  for bak in "${BACKUP_TMP[@]}"; do
+    [[ -n "${bak}" ]] && rm -f "${bak}"
+  done
+  exit 1
+fi
 commit_all || exit 1
 
 # 成功提交后才丢弃备份：失败路径上的备份要么已经用于还原，要么是手工

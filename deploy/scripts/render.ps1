@@ -384,6 +384,9 @@ function Restore-Targets {
             if (Test-Path -LiteralPath $bak) {
                 try {
                     [IO.File]::Copy($bak, $out, $true)
+                    # Consumed: keeping it would leave a stray .bak in the
+                    # deployment directory that nobody knows what to do with.
+                    Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
                 } catch {
                     # Never delete the backup when the restore itself failed: it
                     # is the only remaining copy of the previous config.

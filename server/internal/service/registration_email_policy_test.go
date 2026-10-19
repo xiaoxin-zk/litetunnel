@@ -159,6 +159,7 @@ func TestNonWhitelistQuota(t *testing.T) {
 		KeyRegisterWhitelistOnly:     "true",
 		KeyRegisterNonWhitelistQuota: "1",
 		KeyRegisterRequireEmail:      "false",
+		KeyRegisterCaptcha:           "false",
 	}); err != nil {
 		t.Fatalf("保存设置失败: %v", err)
 	}

@@ -127,6 +127,10 @@ func (s *Services) UpdateSettings(in map[SettingKey]string) error {
 		return err
 	}
 
+	if err := validateOAuthSettings(view, truthy); err != nil {
+		return err
+	}
+
 	if h := strings.TrimSpace(view(KeyGatewayHost)); h != "" {
 		if strings.ContainsAny(h, " \t\r\n/\\:@") {
 			return fmt.Errorf("%w: 网关地址只填主机名或 IP，不要带协议、端口或路径（端口请填在下面一项）", ErrInvalidParam)
@@ -202,6 +206,38 @@ func validateSiteBrand(view func(SettingKey) string) error {
 	}
 	if n := len(view(KeySiteHomeContent)); n > siteHomeContentMax {
 		return fmt.Errorf("%w: 首页内容不能超过 %d 字节", ErrInvalidParam, siteHomeContentMax)
+	}
+	return nil
+}
+
+func validateOAuthSettings(view func(SettingKey) string, truthy func(SettingKey) bool) error {
+	type pair struct {
+		name       string
+		enabled    SettingKey
+		clientID   SettingKey
+		clientSecr SettingKey
+	}
+	for _, p := range []pair{
+		{"GitHub", KeyOAuthGitHubEnabled, KeyOAuthGitHubClientID, KeyOAuthGitHubClientSecret},
+		{"Google", KeyOAuthGoogleEnabled, KeyOAuthGoogleClientID, KeyOAuthGoogleClientSecret},
+	} {
+		if !truthy(p.enabled) {
+			continue
+		}
+		if view(p.clientID) == "" {
+			return fmt.Errorf("%w: 启用 %s 登录前请填写 Client ID", ErrInvalidParam, p.name)
+		}
+		secret := view(p.clientSecr)
+		if secret == "" || secret == SecretMask {
+			return fmt.Errorf("%w: 启用 %s 登录前请填写 Client Secret", ErrInvalidParam, p.name)
+		}
+		if len(secret) < 8 {
+			return fmt.Errorf("%w: %s 的 Client Secret 看起来不完整", ErrInvalidParam, p.name)
+		}
+		if view(KeyDomainPanel) == "" {
+			return fmt.Errorf("%w: 启用 %s 登录前请先填写面板域名：回调地址由它拼出，必须与平台登记的完全一致",
+				ErrInvalidParam, p.name)
+		}
 	}
 	return nil
 }

@@ -302,6 +302,45 @@
             </span>
           </el-form-item>
 
+          <el-divider content-position="left">第三方登录</el-divider>
+
+          <el-form-item label="GitHub 登录">
+            <el-switch v-model="boolForm['oauth.github_enabled']" />
+            <span class="hint">
+              回调地址填 <code>https://面板域名/api/auth/oauth/github/callback</code>；
+              只允许登录已存在且邮箱匹配的账号，不会自动建号
+            </span>
+          </el-form-item>
+          <el-form-item label="GitHub Client ID">
+            <el-input v-model="form['oauth.github_client_id']" placeholder="OAuth App 的 Client ID" />
+          </el-form-item>
+          <el-form-item label="GitHub Client Secret">
+            <el-input
+              v-model="form['oauth.github_client_secret']"
+              type="password"
+              show-password
+              :placeholder="secretPlaceholder('oauth.github_client_secret')"
+            />
+          </el-form-item>
+
+          <el-form-item label="Google 登录">
+            <el-switch v-model="boolForm['oauth.google_enabled']" />
+            <span class="hint">
+              回调地址填 <code>https://面板域名/api/auth/oauth/google/callback</code>
+            </span>
+          </el-form-item>
+          <el-form-item label="Google Client ID">
+            <el-input v-model="form['oauth.google_client_id']" />
+          </el-form-item>
+          <el-form-item label="Google Client Secret">
+            <el-input
+              v-model="form['oauth.google_client_secret']"
+              type="password"
+              show-password
+              :placeholder="secretPlaceholder('oauth.google_client_secret')"
+            />
+          </el-form-item>
+
           <el-divider content-position="left">审计日志</el-divider>
 
           <el-form-item label="操作日志保留天数">
@@ -521,7 +560,9 @@ const BOOL_KEYS = [
   'payment.enabled',
   'firewall.enabled',
   'firewall.auto_open',
-  'security.step_up_enabled'
+  'security.step_up_enabled',
+  'oauth.github_enabled',
+  'oauth.google_enabled'
 ]
 
 const NUM_KEYS = [
@@ -539,7 +580,12 @@ const NUM_KEYS = [
   'audit.retention_days'
 ]
 
-const SECRET_KEYS = ['smtp.password', 'payment.secret']
+const SECRET_KEYS = [
+  'smtp.password',
+  'payment.secret',
+  'oauth.github_client_secret',
+  'oauth.google_client_secret'
+]
 
 const loading = ref(false)
 const saving = ref(false)

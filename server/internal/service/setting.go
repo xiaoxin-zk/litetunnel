@@ -38,6 +38,13 @@ const (
 	KeyAuditRetentionDays SettingKey = "audit.retention_days"
 	KeyStepUpEnabled      SettingKey = "security.step_up_enabled"
 
+	KeyOAuthGitHubEnabled      SettingKey = "oauth.github_enabled"
+	KeyOAuthGitHubClientID     SettingKey = "oauth.github_client_id"
+	KeyOAuthGitHubClientSecret SettingKey = "oauth.github_client_secret"
+	KeyOAuthGoogleEnabled      SettingKey = "oauth.google_enabled"
+	KeyOAuthGoogleClientID     SettingKey = "oauth.google_client_id"
+	KeyOAuthGoogleClientSecret SettingKey = "oauth.google_client_secret"
+
 	KeyAPIRatePerMinute SettingKey = "api.rate_limit_per_minute"
 	KeyAPIRateBurst     SettingKey = "api.rate_limit_burst"
 
@@ -130,6 +137,13 @@ var settingSpecs = []settingSpec{
 
 	{Key: KeyAuditRetentionDays, Default: func(*config.Config) string { return "180" }},
 	{Key: KeyStepUpEnabled, Default: func(*config.Config) string { return "false" }},
+
+	{Key: KeyOAuthGitHubEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyOAuthGitHubClientID, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyOAuthGitHubClientSecret, Secret: true, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyOAuthGoogleEnabled, Default: func(*config.Config) string { return "false" }},
+	{Key: KeyOAuthGoogleClientID, SingleLine: true, Default: func(*config.Config) string { return "" }},
+	{Key: KeyOAuthGoogleClientSecret, Secret: true, SingleLine: true, Default: func(*config.Config) string { return "" }},
 
 	{Key: KeyAPIRatePerMinute, Default: func(*config.Config) string { return "120" }},
 	{Key: KeyAPIRateBurst, Default: func(*config.Config) string { return "60" }},

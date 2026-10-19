@@ -156,6 +156,8 @@ func (h *Handler) PublicSettings(c *gin.Context) {
 		"register_captcha":       s.Bool(service.KeyRegisterCaptcha),
 		"terms":                  s.Get(service.KeyRegisterTerms),
 		"mail_enabled":           h.svc.MailEnabled(),
+		"oauth_github":           h.svc.OAuthAvailable(service.OAuthProviderGitHub),
+		"oauth_google":           h.svc.OAuthAvailable(service.OAuthProviderGoogle),
 		"payment_enabled":        s.Bool(service.KeyPaymentEnabled),
 		"payment_min":            s.Int(service.KeyPaymentMinAmount),
 		"payment_max":            s.Int(service.KeyPaymentMaxAmount),

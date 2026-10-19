@@ -85,6 +85,19 @@
                 注册账号
               </el-button>
             </div>
+
+            <template v-if="site.oauth_github || site.oauth_google">
+              <el-divider>或使用第三方账号登录</el-divider>
+              <div class="oauth-row">
+                <el-button v-if="site.oauth_github" class="oauth-btn" @click="oauthLogin('github')">
+                  GitHub 登录
+                </el-button>
+                <el-button v-if="site.oauth_google" class="oauth-btn" @click="oauthLogin('google')">
+                  Google 登录
+                </el-button>
+              </div>
+              <p class="oauth-hint">仅支持已注册并绑定过的账号，不会自动创建新账号</p>
+            </template>
           </el-form>
         </el-tab-pane>
 
@@ -158,7 +171,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { User, Lock, Key, Refresh } from '@element-plus/icons-vue'
 import { authApi, publicApi, sessionApi, TOKEN_KEY } from '../api'
@@ -167,6 +180,7 @@ import { useCountdown } from '../composables/useCountdown'
 const ADMIN_TOKEN_KEY = 'lt_admin_token'
 
 const router = useRouter()
+const route = useRoute()
 const tab = ref('login')
 const site = ref({})
 const captcha = ref(null)
@@ -347,7 +361,27 @@ function agreeTerms() {
   termsVisible.value = false
 }
 
+function oauthLogin(provider) {
+  window.location.href = `/api/auth/oauth/${provider}/start`
+}
+
+function handleOAuthRedirect() {
+  const oauthError = route.query.oauth_error
+  if (oauthError) {
+    error.value = String(oauthError)
+    router.replace({ path: '/login' })
+    return
+  }
+  const oauthToken = route.query.oauth_token
+  if (oauthToken) {
+    localStorage.setItem(TOKEN_KEY, String(oauthToken))
+    ElMessage.success('第三方登录成功')
+    router.replace('/')
+  }
+}
+
 onMounted(async () => {
+  handleOAuthRedirect()
   await loadSettings()
   if (site.value.register_captcha) await loadCaptcha()
 })
@@ -384,6 +418,23 @@ onMounted(async () => {
   object-fit: contain;
   background: #fff;
   flex-shrink: 0;
+}
+
+.oauth-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.oauth-btn {
+  flex: 1;
+}
+
+.oauth-hint {
+  margin: 10px 0 0;
+  color: #9ca3af;
+  font-size: 12px;
+  text-align: center;
 }
 
 .home-content {

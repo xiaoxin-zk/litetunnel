@@ -72,6 +72,13 @@ func New(
 		pubAuth.POST("/login", authH.Login)
 	}
 
+	oauthPub := r.Group("/api/auth/oauth")
+	oauthPub.Use(middleware.Limit(userAuthLimiter, "oauth"))
+	{
+		oauthPub.GET("/:provider/start", authH.OAuthStart)
+		oauthPub.GET("/:provider/callback", authH.OAuthCallback)
+	}
+
 	public := r.Group("/api/public")
 	public.Use(middleware.Limit(userAPILimiter, "public"))
 	{

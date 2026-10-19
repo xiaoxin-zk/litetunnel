@@ -290,6 +290,19 @@ type StepUpGrant struct {
 
 func (StepUpGrant) TableName() string { return "lt_admin_stepup_grants" }
 
+// AuthIdentity 记录第三方账号与本站账号的绑定关系。
+// (provider, provider_user_id) 唯一，避免同一个第三方账号绑到多个本站账号上。
+type AuthIdentity struct {
+	ID             uint      `gorm:"primarykey" json:"id"`
+	UserID         uint      `gorm:"index;not null" json:"user_id"`
+	Provider       string    `gorm:"size:32;uniqueIndex:idx_oauth_identity;not null" json:"provider"`
+	ProviderUserID string    `gorm:"size:128;uniqueIndex:idx_oauth_identity;not null" json:"provider_user_id"`
+	Email          string    `gorm:"size:128" json:"email"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func (AuthIdentity) TableName() string { return "lt_auth_identities" }
+
 // AdminAPIKey 是供外部集成使用的管理员只读 Key。
 // 只存哈希，明文仅在创建时返回一次；不可用于任何写操作。
 type AdminAPIKey struct {

@@ -29,10 +29,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // CloseUserProxies 关闭某用户在 frps 侧的所有已建立代理，实现「立即断流」。

@@ -413,6 +413,10 @@ jobs:
           tag_name: ${{ steps.ver.outputs.version }}
           name: LiteTunnel ${{ steps.ver.outputs.version }}
           draft: true
+          # 重发同一个版本号（tag 挪到新提交后重跑）时必须覆盖旧产物。
+          # 不覆盖的话上传会因为「asset already exists」失败，而那时镜像和
+          # Release 正文已经是新的——用户看到的正文与下载的包对不上。
+          overwrite_files: true
           generate_release_notes: true
           body: |
             ## 产物说明

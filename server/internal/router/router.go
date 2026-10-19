@@ -225,6 +225,9 @@ func New(
 		adminSuper.POST("/admins/:id/password", adminH.SetAdminPassword)
 		adminSuper.POST("/admins/:id/totp-reset", adminH.ClearAdminTOTP)
 
+		adminSuper.POST("/system/update/apply", adminH.ApplyUpdate)
+		adminSuper.POST("/system/update/restart", adminH.RestartPanel)
+
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
 		adminSuper.POST("/settings/test-mail", adminH.TestMail)
 		adminSuper.POST("/admin-api-keys", adminH.CreateAdminAPIKey)

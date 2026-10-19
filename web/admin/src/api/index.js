@@ -154,7 +154,9 @@ export const clientPkgApi = {
 }
 
 export const systemApi = {
-  update: (force) => http.get('/system/update', { params: force ? { force: 1 } : {} })
+  update: (force) => http.get('/system/update', { params: force ? { force: 1 } : {} }),
+  applyUpdate: () => http.post('/system/update/apply'),
+  restart: () => http.post('/system/update/restart')
 }
 
 export const monitorApi = {

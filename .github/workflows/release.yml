@@ -382,6 +382,55 @@ jobs:
             litetunnel-deploy.zip
             litetunnel-deploy.zip.sha256
 
+  # 面板二进制：容器部署用镜像，但二进制 + systemd 部署要靠它做
+  # 「点击更新 → 重启生效」。不带 web 资源，面板会从 LT_WEB_DIR 读静态目录。
+  panel:
+    name: Package panel binary (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: [test]
+    strategy:
+      fail-fast: true
+      matrix:
+        goarch: [amd64, arm64]
+    env:
+      VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.version || github.sha }}
+
+      - name: Validate version
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本必须形如 v1.2.3，当前为 '$VERSION'"; exit 1
+          fi
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: server/go.sum
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          cd server
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -trimpath \
+            -ldflags="-s -w -X github.com/xiaoxin-zk/litetunnel/server/internal/config.Version=${VERSION}" \
+            -o ../dist/litetunnel-panel ./cmd/panel
+          cd ../dist
+          tar -czf "litetunnel-panel-linux-${{ matrix.goarch }}.tar.gz" litetunnel-panel
+          rm litetunnel-panel
+          sha256sum "litetunnel-panel-linux-${{ matrix.goarch }}.tar.gz" \
+            > "litetunnel-panel-linux-${{ matrix.goarch }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: litetunnel-panel-linux-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
   # ============================================================
   #  创建 Release 并挂载产物
   # ============================================================
@@ -391,7 +440,7 @@ jobs:
     # docker 必须在列：Release 正文会写出 ghcr.io/...:<version> 这个镜像地址。
     # 不依赖它时，镜像构建失败而 Release 照发——用户照着正文 pull 得到
     # manifest unknown，而 Release 页面看起来一切正常。
-    needs: [test, client, deploy-bundle, docker]
+    needs: [test, client, deploy-bundle, panel, docker]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -416,16 +465,27 @@ jobs:
           name: litetunnel-deploy
           path: assets
 
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: litetunnel-panel-linux-*
+          path: assets
+          merge-multiple: true
+
       # 挂上去之前先自查一遍：产物缺失或校验和与产物不匹配时，宁可让发布
       # 失败，也不要发出一个「sha256 对不上」的版本——那比没有校验和更糟，
       # 用户会以为下载被篡改了。
       - name: Verify artifacts
         run: |
           set -euo pipefail
-          for f in assets/LiteTunnel-windows-amd64.zip assets/litetunnel-deploy.zip; do
+          for f in assets/LiteTunnel-windows-amd64.zip assets/litetunnel-deploy.zip \
+                   assets/litetunnel-panel-linux-amd64.tar.gz assets/litetunnel-panel-linux-arm64.tar.gz; do
             [[ -f "$f" ]] || { echo "::error::缺少产物 $f"; exit 1; }
           done
-          ( cd assets && sha256sum -c LiteTunnel-windows-amd64.zip.sha256 litetunnel-deploy.zip.sha256 )
+          ( cd assets && sha256sum -c \
+              LiteTunnel-windows-amd64.zip.sha256 \
+              litetunnel-deploy.zip.sha256 \
+              litetunnel-panel-linux-amd64.tar.gz.sha256 \
+              litetunnel-panel-linux-arm64.tar.gz.sha256 )
 
       - name: Create release
         uses: softprops/action-gh-release@v3
@@ -445,7 +505,9 @@ jobs:
             |---|---|
             | `LiteTunnel-windows-amd64.zip` | Windows 客户端，已内置 frpc.exe，解压即用 |
             | `litetunnel-deploy.zip` | 服务端部署包（compose / frps 模板 / Caddy 模板 / .env 模板） |
-            | `*.zip.sha256` | 产物的 SHA-256 校验和，下载后可核对 |
+            | `litetunnel-panel-linux-amd64.tar.gz` | 面板二进制（x86_64，配合 systemd 部署可在线更新） |
+            | `litetunnel-panel-linux-arm64.tar.gz` | 面板二进制（arm64） |
+            | `*.sha256` | 产物的 SHA-256 校验和，下载后可核对 |
 
             容器镜像：`ghcr.io/${{ github.repository_owner }}/litetunnel-panel:${{ steps.ver.outputs.version }}`
 
@@ -473,3 +535,7 @@ jobs:
             assets/LiteTunnel-windows-amd64.zip.sha256
             assets/litetunnel-deploy.zip
             assets/litetunnel-deploy.zip.sha256
+            assets/litetunnel-panel-linux-amd64.tar.gz
+            assets/litetunnel-panel-linux-amd64.tar.gz.sha256
+            assets/litetunnel-panel-linux-arm64.tar.gz
+            assets/litetunnel-panel-linux-arm64.tar.gz.sha256

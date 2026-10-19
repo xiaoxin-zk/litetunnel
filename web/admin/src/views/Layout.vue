@@ -79,15 +79,27 @@
 
         <template v-if="info?.has_update">
           <el-alert
+            v-if="info.can_self_update"
             type="info"
             :closable="false"
             show-icon
-            title="面板随容器镜像发布：换镜像 tag 并重启容器即完成升级，浏览器刷新后生效"
+            title="点击更新会下载并替换面板二进制，数据目录不受影响；完成后点重启，几秒内恢复"
             style="margin-bottom: 12px"
           />
-          <div class="hint">在服务器上执行：</div>
-          <pre class="cmd">{{ info.deploy_hint }}</pre>
-          <el-button size="small" @click="copyHint">复制命令</el-button>
+          <template v-else>
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              title="当前是容器部署：换镜像 tag 并重启容器即完成升级，浏览器刷新后生效"
+              style="margin-bottom: 12px"
+            />
+            <div class="hint">在服务器上执行：</div>
+            <pre class="cmd">{{ info.deploy_hint }}</pre>
+            <el-button size="small" @click="copyHint">复制命令</el-button>
+          </template>
+
+          <div v-if="appliedVersion" class="ok">新版本 v{{ appliedVersion }} 已就绪，重启后生效</div>
           <el-button v-if="info.release_url" link type="primary" @click="openRelease">打开发布页</el-button>
         </template>
 
@@ -98,6 +110,17 @@
       </div>
       <template #footer>
         <el-button :loading="checking" @click="check(true)">重新检查</el-button>
+        <el-button
+          v-if="info?.has_update && info.can_self_update && !appliedVersion"
+          type="primary"
+          :loading="applying"
+          @click="applyUpdate"
+        >
+          立即更新
+        </el-button>
+        <el-button v-if="appliedVersion" type="success" :loading="restarting" @click="restartPanel">
+          立即重启
+        </el-button>
         <el-button type="primary" @click="updateVisible = false">关闭</el-button>
       </template>
     </el-dialog>
@@ -164,6 +187,48 @@ async function copyHint() {
 
 function openRelease() {
   if (info.value?.release_url) window.open(info.value.release_url, '_blank', 'noopener')
+}
+
+const applying = ref(false)
+const appliedVersion = ref('')
+const restarting = ref(false)
+
+async function applyUpdate() {
+  applying.value = true
+  try {
+    const res = await systemApi.applyUpdate()
+    appliedVersion.value = res?.version || info.value?.latest || ''
+    ElMessage.success('新版本已替换，点「立即重启」生效')
+  } catch {
+    // 拦截器已经提示具体原因
+  } finally {
+    applying.value = false
+  }
+}
+
+function restartPanel() {
+  restarting.value = true
+  // 进程会在响应之后 exec 自身，这里只负责等它回来并刷新页面。
+  systemApi.restart().catch(() => {})
+  let tries = 0
+  const timer = setInterval(async () => {
+    tries += 1
+    try {
+      const res = await fetch('/healthz', { cache: 'no-store' })
+      if (res.ok) {
+        clearInterval(timer)
+        window.location.reload()
+        return
+      }
+    } catch {
+      // 重启窗口内连不上是正常的
+    }
+    if (tries > 60) {
+      clearInterval(timer)
+      restarting.value = false
+      ElMessage.warning('等待重启超时，请手动刷新页面或检查服务状态')
+    }
+  }, 2000)
 }
 
 const active = computed(() => route.path)
@@ -239,6 +304,12 @@ onMounted(async () => {
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.ok {
+  margin: 10px 0;
+  color: #15803d;
+  font-size: 12.5px;
 }
 
 .notes {

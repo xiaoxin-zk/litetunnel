@@ -26,6 +26,24 @@ func (h *Handler) CheckUpdate(c *gin.Context) {
 	httpx.OK(c, status)
 }
 
+// ApplyUpdate 下载并替换面板二进制，重启后生效。
+func (h *Handler) ApplyUpdate(c *gin.Context) {
+	version, err := h.svc.ApplyPanelUpdate(c.Request.Context())
+	if err != nil {
+		httpx.Fail(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	h.audit(c, "system.update.apply", "system", "", "下载并替换面板二进制："+version)
+	httpx.OK(c, gin.H{"applied": true, "version": version, "message": "新版本已就绪，重启后生效"})
+}
+
+// RestartPanel 让新二进制接管进程。
+func (h *Handler) RestartPanel(c *gin.Context) {
+	h.audit(c, "system.update.restart", "system", "", "重启面板使新版本生效")
+	httpx.OK(c, gin.H{"restarting": true, "message": "正在重启"})
+	h.svc.RestartPanel()
+}
+
 func (h *Handler) StatsOverview(c *gin.Context) {
 	var (
 		userTotal    int64

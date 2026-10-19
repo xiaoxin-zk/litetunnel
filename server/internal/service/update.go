@@ -46,6 +46,9 @@ type UpdateStatus struct {
 	Source      string         `json:"source"`
 	Warning     string         `json:"warning,omitempty"`
 	DeployHint  string         `json:"deploy_hint"`
+	// CanSelfUpdate 仅二进制 + systemd 部署为 true；容器部署恒为 false。
+	CanSelfUpdate bool   `json:"can_self_update"`
+	InstallMode   string `json:"install_mode"`
 }
 
 type githubRelease struct {
@@ -124,7 +127,7 @@ func (s *Services) CheckUpdate(ctx context.Context, force bool) (*UpdateStatus, 
 	s.updateMu.Unlock()
 
 	if !force && cached != nil && time.Since(cached.CheckedAt) < updateCheckTTL {
-		return cached, nil
+		return s.decorateUpdate(cached), nil
 	}
 
 	status, err := s.fetchLatestRelease(ctx)
@@ -132,7 +135,7 @@ func (s *Services) CheckUpdate(ctx context.Context, force bool) (*UpdateStatus, 
 		if cached != nil {
 			fallback := *cached
 			fallback.Warning = "本次检查失败，展示的是上次结果：" + err.Error()
-			return &fallback, nil
+			return s.decorateUpdate(&fallback), nil
 		}
 		return nil, err
 	}
@@ -142,7 +145,12 @@ func (s *Services) CheckUpdate(ctx context.Context, force bool) (*UpdateStatus, 
 	keep := *status
 	s.updateCache = &keep
 	s.updateMu.Unlock()
-	return status, nil
+	return s.decorateUpdate(status), nil
+}
+
+func (s *Services) decorateUpdate(st *UpdateStatus) *UpdateStatus {
+	st.CanSelfUpdate, st.InstallMode = s.SelfUpdateState()
+	return st
 }
 
 func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error) {

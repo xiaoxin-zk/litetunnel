@@ -111,17 +111,32 @@ func (s *Services) markFirewallPending(port int, proto string, open bool) error 
 		return ErrFirewallQueueFull
 	}
 	item := pendingFW{open: open, proto: proto, attempts: attempts, gen: gen}
-	s.fwPending[port] = item
 	s.fwMu.Unlock()
 
-	// 落库放在锁外：这是 IO，不该让建/删隧道的请求排在它后面。
-	s.persistPending(port, item)
+	// 先落库再写内存：反过来会留下「内存说有、库里没有」的假象。
+	//
+	// 落库失败时返回错误而不是只记日志：防火墙意图是「端口开着却没人知道
+	// 为什么」的唯一线索，重启后内存那份就消失了。调用方据此明确失败，
+	// 用户会看到「隧道启用但端口策略未下发」，而不是一个静默的不一致。
+	//
+	// IO 放在锁外：不该让建/删隧道排在数据库往返后面。
+	if err := s.persistPending(port, item); err != nil {
+		return fmt.Errorf("%w: %v", ErrFirewallQueueUnavailable, err)
+	}
+
+	s.fwMu.Lock()
+	if cur, ok := s.fwPending[port]; ok && cur.gen >= gen {
+		// 落库期间另一条更新的意图已经写入内存：本次不再覆盖。
+		s.fwMu.Unlock()
+		return nil
+	}
+	s.fwPending[port] = item
+	s.fwMu.Unlock()
 	return nil
 }
 
-// persistPending 把一条待办写入数据库（写失败只记日志：内存里那份仍然有效，
-// 只是这次重启后会丢——比让整个防火墙操作失败要好）。
-func (s *Services) persistPending(port int, item pendingFW) {
+// persistPending 把一条待办写入数据库，返回错误由调用方决定如何处理。
+func (s *Services) persistPending(port int, item pendingFW) error {
 	rec := model.FirewallPending{
 		Port:       port,
 		Proto:      item.proto,
@@ -147,9 +162,12 @@ func (s *Services) persistPending(port int, item pendingFW) {
 			//     last_err，多实例下旧的重试状态不能覆盖新的。
 			gorm.Expr("excluded.generation > lt_firewall_pending.generation OR (excluded.generation = lt_firewall_pending.generation AND excluded.attempts >= lt_firewall_pending.attempts)"),
 		}},
-	}).Create(&rec).Error; err != nil {
-		log.Printf("[firewall] 待办落库失败（端口 %d，重启后会丢失这条意图）: %v", port, err)
+	}).Create(&rec).Error
+	if err != nil {
+		log.Printf("[firewall] 待办落库失败（端口 %d）: %v", port, err)
+		return err
 	}
+	return nil
 }
 
 // dropPending 从内存与数据库里同时移除一条待办，但只在它仍是**同代**时。

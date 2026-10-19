@@ -82,22 +82,25 @@ func (s *Services) runMaintenance(ctx context.Context) {
 	// 会把一次维护拖成好几倍时长。
 	deadline := now.Add(maintenanceBudget)
 
-	s.pruneTable(deadline, "过期验证码", &model.EmailCode{},
+	// 每个查询都带上停机上下文：ctx 取消后，正在排队的 SQL 会立刻返回，
+	// 而不是等数据库/驱动自己的超时。否则 svc.Close() 关闭连接池时，
+	// 这些语句可能正持有连接，形成「等待 worker → worker 等数据库」的僵局。
+	s.pruneTable(ctx, deadline, "过期验证码", &model.EmailCode{},
 		"created_at < ?", now.Add(-emailCodeRetention))
 	if ctx.Err() != nil {
 		return
 	}
-	s.pruneTable(deadline, "过期重置令牌", &model.PasswordResetToken{},
+	s.pruneTable(ctx, deadline, "过期重置令牌", &model.PasswordResetToken{},
 		"created_at < ?", now.Add(-resetTokenRetention))
 	if ctx.Err() != nil {
 		return
 	}
-	s.pruneTable(deadline, "失败邮件", &model.MailOutbox{},
+	s.pruneTable(ctx, deadline, "失败邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailFailed, now.Add(-mailFailedRetention))
 	if ctx.Err() != nil {
 		return
 	}
-	s.pruneMailOutbox(deadline)
+	s.pruneMailOutbox(ctx, deadline)
 	if ctx.Err() != nil {
 		return
 	}
@@ -117,10 +120,10 @@ func (s *Services) runMaintenance(ctx context.Context) {
 // 先取一批主键、再按主键删：GORM 的 Delete 不支持 LIMIT，而「一条语句删干净」
 // 正是这里要避免的。删不动或删失败都只记日志——清理任务不该把服务拖垮，
 // 更不该因为一次数据库抖动就退出。
-func (s *Services) pruneTable(deadline time.Time, name string, dest any, cond string, args ...any) int64 {
+func (s *Services) pruneTable(ctx context.Context, deadline time.Time, name string, dest any, cond string, args ...any) int64 {
 	var total int64
 	for {
-		n := s.pruneBatch(name, dest, cond, args...)
+		n := s.pruneBatch(ctx, name, dest, cond, args...)
 		total += n
 		// 这一批没装满，说明已经清空。
 		if n < maintenanceBatchSize {
@@ -130,7 +133,7 @@ func (s *Services) pruneTable(deadline time.Time, name string, dest any, cond st
 			// 到预算就把剩余量说出来：只有「已清理 N 条」的日志时，
 			// 看不出积压是刚清完还是一直在涨。
 			var left int64
-			if err := s.DB.Model(dest).Where(cond, args...).Count(&left).Error; err != nil {
+			if err := s.DB.WithContext(ctx).Model(dest).Where(cond, args...).Count(&left).Error; err != nil {
 				log.Printf("[cleanup] 统计 %s 剩余量失败: %v", name, err)
 			} else {
 				log.Printf("[cleanup] %s 本轮已清理 %d 条，达到时间预算，剩余约 %d 条下轮继续",
@@ -149,9 +152,9 @@ func (s *Services) pruneTable(deadline time.Time, name string, dest any, cond st
 //
 // 单独保留「一批」这一层：一次性大删会长时间占住写锁（SQLite 更是整库阻塞），
 // 连续分批既能把积压清干净，又不会让单次语句过大。
-func (s *Services) pruneBatch(name string, dest any, cond string, args ...any) int64 {
+func (s *Services) pruneBatch(ctx context.Context, name string, dest any, cond string, args ...any) int64 {
 	var ids []uint
-	if err := s.DB.Model(dest).Where(cond, args...).
+	if err := s.DB.WithContext(ctx).Model(dest).Where(cond, args...).
 		Limit(maintenanceBatchSize).Pluck("id", &ids).Error; err != nil {
 		log.Printf("[cleanup] 查询待清理的%s失败: %v", name, err)
 		return 0
@@ -160,7 +163,7 @@ func (s *Services) pruneBatch(name string, dest any, cond string, args ...any) i
 		return 0
 	}
 
-	res := s.DB.Where("id IN ?", ids).Delete(dest)
+	res := s.DB.WithContext(ctx).Where("id IN ?", ids).Delete(dest)
 	if res.Error != nil {
 		log.Printf("[cleanup] 清理%s失败: %v", name, res.Error)
 		return 0

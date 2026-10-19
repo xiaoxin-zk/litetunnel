@@ -51,7 +51,12 @@ func BackfillIncarnations(db *gorm.DB) error {
 			end = len(ids)
 		}
 		for _, id := range ids[start:end] {
-			if err := db.Model(&User{}).Where("id = ?", id).
+			// 条件更新：两个实例同时启动回填时，后写者不能再覆盖先写者。
+			// 无条件 Update 会让「多实例启动」这个本就允许的场景，随机地用
+			// 后启动那台的随机值抹掉先启动那台的标识——而断流待办可能在
+			// 覆盖发生前后分别写入了不同值，最终有一半对不上。
+			if err := db.Model(&User{}).
+				Where("id = ? AND (incarnation IS NULL OR incarnation = '')", id).
 				Update("incarnation", NewIncarnation()).Error; err != nil {
 				return err
 			}

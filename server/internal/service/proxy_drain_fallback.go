@@ -71,6 +71,11 @@ type proxyDrainFallbackQueue struct {
 	items map[uint]*proxyDrainFallback
 	// dropped 统计因队列满而被丢弃的意图数（暴露给健康检查/管理页）。
 	dropped atomic.Int64
+	// droppedRecent 记录最近被丢弃的用户，供管理页直接点名排查。
+	//
+	// 只留一个数字的话，管理员只能知道「丢过 3 条」，无法知道是哪些账号的
+	// 代理可能还在跑——而排查需要的正是这份名单。
+	droppedRecent []uint
 	// persisted 统计成功补写回库的意图数（说明兜底真的生效过）。
 	persisted atomic.Int64
 	// enqueued 统计进入队列的总数（含后来被覆盖的）。
@@ -103,7 +108,8 @@ func (q *proxyDrainFallbackQueue) enqueue(req proxyDrainRequest) {
 		}
 		delete(q.items, oldest)
 		q.dropped.Add(1)
-		log.Printf("[proxy-drain] 补偿队列已满（%d），丢弃用户 %d 的最旧意图（该账号的残留代理将失去补偿机会）",
+		q.rememberDropped(oldest)
+		log.Printf("[proxy-drain] 补偿队列已满（%d），丢弃用户 %d 的最旧意图（该账号的残留代理失去自动补偿，需人工断流，名单见 drain_fallback.dropped_recent）",
 			proxyDrainFallbackLimit, oldest)
 	}
 	q.items[req.userID] = &proxyDrainFallback{req: req, at: time.Now()}
@@ -136,9 +142,28 @@ func (q *proxyDrainFallbackQueue) putBack(it proxyDrainFallback) {
 	defer q.mu.Unlock()
 	if len(q.items) >= proxyDrainFallbackLimit {
 		q.dropped.Add(1)
+		q.rememberDropped(it.req.userID)
+		log.Printf("[proxy-drain] 补偿队列已满（%d），用户 %d 的断流意图未能放回（需人工断流）",
+			proxyDrainFallbackLimit, it.req.userID)
 		return
 	}
 	q.items[it.req.userID] = &proxyDrainFallback{req: it.req, at: it.at, attempts: it.attempts + 1}
+}
+
+// droppedRecentMax 是保留的「被丢弃用户」名单长度。
+const droppedRecentMax = 16
+
+// rememberDropped 记录一个失去自动补偿机会的用户（调用方持锁）。
+func (q *proxyDrainFallbackQueue) rememberDropped(userID uint) {
+	for _, id := range q.droppedRecent {
+		if id == userID {
+			return
+		}
+	}
+	if len(q.droppedRecent) >= droppedRecentMax {
+		q.droppedRecent = q.droppedRecent[1:]
+	}
+	q.droppedRecent = append(q.droppedRecent, userID)
 }
 
 // size 返回当前队列长度（供健康检查/管理页展示）。
@@ -163,6 +188,11 @@ type ProxyDrainFallbackStats struct {
 	//
 	// 非零意味着「有账号的残留代理失去了补偿机会」，必须人工排查。
 	Dropped int64 `json:"dropped"`
+	// DroppedRecent 是最近被丢弃的用户 ID（最多 16 个）。
+	//
+	// 有了名单，管理员可以直接按账号人工断流；只有计数的话，还得靠翻很久
+	// 以前的日志去猜是谁。
+	DroppedRecent []uint `json:"dropped_recent,omitempty"`
 }
 
 // ProxyDrainFallback 返回断流兜底队列的统计快照。
@@ -174,11 +204,15 @@ func (s *Services) ProxyDrainFallback() ProxyDrainFallbackStats {
 		return ProxyDrainFallbackStats{}
 	}
 	q := s.drainFallback
+	q.mu.Lock()
+	recent := append([]uint(nil), q.droppedRecent...)
+	q.mu.Unlock()
 	return ProxyDrainFallbackStats{
-		Queued:    q.size(),
-		Enqueued:  q.enqueued.Load(),
-		Persisted: q.persisted.Load(),
-		Dropped:   q.dropped.Load(),
+		Queued:        q.size(),
+		Enqueued:      q.enqueued.Load(),
+		Persisted:     q.persisted.Load(),
+		Dropped:       q.dropped.Load(),
+		DroppedRecent: recent,
 	}
 }
 

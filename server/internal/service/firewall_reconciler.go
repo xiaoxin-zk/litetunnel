@@ -101,7 +101,9 @@ func (s *Services) retryPendingFirewall() int {
 				s.fwMu.Lock()
 				s.fwPending[port] = item
 				s.fwMu.Unlock()
-				s.persistPending(port, item)
+				if perr := s.persistPending(port, item); perr != nil {
+					log.Printf("[firewall] 端口 %d 的终态未能落库（重启后仍会重试一轮）: %v", port, perr)
+				}
 				pl.Unlock()
 				log.Printf("[firewall] 端口 %d 连续 %d 次处理失败，已停止自动重试并将保留在管理页（最后错误: %v）",
 					port, item.attempts, err)
@@ -112,7 +114,9 @@ func (s *Services) retryPendingFirewall() int {
 			s.fwMu.Unlock()
 			// 重试次数也要落库：否则重启后计数归零，永久失败的端口
 			// 会重新走满一轮上限，日志反复出现。
-			s.persistPending(port, item)
+			if perr := s.persistPending(port, item); perr != nil {
+				log.Printf("[firewall] 端口 %d 的重试计数未能落库: %v", port, perr)
+			}
 			pl.Unlock()
 			continue
 		}

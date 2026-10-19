@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/xiaoxin-zk/litetunnel/server/internal/model"
 )
@@ -346,10 +347,6 @@ func (s *Services) refreshGuardDue() {
 // 条件更新里重复了「已到期」这个前提：并发改派分组/延长有效期的操作会让它
 // 落空，此时本函数什么都不做，下一次调度按新状态重新判断。
 func (s *Services) migrateExpiredGroups(ids []uint) error {
-	g := s.defaultGroup()
-	if g == nil {
-		return errors.New("没有默认分组，无法把到期用户落回默认分组")
-	}
 	// 分批更新：一次到期一大批用户（比如统一发过一批 30 天试用，集体到期）
 	// 时，单条 IN (...) 的绑定参数会撞上驱动上限（SQLite 32766 /
 	// PostgreSQL 65535），而失败后每轮调度都会原样重试一次，永远迁不完。
@@ -365,14 +362,37 @@ func (s *Services) migrateExpiredGroups(ids []uint) error {
 		// 「已到期」条件，不会再被扫出来）。
 		if err := s.DB.Transaction(func(tx *gorm.DB) error {
 			batch := ids[start:end]
-			if err := tx.Model(&model.User{}).
+			// 在事务内、按行锁重新确认「确实还是过期的」。
+			//
+			// 到期名单来自调度开始时的查询：这期间管理员可能延长了某人的
+			// 有效期。无条件按 batch 刷新隧道的话，那些人的隧道会被写成
+			// 默认分组限速，而他们的用户行仍留在原分组——两处长期不一致，
+			// 且不会再有调度来纠正（他们已经不满足「已到期」条件）。
+			var still []uint
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Model(&model.User{}).
 				Where("id IN ? AND group_expire_at IS NOT NULL AND group_expire_at <= ?", batch, now).
+				Pluck("id", &still).Error; err != nil {
+				return err
+			}
+			if len(still) == 0 {
+				return nil
+			}
+			// 默认分组同样在事务内、加锁读取：与管理员并发改默认组时，
+			// 读到的必须是这次写入生效的那个分组，否则快照会写成上一个
+			// 默认组的限速。
+			g := s.defaultGroupTx(tx)
+			if g == nil {
+				return errors.New("没有默认分组，无法把到期用户落回默认分组")
+			}
+			if err := tx.Model(&model.User{}).
+				Where("id IN ?", still).
 				Updates(map[string]any{"group_id": g.ID, "group_expire_at": nil}).Error; err != nil {
 				return err
 			}
 			// 快照同步到生效分组；trigger 会同时推进隧道清单版本，客户端
 			// 下一次同步就能看到新的限速。
-			return tx.Model(&model.Tunnel{}).Where("user_id IN ?", batch).
+			return tx.Model(&model.Tunnel{}).Where("user_id IN ?", still).
 				Update("bandwidth_limit", g.BandwidthLimit).Error
 		}); err != nil {
 			return err

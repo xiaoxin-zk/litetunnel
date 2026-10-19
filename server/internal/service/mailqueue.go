@@ -630,8 +630,8 @@ func (s *Services) finishMail(id uint, token string, f mailFinish) {
 //
 // 只留「事件」本身（发给谁、什么时候、成功没有）供审计；正文与参数在办结时
 // 就已经清空，不依赖这里。
-func (s *Services) pruneMailOutbox(deadline time.Time) {
-	s.pruneTable(deadline, "已送达邮件", &model.MailOutbox{},
+func (s *Services) pruneMailOutbox(ctx context.Context, deadline time.Time) {
+	s.pruneTable(ctx, deadline, "已送达邮件", &model.MailOutbox{},
 		"status = ? AND updated_at < ?", model.MailSent, time.Now().Add(-mailSentRetention))
 }
 

@@ -57,8 +57,29 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.redis.Del(ctx, c.key(key)).Err()
 }
 
+// BumpVersion 单调推进一个「失效版本」。
+//
+// 不能用「INCR + 一年过期」：key 过期后计数从 1 重新开始，而别的实例本地
+// 缓存里可能还记着 500 —— Observe 只接受更大的版本，于是新的失效通知被
+// 永久忽略，跨实例 fencing 就失效了。
+//
+// 这里的做法是：不存在时用纳秒时间戳作为起点，存在时 +1；并且**不设过期**。
+// 时间戳远大于任何按次累加的值，即使 key 被手工删除/淘汰，重新生成的起点
+// 也一定大于此前观察到的版本。
 func (c *Client) BumpVersion(ctx context.Context, key string) (int64, error) {
-	return c.IncrementWindow(ctx, key, 365*24*time.Hour)
+	if !c.Enabled() {
+		return 0, fmt.Errorf("redis 未配置")
+	}
+	script := redis.NewScript(`
+local v = redis.call('GET', KEYS[1])
+if not v then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return tonumber(ARGV[1])
+end
+local n = tonumber(v) + 1
+redis.call('SET', KEYS[1], n)
+return n`)
+	return script.Run(ctx, c.redis, []string{c.key(key)}, time.Now().UnixNano()).Int64()
 }
 
 func NewFence() string {

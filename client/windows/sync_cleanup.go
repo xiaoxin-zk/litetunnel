@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // cleanupStaleConfigs 清掉「服务端已经没有」的隧道在本地留下的配置文件。
@@ -33,10 +34,11 @@ func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
 		// 其它失败（权限、磁盘、被占用）不能静默：那个目录里是含接入密钥
 		// 的 frpc.toml，读不到就意味着该清的配置清不掉，而用户看不到任何
 		// 提示。记进同步错误，界面上至少有一个可追的线索。
-		a.setSyncErr(fmt.Errorf("无法读取本地配置文件目录（%s），已删除隧道的配置可能残留：%w", dir, err))
+		a.setCleanupErr(fmt.Sprintf("无法读取本地配置文件目录（%s），已删除隧道的配置可能残留：%v", dir, err))
 		return
 	}
 
+	var failures []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -55,7 +57,9 @@ func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
 			continue
 		}
 		if rerr := removeFrpcConfig(id); rerr != nil {
-			a.warnConfigCleanup(id, "本地配置文件清理失败（其中含接入密钥）："+rerr.Error())
+			msg := "本地配置文件清理失败（其中含接入密钥）：" + rerr.Error()
+			a.warnConfigCleanup(id, msg)
+			failures = append(failures, fmt.Sprintf("隧道 %d：%s", id, rerr.Error()))
 			continue
 		}
 		// 清理成功：把「已提示过」的标记一并撤掉。
@@ -65,6 +69,29 @@ func (a *App) cleanupStaleConfigs(alive map[uint]bool) {
 		a.clearCleanupWarn(id)
 		log.Printf("[client] 已清理隧道 %d 的本地配置（该隧道在服务端已不存在）", id)
 	}
+	// 本轮结论落成一个稳定状态：有失败就挂着，全部清干净才撤。
+	// 只在单条提示里说是不够的——那条提示会随界面刷新出现/消失，
+	// 用户无法判断「配置文件里仍有密钥」这件事是否已经解决。
+	if len(failures) > 0 {
+		a.setCleanupErr("本地配置文件清理未完成（其中含接入密钥），将每轮同步自动重试：" +
+			strings.Join(failures, "；"))
+	} else {
+		a.clearCleanupErr()
+	}
+}
+
+// setCleanupErr 记录一个会持续显示到清理成功的错误。
+func (a *App) setCleanupErr(msg string) {
+	a.mu.Lock()
+	a.cleanupErr = clampStatusText(msg)
+	a.mu.Unlock()
+}
+
+// clearCleanupErr 在清理全部成功后撤掉这条状态。
+func (a *App) clearCleanupErr() {
+	a.mu.Lock()
+	a.cleanupErr = ""
+	a.mu.Unlock()
 }
 
 // clearCleanupWarn 撤掉「已提示过清理失败」的标记。

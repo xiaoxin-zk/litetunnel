@@ -234,6 +234,13 @@ type App struct {
 	lastSyncAt time.Time
 	syncErr    string
 
+	// cleanupErr 是「本地配置文件清理」的持续状态。
+	//
+	// 与 syncErr 分开存：同步成功会清空 syncErr，而清理失败可能横跨多轮
+	// （文件被占用、目录只读）。合成在一起会让这条提示在一轮成功同步后
+	// 消失，用户以为含密钥的残留文件已经清掉了。
+	cleanupErr string
+
 	// cfgRev 记录 applied 里那份文本对应的服务端配置摘要(见 TunnelVO.ConfigRev)。
 	//
 	// 两者必须一起记账:只存文本的话,下一轮无法判断「服务端现在会生成的
@@ -379,6 +386,14 @@ type App struct {
 	// （20 秒后）发现进程不在就再拉一次——如此循环，日志每 20 秒重复一遍
 	// 同样的错误，而问题一点没变，用户还以为客户端在「努力重连」。
 	retries map[uint]*retryState
+
+	// stopIntents 记录「用户刚刚主动停掉了这条隧道」。
+	//
+	// 与进程自身的 stopping 标记互补：那个标记只在 mgr.Stop 拿到进程指针时
+	// 才置位；进程恰好在 Stop 之前自己退出时，退出回调看到的是 requested=false，
+	// 会按「异常退出」记一次失败退避，界面上短暂闪出「启动失败」——而用户
+	// 明明点的是「断开」。意图由上层记录，回调消费一次。
+	stopIntents map[uint]bool
 
 	// startGen 记录每条隧道的进程是在哪个**账号代次**下启动的
 	// （值取自 a.authGeneration，与它一同由 a.mu 保护）。
@@ -553,6 +568,12 @@ func (a *App) onTunnelExitGen(id uint, name string, gen uint64, err error, reque
 	// 进程没了，代理自然也不在——无论是我们主动停的还是它自己退出的。
 	// 不清的话，界面会一直显示「运行中」，而实际上这条隧道已经断了。
 	a.setTunnelRegisteredGen(id, gen, false)
+	// 用户刚刚主动断开（StopTunnel / 停用同步）：进程恰好在 Stop 之前退出时
+	// 回调拿到的是 requested=false，这里把上层记录的意图合并进来，避免一次
+	// 正常断开被当成启动失败。
+	if a.consumeStopIntent(id) {
+		requested = true
+	}
 	switch {
 	case requested:
 		// 我们自己停的（用户关开关、退出登录、配置变更重连）：

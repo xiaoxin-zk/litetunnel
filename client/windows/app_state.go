@@ -119,7 +119,10 @@ func (a *App) getStateLocked(logEpoch uint64) State {
 		Group:          a.group,
 		PaymentEnabled: a.paymentEnabled,
 		BalanceCents:   a.balanceCents,
-		SyncErr:        a.syncErr,
+		// 清理失败独立于同步错误：同步成功不代表含密钥的残留文件已经清掉，
+		// 而界面只有一个 SyncErr 位置可显示。两处都有时优先显示同步错误
+		// （它更可能是用户当下要处理的），清理状态在下一轮仍会出现。
+		SyncErr:        firstNonEmpty(a.syncErr, a.cleanupErr),
 		LastSyncAt:     lastSync,
 		ConfigError:    a.cfgErr,
 		Version:        Version(),

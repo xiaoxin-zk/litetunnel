@@ -164,6 +164,17 @@ func (s *service) handleCerts(w http.ResponseWriter, r *http.Request) {
 // 为什么不问 Caddy：它的 admin API 是关闭的（这是刻意的，见包注释），
 // 而证书本来就落在磁盘上。直接读文件既不需要开任何接口，
 // 也能读出**实际**在用的那份证书——包括它到底覆盖了哪些域名。
+// 证书扫描的资源上限。
+//
+// 这些数字远高于正常规模（Caddy 每个域名一张证书，几十张已算多），
+// 只用来挡住「目录被塞满 / 深目录 / 超大文件」这类异常输入。
+const (
+	certScanMaxFiles     = 2000
+	certScanMaxDepth     = 6
+	certScanMaxFileBytes = 1 << 20 // 1 MiB
+	certScanBudget       = 2 * time.Second
+)
+
 func (s *service) certStatus() tlscfg.CertStatus {
 	root := filepath.Join(s.paths.caddyData, "certificates")
 	st := tlscfg.CertStatus{}
@@ -183,8 +194,21 @@ func (s *service) certStatus() tlscfg.CertStatus {
 	// 回调吞掉单条错误是为了「一棵子树读不了不要拖垮整份列表」，
 	// 但吞掉之后 WalkDir 的返回值和「一切正常」就分不出来了，
 	// 所以这里自己记住第一个失败，供下面的诊断文案使用。
-	var walkErr error
+	//
+	// 同时给扫描设硬上限：caddyData 是宿主机上的可写目录，里面可能有用户
+	// 自己塞进来的东西（备份、导出、甚至刻意构造的深目录）。没有上限时
+	// 一次 /certs 请求就能把 helper 卡在 IO 上，而它是面板状态页同步调用的。
+	var (
+		walkErr  error
+		scanned  int
+		truncate string
+		started  = time.Now()
+	)
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if time.Since(started) > certScanBudget {
+			truncate = "遍历超时"
+			return filepath.SkipAll
+		}
 		if err != nil {
 			if walkErr == nil {
 				walkErr = err
@@ -192,10 +216,24 @@ func (s *service) certStatus() tlscfg.CertStatus {
 			return nil
 		}
 		if d.IsDir() {
+			if rel, rerr := filepath.Rel(root, path); rerr == nil &&
+				strings.Count(rel, string(os.PathSeparator)) > certScanMaxDepth {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
 		if ext != ".crt" && ext != ".pem" {
+			return nil
+		}
+		scanned++
+		if scanned > certScanMaxFiles {
+			truncate = fmt.Sprintf("文件数超过 %d", certScanMaxFiles)
+			return filepath.SkipAll
+		}
+		// 单文件上限：parseLeafCert 会整份读入内存，一个几百 MB 的
+		// 「.pem」足以让这次请求失败或长期占住内存。
+		if info, ierr := d.Info(); ierr == nil && info.Size() > certScanMaxFileBytes {
 			return nil
 		}
 		cert, ok := parseLeafCert(path)
@@ -205,7 +243,6 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		st.Certs = append(st.Certs, toCertificate(cert, path))
 		return nil
 	})
-
 	// 遍历失败（权限不足、IO 错误）与「目录里确实没有证书」是两种完全不同的状况：
 	// 前者报成「还没签发成功」会把管理员引向错误的方向去查 Caddy 日志。
 	switch {
@@ -215,6 +252,14 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		st.Reason = fmt.Sprintf("证书列表可能不完整（遍历中断：%v）", walkErr)
 	case len(st.Certs) == 0:
 		st.Reason = "Caddy 数据目录里没有可解析的证书文件（可能还没签发成功，请查看 caddy 容器日志）"
+	}
+	if truncate != "" {
+		note := fmt.Sprintf("证书列表已截断（%s），仅扫描前 %d 个文件", truncate, scanned)
+		if st.Reason != "" {
+			st.Reason += "；" + note
+		} else {
+			st.Reason = note
+		}
 	}
 	// 最快到期的排最前：这才是管理员需要动手的那一张。
 	sort.Slice(st.Certs, func(i, j int) bool {

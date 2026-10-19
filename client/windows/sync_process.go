@@ -200,6 +200,9 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 		return asConfigStage(errors.New("服务端未返回该隧道的配置"))
 	}
 	t.ConfigRev = servedRev
+	// 新的启动让上一次「主动停止」的意图失效：否则它会在本次真正失败时
+	// 被退出回调当作用户主动断开，从而吞掉一次应该进入退避的失败。
+	a.clearStopIntent(t.ID)
 	err = a.writeAndStart(ctx, t, cfgText)
 	if errors.Is(err, errSyncDeadline) {
 		// 手动点连接时「没预算了」就是这次操作超时，不是这条隧道的启动问题：
@@ -213,9 +216,46 @@ func (a *App) startTunnelProcess(ctx context.Context, t TunnelVO) error {
 // stopTunnelProcess 停掉某条隧道的进程。
 func (a *App) stopTunnelProcess(t TunnelVO) error {
 	a.emitTunnelLog(t.Name, "隧道已断开")
+	// 先记意图再停：进程可能在 mgr.Stop 拿到指针之前就自己退出了，那时
+	// quitting 回调带的是 requested=false。没有这个上限为一次的意图，
+	// 用户点「断开」会看到一闪而过的「启动失败」并多等一轮退避。
+	a.markStopIntent(t.ID)
 	// 主动停也要立刻清掉「已注册」：不等进程退出回调，界面马上就是「未连接」。
 	a.setTunnelRegistered(t.ID, false)
-	return a.mgr.Stop(t.ID)
+	err := a.mgr.Stop(t.ID)
+	if err != nil {
+		// 停失败时意图不再成立：留到下一次启动会误吞一次真实的失败。
+		a.clearStopIntent(t.ID)
+	}
+	return err
+}
+
+// markStopIntent 记一次主动停止。
+func (a *App) markStopIntent(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stopIntents == nil {
+		a.stopIntents = map[uint]bool{}
+	}
+	a.stopIntents[id] = true
+}
+
+// clearStopIntent 放弃未消费的停止意图。
+func (a *App) clearStopIntent(id uint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.stopIntents, id)
+}
+
+// consumeStopIntent 取走并清除停止意图，返回这次退出是否由用户主动发起。
+func (a *App) consumeStopIntent(id uint) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.stopIntents[id] {
+		return false
+	}
+	delete(a.stopIntents, id)
+	return true
 }
 
 // retryDelay 计算第 n 次失败之后的重试等待。

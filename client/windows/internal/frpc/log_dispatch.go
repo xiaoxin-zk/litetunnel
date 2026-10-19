@@ -199,13 +199,16 @@ func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, lin
 	}
 
 	now := time.Now()
-	key := fmt.Sprintf("%d\x00%s", tunnelID, line)
+	// 合并键带上进程代次：新旧 frpc 在短时间内输出同一句错误（例如端口
+	// 还没释放）时，不该被合并成一条——「同一个错误出现两次」与「两个进程
+	// 各报一次」在排查时结论完全不同。
+	key := fmt.Sprintf("%d\x00%d\x00%s", gen, tunnelID, line)
 
 	m.mu.Lock()
 	var out []logEntry
 	// 重复窗口结束、或换了一条不同的日志：先把累计的重复次数交代掉。
 	if m.repeatCount > 0 && (key != m.repeatKey || now.Sub(m.repeatAt) >= logRepeatWindow) {
-		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName, gen,
+		out = append(out, m.recordLocked(m.repeatTunnelID, m.repeatTunnelName, m.repeatGen,
 			fmt.Sprintf("（上一条重复 %d 次，已合并）", m.repeatCount), now))
 		m.repeatCount = 0
 	}
@@ -218,6 +221,7 @@ func (m *Manager) appendLogGen(tunnelID uint, tunnelName string, gen uint64, lin
 	}
 	m.repeatKey, m.repeatAt = key, now
 	m.repeatTunnelID, m.repeatTunnelName = tunnelID, tunnelName
+	m.repeatGen = gen
 	out = append(out, m.recordLocked(tunnelID, tunnelName, gen, line, now))
 	// 加锁入队、解锁后投递：既保证调用方按序号收到，又允许回调重入 Manager。
 	m.enqueueEmitLocked(out)

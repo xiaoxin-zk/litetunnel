@@ -18,6 +18,16 @@ import (
 // 保留开头而不是结尾：错误的首行通常就说明了原因。
 const maxStatusTextRunes = 400
 
+// firstNonEmpty 返回第一个非空字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // clampStatusText 按字符（而不是字节）截断，避免把 UTF-8 字符切成半个。
 func clampStatusText(s string) string {
 	r := []rune(s)

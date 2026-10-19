@@ -537,6 +537,23 @@ func (s *SettingStore) Get(k SettingKey) string {
 	return s.vals[k]
 }
 
+// Snapshot 在一把读锁内取多个键的值与「是否存在」标记。
+//
+// 域名配置的校验、DNS 检查与下发各自会读 6~9 个键：逐个 Get 时，另一台
+// 实例（或本进程的保存请求）可以在两次读取之间写入新值，导致一次检查
+// 用着「旧域名 + 新凭据」这种从未存在过的组合。
+func (s *SettingStore) Snapshot(keys ...SettingKey) (map[SettingKey]string, map[SettingKey]bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	vals := make(map[SettingKey]string, len(keys))
+	present := make(map[SettingKey]bool, len(keys))
+	for _, k := range keys {
+		vals[k] = s.vals[k]
+		present[k] = s.present[k]
+	}
+	return vals, present
+}
+
 // Bool 读取布尔配置。仅 "true"/"1"/"yes"/"on" 视为真。
 func (s *SettingStore) Bool(k SettingKey) bool {
 	switch strings.ToLower(strings.TrimSpace(s.Get(k))) {

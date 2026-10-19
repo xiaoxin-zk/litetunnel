@@ -388,6 +388,10 @@ func (a *App) resetPerAccountState() {
 	a.connectAt = map[uint]time.Time{}
 	a.errEmitAt = map[uint]time.Time{}
 	a.cleanupWarned = map[uint]bool{}
+	// 主动停止意图属于上一个账号的操作：不清掉的话，新账号里同一 ID 的
+	// 一次真实启动失败会被旧意图吞掉（而不是进入退避提示）。
+	a.stopIntents = map[uint]bool{}
+	a.cleanupErr = ""
 	// 启动代次同样清掉：这是「迟到的退出回调」的第二道保险。
 	// logout 会先等回调落地再走到这里，但等待有上限——等不到时流程照常
 	// 往下走。清空之后，那个迟到回调查不到自己的记账，就会按「无法证明

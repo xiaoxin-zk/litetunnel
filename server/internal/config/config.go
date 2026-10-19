@@ -263,14 +263,38 @@ func validateNumericEnvs() error {
 		if !ok || strings.TrimSpace(raw) == "" {
 			continue
 		}
-		_, portStr, err := net.SplitHostPort(strings.TrimSpace(raw))
-		if err != nil {
-			return fmt.Errorf("%s=%q 不是合法的 host:port：%w", key, raw, err)
+		if err := validateHostPort(key, raw); err != nil {
+			return err
 		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil || port < 1 || port > 65535 {
-			return fmt.Errorf("%s 的端口 %q 不在 1-65535 范围内", key, portStr)
-		}
+	}
+	return nil
+}
+
+// validateHostPort 严格校验「host:port」形式的监听地址。
+//
+// 只做 SplitHostPort 不够：`http://127.0.0.1:7500`、`user:pass@host:7500`、
+// `host:7500?x=1` 都能被它拆出一段「看起来像端口」的字符串，而 net.Dial /
+// net.Listen 会以完全不同的方式失败。frps 管理接口持续不可用正是最难排查的
+// 一类故障——采集和断流都会静默退化，所以必须在启动时挡住。
+func validateHostPort(key, raw string) error {
+	raw = strings.TrimSpace(raw)
+	switch {
+	case strings.Contains(raw, "://"):
+		return fmt.Errorf("%s=%q 不能带 scheme：只填 host:port", key, raw)
+	case strings.ContainsAny(raw, "?#"):
+		return fmt.Errorf("%s=%q 不能带 query 或 fragment", key, raw)
+	case strings.Contains(raw, "@"):
+		return fmt.Errorf("%s=%q 不能带 userinfo", key, raw)
+	case strings.ContainsAny(raw, " \t\r\n"):
+		return fmt.Errorf("%s=%q 不能包含空白", key, raw)
+	}
+	_, portStr, err := net.SplitHostPort(raw)
+	if err != nil {
+		return fmt.Errorf("%s=%q 不是合法的 host:port：%w", key, raw, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s 的端口 %q 不在 1-65535 范围内", key, portStr)
 	}
 	return nil
 }

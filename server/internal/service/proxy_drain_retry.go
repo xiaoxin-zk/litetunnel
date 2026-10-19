@@ -425,6 +425,12 @@ const (
 	// 与作废必须分开：读不出来不是「已经变了」，据此删待办等于在数据库抖动时
 	// 悄悄放弃一次安全动作。
 	proxyDrainIntentUnverifiable
+	// proxyDrainIntentManual 是升级前遗留的待办（没有 incarnation）。
+	//
+	// 这类记录无法在 ID 复用时自证身份：按前缀自动关代理有可能打掉新账号的
+	// 同名代理。它既不能当有效执行，也不能直接删——删了就再没有线索。因此
+	// 转成终态、写清原因，等人工确认。
+	proxyDrainIntentManual
 )
 
 // proxyDrainIntentState 在动手之前复核这条待办是否仍然成立，返回判定与
@@ -438,6 +444,15 @@ const (
 // 这正是任务要求的「复用 gen / notAfter / deleted 三条判据」，而不是退化成
 // 「按名字盲关」：状态版本决定要不要动手，notAfter 决定关哪些名字。
 func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrainIntent, bool) {
+	// 没有账号标识的旧待办：只要该 ID 上现在有一个已登记标识的账号，就无法
+	// 排除「旧账号已删、ID 被复用」——按前缀关代理等于替另一个账号做决定，
+	// 因此转人工确认。若该 ID 上没有任何账号（删号路径的正常状态），则没有
+	// 可误伤的对象，按删号语义继续。
+	if row.Incarnation == "" {
+		if inc, exists := s.currentIncarnation(row.UserID); exists && inc != "" {
+			return proxyDrainIntentManual, false
+		}
+	}
 	if row.Deleted {
 		// 账号已删：没有「重新启用」这回事，按删号语义继续——
 		// 但必须先排除「这个 ID 已经被另一个账号占用」。导入/恢复流程复用
@@ -475,6 +490,36 @@ func (s *Services) proxyDrainIntentState(row model.ProxyDrainPending) (proxyDrai
 		return proxyDrainIntentAbandoned, false
 	}
 	return proxyDrainIntentActive, false
+}
+
+// currentIncarnation 返回指定 ID 当前账号的生命周期标识，以及该 ID 上有没有账号。
+func (s *Services) currentIncarnation(userID uint) (string, bool) {
+	if s.DB == nil {
+		return "", false
+	}
+	var u model.User
+	if err := s.DB.Select("id", "incarnation").First(&u, userID).Error; err != nil {
+		return "", false
+	}
+	return u.Incarnation, true
+}
+
+// markProxyDrainManual 把一条无法自动核验的遗留待办转成终态。
+//
+// 只改当前围栏持有的那一行：期间若有新意图覆盖（新一次禁用/删号），
+// 那条新意图带着标识，不该被这条旧记录连累。
+func (s *Services) markProxyDrainManual(row model.ProxyDrainPending) {
+	if s.DB == nil || row.Fence == "" {
+		return
+	}
+	if err := s.DB.Model(&model.ProxyDrainPending{}).
+		Where("user_id = ? AND fence = ?", row.UserID, row.Fence).
+		Updates(map[string]any{
+			"exhausted": true,
+			"last_err":  "缺少账号标识（升级前遗留），已停止自动断流，需人工确认后清理",
+		}).Error; err != nil {
+		log.Printf("[proxy-drain] 标记遗留待办失败（用户 %d）: %v", row.UserID, err)
+	}
 }
 
 // ProxyDrainQueueHealth 是断流待办队列的可观测快照。
@@ -572,6 +617,13 @@ func (s *Services) retryPendingProxyDrains(ctx context.Context) int {
 			continue
 		case proxyDrainIntentUnverifiable:
 			// 领取时已经把 next_at 推到租期之后，这里什么都不做，下轮再判。
+			continue
+		case proxyDrainIntentManual:
+			// 升级前的待办没有账号标识，自动执行可能误伤复用同一 ID 的新账号。
+			// 转成终态并写清原因：记录保留（线索不丢），但不再自动重试。
+			s.markProxyDrainManual(row)
+			log.Printf("[proxy-drain] 用户 %d 的断流待办缺少账号标识（升级前遗留），已停止自动断流并保留记录，需人工确认",
+				row.UserID)
 			continue
 		}
 		if asDeleted && !req.deleted {

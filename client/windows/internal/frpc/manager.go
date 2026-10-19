@@ -55,6 +55,11 @@ func (m *Manager) exitLock(tunnelID uint) *sync.Mutex {
 	return &m.exitMu[tunnelID%exitLockShards]
 }
 
+// opLock 返回某条隧道的启停操作锁（Start/Stop 共用）。
+func (m *Manager) opLock(tunnelID uint) *sync.Mutex {
+	return &m.opMu[tunnelID%exitLockShards]
+}
+
 // process 是某一条隧道的 frpc 进程。
 type process struct {
 	// name 只用于日志前缀。进程本身不认隧道名，改名不影响运行中的连接。
@@ -108,6 +113,16 @@ type Manager struct {
 	// 锁序固定为 exitMu → mu，与下面 Start 和 Wait 协程的取法一致。
 	exitMu [exitLockShards]sync.Mutex
 
+	// opMu 按隧道分片，串行化「启动」与「停止」这两类操作本身。
+	//
+	// 只靠 Stop 里的循环复查仍有窗口：它读到 procs[id] == nil 之后、返回之前，
+	// 并发的 Start 可以完成登记，调用方于是以为「已经停了」，实际新进程正在
+	// 转发。两边持同一把分片锁之后，Stop 与 Start 只可能是先后关系。
+	//
+	// 与 exitMu 分开是必须的：Wait 协程在关闭 exitCh 之前要拿 exitMu，
+	// 而 Stop 要等 exitCh 关闭后再返回——用同一把锁会直接死锁。
+	opMu [exitLockShards]sync.Mutex
+
 	// callbackWG 统计正在执行的退出回调。Close 要等它们结束：
 	// 关闭流程接下来会拆掉日志投递，回调若仍在往队列里写，收尾日志会丢。
 	callbackWG sync.WaitGroup
@@ -128,6 +143,7 @@ type Manager struct {
 	repeatCount      int
 	repeatTunnelID   uint
 	repeatTunnelName string
+	repeatGen        uint64
 
 	// logSeq 是日志行的单调序号，清空之后仍然继续递增。
 	//
@@ -287,6 +303,12 @@ func (m *Manager) AnyRunning() bool {
 // tunnelName 只用于日志前缀：进程本身只认配置文件，
 // 不依赖隧道名字，因此改名不影响正在运行的连接。
 func (m *Manager) Start(tunnelID uint, tunnelName, configPath string) error {
+	// 与 Stop 共用同一把操作锁：否则 Stop 可能在「读到没有进程」之后、返回
+	// 之前被本次 Start 登记出新进程，调用方却已收到「停止成功」。
+	op := m.opLock(tunnelID)
+	op.Lock()
+	defer op.Unlock()
+
 	// 持该隧道的 exitMu 分片直到本函数返回：这段时间里它的旧退出回调不会
 	// 执行，因此不可能出现「回调先跑、把刚登记的新进程当成已退出」的覆盖。
 	// 反过来若回调先拿到锁，它会先于本次登记执行完——那时新进程还不存在，
@@ -539,6 +561,12 @@ const stopAttempts = 5
 // 登记一个新进程。只处理手里那个旧进程就返回，会让调用方以为「隧道已停」，
 // 实际上新进程正在转发——StopTunnel 之后隧道自己又活了。
 func (m *Manager) Stop(tunnelID uint) error {
+	// 与 Start 串行：这把锁覆盖整个「停进程 + 确认不在表里」的过程，
+	// 因此不会出现「Stop 判定没有新进程、随后 Start 登记了一个」的假停止。
+	op := m.opLock(tunnelID)
+	op.Lock()
+	defer op.Unlock()
+
 	for attempt := 0; ; attempt++ {
 		m.mu.Lock()
 		p := m.procs[tunnelID]

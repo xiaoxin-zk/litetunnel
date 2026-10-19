@@ -150,14 +150,23 @@ type DomainStatus struct {
 // 一律由 helper 从部署目录的 .env 读取。面板不该、也无法改它们——
 // helper 的白名单会直接拒绝。
 func (s *Services) DomainConfigVars() (map[string]string, error) {
-	panel := s.DesiredPanelDomain()
-	if panel == "" {
+	return s.domainConfigVars(s.DomainSnapshot())
+}
+
+// domainConfigVars 用同一份快照做校验与变量组装。
+func (s *Services) domainConfigVars(snap DomainConfigSnapshot) (map[string]string, error) {
+	if snap.Panel == "" {
 		return nil, fmt.Errorf("%w: 请先填写面板域名（HTTP 模式可填域名或公网 IP）", ErrInvalidParam)
 	}
-	if err := checkDomain(panel); err != nil {
+	if err := checkDomain(snap.Panel); err != nil {
 		return nil, fmt.Errorf("%w: 面板域名 %s", ErrInvalidParam, err.Error())
 	}
-	return s.domainVars(false), nil
+	if snap.Tunnel != "" {
+		if err := checkDomain(snap.Tunnel); err != nil {
+			return nil, fmt.Errorf("%w: 隧道域名 %s", ErrInvalidParam, err.Error())
+		}
+	}
+	return s.domainVarsWith(snap, false), nil
 }
 
 // domainVars 组装一次下发的**完整**变量集：helper 渲染 Caddyfile 与 frps.toml
@@ -168,18 +177,89 @@ func (s *Services) DomainConfigVars() (map[string]string, error) {
 // 渲染类字段取空。它代表从未下发过的部署**实际在跑**的那一份（手工部署时
 // 域名就写在 .env 里），用来与期望值做同口径比较。
 func (s *Services) domainVars(fromEnv bool) map[string]string {
+	return s.domainVarsWith(s.DomainSnapshot(), fromEnv)
+}
+
+// DomainConfigSnapshot 是一次读取得到的域名相关配置。
+//
+// 为什么要快照：DNS 检查、变量校验与下发各自要读域名、模式、helper 地址与
+// 令牌、期望 IP、DNS 凭据等 6~9 个键。逐个读的话，两个请求交错时可能拿到
+// 「旧域名 + 新凭据」这种从未存在过的组合，检查结论也就没有意义。
+type DomainConfigSnapshot struct {
+	Panel          string
+	Tunnel         string
+	HTTPSMode      string
+	ExpectedIP     string
+	ACMEEmail      string
+	DNSProvider    string
+	DNSArgs        string
+	DNSCredential  string
+	HelperAddr     string
+	HelperToken    string
+}
+
+// DomainSnapshot 取一份域名配置快照。
+//
+// 原子性由 SettingStore.Snapshot 的读锁保证（一次读出所有相关键），刻意
+// **不**占 domainMu：那把锁在整次下发期间持有（可能几分钟），状态页若为
+// 读一次配置去等它，会一直转圈。domainMu 只负责把「读—渲染—标记已生效」
+// 串成一个整体，跨请求的配置一致性靠 Settings 自己的原子读。
+func (s *Services) DomainSnapshot() DomainConfigSnapshot {
+	return s.domainSnapshotLocked()
+}
+
+// domainSnapshotLocked 读取快照；调用方必须已持有 domainMu。
+func (s *Services) domainSnapshotLocked() DomainConfigSnapshot {
+	vals, present := s.Settings.Snapshot(
+		KeyDomainPanel, KeyDomainTunnel, KeyDomainHTTPSMode, KeyDomainExpectedIP,
+		KeyDomainACMEEmail, KeyDomainDNSProvider, KeyDomainDNSArgs, KeyDomainDNSCredential,
+		KeyDomainHelperAddr, KeyDomainHelperToken,
+	)
+	snap := DomainConfigSnapshot{
+		// 面板域名不允许为空：空值只是异常状态，回落到 .env 比下发空域名好。
+		Panel:         normalizeDomainValue(vals[KeyDomainPanel]),
+		ExpectedIP:    strings.TrimSpace(vals[KeyDomainExpectedIP]),
+		ACMEEmail:     strings.TrimSpace(vals[KeyDomainACMEEmail]),
+		DNSProvider:   strings.TrimSpace(vals[KeyDomainDNSProvider]),
+		DNSArgs:       strings.TrimSpace(vals[KeyDomainDNSArgs]),
+		DNSCredential: vals[KeyDomainDNSCredential],
+		HelperAddr:    vals[KeyDomainHelperAddr],
+		HelperToken:   vals[KeyDomainHelperToken],
+	}
+	if snap.Panel == "" {
+		snap.Panel = normalizeDomainValue(s.Cfg.UserPublicURL)
+	}
+	// 隧道域名区分「没有行」与「有行且为空」：后者是管理员明确关闭。
+	if present[KeyDomainTunnel] {
+		snap.Tunnel = normalizeDomainValue(vals[KeyDomainTunnel])
+	} else {
+		snap.Tunnel = normalizeDomainValue(s.Cfg.TunnelDomain)
+	}
+	switch strings.ToLower(strings.TrimSpace(vals[KeyDomainHTTPSMode])) {
+	case tlscfg.HTTPSModeE2E:
+		snap.HTTPSMode = tlscfg.HTTPSModeE2E
+	case tlscfg.HTTPSModeEdge:
+		snap.HTTPSMode = tlscfg.HTTPSModeEdge
+	default:
+		snap.HTTPSMode = s.envHTTPSMode()
+	}
+	return snap
+}
+
+// domainVarsWith 用一份快照组装下发的完整变量集。
+func (s *Services) domainVarsWith(snap DomainConfigSnapshot, fromEnv bool) map[string]string {
 	// 只发「面板对外地址」而不是站点地址：站点地址（LT_USER_DOMAIN）由 helper
 	// 从它派生，这样「面板域名」在这一套里只有一个来源。
 	//
 	// 这一份是**要下发**的配置，因此取期望值而不是已生效值。
 	vars := map[string]string{
-		tlscfg.VarUserPublicURL: s.publicPanelURLWithScheme(s.DesiredPanelDomain(), s.desiredPanelScheme()),
-		tlscfg.VarTunnelDomain:  s.DesiredTunnelDomain(),
-		tlscfg.VarACMEEmail:     strings.TrimSpace(s.Settings.Get(KeyDomainACMEEmail)),
-		tlscfg.VarDNSProvider:   strings.TrimSpace(s.Settings.Get(KeyDomainDNSProvider)),
-		tlscfg.VarDNSArgs:       strings.TrimSpace(s.Settings.Get(KeyDomainDNSArgs)),
-		tlscfg.VarDNSCredential: s.Settings.Get(KeyDomainDNSCredential),
-		tlscfg.VarHTTPSMode:     s.DesiredDomainHTTPSMode(),
+		tlscfg.VarUserPublicURL: s.publicPanelURLWithScheme(snap.Panel, publicURLScheme(s.Cfg.UserPublicURL)),
+		tlscfg.VarTunnelDomain:  snap.Tunnel,
+		tlscfg.VarACMEEmail:     snap.ACMEEmail,
+		tlscfg.VarDNSProvider:   snap.DNSProvider,
+		tlscfg.VarDNSArgs:       snap.DNSArgs,
+		tlscfg.VarDNSCredential: snap.DNSCredential,
+		tlscfg.VarHTTPSMode:     snap.HTTPSMode,
 	}
 	if !fromEnv {
 		return vars
@@ -424,10 +504,10 @@ func (s *Services) TunnelPublicAddr(t *model.Tunnel) string {
 
 // DomainHelper 返回宿主机配置服务的客户端。
 func (s *Services) DomainHelper() *tlscfg.Client {
-	return tlscfg.NewClient(
-		s.Settings.Get(KeyDomainHelperAddr),
-		s.Settings.Get(KeyDomainHelperToken),
-	)
+	// 走同一份快照：地址与令牌必须成对读取，逐个 Get 可能拼出
+	// 「旧地址 + 新令牌」的组合，表现为 401 或连到错误实例。
+	snap := s.DomainSnapshot()
+	return tlscfg.NewClient(snap.HelperAddr, snap.HelperToken)
 }
 
 // ApplyDomainConfig 把当前设置渲染成 Caddyfile / frps.toml 并（可选）应用。
@@ -447,11 +527,14 @@ func (s *Services) ApplyDomainConfig(ctx context.Context, apply bool) (tlscfg.Re
 	s.domainMu.Lock()
 	defer s.domainMu.Unlock()
 
-	client := s.DomainHelper()
+	// 整个下发过程用同一份快照：helper 地址/令牌与要渲染的变量必须来自
+	// 同一次读取。分两次读会出现「发给 A helper 的却是给 B 的配置」。
+	snap := s.domainSnapshotLocked()
+	client := tlscfg.NewClient(snap.HelperAddr, snap.HelperToken)
 	if !client.Configured() {
 		return tlscfg.RenderResult{}, fmt.Errorf("%w: %s", ErrDomainApply, client.Reason())
 	}
-	vars, err := s.DomainConfigVars()
+	vars, err := s.domainConfigVars(snap)
 	if err != nil {
 		return tlscfg.RenderResult{}, err
 	}
@@ -488,18 +571,21 @@ func (s *Services) ApplyDomainConfig(ctx context.Context, apply bool) (tlscfg.Re
 // ctx 是发起检查的请求上下文：DNS 检查串行跑若干条记录，单条 5 秒，
 // 最多 20 条。客户端断开后必须尽快收手，否则重复点击会叠出成堆的后台查询。
 func (s *Services) DomainDNSCheck(ctx context.Context) ([]tlscfg.DNSRecord, error) {
-	client := s.DomainHelper()
+	// 一次快照读全：域名、期望 IP、helper 地址与令牌必须同源。逐个读会在
+	// 并发保存时混用新旧配置（用旧域名配新凭据去查，结论没有意义）。
+	snap := s.DomainSnapshot()
+	client := tlscfg.NewClient(snap.HelperAddr, snap.HelperToken)
 	if !client.Configured() {
 		return nil, fmt.Errorf("%w: %s", ErrDomainApply, client.Reason())
 	}
 
 	names := make([]string, 0, 3)
-	if d := normalizeDomainValue(s.Settings.Get(KeyDomainPanel)); d != "" {
-		names = append(names, d)
+	if snap.Panel != "" {
+		names = append(names, snap.Panel)
 	}
-	if d := normalizeDomainValue(s.Settings.Get(KeyDomainTunnel)); d != "" {
-		names = append(names, d)
-		names = append(names, randomProbeLabel()+"."+d)
+	if snap.Tunnel != "" {
+		names = append(names, snap.Tunnel)
+		names = append(names, randomProbeLabel()+"."+snap.Tunnel)
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("%w: 请先填写面板域名与隧道根域名", ErrInvalidParam)
@@ -507,7 +593,7 @@ func (s *Services) DomainDNSCheck(ctx context.Context) ([]tlscfg.DNSRecord, erro
 
 	return client.DNSCheck(ctx, tlscfg.DNSCheckRequest{
 		Names:      names,
-		ExpectedIP: strings.TrimSpace(s.Settings.Get(KeyDomainExpectedIP)),
+		ExpectedIP: snap.ExpectedIP,
 	})
 }
 

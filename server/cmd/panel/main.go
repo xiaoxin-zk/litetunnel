@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,20 +80,20 @@ func main() {
 	// 统一收集后台 worker 的退出信号，关闭阶段逐个等待（见 waitWorkers）。
 	// 之前只有防火墙协调器被等待，其余 worker 在进程退出时可能还握着
 	// 数据库连接或 SMTP 会话，尾部数据会丢。
-	workers := []<-chan struct{}{
-		svc.StartTrafficCollector(ctx),
-		svc.StartLoginLogWriter(logCtx),
-		svc.StartMailWorker(ctx),
-		svc.StartRecoveryWorker(ctx),
+	workers := []workerRun{
+		{"traffic-collector", svc.StartTrafficCollector(ctx)},
+		{"login-log-writer", svc.StartLoginLogWriter(logCtx)},
+		{"mail-worker", svc.StartMailWorker(ctx)},
+		{"recovery-worker", svc.StartRecoveryWorker(ctx)},
 		// 短期数据（过期验证码、用完的令牌、终态邮件记录）的周期清理。
 		// 没有它，公网服务跑久了这几张表会一直膨胀。
-		svc.StartMaintenanceWorker(ctx),
-		svc.StartFirewallReconciler(ctx),
+		{"maintenance-worker", svc.StartMaintenanceWorker(ctx)},
+		{"firewall-reconciler", svc.StartFirewallReconciler(ctx)},
 		// 断流待办的补偿重试：禁用/删号时若 frps 管理接口不可用，那批代理
 		// 关不掉，只把意图落库（lt_proxy_drain_pending）。没有这个 worker，
 		// 落库的待办就没有任何执行者——账号已禁用、流量却一直跑着，重启
 		// 也不会好转，而这从业务界面上完全看不出来。
-		svc.StartProxyDrainWorker(ctx),
+		{"proxy-drain-worker", svc.StartProxyDrainWorker(ctx)},
 	}
 	// 系统指标采集：每 5 秒一次，只写内存环形缓冲。
 	//
@@ -104,7 +105,7 @@ func main() {
 		defer close(monDone)
 		svc.Monitor.Start(ctx)
 	}()
-	workers = append(workers, monDone)
+	workers = append(workers, workerRun{"monitor", monDone})
 
 	engine := router.New(cfg, svc,
 		authapi.New(svc, cfg.AdminPath),
@@ -152,23 +153,47 @@ func main() {
 // 无限期关不掉。
 const workerShutdownWait = 5 * time.Second
 
+// workerRun 是一个后台 worker 的退出信号与名字。
+//
+// 带名字是为了超时日志能直接说出「谁没收尾」：只报一句「有 worker 超时」，
+// 运维还是得靠猜；而 goroutine dump 在生产里通常拿不到。
+type workerRun struct {
+	name string
+	done <-chan struct{}
+}
+
 // waitWorkers 等待所有后台 worker 退出，超过总上限则记录并继续关闭。
-func waitWorkers(workers []<-chan struct{}) {
+func waitWorkers(workers []workerRun) {
 	if len(workers) == 0 {
 		return
 	}
+	var wg sync.WaitGroup
+	wg.Add(len(workers))
+	for _, w := range workers {
+		go func(w workerRun) {
+			defer wg.Done()
+			<-w.done
+		}(w)
+	}
 	allDone := make(chan struct{})
 	go func() {
-		for _, done := range workers {
-			<-done
-		}
+		wg.Wait()
 		close(allDone)
 	}()
 	select {
 	case <-allDone:
 		return
 	case <-time.After(workerShutdownWait):
-		log.Println("后台 worker 未在 5 秒内全部退出，继续关闭")
+		remaining := make([]string, 0, len(workers))
+		for _, w := range workers {
+			select {
+			case <-w.done:
+			default:
+				remaining = append(remaining, w.name)
+			}
+		}
+		log.Printf("后台 worker 未在 %s 内全部退出，仍在运行：%s",
+			workerShutdownWait, strings.Join(remaining, ", "))
 	}
 }
 

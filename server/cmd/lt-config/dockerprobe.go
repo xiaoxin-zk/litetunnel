@@ -161,12 +161,6 @@ func composeAfterDocker(res dockerProbeResult, probeCompose func() composeProbeR
 	cres := probeCompose()
 	res.ComposeReady = cres.Ready
 	res.ComposeReason = cres.Reason
-	if cres.Ready {
-		s.composeMu.Lock()
-		s.composeBin = cres.Bin
-		s.composeV2 = cres.V2
-		s.composeMu.Unlock()
-	}
 	return res
 }
 

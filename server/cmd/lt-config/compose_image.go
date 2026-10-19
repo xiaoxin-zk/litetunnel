@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
+	"time"
 )
 
 // composeServiceImage 从 compose 文件里读出某个服务的 image。
@@ -67,6 +71,52 @@ func composeServiceImage(path, service string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("compose 文件 %s 中找不到服务 %s 的 image", path, service)
+}
+
+// composeServiceImageViaDocker 让 Compose 自己解析出某个服务的镜像。
+//
+// # 为什么在能手写解析的情况下还要调 docker
+//
+// composeServiceImage 只认「services 下两空格缩进、image: 前缀」这一种写法。
+// 本仓库的 compose 文件确实是这么写的，但格式敏感性本身就是缺陷：换成
+// YAML 锚点、include、或调整缩进，解析器会读不到而**退回默认值**——
+// 于是校验又变成「为一个没人用的镜像背书」，正是这条校验要防的事。
+//
+// `docker compose config --format json` 是 Compose 自己的解析结果：--env-file、
+// 变量插值、extends、anchors 全由它处理。我们只读 JSON 里的 services.<name>.image，
+// 不需要引入 YAML 依赖，也不需要跟着 compose 的语义演进。
+//
+// 返回 ok=false 时调用方退回手写解析：lt-config 也可能部署在没有 docker CLI
+// 的宿主机上（此时它只做渲染，不做容器重建），或 compose 版本不支持
+// --format json。这不是错误路径，只是「用不了这个更可靠的来源」。
+func composeServiceImageViaDocker(composeFile, envFile, service string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	args := []string{"compose", "-f", composeFile}
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	args = append(args, "config", "--format", "json")
+
+	out, err := exec.CommandContext(ctx, "docker", args...).Output()
+	if err != nil {
+		return "", false
+	}
+	var doc struct {
+		Services map[string]struct {
+			Image string `json:"image"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return "", false
+	}
+	svc, ok := doc.Services[service]
+	if !ok || strings.TrimSpace(svc.Image) == "" {
+		return "", false
+	}
+	// Compose 已经完成插值，返回的就是容器实际会用的镜像名。
+	return strings.TrimSpace(svc.Image), true
 }
 
 // resolveComposeImage 按 Compose 的插值规则展开镜像名里的变量。

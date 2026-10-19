@@ -173,6 +173,23 @@ const (
 	certScanMaxDepth     = 6
 	certScanMaxFileBytes = 1 << 20 // 1 MiB
 	certScanBudget       = 2 * time.Second
+	// certScanMaxTotalBytes 是**累计**读入证书内容的字节上限。
+	//
+	// 单文件上限 1 MiB 只挡住「一个巨大的文件」；2000 个文件各自接近 1 MiB
+	// 时，总读入量仍是 2 GiB，而 parseLeafCert 会把每份整读进内存再解析。
+	// 只靠 2 秒墙钟也不可靠：快设备上 2 秒能读很多，慢盘上又读不了几个——
+	// 时间预算挡不住「快设备上的一次内存尖峰」。
+	certScanMaxTotalBytes = 32 << 20
+	// certScanMaxCerts 是列出的证书条数上限。
+	//
+	// 文件数上限不等于证书条数：一个 .pem 里能塞很多份证书，而每份都要
+	// 序列化进响应体。这个上限守的是**响应体**与前端渲染，不是 IO。
+	certScanMaxCerts = 500
+	// certScanMaxSANs 是单张证书列出的 SAN 条数上限。
+	//
+	// x509 允许几乎任意多的 SAN。一张带几万个名字的证书会把响应体放大到
+	// 几 MB，而界面根本展示不了——截断并把事实写进 reason，比悄悄撑爆好。
+	certScanMaxSANs = 100
 )
 
 func (s *service) certStatus() tlscfg.CertStatus {
@@ -201,8 +218,12 @@ func (s *service) certStatus() tlscfg.CertStatus {
 	var (
 		walkErr  error
 		scanned  int
+		readByte int64
 		truncate string
-		started  = time.Now()
+		// sansTruncated 记住「有证书的 SAN 列表被截断过」，用于在 reason 里
+		// 说明清楚：界面上少列几个名字不该让管理员以为证书只覆盖了这些。
+		sansTruncated bool
+		started       = time.Now()
 	)
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if time.Since(started) > certScanBudget {
@@ -233,14 +254,34 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		}
 		// 单文件上限：parseLeafCert 会整份读入内存，一个几百 MB 的
 		// 「.pem」足以让这次请求失败或长期占住内存。
-		if info, ierr := d.Info(); ierr == nil && info.Size() > certScanMaxFileBytes {
-			return nil
+		//
+		// 累计上限同理，且不可省：单文件合规不代表整体合规——2000 个 1 MiB
+		// 的文件加起来是 2 GiB。两者一个管「单个坏文件」，一个管「一整片
+		// 合规文件加起来的内存尖峰」。
+		if info, ierr := d.Info(); ierr == nil {
+			if info.Size() > certScanMaxFileBytes {
+				return nil
+			}
+			if readByte+info.Size() > certScanMaxTotalBytes {
+				truncate = fmt.Sprintf("累计读取超过 %d 字节", int64(certScanMaxTotalBytes))
+				return filepath.SkipAll
+			}
+			readByte += info.Size()
+		}
+		// 响应体上限：证书条数要单独设，文件数挡不住「一个 pem 里很多份」。
+		if len(st.Certs) >= certScanMaxCerts {
+			truncate = fmt.Sprintf("证书数超过 %d", certScanMaxCerts)
+			return filepath.SkipAll
 		}
 		cert, ok := parseLeafCert(path)
 		if !ok {
 			return nil
 		}
-		st.Certs = append(st.Certs, toCertificate(cert, path))
+		item, cut := toCertificate(cert, path)
+		if cut {
+			sansTruncated = true
+		}
+		st.Certs = append(st.Certs, item)
 		return nil
 	})
 	// 遍历失败（权限不足、IO 错误）与「目录里确实没有证书」是两种完全不同的状况：
@@ -252,6 +293,14 @@ func (s *service) certStatus() tlscfg.CertStatus {
 		st.Reason = fmt.Sprintf("证书列表可能不完整（遍历中断：%v）", walkErr)
 	case len(st.Certs) == 0:
 		st.Reason = "Caddy 数据目录里没有可解析的证书文件（可能还没签发成功，请查看 caddy 容器日志）"
+	}
+	if sansTruncated {
+		note := fmt.Sprintf("部分证书的域名列表已截断（每张最多列出 %d 个）", certScanMaxSANs)
+		if st.Reason != "" {
+			st.Reason += "；" + note
+		} else {
+			st.Reason = note
+		}
 	}
 	if truncate != "" {
 		note := fmt.Sprintf("证书列表已截断（%s），仅扫描前 %d 个文件", truncate, scanned)
@@ -290,7 +339,11 @@ func parseLeafCert(path string) (*x509.Certificate, bool) {
 	}
 }
 
-func toCertificate(cert *x509.Certificate, path string) tlscfg.Certificate {
+// toCertificate 把 x509 证书转成展示用的结构。
+//
+// 第二个返回值表示 SAN 列表是否被截断：证书里的 DNSNames 没有上限，一张
+// 构造出来的证书可以带几万个名字，原样塞进响应体会把状态接口撑成几 MB。
+func toCertificate(cert *x509.Certificate, path string) (tlscfg.Certificate, bool) {
 	domain := cert.Subject.CommonName
 	if domain == "" && len(cert.DNSNames) > 0 {
 		domain = cert.DNSNames[0]
@@ -303,6 +356,12 @@ func toCertificate(cert *x509.Certificate, path string) tlscfg.Certificate {
 	case strings.Contains(filepath.ToSlash(path), "/local/"):
 		kind = "local"
 	}
+	names := cert.DNSNames
+	cut := false
+	if len(names) > certScanMaxSANs {
+		names = names[:certScanMaxSANs]
+		cut = true
+	}
 	return tlscfg.Certificate{
 		Domain:    domain,
 		Issuer:    cert.Issuer.CommonName,
@@ -310,6 +369,6 @@ func toCertificate(cert *x509.Certificate, path string) tlscfg.Certificate {
 		NotAfter:  cert.NotAfter.Format(time.RFC3339),
 		DaysLeft:  int(time.Until(cert.NotAfter).Hours() / 24),
 		Kind:      kind,
-		Names:     cert.DNSNames,
-	}
+		Names:     names,
+	}, cut
 }

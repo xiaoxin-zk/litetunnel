@@ -114,11 +114,20 @@ func main() {
 	// 里的镜像必须**阻断启动**，而不是退回默认值——拿一个可能错误的镜像去
 	// 校验，等于为一个根本不会上线的镜像背书，还让「校验通过」看起来一切正常。
 	if *validateFrps {
-		if img, err := composeServiceImage(p.composeFile, "frps"); err != nil {
-			log.Fatalf("[lt-config] 无法从 Compose 读取 frps 镜像，无法确认校验镜像与实际运行镜像一致: %v", err)
-		} else if resolved, ok := resolveComposeImage(img, composeEnvLookup(p.envFile)); !ok {
-			log.Fatalf("[lt-config] Compose 的 frps 镜像 %q 含无法解析的变量，无法确认校验镜像与实际运行镜像一致", img)
-		} else if *frpsImage != resolved {
+		// 先让 Compose 自己解析（--format json）：它把 env-file、插值、锚点
+		// 全处理完，结果就是容器实际会用的镜像名。拿不到时退回手写解析，
+		// 那条路径仍然要读 .env 做插值（见 composeEnvLookup）。
+		resolved, ok := composeServiceImageViaDocker(p.composeFile, p.envFile, "frps")
+		if !ok {
+			img, err := composeServiceImage(p.composeFile, "frps")
+			if err != nil {
+				log.Fatalf("[lt-config] 无法从 Compose 读取 frps 镜像，无法确认校验镜像与实际运行镜像一致: %v", err)
+			}
+			if resolved, ok = resolveComposeImage(img, composeEnvLookup(p.envFile)); !ok {
+				log.Fatalf("[lt-config] Compose 的 frps 镜像 %q 含无法解析的变量，无法确认校验镜像与实际运行镜像一致", img)
+			}
+		}
+		if *frpsImage != resolved {
 			log.Fatalf("[lt-config] 校验用的 frps 镜像（%s）与 Compose 实际使用的镜像（%s）不一致："+
 				"请让 LT_CFG_FRPS_IMAGE 与 Compose 中的 image 相同，或取消前者", *frpsImage, resolved)
 		}

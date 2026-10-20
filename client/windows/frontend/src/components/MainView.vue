@@ -473,14 +473,29 @@ onUnmounted(() => {
 
 // 新建成功后的结果面板：只展示本次新增的隧道（按 ID 差集，批量也适用）。
 const createdOpen = ref(false)
-const createdList = ref([])
+const createdIds = ref([])
+
+// 只记住 ID，内容从实时 state 里取：
+// 否则弹窗会一直停在创建那一刻的「连接中」，隧道其实早就上线了。
+const createdList = computed(() =>
+  createdIds.value
+    .map((id) => props.state.tunnels.find((t) => t.id === id))
+    .filter(Boolean)
+)
 
 function showCreated(before, next) {
   const list = (next?.tunnels || []).filter((t) => !before.has(t.id))
   if (!list.length) return
-  createdList.value = list
+  createdIds.value = list.map((t) => t.id)
   createdOpen.value = true
 }
+
+// 弹窗开着时隧道被删光了就自动收起，不留一个空面板。
+watch(createdList, (list) => {
+  if (createdOpen.value && createdIds.value.length && !list.length) {
+    createdOpen.value = false
+  }
+})
 
 // 网站类隧道给的是完整 URL，TCP/UDP 给的是「主机:端口」。
 function addrLabel(t) {

@@ -1,6 +1,9 @@
 package userapi
 
 import (
+	"errors"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -238,7 +241,15 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 	dir := h.svc.Cfg.ClientDistDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		httpx.OK(c, gin.H{"download_url": url, "files": []ClientDownload{}})
+		// 目录不存在 = 还没上传过，属于正常状态；其余错误（权限、挂载丢失、
+		// 磁盘故障）必须报出来，否则前端会显示「管理员尚未上传」，
+		// 把运维问题伪装成业务状态。
+		if errors.Is(err, fs.ErrNotExist) {
+			httpx.OK(c, gin.H{"download_url": url, "files": []ClientDownload{}})
+			return
+		}
+		log.Printf("[client] 读取分发目录 %s 失败: %v", dir, err)
+		httpx.ServerError(c, "读取安装包目录失败，请检查服务器磁盘与挂载")
 		return
 	}
 	list := make([]ClientDownload, 0, len(entries))

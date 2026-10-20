@@ -131,7 +131,13 @@ function saveBlob(blob, filename) {
 // 下载接口需要 Bearer token，浏览器原生 <a href> 带不上，所以只能 fetch 取 blob。
 // 这里把失败原因区分开：登录过期、文件不存在、服务端错误，各给各的提示，
 // 不要一律「下载失败」。
-async function fetchBlob(url, what) {
+//
+// 逐块读取（ReadableStream）而不是一次性 res.blob()，有两个好处：
+//   - 传输中途断开时立刻 reject 并提示，不会让用户对着「没反应」等；
+//   - 能把已下载字节数报给调用方，页面上显示进度。
+// 注意：这仍然是「先缓存到内存再交给浏览器」，大文件仍会占用内存；
+// 要彻底改成浏览器原生下载，需要服务端签发短时单次下载地址。
+async function downloadToBlob(url, what, onProgress) {
   const token = localStorage.getItem(TOKEN_KEY)
   let res
   try {
@@ -152,22 +158,66 @@ async function fetchBlob(url, what) {
     ElMessage.error(`下载${what}失败（HTTP ${res.status}），请稍后重试`)
     return null
   }
-  const blob = await res.blob()
+
+  const total = Number(res.headers.get('Content-Length')) || 0
+  const chunks = []
+  let loaded = 0
+  try {
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(value)
+        loaded += value.byteLength
+        if (onProgress) onProgress(loaded, total)
+      }
+    } else {
+      // 老浏览器没有流式读取：退回一次性读取，至少不会漏掉异常。
+      const buf = await res.arrayBuffer()
+      chunks.push(new Uint8Array(buf))
+      loaded = buf.byteLength
+      if (onProgress) onProgress(loaded, total || loaded)
+    }
+  } catch (e) {
+    // 浏览器/代理/网络在传输过程中断开都会走到这里。不接住的话调用方
+    // 只能看到「没有反应」——这正是之前用户反馈的现象。
+    if (e?.name === 'AbortError') {
+      ElMessage.warning(`下载${what}已取消`)
+    } else {
+      ElMessage.error(`下载${what}中断：连接已断开，请重试`)
+    }
+    return null
+  }
+
+  const blob = new Blob(chunks, {
+    type: res.headers.get('Content-Type') || 'application/octet-stream'
+  })
   if (blob.size === 0) {
     ElMessage.error(`下载${what}失败：服务器返回了空文件`)
+    return null
+  }
+  // 有 Content-Length 时校验长度：代理截断、连接提前关闭都会在这里暴露，
+  // 而不是让用户拿到一个损坏的 zip。
+  if (total && blob.size !== total) {
+    ElMessage.error(`下载${what}不完整（${blob.size}/${total} 字节），请重试`)
     return null
   }
   return blob
 }
 
 export async function downloadFrpcConfig() {
-  const blob = await fetchBlob('/api/user/client/config?download=1', '配置')
+  const blob = await downloadToBlob('/api/user/client/config?download=1', '配置')
   if (blob) saveBlob(blob, 'frpc.toml')
 }
 
-export async function downloadClientFile(name) {
-  const blob = await fetchBlob(`/api/user/client/downloads/${encodeURIComponent(name)}`, '安装包')
-  if (!blob) return
+export async function downloadClientFile(name, onProgress) {
+  const blob = await downloadToBlob(
+    `/api/user/client/downloads/${encodeURIComponent(name)}`,
+    '安装包',
+    onProgress
+  )
+  if (!blob) return false
   saveBlob(blob, name)
-  ElMessage.success(`已开始下载 ${name}`)
+  return true
 }

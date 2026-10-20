@@ -51,10 +51,19 @@
           <span v-if="latest" class="lt-mono">
             {{ latest.name }} · v{{ latest.version }} · {{ fmtBytes(latest.size) }}
           </span>
-          <span v-else class="lt-muted">未获取到最新版本信息（请检查更新通道）</span>
+          <span v-else-if="releaseErr" class="lt-muted">查询失败：{{ releaseErr }}</span>
+          <span v-else class="lt-muted">正在获取最新版本信息…</span>
           <span v-if="syncing" class="lt-muted">正在下载并校验…</span>
         </div>
         <el-button
+          v-if="releaseErr"
+          :loading="releaseLoading"
+          @click="loadLatest"
+        >
+          重新获取
+        </el-button>
+        <el-button
+          v-else
           type="primary"
           :loading="syncing"
           :disabled="!latest"
@@ -181,6 +190,8 @@ const uploadHint = ref('')
 
 const latest = ref(null)
 const syncing = ref(false)
+const releaseLoading = ref(false)
+const releaseErr = ref('')
 
 const acceptList = '.zip,.exe,.gz,.tar,.deb,.rpm,.dmg'
 const maxSizeMB = computed(() => Math.round(maxSize.value / 1024 / 1024))
@@ -246,15 +257,26 @@ async function doUpload() {
 }
 
 // 从最新 Release 里取客户端包信息（名称/版本/大小），供「一键同步」展示。
+// 失败必须显式提示：否则按钮只是变成禁用状态，看起来和「点了没反应」一样。
 async function loadLatest() {
+  releaseLoading.value = true
+  releaseErr.value = ''
   try {
     const d = await clientPkgApi.release()
     const asset = (d?.assets || []).find((a) => a.name === 'LiteTunnel-windows-amd64.zip')
     if (asset) {
       latest.value = { name: asset.name, version: d.version, size: asset.size }
+    } else {
+      latest.value = null
+      releaseErr.value = d?.version
+        ? `最新版本 v${d.version} 里没有客户端安装包`
+        : '最新 Release 里没有客户端安装包'
     }
-  } catch {
-    // 取不到版本信息不影响页面上传功能
+  } catch (e) {
+    latest.value = null
+    releaseErr.value = e?.message || '无法从 GitHub 获取版本信息'
+  } finally {
+    releaseLoading.value = false
   }
 }
 

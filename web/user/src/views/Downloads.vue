@@ -5,7 +5,7 @@
         <div class="lt-card">
           <div class="lt-card-title">
             <span>客户端下载</span>
-            <el-button v-if="!downloadUrl" link :icon="Refresh" @click="load">刷新</el-button>
+            <el-button link :icon="Refresh" @click="load">刷新</el-button>
           </div>
 
           <template v-if="downloadUrl">
@@ -42,13 +42,31 @@
             <el-table-column label="更新时间" width="160">
               <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="100">
+            <el-table-column label="操作" width="120">
               <template #default="{ row }">
-                <el-button link type="primary" @click="downloadFile(row.name)">下载</el-button>
+                <el-button
+                  link
+                  type="primary"
+                  :loading="downloading === row.name"
+                  :disabled="!!downloading && downloading !== row.name"
+                  @click="downloadFile(row.name)"
+                >
+                  {{ downloading === row.name ? downloadLabel : '下载' }}
+                </el-button>
               </template>
             </el-table-column>
           </el-table>
-          <el-empty v-else-if="!downloadUrl" description="管理员尚未上传客户端安装包" />
+          <el-alert
+            v-if="loadErr"
+            type="error"
+            :closable="false"
+            show-icon
+            style="margin-top: 12px"
+            :title="loadErr"
+          >
+            <el-button size="small" @click="load">重试</el-button>
+          </el-alert>
+          <el-empty v-else-if="!downloadUrl && !loading" description="管理员尚未上传客户端安装包" />
         </div>
       </el-col>
 
@@ -157,7 +175,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Monitor, Download } from '@element-plus/icons-vue'
 import { clientApi, downloadFrpcConfig, downloadClientFile } from '../api'
@@ -177,6 +195,19 @@ const files = ref([])
 const info = ref({})
 const loading = ref(false)
 const downloadUrl = ref('')
+const loadErr = ref('')
+
+// 同一时刻只允许下载一个文件：重复点击会在内存里堆出多份 10MB+ 的 blob。
+const downloading = ref('')
+const downloadedBytes = ref(0)
+const totalBytes = ref(0)
+const downloadLabel = computed(() => {
+  if (!totalBytes.value) {
+    return downloadedBytes.value ? `下载中 ${fmtBytes(downloadedBytes.value)}` : '下载中'
+  }
+  const pct = Math.min(100, Math.round((downloadedBytes.value / totalBytes.value) * 100))
+  return `下载中 ${pct}%`
+})
 
 function fmtBytes(v) {
   return formatBytes(v)
@@ -187,20 +218,45 @@ function openDownloadUrl() {
   window.open(downloadUrl.value, '_blank', 'noopener,noreferrer')
 }
 
+// 两个请求分开处理：原先 Promise.all 任一失败会让下载列表和接入信息
+// 一起消失，页面看起来像「没反应」，也看不到失败原因。
 async function load() {
   loading.value = true
+  loadErr.value = ''
   try {
-    const [d, i] = await Promise.all([clientApi.downloads(), clientApi.info()])
+    const d = await clientApi.downloads()
     files.value = d?.files || []
     downloadUrl.value = d?.download_url || ''
-    info.value = i || {}
+  } catch {
+    // axios 拦截器已经弹过具体错误，这里保留一条常驻提示，便于用户重试
+    loadErr.value = '读取安装包列表失败，请稍后重试'
   } finally {
     loading.value = false
   }
+
+  try {
+    info.value = (await clientApi.info()) || {}
+  } catch {
+    info.value = {}
+  }
 }
 
-function downloadFile(name) {
-  downloadClientFile(name)
+async function downloadFile(name) {
+  if (downloading.value) return
+  downloading.value = name
+  downloadedBytes.value = 0
+  totalBytes.value = 0
+  try {
+    const ok = await downloadClientFile(name, (loaded, total) => {
+      downloadedBytes.value = loaded
+      totalBytes.value = total
+    })
+    if (ok) ElMessage.success(`已开始下载 ${name}`)
+  } finally {
+    downloading.value = ''
+    downloadedBytes.value = 0
+    totalBytes.value = 0
+  }
 }
 
 function downloadConfig() {

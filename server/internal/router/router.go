@@ -49,7 +49,7 @@ func New(
 			c.JSON(http.StatusOK, gin.H{"status": "ok"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": config.Version})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "version": config.DisplayVersion()})
 	})
 
 	r.POST("/api/frps/plugin", plugin.Guard(), plugin.Handle)
@@ -244,6 +244,7 @@ func New(
 		adminSuper.POST("/backups/:name/restore", adminH.RestoreBackup)
 
 		adminSuper.POST("/system/update/apply", adminH.ApplyUpdate)
+		adminSuper.POST("/system/update/docker", adminH.ApplyDockerUpdate)
 		adminSuper.POST("/system/update/restart", adminH.RestartPanel)
 
 		adminSuper.PUT("/settings", adminH.UpdateSettings)
@@ -312,7 +313,7 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 				c.Redirect(http.StatusFound, adminPath+"/")
 				return
 			}
-			serveIndexHTML(c, adminIndex, config.Version)
+			serveIndexHTML(c, adminIndex, config.DisplayVersion())
 			return
 		}
 
@@ -320,7 +321,7 @@ func serveSPA(r *gin.Engine, cfg *config.Config, adminAllow *middleware.CIDRSet)
 			httpx.NotFound(c, "前端资源未构建")
 			return
 		}
-		serveIndexHTML(c, userIndex, config.Version)
+		serveIndexHTML(c, userIndex, config.DisplayVersion())
 	})
 }
 

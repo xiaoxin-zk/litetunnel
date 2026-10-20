@@ -156,6 +156,8 @@ export const clientPkgApi = {
 export const systemApi = {
   update: (force) => http.get('/system/update', { params: force ? { force: 1 } : {} }),
   applyUpdate: () => http.post('/system/update/apply'),
+  // 容器一键更新：后端要拉镜像，耗时以分钟计，关闭 axios 超时由前端轮询收尾
+  applyDocker: () => http.post('/system/update/docker', null, { timeout: 0 }),
   restart: () => http.post('/system/update/restart')
 }
 

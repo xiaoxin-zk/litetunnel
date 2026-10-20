@@ -50,7 +50,20 @@
               />
 
               <template v-if="info?.has_update">
-                <template v-if="info.can_self_update">
+                <template v-if="info.can_self_update && info.install_mode === 'docker'">
+                  <p class="up-tip">一键更新：面板会拉取新镜像并重建自己的容器，数据目录不受影响，全程约 1-2 分钟，期间页面会短暂断开。</p>
+                  <el-button
+                    type="primary"
+                    size="small"
+                    class="up-btn"
+                    :loading="dockerApplying"
+                    @click="dockerUpdate"
+                  >
+                    一键更新
+                  </el-button>
+                  <p v-if="dockerApplying" class="up-state">正在升级，请勿关闭页面…</p>
+                </template>
+                <template v-else-if="info.can_self_update">
                   <p class="up-tip">点击更新会下载并替换面板二进制，数据目录不受影响；完成后点重启，几秒内恢复。</p>
                   <el-button
                     type="primary"
@@ -62,8 +75,13 @@
                     立即更新
                   </el-button>
                 </template>
-                <template v-else>
-                  <p class="up-tip">容器部署：换镜像 tag 并重启容器即完成升级。</p>
+                <template v-else-if="info.install_mode === 'docker'">
+                  <p class="up-tip">容器部署，但未挂载 docker.sock，暂时只能命令行升级。想在这里一键更新，给 panel 服务加一条挂载即可：</p>
+                  <pre class="up-cmd">volumes:
+  - ./data/panel:/data
+  - /var/run/docker.sock:/var/run/docker.sock</pre>
+                  <el-button size="small" class="up-btn" @click="copyMount">复制挂载配置</el-button>
+                  <p class="up-state">或直接复制下面的命令，在服务器上执行：</p>
                   <pre class="up-cmd">{{ info.deploy_hint }}</pre>
                   <el-button size="small" class="up-btn" @click="copyHint">复制命令</el-button>
                 </template>
@@ -212,6 +230,18 @@ async function copyHint() {
   ElMessage.warning('复制失败，请手动选中复制')
 }
 
+const sockMountHint = `volumes:
+  - ./data/panel:/data
+  - /var/run/docker.sock:/var/run/docker.sock`
+
+async function copyMount() {
+  if (await copyText(sockMountHint)) {
+    ElMessage.success('已复制挂载配置，粘贴到 deploy/docker-compose.yml 的 panel 服务后重新 up -d')
+    return
+  }
+  ElMessage.warning('复制失败，请手动选中复制')
+}
+
 function openRelease() {
   if (info.value?.release_url) window.open(info.value.release_url, '_blank', 'noopener')
 }
@@ -219,6 +249,38 @@ function openRelease() {
 const applying = ref(false)
 const appliedVersion = ref('')
 const restarting = ref(false)
+const dockerApplying = ref(false)
+
+// 容器一键更新：请求返回时新容器已在启动，旧容器几秒后销毁。
+// 中间会出现短暂连不上（旧容器停 → 新容器起来），轮询 profile 直到
+// 版本号变化再整页刷新，加载新版本的前端资源。
+async function dockerUpdate() {
+  dockerApplying.value = true
+  const oldVersion = info.value?.current || version.value
+  try {
+    const res = await systemApi.applyDocker()
+    ElMessage.success(res?.message || '正在升级，面板即将切换到新版本')
+    const target = res?.version || info.value?.latest || ''
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 3000))
+      try {
+        const p = await authApi.profile()
+        if (p?.version && p.version !== oldVersion) {
+          ElMessage.success(`面板已更新到 v${p.version}`)
+          window.location.reload()
+          return
+        }
+      } catch {
+        // 新旧容器切换的空窗期，继续等
+      }
+    }
+    ElMessage.warning(`更新命令已执行（目标 v${target}），但未检测到版本变化，请稍后刷新页面或查看容器日志`)
+  } catch {
+    // 拦截器已经提示具体原因
+  } finally {
+    dockerApplying.value = false
+  }
+}
 
 async function applyUpdate() {
   applying.value = true

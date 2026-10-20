@@ -60,10 +60,12 @@ func canWriteDir(dir string) bool {
 }
 
 // SelfUpdateState 返回「能否在线更新」与部署形态。
-// 容器里永远为 false：镜像不可变，改了 /app 里的二进制，重启后一样回到旧镜像。
+// 容器里：挂了 docker.sock 就支持一键更新（拉新镜像并重建自己，
+// 见 dockerupdate.go）；没挂则回退到更新面板里的命令行升级。
+// 二进制部署：改 /app 里的二进制重启会丢，所以需要显式 LT_SELF_UPDATE=1。
 func (s *Services) SelfUpdateState() (bool, string) {
 	if runningInContainer() {
-		return false, "docker"
+		return dockerSocketReachable(), "docker"
 	}
 	if !selfUpdateEnvEnabled() {
 		return false, "binary"

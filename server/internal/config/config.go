@@ -33,6 +33,13 @@ func localPortRange() (lo, hi int, err error) {
 
 var Version = "dev"
 
+// DisplayVersion 返回去掉「v」前缀的纯版本号（如 1.2.3）。
+// CI 把 tag 原文（v1.2.3）注入进来，而前端统一自己加 v 前缀展示；
+// 后端 HTTP 出口若带 v，面板就会出现 vv1.2.3。所有对外出口都用这里。
+func DisplayVersion() string {
+	return strings.TrimPrefix(Version, "v")
+}
+
 type Config struct {
 	Env      string
 	LogLevel string

@@ -104,6 +104,14 @@ services:
       LT_PROXY_DRAIN_WAL: "/data/proxy-drain-outbox.jsonl"
     volumes:
       - ./data/panel:/data
+      # 一键更新（可选）：取消注释后，管理后台左下角「版本号 → 更新面板」
+      # 会出现「一键更新」按钮，面板会通过 Docker API 拉取新镜像并重建自己，
+      # 升级不再需要 SSH 上服务器敲命令。
+      #
+      # 代价要想清楚：docker.sock 等于宿主机 root 的完全控制权，面板被攻破
+      # 即主机失守——这与下面 cap_drop: ALL 的最小权限思路相悖。默认不挂载，
+      # 更新面板仍会给出可直接执行的命令行升级方式。
+      # - /var/run/docker.sock:/var/run/docker.sock
     read_only: true
     tmpfs:
       - /tmp

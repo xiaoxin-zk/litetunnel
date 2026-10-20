@@ -32,8 +32,10 @@ type ReleaseAsset struct {
 }
 
 // UpdateStatus 是面板与客户端共用的版本信息。
-// 本项目通过容器镜像发布：面板随镜像一起更新，所以这里只负责「告诉你有新版本」，
-// 不提供在容器内替换二进制的在线自更新（重启后会回到旧镜像）。
+// 更新路径按部署形态分三种，见 selfupdate.go 与 dockerupdate.go：
+//   - 容器 + docker.sock：一键更新（拉新镜像并重建自己）；
+//   - 二进制 + LT_SELF_UPDATE=1：下载替换二进制后重启；
+//   - 其余：只提示有新版本，DeployHint 提供可复制的命令行升级方式。
 type UpdateStatus struct {
 	Current     string         `json:"current"`
 	Latest      string         `json:"latest"`
@@ -209,7 +211,9 @@ func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error
 	}
 
 	latest := strings.TrimPrefix(rel.TagName, "v")
-	current := config.Version
+	// CI 注入的 config.Version 带 v 前缀；出口统一去掉，前端自己加 v 展示，
+	// 否则面板会出现 vv0.1.123。
+	current := strings.TrimPrefix(config.Version, "v")
 	hasUpdate, comparable := versionLess(current, latest)
 
 	status := &UpdateStatus{
@@ -249,7 +253,8 @@ func (s *Services) LatestClientPackage(ctx context.Context, clientVersion string
 	}
 	hasUpdate, comparable := versionLess(clientVersion, status.Latest)
 	return map[string]any{
-		"current":        clientVersion,
+		// 客户端上报的版本带 v 前缀（tag 原文注入），出口统一去掉。
+		"current":        strings.TrimPrefix(clientVersion, "v"),
 		"latest":         status.Latest,
 		"has_update":     hasUpdate,
 		"comparable":     comparable,

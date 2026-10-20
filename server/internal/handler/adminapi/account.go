@@ -30,7 +30,7 @@ func (h *Handler) Profile(c *gin.Context) {
 		"totp_verified_at": a.TOTPVerifiedAt,
 		"last_login_at":    a.LastLoginAt,
 		"last_login_ip":    a.LastLoginIP,
-		"version":          config.Version,
+		"version":          config.DisplayVersion(),
 	})
 }
 

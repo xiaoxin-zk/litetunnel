@@ -37,6 +37,22 @@ func (h *Handler) ApplyUpdate(c *gin.Context) {
 	httpx.OK(c, gin.H{"applied": true, "version": version, "message": "新版本已就绪，重启后生效"})
 }
 
+// ApplyDockerUpdate 容器一键更新：拉新镜像并重建面板容器。
+// 该请求可能持续数分钟（取决于镜像拉取速度），前端用长超时轮询结果。
+func (h *Handler) ApplyDockerUpdate(c *gin.Context) {
+	version, err := h.svc.ApplyDockerUpdate(c.Request.Context())
+	if err != nil {
+		httpx.Fail(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	h.audit(c, "system.update.docker", "system", "", "容器一键更新：拉取新镜像并重建面板容器，目标版本 "+version)
+	httpx.OK(c, gin.H{
+		"applied": true,
+		"version": version,
+		"message": "新镜像已拉取、新容器已启动，面板即将切换到新版本",
+	})
+}
+
 // RestartPanel 让新二进制接管进程。
 func (h *Handler) RestartPanel(c *gin.Context) {
 	h.audit(c, "system.update.restart", "system", "", "重启面板使新版本生效")

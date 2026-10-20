@@ -207,16 +207,23 @@ body {
   box-shadow: var(--lt-shadow-sm);
 }
 
-.aside .aside-foot {
-  border-top: 1px solid var(--lt-line) !important;
-}
-
-.aside .ver-btn {
+.aside .ver-chip {
+  border-color: var(--lt-line) !important;
+  background: var(--lt-surface) !important;
   color: var(--lt-ink-soft) !important;
 }
 
-.aside .ver-btn:hover {
+.aside .ver-chip:hover {
+  border-color: var(--lt-primary) !important;
   color: var(--lt-primary-strong) !important;
+}
+
+/* 更新面板跟随主题（popover 挂在 body 上，不在 scoped 样式里） */
+.lt-update-pop.el-popover {
+  border-radius: 12px;
+  border-color: var(--lt-line);
+  background: var(--lt-surface);
+  color: var(--lt-ink-2);
 }
 
 /* 顶栏 */

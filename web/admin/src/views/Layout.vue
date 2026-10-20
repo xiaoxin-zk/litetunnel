@@ -3,9 +3,97 @@
     <el-aside width="212px" class="aside">
       <div class="brand">
         <div class="logo">LT</div>
-        <div>
+        <div class="brand-text">
           <div class="brand-title">LiteTunnel</div>
-          <div class="brand-sub">管理后台</div>
+          <!-- 版本号挂在品牌下方，点击就地展开更新面板（不是弹窗） -->
+          <el-popover
+            placement="right-start"
+            :width="330"
+            trigger="click"
+            popper-class="lt-update-pop"
+            @show="check(false)"
+          >
+            <template #reference>
+              <button
+                class="ver-chip"
+                :title="hasUpdate ? `发现新版本 v${info?.latest || ''}，点击查看` : '管理后台 · 点击查看版本与更新'"
+              >
+                <span v-if="hasUpdate" class="update-dot"></span>
+                {{ displayVersion }}
+              </button>
+            </template>
+
+            <div v-loading="checking" class="up-panel">
+              <div class="up-head">
+                <span class="up-label">当前版本</span>
+                <el-button link size="small" :loading="checking" @click="check(true)">
+                  重新检查
+                </el-button>
+              </div>
+
+              <div class="up-ver">{{ info?.current ? 'v' + info.current : displayVersion }}</div>
+              <div class="up-state">
+                <template v-if="info?.has_update">
+                  发现新版本 <b>v{{ info.latest }}</b>
+                </template>
+                <template v-else-if="info && !info.warning">已是最新版本</template>
+                <template v-else-if="!info">点击「重新检查」获取最新版本</template>
+              </div>
+
+              <el-alert
+                v-if="info?.warning"
+                :title="info.warning"
+                type="warning"
+                :closable="false"
+                show-icon
+                style="margin: 10px 0 0"
+              />
+
+              <template v-if="info?.has_update">
+                <template v-if="info.can_self_update">
+                  <p class="up-tip">点击更新会下载并替换面板二进制，数据目录不受影响；完成后点重启，几秒内恢复。</p>
+                  <el-button
+                    type="primary"
+                    size="small"
+                    class="up-btn"
+                    :loading="applying"
+                    @click="applyUpdate"
+                  >
+                    立即更新
+                  </el-button>
+                </template>
+                <template v-else>
+                  <p class="up-tip">容器部署：换镜像 tag 并重启容器即完成升级。</p>
+                  <pre class="up-cmd">{{ info.deploy_hint }}</pre>
+                  <el-button size="small" class="up-btn" @click="copyHint">复制命令</el-button>
+                </template>
+
+                <div v-if="appliedVersion" class="up-ok">
+                  新版本 v{{ appliedVersion }} 已就绪，重启后生效
+                </div>
+                <el-button
+                  v-if="appliedVersion"
+                  type="success"
+                  size="small"
+                  class="up-btn"
+                  :loading="restarting"
+                  @click="restartPanel"
+                >
+                  立即重启
+                </el-button>
+                <el-button
+                  v-if="info.release_url"
+                  link
+                  type="primary"
+                  size="small"
+                  class="up-link"
+                  @click="openRelease"
+                >
+                  打开发布页
+                </el-button>
+              </template>
+            </div>
+          </el-popover>
         </div>
       </div>
       <el-menu :default-active="active" router class="menu">
@@ -26,13 +114,6 @@
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon><span>账号设置</span></el-menu-item>
       </el-menu>
 
-      <div class="aside-foot">
-        <el-badge :is-dot="hasUpdate" :hidden="!hasUpdate">
-          <el-button link class="ver-btn" @click="openUpdate">
-            {{ displayVersion }}
-          </el-button>
-        </el-badge>
-      </div>
     </el-aside>
 
     <el-container>
@@ -69,71 +150,6 @@
       </el-main>
     </el-container>
 
-    <el-dialog v-model="updateVisible" title="版本更新" width="660px">
-      <div v-loading="checking" class="update-body">
-        <div class="ver-line">
-          <span>当前版本 <b>{{ info?.current ? 'v' + info.current : '未知' }}</b></span>
-          <span v-if="info?.latest">最新发布 <b>v{{ info.latest }}</b></span>
-          <el-tag v-if="info?.has_update" type="warning" size="small">有新版本</el-tag>
-          <el-tag v-else-if="info && !info.warning" type="success" size="small">已是最新</el-tag>
-        </div>
-
-        <el-alert
-          v-if="info?.warning"
-          :title="info.warning"
-          type="warning"
-          :closable="false"
-          show-icon
-          style="margin-bottom: 12px"
-        />
-
-        <template v-if="info?.has_update">
-          <el-alert
-            v-if="info.can_self_update"
-            type="info"
-            :closable="false"
-            show-icon
-            title="点击更新会下载并替换面板二进制，数据目录不受影响；完成后点重启，几秒内恢复"
-            style="margin-bottom: 12px"
-          />
-          <template v-else>
-            <el-alert
-              type="info"
-              :closable="false"
-              show-icon
-              title="当前是容器部署：换镜像 tag 并重启容器即完成升级，浏览器刷新后生效"
-              style="margin-bottom: 12px"
-            />
-            <div class="hint">在服务器上执行：</div>
-            <pre class="cmd">{{ info.deploy_hint }}</pre>
-            <el-button size="small" @click="copyHint">复制命令</el-button>
-          </template>
-
-          <div v-if="appliedVersion" class="ok">新版本 v{{ appliedVersion }} 已就绪，重启后生效</div>
-          <el-button v-if="info.release_url" link type="primary" @click="openRelease">打开发布页</el-button>
-        </template>
-
-        <template v-if="info?.notes">
-          <el-divider content-position="left">更新说明</el-divider>
-          <pre class="notes">{{ info.notes }}</pre>
-        </template>
-      </div>
-      <template #footer>
-        <el-button :loading="checking" @click="check(true)">重新检查</el-button>
-        <el-button
-          v-if="info?.has_update && info.can_self_update && !appliedVersion"
-          type="primary"
-          :loading="applying"
-          @click="applyUpdate"
-        >
-          立即更新
-        </el-button>
-        <el-button v-if="appliedVersion" type="success" :loading="restarting" @click="restartPanel">
-          立即重启
-        </el-button>
-        <el-button type="primary" @click="updateVisible = false">关闭</el-button>
-      </template>
-    </el-dialog>
   </el-container>
 </template>
 
@@ -157,7 +173,6 @@ onBeforeUnmount(offTheme)
 
 const info = ref(null)
 const version = ref('')
-const updateVisible = ref(false)
 const checking = ref(false)
 const hasUpdate = computed(() => !!info.value?.has_update)
 const displayVersion = computed(() => {
@@ -187,11 +202,6 @@ async function check(force) {
   } finally {
     checking.value = false
   }
-}
-
-async function openUpdate() {
-  updateVisible.value = true
-  if (!info.value) await check(false)
 }
 
 async function copyHint() {
@@ -276,60 +286,105 @@ onMounted(async () => {
   flex-direction: column;
 }
 
-.aside-foot {
-  margin-top: auto;
-  padding: 12px 16px 18px;
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
 }
 
-.ver-btn {
-  font-size: 12px;
+/* 版本号做成小胶囊，点开是下拉面板 */
+.ver-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border: 1px solid var(--lt-line);
+  border-radius: 999px;
+  background: var(--lt-surface);
+  color: var(--lt-ink-soft);
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
 }
 
-.update-body {
-  min-height: 80px;
+.ver-chip:hover {
+  color: var(--lt-primary-strong);
+  border-color: var(--lt-primary);
 }
 
-.ver-line {
+.update-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--lt-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--lt-danger) 20%, transparent);
+}
+
+.up-panel {
+  min-height: 60px;
+}
+
+.up-head {
   display: flex;
   align-items: center;
-  gap: 14px;
-  margin-bottom: 14px;
-  color: var(--lt-ink-2);
-  font-size: 13px;
-}
-
-.hint {
-  color: var(--lt-ink-soft);
-  font-size: 12.5px;
+  justify-content: space-between;
   margin-bottom: 6px;
 }
 
-.cmd {
-  margin: 0 0 10px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-family: ui-monospace, Consolas, monospace;
+.up-label {
   font-size: 12px;
+  color: var(--lt-ink-soft);
+}
+
+.up-ver {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--lt-ink);
+  line-height: 1.2;
+}
+
+.up-state {
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--lt-ink-2);
+}
+
+.up-tip {
+  margin: 10px 0 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--lt-ink-soft);
+}
+
+.up-btn {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.up-link {
+  margin-top: 6px;
+}
+
+.up-cmd {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--lt-surface-2);
+  color: var(--lt-ink-2);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
   line-height: 1.7;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
-.ok {
-  margin: 10px 0;
+.up-ok {
+  margin-top: 8px;
+  font-size: 12px;
   color: var(--lt-success);
-  font-size: 12.5px;
-}
-
-.notes {
-  margin: 0;
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: 12.5px;
-  line-height: 1.8;
-  white-space: pre-wrap;
-  max-height: 260px;
-  overflow: auto;
 }
 
 .brand {

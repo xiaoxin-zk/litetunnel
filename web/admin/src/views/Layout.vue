@@ -76,12 +76,19 @@
                   </el-button>
                 </template>
                 <template v-else-if="info.install_mode === 'docker'">
-                  <p class="up-tip">容器部署，但未挂载 docker.sock，暂时只能命令行升级。想在这里一键更新，给 panel 服务加一条挂载即可：</p>
-                  <pre class="up-cmd">volumes:
-  - ./data/panel:/data
-  - /var/run/docker.sock:/var/run/docker.sock</pre>
-                  <el-button size="small" class="up-btn" @click="copyMount">复制挂载配置</el-button>
-                  <p class="up-state">或直接复制下面的命令，在服务器上执行：</p>
+                  <p class="up-tip">
+                    容器部署，但面板没有 Docker 套接字权限，无法自己重建容器。在部署目录执行一次下面的命令即可开启——
+                    之后每个版本都能在这里点「一键更新」。
+                  </p>
+                  <pre class="up-cmd">{{ sockEnableCmd }}</pre>
+                  <el-button size="small" class="up-btn" @click="copySockEnable">
+                    复制命令（只需一次）
+                  </el-button>
+                  <p class="up-state">
+                    命令没生效（自定义过 compose 结构）时，手工在 panel 服务的 volumes 下加一行
+                    <code>- /var/run/docker.sock:/var/run/docker.sock</code>，再执行 <code>up -d panel</code>。
+                  </p>
+                  <p class="up-state">本次也可以在服务器上直接命令行升级：</p>
                   <pre class="up-cmd">{{ info.deploy_hint }}</pre>
                   <el-button size="small" class="up-btn" @click="copyHint">复制命令</el-button>
                 </template>
@@ -230,13 +237,19 @@ async function copyHint() {
   ElMessage.warning('复制失败，请手动选中复制')
 }
 
-const sockMountHint = `volumes:
-  - ./data/panel:/data
-  - /var/run/docker.sock:/var/run/docker.sock`
+// 一次性开启一键更新：在 panel 段的 volumes 下插入 sock 挂载，再重建面板容器。
+// 用 grep 做幂等保护，重复执行不会插入两遍；sed 只匹配到 caddy 段为止，
+// 不会影响到其他服务的挂载。未命中（自定义过 compose）时命令原样返回，
+// 页面另有手工挂载的说明。
+const sockEnableCmd =
+  "grep -q docker.sock deploy/docker-compose.yml || " +
+  "sed -i '/^  panel:$/,/^  caddy:$/ s|^    volumes:$|    volumes:\\n" +
+  "      - /var/run/docker.sock:/var/run/docker.sock|' deploy/docker-compose.yml; " +
+  "docker compose --env-file .env -f deploy/docker-compose.yml up -d panel"
 
-async function copyMount() {
-  if (await copyText(sockMountHint)) {
-    ElMessage.success('已复制挂载配置，粘贴到 deploy/docker-compose.yml 的 panel 服务后重新 up -d')
+async function copySockEnable() {
+  if (await copyText(sockEnableCmd)) {
+    ElMessage.success('已复制。在部署目录执行一次，之后就能在这里一键更新')
     return
   }
   ElMessage.warning('复制失败，请手动选中复制')

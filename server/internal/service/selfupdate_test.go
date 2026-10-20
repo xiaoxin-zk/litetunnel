@@ -93,14 +93,39 @@ func TestExtractPanelBinaryMissingEntry(t *testing.T) {
 func TestSelfUpdateUnavailableInContainer(t *testing.T) {
 	t.Setenv("LT_CONTAINER", "1")
 	t.Setenv("LT_SELF_UPDATE", "1")
+	// CI runner（以及多数 Docker 宿主机）自带 /var/run/docker.sock；
+	// 把套接字指到不存在的路径，模拟「没挂载 sock」的容器。
+	t.Setenv("LT_DOCKER_SOCK", filepath.Join(t.TempDir(), "no-such.sock"))
 	svc := newTestServices(t, nil)
 
 	ok, mode := svc.SelfUpdateState()
 	if ok || mode != "docker" {
-		t.Fatalf("容器里必须禁止在线更新，实际 ok=%v mode=%q", ok, mode)
+		t.Fatalf("容器里没挂 sock 必须禁止在线更新，实际 ok=%v mode=%q", ok, mode)
 	}
 	if _, err := svc.ApplyPanelUpdate(t.Context()); err == nil {
-		t.Fatal("容器里调用更新应当直接拒绝")
+		t.Fatal("容器里调用二进制替换更新应当直接拒绝")
+	}
+	if _, err := svc.ApplyDockerUpdate(t.Context()); err == nil {
+		t.Fatal("容器里没挂 sock 调用容器更新应当直接拒绝")
+	}
+}
+
+// 有 sock 的环境（GitHub runner 自带 Docker）里，容器内允许一键更新，
+// 但二进制替换仍然必须被拒绝——容器里换文件重启就会丢。
+func TestContainerWithSockAllowsDockerOnly(t *testing.T) {
+	if _, err := os.Stat("/var/run/docker.sock"); err != nil {
+		t.Skip("本机没有 /var/run/docker.sock，跳过")
+	}
+	t.Setenv("LT_CONTAINER", "1")
+	t.Setenv("LT_SELF_UPDATE", "1")
+	svc := newTestServices(t, nil)
+
+	ok, mode := svc.SelfUpdateState()
+	if !ok || mode != "docker" {
+		t.Fatalf("挂了 sock 的容器里应允许 docker 更新，实际 ok=%v mode=%q", ok, mode)
+	}
+	if _, err := svc.ApplyPanelUpdate(t.Context()); err == nil {
+		t.Fatal("容器里调用二进制替换更新应当直接拒绝")
 	}
 }
 

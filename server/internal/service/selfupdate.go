@@ -90,9 +90,10 @@ func panelAssetName() string {
 
 // ApplyPanelUpdate 下载并校验新版本，原子替换当前可执行文件。旧文件保留为 .old 便于回滚。
 // 替换后需要重启进程才会生效（见 RestartPanel）。
+// 只对二进制部署开放：容器里走 dockerupdate.go 的镜像重建，替换文件毫无意义。
 func (s *Services) ApplyPanelUpdate(ctx context.Context) (string, error) {
-	ok, _ := s.SelfUpdateState()
-	if !ok {
+	ok, mode := s.SelfUpdateState()
+	if !ok || mode != "binary" {
 		return "", ErrSelfUpdateUnavailable
 	}
 

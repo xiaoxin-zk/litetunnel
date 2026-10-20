@@ -586,13 +586,13 @@ onMounted(load)
   margin: -8px 0 18px 150px;
   font-size: 12px;
   line-height: 1.8;
-  color: #909399;
+  color: var(--lt-ink-soft);
 }
 
 .hint-inline {
   margin-left: 8px;
   font-size: 12px;
-  color: #909399;
+  color: var(--lt-ink-soft);
 }
 
 .mono {
@@ -604,8 +604,8 @@ onMounted(load)
   margin: 0;
   max-height: 320px;
   overflow: auto;
-  background: #0b1220;
-  color: #e5e7eb;
+  background: var(--lt-surface-3);
+  color: var(--lt-ink-2);
   padding: 12px;
   border-radius: 8px;
   font-size: 12px;

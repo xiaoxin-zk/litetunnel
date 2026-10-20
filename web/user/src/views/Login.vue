@@ -394,8 +394,10 @@ onMounted(async () => {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: radial-gradient(1200px 600px at 20% 0%, #dbeafe 0%, transparent 60%),
-    radial-gradient(900px 500px at 100% 100%, #e0e7ff 0%, transparent 55%), #f5f7fb;
+  background:
+    radial-gradient(1200px 600px at 20% 0%, var(--lt-glow-1) 0%, transparent 60%),
+    radial-gradient(900px 500px at 100% 100%, var(--lt-glow-2) 0%, transparent 55%),
+    var(--lt-canvas);
 }
 
 .panel {
@@ -416,7 +418,7 @@ onMounted(async () => {
   height: 46px;
   border-radius: 13px;
   object-fit: contain;
-  background: #fff;
+  background: var(--lt-surface);
   flex-shrink: 0;
 }
 
@@ -432,7 +434,7 @@ onMounted(async () => {
 
 .oauth-hint {
   margin: 10px 0 0;
-  color: #9ca3af;
+  color: var(--lt-ink-soft);
   font-size: 12px;
   text-align: center;
 }
@@ -442,8 +444,8 @@ onMounted(async () => {
   margin-bottom: 16px;
   padding: 12px 14px;
   border-radius: 10px;
-  background: #f8fafc;
-  color: #4b5563;
+  background: var(--lt-surface-2);
+  color: var(--lt-ink-2);
   font-size: 13px;
   line-height: 1.8;
 }
@@ -452,7 +454,7 @@ onMounted(async () => {
   width: 46px;
   height: 46px;
   border-radius: 13px;
-  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  background: linear-gradient(135deg, var(--lt-primary), var(--lt-primary-strong));
   color: #fff;
   font-weight: 700;
   display: flex;
@@ -468,7 +470,7 @@ onMounted(async () => {
 .brand p {
   margin: 4px 0 0;
   font-size: 12.5px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
 }
 
 .tabs :deep(.el-tabs__header) {
@@ -486,8 +488,8 @@ onMounted(async () => {
 }
 
 .error {
-  background: #fee2e2;
-  color: #b91c1c;
+  background: var(--lt-danger-soft);
+  color: var(--lt-danger);
   border-radius: 9px;
   padding: 10px 12px;
   font-size: 13px;
@@ -498,7 +500,7 @@ onMounted(async () => {
   margin-top: 16px;
   text-align: center;
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--lt-ink-soft);
 }
 
 .terms {
@@ -506,7 +508,7 @@ onMounted(async () => {
   font-family: inherit;
   font-size: 13px;
   line-height: 1.9;
-  color: #374151;
+  color: var(--lt-ink-2);
   margin: 0;
   max-height: 420px;
   overflow: auto;

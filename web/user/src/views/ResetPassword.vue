@@ -106,17 +106,19 @@ onMounted(() => {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: radial-gradient(1200px 600px at 20% 0%, #dbeafe 0%, transparent 60%),
-    radial-gradient(900px 500px at 100% 100%, #e0e7ff 0%, transparent 55%), #f5f7fb;
+  background:
+    radial-gradient(1200px 600px at 20% 0%, var(--lt-glow-1) 0%, transparent 60%),
+    radial-gradient(900px 500px at 100% 100%, var(--lt-glow-2) 0%, transparent 55%),
+    var(--lt-canvas);
 }
 
 .panel {
   width: 100%;
   max-width: 420px;
-  background: #fff;
+  background: var(--lt-surface);
   border-radius: 18px;
   padding: 32px 30px 24px;
-  box-shadow: 0 20px 50px rgba(16, 24, 40, 0.12);
+  box-shadow: var(--lt-shadow-md);
 }
 
 .brand {
@@ -130,7 +132,7 @@ onMounted(() => {
   width: 48px;
   height: 48px;
   border-radius: 14px;
-  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  background: linear-gradient(135deg, var(--lt-primary), var(--lt-primary-strong));
   color: #fff;
   font-weight: 700;
   display: flex;
@@ -146,7 +148,7 @@ onMounted(() => {
 .brand p {
   margin: 4px 0 0;
   font-size: 12.5px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
 }
 
 .submit {

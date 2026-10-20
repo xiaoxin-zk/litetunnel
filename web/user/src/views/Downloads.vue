@@ -228,7 +228,7 @@ onMounted(load)
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  background: linear-gradient(135deg, var(--lt-primary), var(--lt-primary-strong));
   color: #fff;
   font-size: 12px;
   display: flex;

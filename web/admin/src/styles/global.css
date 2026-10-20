@@ -1,7 +1,7 @@
-:root {
-  --lt-bg: #f4f6fa;
-}
-
+/**
+ * 结构样式：只管布局与尺寸，颜色一律来自 styles/theme.css 的 --lt-* 变量。
+ * 这样深色模式只需要切 <html class="dark">，不用改任何页面。
+ */
 * {
   box-sizing: border-box;
 }
@@ -16,15 +16,11 @@ body,
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
     'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-  background: var(--lt-bg);
-  color: #1f2937;
+  -webkit-font-smoothing: antialiased;
 }
 
 .lt-card {
-  background: #fff;
-  border-radius: 14px;
   padding: 20px 22px;
-  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
 }
 
 .lt-card-title {
@@ -37,7 +33,6 @@ body {
 }
 
 .lt-muted {
-  color: #6b7280;
   font-size: 13px;
 }
 
@@ -45,7 +40,7 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-.el-table th.el-table__cell {
-  background: #f9fafb !important;
-  font-weight: 600;
+/* 数字对齐：表格里的金额/流量用等宽数字，扫视时不跳动 */
+.el-table .cell {
+  font-variant-numeric: tabular-nums;
 }

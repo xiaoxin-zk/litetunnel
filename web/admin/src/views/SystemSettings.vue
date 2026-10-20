@@ -556,7 +556,7 @@
           <div class="hint" style="margin: 0 0 8px">标题：{{ mailPreview.subject }}</div>
           <iframe
             :srcdoc="mailPreview.body"
-            style="width: 100%; height: 460px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff"
+            style="width: 100%; height: 460px; border: 1px solid var(--lt-line); border-radius: 8px; background: #fff"
           />
         </div>
       </el-tab-pane>
@@ -845,7 +845,7 @@ onMounted(() => {
 <style scoped>
 .hint {
   margin-left: 12px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
   font-size: 12.5px;
   line-height: 1.7;
 }
@@ -853,9 +853,9 @@ onMounted(() => {
 code {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;
-  background: #f5f7fa;
+  background: var(--lt-surface-3);
   padding: 1px 4px;
   border-radius: 3px;
-  color: #303133;
+  color: var(--lt-ink-2);
 }
 </style>

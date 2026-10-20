@@ -21,6 +21,14 @@
           <span class="page-title">{{ pageTitle }}</span>
         </div>
         <div class="header-right">
+          <el-tooltip :content="isDark ? '切换到浅色' : '切换到深色'" placement="bottom">
+            <el-button circle text class="theme-toggle" @click="toggleTheme">
+              <el-icon :size="17">
+                <Sunny v-if="isDark" />
+                <Moon v-else />
+              </el-icon>
+            </el-button>
+          </el-tooltip>
           <el-tag v-if="profile" :type="profile.traffic_exceeded ? 'danger' : 'success'" effect="light" round>
             {{ profile.traffic_exceeded ? '流量已用尽' : '状态正常' }}
           </el-tag>
@@ -50,13 +58,20 @@
 </template>
 
 <script setup>
-import { computed, onMounted, provide, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, provide, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { profileApi, authApi, TOKEN_KEY } from '../api'
+import { currentTheme, onThemeChange, toggleTheme } from '../utils/theme'
 
 const route = useRoute()
 const router = useRouter()
 const profile = ref(null)
+
+const isDark = ref(currentTheme() === 'dark')
+const offTheme = onThemeChange((theme) => {
+  isDark.value = theme === 'dark'
+})
+onBeforeUnmount(offTheme)
 
 const active = computed(() => route.path)
 const pageTitle = computed(() => route.meta?.title || String(route.name || ''))
@@ -88,13 +103,12 @@ onMounted(loadProfile)
 </script>
 
 <style scoped>
+/* 只保留结构，颜色交给 styles/theme.css */
 .layout {
   height: 100vh;
 }
 
 .aside {
-  background: #0f172a;
-  color: #cbd5e1;
   display: flex;
   flex-direction: column;
 }
@@ -105,7 +119,6 @@ onMounted(loadProfile)
   gap: 10px;
   padding: 20px 18px 14px;
   font-weight: 600;
-  color: #fff;
   font-size: 15px;
 }
 
@@ -113,7 +126,6 @@ onMounted(loadProfile)
   width: 32px;
   height: 32px;
   border-radius: 9px;
-  background: linear-gradient(135deg, #2563eb, #6366f1);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -124,30 +136,16 @@ onMounted(loadProfile)
 .menu {
   border-right: none;
   background: transparent;
-  --el-menu-bg-color: transparent;
-  --el-menu-text-color: #cbd5e1;
-  --el-menu-hover-bg-color: rgba(255, 255, 255, 0.06);
-  --el-menu-active-color: #ffffff;
-}
-
-.menu :deep(.el-menu-item.is-active) {
-  background: rgba(37, 99, 235, 0.9) !important;
-  border-radius: 8px;
-  margin: 0 10px;
 }
 
 .menu :deep(.el-menu-item) {
-  margin: 2px 10px;
-  border-radius: 8px;
   height: 44px;
 }
 
 .header {
-  background: #fff;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid #eef1f6;
   height: 60px;
 }
 
@@ -168,10 +166,12 @@ onMounted(loadProfile)
   gap: 8px;
   cursor: pointer;
   outline: none;
+  color: var(--lt-ink-2);
 }
 
 .avatar {
-  background: linear-gradient(135deg, #2563eb, #6366f1);
+  background: linear-gradient(135deg, var(--lt-primary), var(--lt-primary-strong));
+  color: #fff;
   font-size: 13px;
 }
 

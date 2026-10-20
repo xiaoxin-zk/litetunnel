@@ -39,6 +39,14 @@
       <el-header class="header">
         <span class="page-title">{{ route.meta?.title || '' }}</span>
         <div class="header-right">
+          <el-tooltip :content="isDark ? '切换到浅色' : '切换到深色'" placement="bottom">
+            <el-button circle text class="theme-toggle" @click="toggleTheme">
+              <el-icon :size="17">
+                <Sunny v-if="isDark" />
+                <Moon v-else />
+              </el-icon>
+            </el-button>
+          </el-tooltip>
           <el-tag type="info" effect="plain" round>
             {{ admin?.nickname || admin?.username || '管理员' }}
             <span v-if="admin?.role"> · {{ roleLabel }}</span>
@@ -130,14 +138,21 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { authApi, systemApi, TOKEN_KEY } from '../api'
+import { currentTheme, onThemeChange, toggleTheme } from '../utils/theme'
 
 const route = useRoute()
 const router = useRouter()
 const admin = ref(null)
+
+const isDark = ref(currentTheme() === 'dark')
+const offTheme = onThemeChange((theme) => {
+  isDark.value = theme === 'dark'
+})
+onBeforeUnmount(offTheme)
 
 const info = ref(null)
 const version = ref('')
@@ -251,12 +266,12 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* 只保留结构与尺寸，颜色全部交给 styles/theme.css（深色模式才不用改这里） */
 .layout {
   height: 100vh;
 }
 
 .aside {
-  background: #0b1220;
   display: flex;
   flex-direction: column;
 }
@@ -264,16 +279,10 @@ onMounted(async () => {
 .aside-foot {
   margin-top: auto;
   padding: 12px 16px 18px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .ver-btn {
-  color: #94a3b8;
   font-size: 12px;
-}
-
-.ver-btn:hover {
-  color: #e2e8f0;
 }
 
 .update-body {
@@ -285,12 +294,12 @@ onMounted(async () => {
   align-items: center;
   gap: 14px;
   margin-bottom: 14px;
-  color: #4b5563;
+  color: var(--lt-ink-2);
   font-size: 13px;
 }
 
 .hint {
-  color: #6b7280;
+  color: var(--lt-ink-soft);
   font-size: 12.5px;
   margin-bottom: 6px;
 }
@@ -299,8 +308,6 @@ onMounted(async () => {
   margin: 0 0 10px;
   padding: 10px 12px;
   border-radius: 8px;
-  background: #0b1220;
-  color: #e2e8f0;
   font-family: ui-monospace, Consolas, monospace;
   font-size: 12px;
   line-height: 1.7;
@@ -310,7 +317,7 @@ onMounted(async () => {
 
 .ok {
   margin: 10px 0;
-  color: #15803d;
+  color: var(--lt-success);
   font-size: 12.5px;
 }
 
@@ -318,8 +325,6 @@ onMounted(async () => {
   margin: 0;
   padding: 10px 12px;
   border-radius: 8px;
-  background: #f8fafc;
-  color: #374151;
   font-size: 12.5px;
   line-height: 1.8;
   white-space: pre-wrap;
@@ -332,14 +337,12 @@ onMounted(async () => {
   align-items: center;
   gap: 10px;
   padding: 18px 16px 14px;
-  color: #fff;
 }
 
 .logo {
   width: 32px;
   height: 32px;
   border-radius: 9px;
-  background: linear-gradient(135deg, #334155, #64748b);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -354,34 +357,21 @@ onMounted(async () => {
 
 .brand-sub {
   font-size: 11px;
-  color: #94a3b8;
 }
 
 .menu {
   border-right: none;
   background: transparent;
-  --el-menu-bg-color: transparent;
-  --el-menu-text-color: #cbd5e1;
-  --el-menu-hover-bg-color: rgba(255, 255, 255, 0.06);
-  --el-menu-active-color: #ffffff;
 }
 
 .menu :deep(.el-menu-item) {
-  margin: 2px 10px;
-  border-radius: 8px;
   height: 44px;
 }
 
-.menu :deep(.el-menu-item.is-active) {
-  background: rgba(51, 65, 85, 0.95) !important;
-}
-
 .header {
-  background: #fff;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid #eef1f6;
   height: 60px;
 }
 

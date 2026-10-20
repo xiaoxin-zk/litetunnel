@@ -68,7 +68,7 @@
     </el-row>
 
     <div class="lt-card danger-zone">
-      <div class="lt-card-title" style="color: #b91c1c">危险操作</div>
+      <div class="lt-card-title" style="color: var(--lt-danger)">危险操作</div>
       <div class="danger-row">
         <div>
           <div class="danger-title">注销账号</div>
@@ -319,7 +319,7 @@ async function confirmDelete() {
 
 .danger-zone {
   margin-top: 16px;
-  border: 1px solid #fee2e2;
+  border: 1px solid var(--lt-danger-soft);
 }
 
 .danger-row {

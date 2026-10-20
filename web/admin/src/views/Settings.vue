@@ -381,15 +381,16 @@ onMounted(load)
 .qr {
   width: 200px;
   height: 200px;
-  border: 1px solid #eef1f6;
+  border: 1px solid var(--lt-line);
   border-radius: 12px;
   padding: 6px;
+  /* 二维码必须是白底，深色模式下也不能跟着变 */
   background: #fff;
 }
 
 .secret-box {
   margin-top: 12px;
-  background: #f8fafc;
+  background: var(--lt-surface-2);
   border-radius: 10px;
   padding: 10px 12px;
 }

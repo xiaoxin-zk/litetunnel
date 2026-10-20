@@ -70,12 +70,33 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { statsApi, profileApi, publicApi } from '../api'
 import { formatBytes, formatTime } from '../utils/format'
+import { cssVar, onThemeChange } from '../utils/theme'
 
 const props = defineProps({ profile: Object })
+
+// 主题切换后让卡片色与图表重新取值
+const themeTick = ref(0)
+const offTheme = onThemeChange(() => {
+  themeTick.value++
+  nextTick(() => renderChart())
+})
+
+function palette() {
+  return {
+    primary: cssVar('--lt-primary', '#5f57d6'),
+    accent: cssVar('--lt-accent', '#0fa89a'),
+    success: cssVar('--lt-success', '#0f9d6e'),
+    danger: cssVar('--lt-danger', '#d64545'),
+    info: cssVar('--lt-info', '#2f6fed'),
+    ink: cssVar('--lt-ink', '#1e2235'),
+    axis: cssVar('--lt-line', '#e6e8f2'),
+    label: cssVar('--lt-ink-soft', '#7c839b')
+  }
+}
 
 const loading = ref(false)
 const stats = ref({})
@@ -85,24 +106,26 @@ const paymentEnabled = ref(false)
 let chart = null
 
 const cards = computed(() => {
+  void themeTick.value
+  const p = palette()
   const list = [
     {
       label: '隧道总数',
       value: stats.value.tunnel_total ?? 0,
       sub: `在线 ${stats.value.tunnel_online ?? 0} 条`,
-      color: '#2563eb'
+      color: p.info
     },
     {
       label: '已用流量',
       value: fmtBytes(stats.value.traffic_used),
       sub: `配额 ${quotaText.value}`,
-      color: stats.value.traffic_exceeded ? '#dc2626' : '#0f172a'
+      color: stats.value.traffic_exceeded ? p.danger : p.ink
     },
     {
       label: '在线客户端',
       value: stats.value.tunnel_online ?? 0,
       sub: '实时在线隧道数',
-      color: '#059669'
+      color: p.success
     }
   ]
   if (paymentEnabled.value) {
@@ -110,7 +133,7 @@ const cards = computed(() => {
       label: '账户余额',
       value: '¥ ' + ((stats.value.balance || 0) / 100).toFixed(2),
       sub: '可通过兑换码或在线充值获取',
-      color: '#7c3aed'
+      color: p.primary
     })
   }
   return list
@@ -141,15 +164,32 @@ function fmtBytes(v) {
 function renderChart() {
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
+  const p = palette()
   const dates = series.value.map((r) => r.date.slice(5))
   const inData = series.value.map((r) => +(r.in_bytes / 1024 / 1024).toFixed(2))
   const outData = series.value.map((r) => +(r.out_bytes / 1024 / 1024).toFixed(2))
   chart.setOption({
     grid: { left: 44, right: 16, top: 30, bottom: 28 },
     tooltip: { trigger: 'axis' },
-    legend: { data: ['下行', '上行'], right: 0, top: 0, icon: 'roundRect' },
-    xAxis: { type: 'category', data: dates, boundaryGap: false, axisLine: { lineStyle: { color: '#e5e7eb' } } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#f1f5f9' } } },
+    legend: {
+      data: ['下行', '上行'],
+      right: 0,
+      top: 0,
+      icon: 'roundRect',
+      textStyle: { color: p.label }
+    },
+    xAxis: {
+      type: 'category',
+      data: dates,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: p.axis } },
+      axisLabel: { color: p.label }
+    },
+    yAxis: {
+      type: 'value',
+      splitLine: { lineStyle: { color: p.axis } },
+      axisLabel: { color: p.label }
+    },
     series: [
       {
         name: '下行',
@@ -158,8 +198,8 @@ function renderChart() {
         showSymbol: false,
         data: inData,
         areaStyle: { opacity: 0.12 },
-        lineStyle: { width: 2, color: '#2563eb' },
-        itemStyle: { color: '#2563eb' }
+        lineStyle: { width: 2, color: p.info },
+        itemStyle: { color: p.info }
       },
       {
         name: '上行',
@@ -168,8 +208,8 @@ function renderChart() {
         showSymbol: false,
         data: outData,
         areaStyle: { opacity: 0.1 },
-        lineStyle: { width: 2, color: '#10b981' },
-        itemStyle: { color: '#10b981' }
+        lineStyle: { width: 2, color: p.success },
+        itemStyle: { color: p.success }
       }
     ]
   })
@@ -197,13 +237,24 @@ async function load() {
   }
 }
 
+const onResize = () => chart?.resize()
+
 onMounted(async () => {
+  window.addEventListener('resize', onResize)
   await loadSettings()
   await load()
 })
 
+onBeforeUnmount(() => {
+  offTheme()
+  window.removeEventListener('resize', onResize)
+  if (chart) {
+    chart.dispose()
+    chart = null
+  }
+})
+
 watch(() => props.profile, () => load())
-window.addEventListener('resize', () => chart?.resize())
 </script>
 
 <style scoped>
@@ -213,7 +264,7 @@ window.addEventListener('resize', () => chart?.resize())
 
 .stat-label {
   font-size: 13px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
 }
 
 .stat-value {
@@ -224,7 +275,7 @@ window.addEventListener('resize', () => chart?.resize())
 
 .stat-sub {
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--lt-ink-soft);
 }
 
 .chart {

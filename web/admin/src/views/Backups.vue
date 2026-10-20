@@ -210,13 +210,13 @@ onMounted(async () => {
 }
 
 .strategy-item .label {
-  color: #2b2440;
+  color: var(--lt-ink);
   font-weight: 600;
   font-size: 13.5px;
 }
 
 .hint {
-  color: #6f6689;
+  color: var(--lt-ink-soft);
   font-size: 12.5px;
 }
 
@@ -224,8 +224,8 @@ onMounted(async () => {
   margin-top: 16px;
   padding: 10px 14px;
   border-radius: 12px;
-  background: linear-gradient(120deg, #f7f4ff, #eefaf7);
-  color: #554d70;
+  background: linear-gradient(120deg, var(--lt-primary-soft), var(--lt-accent-soft));
+  color: var(--lt-ink-2);
   font-size: 12.5px;
 }
 </style>

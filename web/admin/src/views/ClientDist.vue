@@ -219,8 +219,8 @@ onMounted(load)
   gap: 12px;
   margin-top: 16px;
   padding: 12px 14px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: var(--lt-surface-2);
+  border: 1px solid var(--lt-line);
   border-radius: 10px;
 }
 

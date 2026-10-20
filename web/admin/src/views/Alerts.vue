@@ -250,6 +250,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { alertApi } from '../api'
+import { cssVar, onThemeChange } from '../utils/theme'
 
 const loadingConfig = ref(false)
 const saving = ref(false)
@@ -534,24 +535,38 @@ function renderChart() {
   if (!chartRef.value) return
   if (!chart) chart = echarts.init(chartRef.value)
 
+  // ECharts 只认真实色值：每次渲染都从 CSS 变量取，深色模式下才不会出现浅灰轴线。
+  const axis = cssVar('--lt-line', '#e6e8f2')
+  const label = cssVar('--lt-ink-soft', '#7c839b')
+  const danger = cssVar('--lt-danger', '#d64545')
+  const info = cssVar('--lt-info', '#2f6fed')
+
   const s = series.value
   const opt = {
     grid: { left: 52, right: 16, top: 40, bottom: 30 },
     tooltip: { trigger: 'axis' },
-    legend: { data: ['错误率', '磁盘使用率'], right: 0, top: 0, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+    legend: {
+      data: ['错误率', '磁盘使用率'],
+      right: 0,
+      top: 0,
+      icon: 'roundRect',
+      itemWidth: 12,
+      itemHeight: 8,
+      textStyle: { color: label }
+    },
     xAxis: {
       type: 'category',
       data: timeAxis(),
       boundaryGap: false,
-      axisLine: { lineStyle: { color: '#e5e7eb' } },
-      axisLabel: { color: '#9ca3af', fontSize: 11 }
+      axisLine: { lineStyle: { color: axis } },
+      axisLabel: { color: label, fontSize: 11 }
     },
     yAxis: {
       type: 'value',
       min: 0,
       max: 100,
-      splitLine: { lineStyle: { color: '#f1f5f9' } },
-      axisLabel: { color: '#9ca3af', fontSize: 11, formatter: '{value}%' }
+      splitLine: { lineStyle: { color: axis } },
+      axisLabel: { color: label, fontSize: 11, formatter: '{value}%' }
     },
     series: [
       {
@@ -559,8 +574,8 @@ function renderChart() {
         type: 'line',
         smooth: true,
         showSymbol: false,
-        lineStyle: { width: 2, color: '#dc2626' },
-        itemStyle: { color: '#dc2626' },
+        lineStyle: { width: 2, color: danger },
+        itemStyle: { color: danger },
         data: s.map((x) => +(x.error_rate || 0).toFixed(2))
       },
       {
@@ -568,8 +583,8 @@ function renderChart() {
         type: 'line',
         smooth: true,
         showSymbol: false,
-        lineStyle: { width: 2, color: '#2563eb' },
-        itemStyle: { color: '#2563eb' },
+        lineStyle: { width: 2, color: info },
+        itemStyle: { color: info },
         data: s.map((x) => +(x.disk_used_pct || 0).toFixed(2))
       }
     ]
@@ -608,7 +623,12 @@ onMounted(async () => {
   await Promise.all([loadConfig(), loadSamples(), loadEvents()])
 })
 
+const offTheme = onThemeChange(() => {
+  nextTick(() => renderChart())
+})
+
 onBeforeUnmount(() => {
+  offTheme()
   window.removeEventListener('resize', resize)
   if (chart) {
     chart.dispose()
@@ -640,7 +660,7 @@ onBeforeUnmount(() => {
 .hint {
   display: block;
   margin-top: 4px;
-  color: #9ca3af;
+  color: var(--lt-ink-soft);
   font-size: 12px;
   line-height: 1.7;
 }

@@ -454,7 +454,7 @@ onMounted(load)
   height: 22px;
   border-radius: 6px;
   overflow: hidden;
-  background: #f3f4f6;
+  background: var(--lt-surface-3);
   margin-bottom: 12px;
 }
 
@@ -464,16 +464,16 @@ onMounted(load)
 }
 
 .seg.reserved {
-  background: #94a3b8;
+  background: var(--lt-ink-soft);
 }
 .seg.system {
-  background: #f59e0b;
+  background: var(--lt-warning);
 }
 .seg.allocated {
-  background: #2563eb;
+  background: var(--lt-info);
 }
 .seg.free {
-  background: #d1fae5;
+  background: var(--lt-accent-soft);
 }
 
 .legend {
@@ -481,7 +481,7 @@ onMounted(load)
   gap: 18px;
   flex-wrap: wrap;
   font-size: 13px;
-  color: #4b5563;
+  color: var(--lt-ink-2);
   align-items: center;
 }
 
@@ -494,16 +494,16 @@ onMounted(load)
 }
 
 .dot.reserved {
-  background: #94a3b8;
+  background: var(--lt-ink-soft);
 }
 .dot.system {
-  background: #f59e0b;
+  background: var(--lt-warning);
 }
 .dot.allocated {
-  background: #2563eb;
+  background: var(--lt-info);
 }
 .dot.free {
-  background: #d1fae5;
+  background: var(--lt-accent-soft);
 }
 
 .chips {

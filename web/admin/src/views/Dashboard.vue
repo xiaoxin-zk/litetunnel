@@ -218,6 +218,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as echarts from 'echarts'
 import { healthApi, monitorApi, statsApi } from '../api'
 import { formatBytes } from '../utils/format'
+import { cssVar, onThemeChange } from '../utils/theme'
 
 const loading = ref(false)
 const stats = ref({})
@@ -227,24 +228,49 @@ const health = ref(null)
 const healthLoading = ref(false)
 let healthTimer = null
 
+// 主题切换后要让图表与内联色重新取值：ECharts 只认真实色值，不认 CSS 变量。
+const themeTick = ref(0)
+const offTheme = onThemeChange(() => {
+  themeTick.value++
+  nextTick(() => renderCharts())
+})
+
+function palette() {
+  return {
+    primary: cssVar('--lt-primary', '#5f57d6'),
+    accent: cssVar('--lt-accent', '#0fa89a'),
+    success: cssVar('--lt-success', '#0f9d6e'),
+    warning: cssVar('--lt-warning', '#c9761a'),
+    danger: cssVar('--lt-danger', '#d64545'),
+    info: cssVar('--lt-info', '#2f6fed'),
+    ink: cssVar('--lt-ink', '#1e2235'),
+    axis: cssVar('--lt-line', '#e6e8f2'),
+    label: cssVar('--lt-ink-soft', '#7c839b')
+  }
+}
+
 const gradeColor = computed(() => {
+  void themeTick.value
+  const p = palette()
   const s = health.value?.score ?? 0
-  if (s >= 90) return '#059669'
-  if (s >= 75) return '#2563eb'
-  if (s >= 60) return '#d97706'
-  return '#dc2626'
+  if (s >= 90) return p.success
+  if (s >= 75) return p.info
+  if (s >= 60) return p.warning
+  return p.danger
 })
 
 function compColor(status) {
+  void themeTick.value
+  const p = palette()
   switch (status) {
     case 'critical':
-      return '#dc2626'
+      return p.danger
     case 'warn':
-      return '#d97706'
+      return p.warning
     case 'ok':
-      return '#059669'
+      return p.success
     default:
-      return '#cbd5e1'
+      return p.axis
   }
 }
 
@@ -312,6 +338,8 @@ const rangeText = computed(() => {
 })
 
 const metricCards = computed(() => {
+  void themeTick.value
+  const p = palette()
   const m = latest.value
   const memPercent = m.mem_total ? (m.mem_used / m.mem_total) * 100 : 0
   const diskPercent = m.disk_total ? (m.disk_used / m.disk_total) * 100 : 0
@@ -323,26 +351,26 @@ const metricCards = computed(() => {
       value: cpu.toFixed(1) + '%',
       sub: `${m.cpu_cores || 0} 核`,
       percent: cpu,
-      color: cpu >= 80 ? '#dc2626' : cpu >= 60 ? '#d97706' : '#059669'
+      color: cpu >= 80 ? p.danger : cpu >= 60 ? p.warning : p.success
     },
     {
       label: '内存使用率',
       value: memPercent.toFixed(1) + '%',
       sub: `${fmtBytes(m.mem_used)} / ${fmtBytes(m.mem_total)}`,
       percent: memPercent,
-      color: memPercent >= 85 ? '#dc2626' : memPercent >= 70 ? '#d97706' : '#2563eb'
+      color: memPercent >= 85 ? p.danger : memPercent >= 70 ? p.warning : p.info
     },
     {
       label: '系统负载',
       value: (m.load1 || 0).toFixed(2),
       sub: `5 分 ${(m.load5 || 0).toFixed(2)} · 15 分 ${(m.load15 || 0).toFixed(2)}`,
-      color: (m.load1 || 0) > (m.cpu_cores || 1) ? '#dc2626' : '#7c3aed'
+      color: (m.load1 || 0) > (m.cpu_cores || 1) ? p.danger : p.primary
     },
     {
       label: '运行时长',
       value: fmtUptime(m.uptime_seconds),
       sub: '系统已连续运行',
-      color: '#0891b2'
+      color: p.accent
     }
   ]
 
@@ -352,7 +380,7 @@ const metricCards = computed(() => {
       value: diskPercent.toFixed(1) + '%',
       sub: `${m.disk_path || '/'} · ${fmtBytes(m.disk_used)} / ${fmtBytes(m.disk_total)}`,
       percent: diskPercent,
-      color: diskPercent >= 90 ? '#dc2626' : diskPercent >= 75 ? '#d97706' : '#059669'
+      color: diskPercent >= 90 ? p.danger : diskPercent >= 75 ? p.warning : p.success
     })
   }
 
@@ -360,20 +388,24 @@ const metricCards = computed(() => {
     label: '实时网络',
     value: fmtRate(m.net_rx_rate),
     sub: `上行 ${fmtRate(m.net_tx_rate)}`,
-    color: '#0f172a'
+    color: p.ink
   })
 
   return list
 })
 
-const cards = computed(() => [
-  { label: '用户总数', value: stats.value.user_total ?? 0, color: '#2563eb' },
-  { label: '正常用户', value: stats.value.user_active ?? 0, color: '#059669' },
-  { label: '隧道总数', value: stats.value.tunnel_total ?? 0, color: '#7c3aed' },
-  { label: '启用隧道', value: stats.value.tunnel_active ?? 0, color: '#0891b2' },
-  { label: '在线客户端', value: stats.value.online_client ?? 0, color: '#d97706' },
-  { label: '累计流量', value: formatBytes(stats.value.traffic_used_total), color: '#0f172a' }
-])
+const cards = computed(() => {
+  void themeTick.value
+  const p = palette()
+  return [
+    { label: '用户总数', value: stats.value.user_total ?? 0, color: p.info },
+    { label: '正常用户', value: stats.value.user_active ?? 0, color: p.success },
+    { label: '隧道总数', value: stats.value.tunnel_total ?? 0, color: p.primary },
+    { label: '启用隧道', value: stats.value.tunnel_active ?? 0, color: p.accent },
+    { label: '在线客户端', value: stats.value.online_client ?? 0, color: p.warning },
+    { label: '累计流量', value: formatBytes(stats.value.traffic_used_total), color: p.ink }
+  ]
+})
 
 function timeAxis() {
   return series.value.map((s) => {
@@ -384,27 +416,36 @@ function timeAxis() {
 }
 
 function lineOption({ names, colors, data, unit, max }) {
+  const p = palette()
   return {
     grid: { left: 58, right: 16, top: 34, bottom: 26 },
     tooltip: {
       trigger: 'axis',
       valueFormatter: unit === 'bytes' ? (v) => fmtRate(v) : (v) => `${Number(v).toFixed(1)}%`
     },
-    legend: { data: names, right: 0, top: 0, icon: 'roundRect', itemWidth: 12, itemHeight: 8 },
+    legend: {
+      data: names,
+      right: 0,
+      top: 0,
+      icon: 'roundRect',
+      itemWidth: 12,
+      itemHeight: 8,
+      textStyle: { color: p.label }
+    },
     xAxis: {
       type: 'category',
       data: timeAxis(),
       boundaryGap: false,
-      axisLine: { lineStyle: { color: '#e5e7eb' } },
-      axisLabel: { color: '#9ca3af', fontSize: 11 }
+      axisLine: { lineStyle: { color: p.axis } },
+      axisLabel: { color: p.label, fontSize: 11 }
     },
     yAxis: {
       type: 'value',
       max,
       min: 0,
-      splitLine: { lineStyle: { color: '#f1f5f9' } },
+      splitLine: { lineStyle: { color: p.axis } },
       axisLabel: {
-        color: '#9ca3af',
+        color: p.label,
         fontSize: 11,
         formatter: unit === 'bytes' ? (v) => fmtBytes(v) : '{value}%'
       }
@@ -431,6 +472,7 @@ function lineOption({ names, colors, data, unit, max }) {
 function renderCharts() {
   const s = series.value
   if (!s.length) return
+  const p = palette()
 
   const jobs = [
     [
@@ -438,7 +480,7 @@ function renderCharts() {
       cpuRef.value,
       {
         names: ['CPU'],
-        colors: ['#2563eb'],
+        colors: [p.info],
         data: [s.map((x) => +(x.cpu_percent || 0).toFixed(2))],
         unit: 'percent',
         max: 100
@@ -449,7 +491,7 @@ function renderCharts() {
       memRef.value,
       {
         names: ['内存'],
-        colors: ['#7c3aed'],
+        colors: [p.primary],
         data: [
           s.map((x) => +((x.mem_total ? (x.mem_used / x.mem_total) * 100 : 0)).toFixed(2))
         ],
@@ -462,7 +504,7 @@ function renderCharts() {
       netRef.value,
       {
         names: ['下行', '上行'],
-        colors: ['#059669', '#d97706'],
+        colors: [p.success, p.warning],
         data: [
           s.map((x) => +(x.net_rx_rate || 0).toFixed(0)),
           s.map((x) => +(x.net_tx_rate || 0).toFixed(0))
@@ -475,7 +517,7 @@ function renderCharts() {
       diskRef.value,
       {
         names: ['读', '写'],
-        colors: ['#0891b2', '#dc2626'],
+        colors: [p.accent, p.danger],
         data: [
           s.map((x) => +(x.disk_read_rate || 0).toFixed(0)),
           s.map((x) => +(x.disk_write_rate || 0).toFixed(0))
@@ -520,6 +562,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   if (healthTimer) clearInterval(healthTimer)
+  offTheme()
   window.removeEventListener('resize', resizeCharts)
   Object.values(charts).forEach((c) => c && c.dispose())
 })
@@ -532,7 +575,7 @@ onBeforeUnmount(() => {
 
 .metric-label {
   font-size: 13px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
 }
 
 .metric-value {
@@ -544,7 +587,7 @@ onBeforeUnmount(() => {
 
 .metric-sub {
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--lt-ink-soft);
   margin-top: 2px;
   white-space: nowrap;
   overflow: hidden;
@@ -559,7 +602,7 @@ onBeforeUnmount(() => {
 .tips {
   margin: 0;
   padding-left: 18px;
-  color: #4b5563;
+  color: var(--lt-ink-2);
   line-height: 2;
   font-size: 13.5px;
 }
@@ -582,7 +625,7 @@ onBeforeUnmount(() => {
 
 .health-grade {
   font-size: 13px;
-  color: #6b7280;
+  color: var(--lt-ink-soft);
   margin-bottom: 4px;
 }
 
@@ -600,7 +643,7 @@ onBeforeUnmount(() => {
 
 .health-comp-name {
   width: 42px;
-  color: #374151;
+  color: var(--lt-ink-2);
   flex: none;
 }
 
@@ -613,7 +656,7 @@ onBeforeUnmount(() => {
 
 .health-todos {
   margin-top: 14px;
-  border-top: 1px solid #eef1f6;
+  border-top: 1px solid var(--lt-line);
   padding-top: 10px;
 }
 

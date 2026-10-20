@@ -107,8 +107,8 @@ onMounted(load)
 }
 
 .code {
-  background: #0f172a;
-  color: #e2e8f0;
+  background: var(--lt-surface-3);
+  color: var(--lt-ink-2);
   padding: 12px 14px;
   border-radius: 10px;
   font-size: 12.5px;

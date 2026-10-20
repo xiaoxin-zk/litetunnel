@@ -1,43 +1,250 @@
 /**
- * 管理端主题：浅薰衣草白帆布 + 紫色主色 + 青绿点缀。
- * 只做视觉层覆盖，不改任何业务样式类名。
+ * 管理端主题：浅色 = 冷白画布 + 靛蓝主色；深色 = 墨蓝画布 + 同色系提亮。
+ *
+ * 约定：
+ *   1. 业务样式只允许用 --lt-* 变量取色，不要再写 #fff / #6b7280 之类的字面量；
+ *   2. Element Plus 的组件颜色通过 --el-* 变量映射，深色下由 html.dark 覆盖；
+ *   3. 与 web/user/src/styles/theme.css 保持同一套令牌，两个前端才不会有色差。
  */
 :root {
-  --lt-canvas: #f7f5ff;
-  --lt-ink: #2b2440;
-  --lt-ink-soft: #6f6689;
-  --lt-primary: #6d5bd0;
-  --lt-primary-strong: #5644c0;
-  --lt-primary-soft: #ede7ff;
-  --lt-accent: #17b8a6;
-  --lt-accent-soft: #e2f8f4;
-  --lt-line: #ece7fb;
+  color-scheme: light;
 
-  --el-color-primary: #6d5bd0;
-  --el-color-primary-light-3: #9a8ce0;
-  --el-color-primary-light-5: #b9afe9;
-  --el-color-primary-light-7: #d8d2f4;
-  --el-color-primary-light-8: #e5e1f8;
-  --el-color-primary-light-9: #f1eefc;
-  --el-color-primary-dark-2: #5644c0;
+  /* 画布与层次 */
+  --lt-canvas: #f5f6fb;
+  --lt-surface: #ffffff;
+  --lt-surface-2: #f7f8fd;
+  --lt-surface-3: #eef0f9;
+
+  /* 文字 */
+  --lt-ink: #1e2235;
+  --lt-ink-2: #454c63;
+  --lt-ink-soft: #7c839b;
+
+  /* 描边 */
+  --lt-line: #e6e8f2;
+  --lt-line-strong: #d5d9e8;
+
+  /* 品牌与语义色 */
+  --lt-primary: #5f57d6;
+  --lt-primary-strong: #4b43bd;
+  --lt-primary-soft: #eceafb;
+  --lt-accent: #0fa89a;
+  --lt-accent-soft: #e2f6f3;
+  --lt-success: #0f9d6e;
+  --lt-warning: #c9761a;
+  --lt-danger: #d64545;
+  --lt-danger-soft: #fdeaea;
+  --lt-info: #2f6fed;
+
+  /* 装饰 */
+  --lt-glow-1: rgba(95, 87, 214, 0.1);
+  --lt-glow-2: rgba(15, 168, 154, 0.08);
+  --lt-shadow-sm: 0 1px 2px rgba(30, 34, 53, 0.05), 0 1px 3px rgba(30, 34, 53, 0.04);
+  --lt-shadow-md: 0 10px 28px rgba(30, 34, 53, 0.08);
+  --lt-aside-bg: linear-gradient(180deg, #f7f6ff 0%, #eef0fb 100%);
+  --lt-header-bg: rgba(255, 255, 255, 0.78);
+  --lt-scrollbar: #c9cede;
+
+  /* Element Plus 基础变量映射 */
+  --el-color-primary: var(--lt-primary);
+  --el-color-primary-light-3: #8b84e4;
+  --el-color-primary-light-5: #aca7ec;
+  --el-color-primary-light-7: #cecbf4;
+  --el-color-primary-light-8: #dedcf7;
+  --el-color-primary-light-9: #eeeefa;
+  --el-color-primary-dark-2: var(--lt-primary-strong);
+  --el-color-success: var(--lt-success);
+  --el-color-warning: var(--lt-warning);
+  --el-color-danger: var(--lt-danger);
+  --el-color-error: var(--lt-danger);
+  --el-color-info: var(--lt-ink-soft);
+
+  --el-bg-color: var(--lt-surface);
+  --el-bg-color-page: var(--lt-canvas);
+  --el-bg-color-overlay: var(--lt-surface);
+  --el-fill-color-blank: var(--lt-surface);
+  --el-fill-color-light: var(--lt-surface-2);
+  --el-fill-color-lighter: var(--lt-surface-2);
+  --el-fill-color-extra-light: var(--lt-surface-2);
+
+  --el-text-color-primary: var(--lt-ink);
+  --el-text-color-regular: var(--lt-ink-2);
+  --el-text-color-secondary: var(--lt-ink-soft);
+  --el-text-color-placeholder: var(--lt-ink-soft);
+
+  --el-border-color: var(--lt-line);
+  --el-border-color-light: var(--lt-line);
+  --el-border-color-lighter: var(--lt-line);
+  --el-border-color-extra-light: var(--lt-line);
   --el-border-radius-base: 10px;
-  --el-text-color-primary: #2b2440;
-  --el-text-color-regular: #4b4463;
+
+  --el-box-shadow-light: var(--lt-shadow-sm);
+}
+
+html.dark {
+  color-scheme: dark;
+
+  --lt-canvas: #0e1017;
+  --lt-surface: #161923;
+  --lt-surface-2: #1c2030;
+  --lt-surface-3: #242a3c;
+
+  --lt-ink: #e8eaf3;
+  --lt-ink-2: #b7bed3;
+  --lt-ink-soft: #8b93aa;
+
+  --lt-line: #2a3040;
+  --lt-line-strong: #3a4258;
+
+  --lt-primary: #8f85f2;
+  --lt-primary-strong: #a79eff;
+  --lt-primary-soft: rgba(143, 133, 242, 0.16);
+  --lt-accent: #2dd4bf;
+  --lt-accent-soft: rgba(45, 212, 191, 0.14);
+  --lt-success: #34d399;
+  --lt-warning: #fbbf24;
+  --lt-danger: #f87171;
+  --lt-danger-soft: rgba(248, 113, 113, 0.16);
+  --lt-info: #60a5fa;
+
+  --lt-glow-1: rgba(143, 133, 242, 0.1);
+  --lt-glow-2: rgba(45, 212, 191, 0.07);
+  --lt-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --lt-shadow-md: 0 12px 30px rgba(0, 0, 0, 0.5);
+  --lt-aside-bg: linear-gradient(180deg, #171a26 0%, #12141d 100%);
+  --lt-header-bg: rgba(22, 25, 35, 0.78);
+  --lt-scrollbar: #3a4258;
+
+  --el-color-primary: var(--lt-primary);
+  --el-color-primary-light-3: #7c73d9;
+  --el-color-primary-light-5: #5f57b0;
+  --el-color-primary-light-7: #47417f;
+  --el-color-primary-light-8: #3a3566;
+  --el-color-primary-light-9: #2b2848;
+  --el-color-primary-dark-2: var(--lt-primary-strong);
+  --el-color-success: var(--lt-success);
+  --el-color-warning: var(--lt-warning);
+  --el-color-danger: var(--lt-danger);
+  --el-color-error: var(--lt-danger);
+  --el-color-info: var(--lt-ink-soft);
+
+  --el-bg-color: var(--lt-surface);
+  --el-bg-color-page: var(--lt-canvas);
+  --el-bg-color-overlay: var(--lt-surface-2);
+  --el-fill-color-blank: var(--lt-surface);
+  --el-fill-color-light: var(--lt-surface-2);
+  --el-fill-color-lighter: var(--lt-surface-2);
+  --el-fill-color-extra-light: var(--lt-surface-2);
+
+  --el-text-color-primary: var(--lt-ink);
+  --el-text-color-regular: var(--lt-ink-2);
+  --el-text-color-secondary: var(--lt-ink-soft);
+  --el-text-color-placeholder: var(--lt-ink-soft);
+
+  --el-border-color: var(--lt-line);
+  --el-border-color-light: var(--lt-line);
+  --el-border-color-lighter: var(--lt-line);
+  --el-border-color-extra-light: var(--lt-line);
+  --el-box-shadow-light: var(--lt-shadow-sm);
 }
 
 body {
   background:
-    radial-gradient(1100px 520px at 82% -8%, #efe7ff 0%, rgba(247, 245, 255, 0) 62%),
-    radial-gradient(900px 480px at -5% 100%, #e6f8f4 0%, rgba(247, 245, 255, 0) 58%),
+    radial-gradient(1100px 520px at 82% -8%, var(--lt-glow-1) 0%, transparent 62%),
+    radial-gradient(900px 480px at -5% 100%, var(--lt-glow-2) 0%, transparent 58%),
     var(--lt-canvas);
+  color: var(--lt-ink);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* 滚动条跟随主题，否则深色下会出现一条亮色轨道 */
+* {
+  scrollbar-color: var(--lt-scrollbar) transparent;
+}
+
+/* 侧边栏 */
+.aside {
+  background: var(--lt-aside-bg) !important;
+  border-right: 1px solid var(--lt-line) !important;
+}
+
+.aside .brand .brand-title,
+.aside .brand span {
+  color: var(--lt-ink) !important;
+}
+
+.aside .brand .brand-sub {
+  color: var(--lt-ink-soft) !important;
+}
+
+.aside .brand .logo {
+  background: linear-gradient(135deg, var(--lt-primary) 0%, var(--lt-primary-strong) 100%) !important;
+  color: #fff !important;
+  box-shadow: 0 8px 18px var(--lt-glow-1);
+}
+
+.aside .menu {
+  background: transparent !important;
+  border-right: none !important;
+}
+
+.aside .menu .el-menu-item {
+  color: var(--lt-ink-2) !important;
+  height: 42px;
+  margin: 2px 10px;
+  border-radius: 11px;
+}
+
+.aside .menu .el-menu-item:hover {
+  background: var(--lt-surface) !important;
+  color: var(--lt-primary-strong) !important;
+}
+
+.aside .menu .el-menu-item.is-active {
+  background: var(--lt-surface) !important;
+  color: var(--lt-primary-strong) !important;
+  font-weight: 600;
+  box-shadow: var(--lt-shadow-sm);
+}
+
+.aside .aside-foot {
+  border-top: 1px solid var(--lt-line) !important;
+}
+
+.aside .ver-btn {
+  color: var(--lt-ink-soft) !important;
+}
+
+.aside .ver-btn:hover {
+  color: var(--lt-primary-strong) !important;
+}
+
+/* 顶栏 */
+.header {
+  background: var(--lt-header-bg) !important;
+  border-bottom: 1px solid var(--lt-line) !important;
+  backdrop-filter: blur(10px);
+}
+
+.page-title {
   color: var(--lt-ink);
 }
 
+.theme-toggle {
+  color: var(--lt-ink-2) !important;
+}
+
+.theme-toggle:hover {
+  color: var(--lt-primary-strong) !important;
+  background: var(--lt-primary-soft) !important;
+}
+
+/* 卡片 */
 .lt-card {
-  background: #fff;
+  background: var(--lt-surface);
   border: 1px solid var(--lt-line);
   border-radius: 16px;
-  box-shadow: 0 10px 30px rgba(88, 66, 168, 0.06);
+  box-shadow: var(--lt-shadow-sm);
 }
 
 .lt-card-title {
@@ -48,67 +255,26 @@ body {
   color: var(--lt-ink-soft);
 }
 
-/* 侧边栏：浅薰衣草画布，不再压深色 */
-.aside {
-  background: linear-gradient(180deg, #f5f0ff 0%, #eae3ff 100%) !important;
-  border-right: 1px solid #e4dcfb !important;
+/* 表格：走 Element Plus 变量，深色自动跟随 */
+.el-table {
+  --el-table-bg-color: var(--lt-surface);
+  --el-table-tr-bg-color: var(--lt-surface);
+  --el-table-header-bg-color: var(--lt-surface-2);
+  --el-table-border-color: var(--lt-line);
+  --el-table-text-color: var(--lt-ink-2);
+  --el-table-header-text-color: var(--lt-ink-2);
+  --el-table-row-hover-bg-color: var(--lt-surface-3);
 }
 
-.aside .brand .brand-title {
-  color: #2b2440 !important;
-}
-
-.aside .brand .brand-sub {
-  color: #7a7194 !important;
-}
-
-.aside .brand .logo {
-  background: linear-gradient(135deg, #8071e6 0%, #5a48c0 100%) !important;
-  color: #fff !important;
-  box-shadow: 0 8px 18px rgba(109, 91, 208, 0.32);
-}
-
-.aside .menu {
-  background: transparent !important;
-  border-right: none !important;
-}
-
-.aside .menu .el-menu-item {
-  color: #554d70 !important;
-  height: 42px;
-  margin: 2px 10px;
-  border-radius: 11px;
-}
-
-.aside .menu .el-menu-item:hover {
-  background: rgba(255, 255, 255, 0.72) !important;
-  color: var(--lt-primary-strong) !important;
-}
-
-.aside .menu .el-menu-item.is-active {
-  background: #fff !important;
-  color: var(--lt-primary-strong) !important;
+.el-table th.el-table__cell {
   font-weight: 600;
-  box-shadow: 0 8px 18px rgba(109, 91, 208, 0.16);
 }
 
-.aside .aside-foot {
-  border-top: 1px solid #e4dcfb !important;
-}
-
-.aside .ver-btn {
-  color: #6f6689 !important;
-}
-
-.header {
-  background: transparent;
-}
-
-/* 指标卡：紫色放射底 + 青绿进度条 */
+/* 指标卡 */
 .metric {
   background:
-    radial-gradient(120px 90px at 88% -20%, rgba(109, 91, 208, 0.12), rgba(255, 255, 255, 0) 70%),
-    linear-gradient(165deg, #ffffff 0%, #faf8ff 100%);
+    radial-gradient(120px 90px at 88% -20%, var(--lt-primary-soft), transparent 70%),
+    var(--lt-surface-2);
   border: 1px solid var(--lt-line);
   border-radius: 14px;
   padding: 14px 16px;
@@ -123,16 +289,30 @@ body {
 }
 
 .metric-sub {
-  color: #8d85a6;
+  color: var(--lt-ink-soft);
 }
 
-.el-table th.el-table__cell {
-  background: #f7f4ff !important;
-  color: #5a5170;
-}
-
+/* 语义色标签 */
 .el-tag--success {
   --el-tag-bg-color: var(--lt-accent-soft);
-  --el-tag-text-color: #0f8d7f;
-  --el-tag-border-color: #bdeee7;
+  --el-tag-text-color: var(--lt-success);
+  --el-tag-border-color: transparent;
+}
+
+/* 代码块 / 命令提示 */
+pre,
+.cmd,
+.notes {
+  background: var(--lt-surface-2) !important;
+  color: var(--lt-ink-2) !important;
+  border: 1px solid var(--lt-line);
+}
+
+/* 空状态、分割线 */
+.el-divider {
+  border-color: var(--lt-line);
+}
+
+.el-empty__description p {
+  color: var(--lt-ink-soft);
 }

@@ -153,6 +153,27 @@ func (s *Services) decorateUpdate(st *UpdateStatus) *UpdateStatus {
 	return st
 }
 
+// updateHTTPError 把 GitHub 的状态码翻译成可执行的原因。
+// 「GitHub 返回 404」对管理员没有信息量：这里 404 通常不是地址写错，
+// 而是仓库还没有**已发布**的 Release（草稿对 /releases/latest 不可见）。
+func updateHTTPError(repo string, status int, rateRemaining string) error {
+	switch status {
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: 仓库 %s 还没有已发布的 Release（草稿不计入），发布后才能在面板里检查到更新",
+			ErrUpdateCheckFailed, repo)
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: GitHub 访问令牌无效或已过期（检查 LT_UPDATE_TOKEN）", ErrUpdateCheckFailed)
+	case http.StatusForbidden, http.StatusTooManyRequests:
+		if rateRemaining == "0" {
+			return fmt.Errorf("%w: GitHub API 速率限制已用尽，请稍后重试"+
+				"（未认证每小时 60 次，配置 LT_UPDATE_TOKEN 可提高额度）", ErrUpdateCheckFailed)
+		}
+		return fmt.Errorf("%w: GitHub 拒绝了请求（HTTP %d），请检查访问令牌权限", ErrUpdateCheckFailed, status)
+	default:
+		return fmt.Errorf("%w: GitHub 返回 %d", ErrUpdateCheckFailed, status)
+	}
+}
+
 func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error) {
 	repo := updateRepo()
 	endpoint := "https://api.github.com/repos/" + repo + "/releases/latest"
@@ -175,7 +196,7 @@ func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: GitHub 返回 %d", ErrUpdateCheckFailed, resp.StatusCode)
+		return nil, updateHTTPError(repo, resp.StatusCode, resp.Header.Get("X-RateLimit-Remaining"))
 	}
 
 	var rel githubRelease
@@ -183,7 +204,8 @@ func (s *Services) fetchLatestRelease(ctx context.Context) (*UpdateStatus, error
 		return nil, fmt.Errorf("%w: %v", ErrUpdateCheckFailed, err)
 	}
 	if rel.TagName == "" || rel.Draft {
-		return nil, ErrUpdateCheckFailed
+		// /releases/latest 理论上不会返回草稿；这里兜底，避免拿到空版本号继续比。
+		return nil, fmt.Errorf("%w: 最新 Release 仍是草稿或缺少版本号，发布后才能检查到更新", ErrUpdateCheckFailed)
 	}
 
 	latest := strings.TrimPrefix(rel.TagName, "v")

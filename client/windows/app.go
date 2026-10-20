@@ -123,6 +123,10 @@ type App struct {
 	// authRejected 防止多个并发请求同时触发「自动退出登录」。
 	authRejected bool
 
+	// frpcReady 在「内嵌 frpc 已释放到磁盘」后关闭：首次同步要等它，
+	// 否则会拿着空路径去启动进程，报一个假的「frpc 不存在」。
+	frpcReady chan struct{}
+
 	syncStart int
 
 	syncRoot   context.Context
@@ -177,18 +181,15 @@ func NewApp() *App {
 		log.Printf("[client] %v", cfgErr)
 	}
 
-	exePath, err := ensureFrpc()
-	if err != nil {
-		log.Printf("[client] %v，将回退到同目录查找 frpc.exe", err)
-		exePath = ""
-	}
+	// 这里刻意不再释放内嵌 frpc：首次要写 ~20MB，会挡在窗口创建之前。
+	// 现在先让窗口带着启动动画出来，释放动作放到 startup 里异步做。
 	frpc.SetStrictLookup(len(embeddedFrpc) > 0)
 
 	syncCtx, syncCancel := context.WithCancel(context.Background())
 
 	app := &App{
 		cfg:          cfg,
-		mgr:          frpc.New(exePath),
+		mgr:          frpc.New(""),
 		syncRoot:     syncCtx,
 		syncCancel:   syncCancel,
 		applied:      map[uint]string{},
@@ -200,6 +201,7 @@ func NewApp() *App {
 		connectAt:    map[uint]time.Time{},
 		errEmitAt:    map[uint]time.Time{},
 		startGen:     map[uint]uint64{},
+		frpcReady:    make(chan struct{}),
 		logKick:      make(chan struct{}, 1),
 		stateKick:    make(chan struct{}, 1),
 		logStop:      make(chan struct{}),
@@ -216,6 +218,22 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// 窗口已经创建好了，再把内嵌 frpc 释放到磁盘：
+	// 首次启动要写 ~20MB，放在这里就不会让用户对着空白窗口等。
+	go func() {
+		defer close(a.frpcReady)
+		exePath, err := ensureFrpc()
+		if err != nil {
+			log.Printf("[client] %v，将回退到同目录查找 frpc.exe", err)
+			return
+		}
+		if exePath != "" {
+			a.mgr.SetExePath(exePath)
+			a.requestState()
+		}
+	}()
+
 	a.startLogFlusher()
 	a.logWg.Add(1)
 	go func() {
@@ -320,6 +338,13 @@ func (a *App) startOnce(ctx context.Context) {
 		case <-a.rootContext().Done():
 			return
 		case <-timer.C:
+		}
+
+		// 等内嵌 frpc 落盘：否则首启可能拿着空路径启动，报一个假的「frpc 不存在」。
+		select {
+		case <-a.frpcReady:
+		case <-time.After(5 * time.Second):
+			log.Printf("[client] 等待内置 frpc 释放超时，继续尝试同步")
 		}
 
 		a.mu.RLock()

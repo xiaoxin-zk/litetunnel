@@ -161,6 +161,14 @@ func (m *Manager) ExePath() string {
 	return m.exePath
 }
 
+// SetExePath 延迟注入 frpc 路径：调用方可以先把窗口显示出来，
+// 再把内嵌的 frpc 释放到磁盘，避免首次启动被 20MB 写盘挡住。
+func (m *Manager) SetExePath(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.exePath = path
+}
+
 func (m *Manager) Available() bool {
 	return usableExecutable(m.ExePath())
 }

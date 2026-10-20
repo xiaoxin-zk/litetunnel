@@ -1,6 +1,9 @@
 <template>
   <div class="app">
-    <transition name="fade" mode="out-in">
+    <!-- 首帧状态还没回来时先留白，由 index.html 里的启动画面盖着，
+         避免先闪一下登录页再切到主界面。 -->
+    <div v-if="!ready" class="boot-pad"></div>
+    <transition v-else name="fade" mode="out-in">
       <LoginView v-if="!state.logged_in" :state="state" @connected="onConnected" />
       <MainView
         v-else
@@ -34,6 +37,18 @@ const state = ref({
 })
 const logs = ref([])
 const notice = ref(null)
+const ready = ref(false)
+
+// 首个状态到达后移除 index.html 里的启动画面。
+// 有 4 秒兜底：后端异常时也不能让用户一直看着转圈。
+function markReady() {
+  if (ready.value) return
+  ready.value = true
+  const splash = document.getElementById('lt-splash')
+  if (!splash) return
+  splash.classList.add('lt-hide')
+  setTimeout(() => splash.remove(), 260)
+}
 
 let stateSeq = 0
 
@@ -63,6 +78,7 @@ function applyState(next) {
   const wasIn = wasLoggedIn
   wasLoggedIn = !!next.logged_in
   state.value = next
+  markReady()
   if (wasIn && !wasLoggedIn) {
     discardLogsForLogout(next.log_epoch)
   }
@@ -211,6 +227,8 @@ function subscribe(name, handler) {
 
 onMounted(async () => {
   disposed = false // 同一模块被重复挂载（热重载）时重新开放
+  // 兜底：状态一直没回来也要把界面露出来，不能卡在启动画面上。
+  setTimeout(markReady, 4000)
   subscribe('state', (payload) => {
     stateSeq++ // 事件状态比任何在途快照都新，让它们失效
     applyState(payload)
@@ -246,6 +264,10 @@ onUnmounted(() => {
 
 <style scoped>
 .app {
+  height: 100%;
+}
+
+.boot-pad {
   height: 100%;
 }
 

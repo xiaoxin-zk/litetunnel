@@ -8,8 +8,84 @@
       content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
     />
     <title>LiteTunnel 客户端</title>
+    <style>
+      /* 启动画面：写在 HTML 里，Vue 还没挂载就能画出来，
+         窗口一出现就有反馈，不用对着空白等 WebView2 初始化。 */
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        background: #f5f7fb;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      }
+      #lt-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #f5f7fb;
+        transition: opacity 0.22s ease;
+      }
+      #lt-splash.lt-hide {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .lt-logo {
+        width: 56px;
+        height: 56px;
+        border-radius: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(135deg, #5f57d6, #4b43bd);
+        color: #fff;
+        font-weight: 700;
+        font-size: 18px;
+        letter-spacing: 0.5px;
+        box-shadow: 0 10px 24px rgba(95, 87, 214, 0.28);
+      }
+      .lt-name {
+        font-size: 15px;
+        font-weight: 600;
+        color: #1e2235;
+      }
+      .lt-spin {
+        width: 26px;
+        height: 26px;
+        border-radius: 50%;
+        border: 3px solid #dcdff0;
+        border-top-color: #5f57d6;
+        animation: lt-spin 0.8s linear infinite;
+      }
+      .lt-tip {
+        font-size: 12px;
+        color: #7c839b;
+      }
+      @keyframes lt-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .lt-spin {
+          animation-duration: 2.4s;
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="lt-splash">
+      <div class="lt-logo">LT</div>
+      <div class="lt-name">LiteTunnel</div>
+      <div class="lt-spin"></div>
+      <div class="lt-tip">正在启动…</div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>

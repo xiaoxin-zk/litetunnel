@@ -17,6 +17,25 @@ type envelope struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+// apiStatusError 保留 HTTP 状态码：上层需要区分「网络问题」和
+// 「凭据已被服务端拒绝」（账号被删除/禁用、API Key 被轮换）。
+type apiStatusError struct {
+	Status  int
+	Message string
+}
+
+func (e *apiStatusError) Error() string { return e.Message }
+
+// unauthorized 判断是否属于「凭据失效」。只认 401：
+// 403 还可能是 IP 封禁、只读接口等业务限制，不该据此清掉本地凭据。
+func unauthorized(err error) bool {
+	var se *apiStatusError
+	if errors.As(err, &se) {
+		return se.Status == http.StatusUnauthorized
+	}
+	return false
+}
+
 func (a *App) getJSON(ctx context.Context, endpoint, token string, out any) error {
 	body, err := a.do(ctx, http.MethodGet, endpoint, token, nil)
 	if err != nil {
@@ -52,7 +71,14 @@ func (a *App) getRawWithRev(ctx context.Context, endpoint, token string) (string
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("服务器返回状态码 %d", resp.StatusCode)
+		err := &apiStatusError{
+			Status:  resp.StatusCode,
+			Message: fmt.Sprintf("服务器返回状态码 %d", resp.StatusCode),
+		}
+		if token != "" && unauthorized(err) {
+			a.credentialRejected()
+		}
+		return "", "", err
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
@@ -104,7 +130,13 @@ func (a *App) do(ctx context.Context, method, endpoint, token string, payload []
 		if msg == "" {
 			msg = fmt.Sprintf("请求失败（状态码 %d）", resp.StatusCode)
 		}
-		return nil, errors.New(clampStatusText(msg))
+		err := &apiStatusError{Status: resp.StatusCode, Message: clampStatusText(msg)}
+		// 带着已保存的凭据仍被拒绝（401）：账号很可能已被删除或禁用，
+		// 必须让客户端退出登录，否则界面会一直停在「已接入」但什么都做不了。
+		if token != "" && unauthorized(err) {
+			a.credentialRejected()
+		}
+		return nil, err
 	}
 	return env.Data, nil
 }

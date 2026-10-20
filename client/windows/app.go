@@ -120,6 +120,9 @@ type App struct {
 
 	authGeneration uint64
 
+	// authRejected 防止多个并发请求同时触发「自动退出登录」。
+	authRejected bool
+
 	syncStart int
 
 	syncRoot   context.Context

@@ -266,6 +266,8 @@ func (a *App) resetPerAccountState() {
 	a.lastSyncAt = time.Time{}
 	a.startGen = map[uint]uint64{}
 	a.cfgErr = ""
+	// 退出后必须复位：否则下一次接入的账号被删时不会再触发自动退出。
+	a.authRejected = false
 }
 
 func (a *App) currentCredential() (base, apiKey string, err error) {

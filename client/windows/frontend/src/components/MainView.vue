@@ -878,12 +878,46 @@ const handleClearLogs = () => run(props.clearLogs, '日志已清空')
 
 const handleOpenDataDir = () => run(props.openDataDir)
 
+// 复制到剪贴板。
+// WebView2 里页面来源不一定是安全上下文，navigator.clipboard 可能不存在，
+// 只写 Clipboard API 会必然失败，所以这里要兜底到 execCommand。
 async function copy(text) {
+  const value = String(text ?? '')
+  if (!value) return
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      flash('已复制到剪贴板')
+      return
+    } catch {
+      // 权限被拒或非安全上下文：走兜底
+    }
+  }
+
+  const ta = document.createElement('textarea')
+  ta.value = value
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.top = '-1000px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  const prevFocus = document.activeElement
+  ta.select()
+  ta.setSelectionRange(0, value.length)
+  let ok = false
   try {
-    await navigator.clipboard.writeText(text)
-    flash('已复制到剪贴板')
+    ok = document.execCommand('copy')
   } catch {
-    flash('复制失败，请手动复制', 'warn')
+    ok = false
+  }
+  document.body.removeChild(ta)
+  if (prevFocus instanceof HTMLElement) prevFocus.focus()
+
+  if (ok) {
+    flash('已复制到剪贴板')
+  } else {
+    flash('复制失败，请手动选中复制', 'warn')
   }
 }
 

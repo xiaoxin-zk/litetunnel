@@ -27,7 +27,7 @@ func (q queryCounter) Trace(_ context.Context, _ time.Time, _ func() (string, in
 }
 
 func TestBuildFrpcConfigLogsToConsole(t *testing.T) {
-	svc := newTestServices(t, nil)
+	svc := newTestServices(t, &config.Config{GatewayHost: "203.0.113.10"})
 
 	u := &model.User{Username: "cfguser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {
@@ -56,7 +56,7 @@ func TestBuildFrpcConfigLogsToConsole(t *testing.T) {
 }
 
 func TestFrpcConfigRevTracksEveryInput(t *testing.T) {
-	svc := newTestServices(t, nil)
+	svc := newTestServices(t, &config.Config{GatewayHost: "203.0.113.10"})
 
 	u := &model.User{Username: "revuser", Password: "not-used", Status: model.UserStatusActive}
 	if err := svc.DB.Create(u).Error; err != nil {

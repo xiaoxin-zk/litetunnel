@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,6 +143,90 @@ func TestNotificationMailFinishesWithoutActivation(t *testing.T) {
 	}
 	if row.Body != "" || row.Payload != "" {
 		t.Error("送达后应清空正文与参数")
+	}
+}
+
+// 发件箱最终失败时必须清掉 queued，否则下一轮提醒会以为「已入队」而不再重试。
+func TestAlertMailFinalFailureClearsQueued(t *testing.T) {
+	svc := newTestServices(t, nil)
+	ev := model.AlertEvent{
+		Kind: "disk", Level: "critical", Message: "磁盘 95%",
+		Status: model.AlertStatusFiring, MailQueued: true, Instance: svc.nodeID,
+	}
+	if err := svc.DB.Create(&ev).Error; err != nil {
+		t.Fatalf("写入告警失败: %v", err)
+	}
+
+	svc.noteAlertMailFailed(model.MailOutbox{
+		Kind:    model.MailKindAlertFiring,
+		Payload: fmt.Sprintf(`{"alert_event_id":%d}`, ev.ID),
+	})
+	if err := svc.DB.First(&ev, ev.ID).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if ev.MailQueued {
+		t.Error("最终失败后必须清掉 mail_queued，否则提醒不会再发邮件")
+	}
+	if !ev.MailFailed {
+		t.Error("最终失败后应标记 mail_failed")
+	}
+
+	// 恢复邮件走独立字段，不能污染触发状态。
+	ev.MailFailed = false
+	if err := svc.DB.Model(&ev).Update("mail_failed", false).Error; err != nil {
+		t.Fatalf("重置失败: %v", err)
+	}
+	svc.noteAlertMailFailed(model.MailOutbox{
+		Kind:    model.MailKindAlertResolved,
+		Payload: fmt.Sprintf(`{"alert_event_id":%d,"phase":"resolved"}`, ev.ID),
+	})
+	if err := svc.DB.First(&ev, ev.ID).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if !ev.ResolvedMailFailed || ev.ResolvedMailQueued {
+		t.Errorf("恢复邮件失败应记在 resolved 字段，实际 queued=%v failed=%v",
+			ev.ResolvedMailQueued, ev.ResolvedMailFailed)
+	}
+	if ev.MailFailed {
+		t.Error("恢复邮件失败不该影响触发邮件的状态")
+	}
+}
+
+// 认领后进程崩溃：租约到期前不重发，到期后能自动补发。
+func TestReportClaimLeaseRecoversAfterCrash(t *testing.T) {
+	svc := newTestServices(t, nil)
+	enableTestMail(t, svc)
+	if err := svc.UpdateSettings(map[SettingKey]string{
+		KeyAlertEmailTo:        "ops@example.com",
+		KeyReportEnabled:       "true",
+		KeyReportDailyEnabled:  "true",
+		KeyReportDailyHour:     "9",
+		KeyReportWeeklyEnabled: "false",
+	}); err != nil {
+		t.Fatalf("保存报告设置失败: %v", err)
+	}
+
+	now := time.Date(2026, 10, 20, 9, 30, 0, 0, time.Local)
+	occurrence := lastDailyOccurrence(now, 9)
+
+	// 模拟「已认领但进程在写发件箱前退出」：租约还在。
+	claim := formatReportClaim(reportClaim{Period: occurrence, Lease: now.Add(5 * time.Minute)})
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyReportDailyLastAt: claim}); err != nil {
+		t.Fatalf("写入认领标记失败: %v", err)
+	}
+	svc.runDueReports(now)
+	if n := countMailKind(t, svc, model.MailKindReportSummary); n != 0 {
+		t.Fatalf("租约未到期不该重发，实际 %d 封", n)
+	}
+
+	// 租约过期：上一轮显然已经挂了，应当补发。
+	expired := formatReportClaim(reportClaim{Period: occurrence, Lease: now.Add(-time.Minute)})
+	if err := svc.Settings.SetInternal(map[SettingKey]string{KeyReportDailyLastAt: expired}); err != nil {
+		t.Fatalf("写入过期认领失败: %v", err)
+	}
+	svc.runDueReports(now)
+	if n := countMailKind(t, svc, model.MailKindReportSummary); n != 1 {
+		t.Fatalf("租约过期后应补发 1 封，实际 %d 封", n)
 	}
 }
 

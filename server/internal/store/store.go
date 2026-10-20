@@ -171,7 +171,7 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 	// 先收敛成每个 (kind, instance) 的最新一条，再建唯一索引。
 	// 索引必须带上 instance：告警事件已按实例隔离，只按 kind 唯一会挡住第二台实例。
 	if err := db.Exec(`DROP INDEX IF EXISTS idx_lt_alert_events_firing`).Error; err != nil {
-		log.Printf("[store] 删除旧的进行中告警索引失败: %v", err)
+		return nil, fmt.Errorf("删除旧的进行中告警索引失败: %w", err)
 	}
 	if err := db.Exec(
 		`UPDATE lt_alert_events SET status = ?, resolved_at = created_at
@@ -180,13 +180,14 @@ func Open(cfg *config.Config) (*gorm.DB, error) {
 		  )`,
 		model.AlertStatusResolved, model.AlertStatusFiring, model.AlertStatusFiring,
 	).Error; err != nil {
-		log.Printf("[store] 收敛重复的进行中告警失败: %v", err)
+		return nil, fmt.Errorf("收敛重复的进行中告警失败（请先人工清理 lt_alert_events 中同 kind/instance 的多条 firing）: %w", err)
 	}
+	// 这条唯一索引是多实例正确性的一部分：建不出来就不能假装没事继续跑。
 	if err := db.Exec(
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_lt_alert_events_firing_v2
 		 ON lt_alert_events(kind, instance) WHERE status = 'firing'`,
 	).Error; err != nil {
-		log.Printf("[store] 进行中告警唯一索引未建立（多实例下可能重复推送）: %v", err)
+		return nil, fmt.Errorf("创建进行中告警唯一索引失败（该约束用于防止多实例重复推送，不能跳过）: %w", err)
 	}
 
 	if err := ensureTunnelListRevTriggers(db, cfg.DBDriver); err != nil {

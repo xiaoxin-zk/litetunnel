@@ -105,7 +105,7 @@ echo "LT_BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 15 | tr -d '/+=')"
 |---|---|
 | `LT_ENV` | 填 `production` |
 | `LT_USER_PUBLIC_URL` | 控制台对外地址。`https://panel.example.com` 自动申请证书；`http://1.2.3.4` 为无域名时的明文模式 |
-| `LT_GATEWAY_HOST` | 客户端接入地址，填域名或公网 IP |
+| `LT_GATEWAY_HOST` | 客户端接入地址，必填且必须是域名或公网 IP（生产拒绝空值、回环与 0.0.0.0） |
 | `LT_ACME_EMAIL` | 证书通知邮箱（HTTP 模式下不使用） |
 | 上面生成的 6 个密钥 | 直接粘贴 |
 

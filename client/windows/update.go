@@ -89,27 +89,34 @@ func (a *App) DownloadClientUpdate() (UpdateInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	sum, err := downloadFile(ctx, info.DownloadURL, target)
+	// 先下到 .part，校验通过后才覆盖目标文件：
+	// 校验失败只删临时文件，不会把上一次下载好的有效包删掉。
+	sum, tmp, err := downloadFile(ctx, info.DownloadURL, target)
 	if err != nil {
 		return info, err
 	}
+	discard := func() { _ = os.Remove(tmp) }
 
 	if info.ChecksumURL == "" {
-		_ = os.Remove(target)
+		discard()
 		return info, errors.New("该版本没有提供校验和，已拒绝下载；请到发布页手动下载")
 	}
 	want, err := fetchChecksum(ctx, info.ChecksumURL, asset, name)
 	if err != nil {
-		_ = os.Remove(target)
+		discard()
 		return info, err
 	}
 	if want == "" {
-		_ = os.Remove(target)
+		discard()
 		return info, fmt.Errorf("发布清单里没有 %s 的校验和，已删除下载文件", asset)
 	}
 	if want != sum {
-		_ = os.Remove(target)
+		discard()
 		return info, errors.New("下载文件的 SHA-256 与发布页不一致，已删除，请重试或手动下载")
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		discard()
+		return info, fmt.Errorf("保存文件失败: %w", err)
 	}
 
 	info.LocalPath = target
@@ -125,53 +132,51 @@ func downloadDir() string {
 	return os.TempDir()
 }
 
-func downloadFile(ctx context.Context, src, target string) (string, error) {
+// downloadFile 下载到 target.part 并返回哈希与临时文件路径，不覆盖 target。
+// 是否替换由调用方在校验通过后决定。
+func downloadFile(ctx context.Context, src, target string) (string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	req.Header.Set("User-Agent", "LiteTunnel-Client")
 
 	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("下载失败: %w", err)
+		return "", "", fmt.Errorf("下载失败: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载失败: 服务器返回 %d", resp.StatusCode)
+		return "", "", fmt.Errorf("下载失败: 服务器返回 %d", resp.StatusCode)
 	}
 
 	if resp.ContentLength > maxUpdateBytes {
-		return "", fmt.Errorf("更新包超过 %d MiB，已拒绝下载", maxUpdateBytes>>20)
+		return "", "", fmt.Errorf("更新包超过 %d MiB，已拒绝下载", maxUpdateBytes>>20)
 	}
 
 	tmp := target + ".part"
 	f, err := os.Create(tmp)
 	if err != nil {
-		return "", fmt.Errorf("写入文件失败: %w", err)
+		return "", "", fmt.Errorf("写入文件失败: %w", err)
 	}
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(resp.Body, maxUpdateBytes+1))
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("下载中断: %w", copyErr)
+		return "", "", fmt.Errorf("下载中断: %w", copyErr)
 	}
 	// LimitReader 到上限就停，必须显式判定，否则截断的文件会被当成下载成功。
 	if written > maxUpdateBytes {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("更新包超过 %d MiB，已删除", maxUpdateBytes>>20)
+		return "", "", fmt.Errorf("更新包超过 %d MiB，已删除", maxUpdateBytes>>20)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("写入文件失败: %w", closeErr)
+		return "", "", fmt.Errorf("写入文件失败: %w", closeErr)
 	}
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return "", fmt.Errorf("保存文件失败: %w", err)
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	return hex.EncodeToString(hasher.Sum(nil)), tmp, nil
 }
 
 // fetchChecksum 在 sha256sum 格式的清单里按文件名精确匹配，返回对应哈希。

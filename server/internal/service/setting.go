@@ -134,6 +134,9 @@ const (
 	KeyReportWeeklyHour    SettingKey = "report.weekly_hour"
 	KeyReportDailyLastAt   SettingKey = "report.daily_last_at"
 	KeyReportWeeklyLastAt  SettingKey = "report.weekly_last_at"
+
+	// KeyNodeID 是持久化的节点标识：容器重建、主机名变化后仍能接管旧告警。
+	KeyNodeID SettingKey = "node.id"
 )
 
 const SecretMask = "__UNCHANGED__"
@@ -285,6 +288,8 @@ var settingSpecs = []settingSpec{
 	{Key: KeyReportWeeklyHour, Default: func(*config.Config) string { return "9" }},
 	{Key: KeyReportDailyLastAt, Internal: true, Default: func(*config.Config) string { return "" }},
 	{Key: KeyReportWeeklyLastAt, Internal: true, Default: func(*config.Config) string { return "" }},
+
+	{Key: KeyNodeID, Internal: true, Default: func(*config.Config) string { return "" }},
 }
 
 var settingByKey = func() map[SettingKey]settingSpec {

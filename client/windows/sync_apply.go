@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// errTunnelSyncPartial 表示面板可达，只是部分隧道同步失败。
+// 这类失败要展示给用户，但不触发全局退避：健康隧道的变更仍需按 20 秒节奏同步。
+var errTunnelSyncPartial = errors.New("部分隧道同步失败")
+
 func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint64) (changed bool, err error) {
 	if seq <= a.appliedSyncSeq {
 		return false, nil
@@ -235,7 +239,8 @@ func (a *App) applySyncData(ctx context.Context, data *clientInfoData, seq uint6
 		if len(failures) > 1 {
 			detail = fmt.Sprintf("%s 等 %d 条", failures[0], len(failures))
 		}
-		return changed, fmt.Errorf("%d 条隧道同步失败：%s", len(failures), detail)
+		// 单条隧道失败不代表面板不可用：标记成 partial，调度层不据此退避。
+		return changed, fmt.Errorf("%w：%d 条隧道同步失败：%s", errTunnelSyncPartial, len(failures), detail)
 	}
 	return changed, nil
 }

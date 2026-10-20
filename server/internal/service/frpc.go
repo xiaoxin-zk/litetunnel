@@ -170,6 +170,11 @@ func (s *Services) BuildClientInfo(u *model.User) (*ClientInfo, error) {
 		return nil, err
 	}
 	gatewayHost, gatewayPort := s.GatewayEndpoint()
+	if strings.TrimSpace(gatewayHost) == "" {
+		// 宁可让客户端页面明确报错，也不下发一个连不上的地址。
+		return nil, fmt.Errorf("%w: 尚未配置客户端可访问的网关地址"+
+			"（系统设置 → 端口与防火墙 → 隧道网关地址，或环境变量 LT_GATEWAY_HOST）", ErrInvalidParam)
+	}
 	return &ClientInfo{
 		ServerAddr:    gatewayHost,
 		ServerPort:    gatewayPort,

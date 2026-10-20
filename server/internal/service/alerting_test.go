@@ -254,6 +254,47 @@ func TestAlertLifecycleResolveAndNotify(t *testing.T) {
 	}
 }
 
+// 节点标识必须落在库里：容器重建/主机名变化后，旧告警仍要能被同一个节点恢复。
+func TestNodeIDPersistsAcrossRestart(t *testing.T) {
+	svc := newTestServices(t, nil)
+	if svc.nodeID == "" {
+		t.Fatal("节点标识不能为空")
+	}
+	restarted := New(svc.DB, svc.Cfg)
+	if restarted.nodeID != svc.nodeID {
+		t.Fatalf("节点标识未持久化：%q → %q", svc.nodeID, restarted.nodeID)
+	}
+}
+
+// 升级前 instance 为空的历史告警要被迁移到当前节点，否则永远无法恢复。
+func TestLegacyAlertAdoptedByNode(t *testing.T) {
+	svc := newTestServices(t, nil)
+	legacy := model.AlertEvent{
+		Kind: "disk", Level: "critical", Message: "升级前的告警",
+		Status: model.AlertStatusFiring,
+	}
+	if err := svc.DB.Create(&legacy).Error; err != nil {
+		t.Fatalf("写入旧告警失败: %v", err)
+	}
+
+	restarted := New(svc.DB, svc.Cfg)
+	var got model.AlertEvent
+	if err := restarted.DB.First(&got, legacy.ID).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if got.Instance != restarted.nodeID {
+		t.Fatalf("旧告警未迁移：instance=%q，期望 %q", got.Instance, restarted.nodeID)
+	}
+
+	restarted.resolveAlert("disk", "磁盘已回落")
+	if err := restarted.DB.First(&got, legacy.ID).Error; err != nil {
+		t.Fatalf("读取告警失败: %v", err)
+	}
+	if got.Status != model.AlertStatusResolved {
+		t.Errorf("迁移后的旧告警应能被自动恢复，状态 = %q", got.Status)
+	}
+}
+
 // 两台实例各自采样：A 的故障不能被 B 的正常样本「恢复」。
 func TestAlertEventsAreScopedPerInstance(t *testing.T) {
 	svc := newTestServices(t, nil)

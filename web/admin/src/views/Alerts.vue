@@ -214,9 +214,9 @@
             <el-tag size="small" :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="通知" width="110">
+        <el-table-column label="通知" width="150">
           <template #default="{ row }">
-            <el-tag size="small" :type="notifyState(row).ok ? 'success' : 'info'">
+            <el-tag size="small" :type="notifyState(row).type">
               {{ notifyState(row).text }}
             </el-tag>
           </template>
@@ -349,16 +349,24 @@ function statusTagType(status) {
 // 通知列分两种语义：进行中看触发通知是否送达，已恢复看恢复通知是否送达。
 function notifyState(row) {
   if (row.status === 'resolved') {
-    return { ok: !!row.resolved_notified, text: row.resolved_notified ? '恢复已通知' : '恢复未通知' }
+    if (row.resolved_mail_failed) {
+      return {
+        type: row.resolved_notified ? 'warning' : 'danger',
+        text: row.resolved_notified ? '已恢复 · 邮件失败' : '恢复邮件失败'
+      }
+    }
+    if (row.resolved_notified) return { type: 'success', text: '恢复已通知' }
+    if (row.resolved_mail_queued) return { type: 'info', text: '恢复邮件已入队' }
+    return { type: 'warning', text: '恢复未通知' }
   }
-  if (row.status === 'manual_resolved') {
-    return { ok: true, text: '—' }
-  }
-  // Webhook 与邮件分开显示：入队不等于对方服务器已经收到，最终失败也要如实标出来。
-  if (row.delivered) return { ok: true, text: '已推送' }
-  if (row.mail_failed) return { ok: false, text: '邮件失败' }
-  if (row.mail_queued) return { ok: true, text: '邮件已入队' }
-  return { ok: false, text: '未送达' }
+  if (row.status === 'manual_resolved') return { type: 'info', text: '—' }
+
+  // Webhook 与邮件分开显示：入队不等于对方已收到，邮件失败不能被「已推送」盖住。
+  if (row.delivered && row.mail_failed) return { type: 'warning', text: '已推送 · 邮件失败' }
+  if (row.delivered) return { type: 'success', text: '已推送' }
+  if (row.mail_failed) return { type: 'danger', text: '邮件失败' }
+  if (row.mail_queued) return { type: 'info', text: '邮件已入队' }
+  return { type: 'danger', text: '未送达' }
 }
 
 async function resolveEvent(row) {

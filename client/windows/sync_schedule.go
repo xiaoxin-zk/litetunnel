@@ -59,6 +59,10 @@ func (a *App) autoSyncOnce() error {
 			a.setSyncErr(err)
 			a.emitState()
 		}
+		// 只有面板本身不可用才退避；单条隧道失败仍按正常节奏重试。
+		if errors.Is(err, errTunnelSyncPartial) {
+			return nil
+		}
 		return err
 	}
 

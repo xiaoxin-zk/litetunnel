@@ -331,9 +331,9 @@ func (c *Config) fillDefaults() error {
 		c.BootstrapAdminPassword = v
 		c.EphemeralAdminPassword = true
 	}
-	if c.GatewayHost == "" {
-		c.GatewayHost = "127.0.0.1"
-	}
+	// 刻意不再把空的 LT_GATEWAY_HOST 默认成 127.0.0.1：
+	// 那个值会被下发给客户端，外部机器连自己的回环，隧道必然建不起来。
+	// 生产环境由 validate() 拒绝空值/回环，非生产环境只给出警告。
 	if c.FrpsToken == "" {
 		v, err := randomHex(32)
 		if err != nil {
@@ -343,6 +343,19 @@ func (c *Config) fillDefaults() error {
 		c.GeneratedSecrets = append(c.GeneratedSecrets, "LT_FRPS_TOKEN")
 	}
 	return nil
+}
+
+// isUnroutableGatewayHost 判断地址能否作为「客户端要连的网关」：
+// 空值、localhost、回环、未指定地址（0.0.0.0 / ::）都不行。
+func isUnroutableGatewayHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" || strings.EqualFold(h, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
 }
 
 func (c *Config) validate() error {
@@ -426,6 +439,10 @@ func (c *Config) validate() error {
 			c.Warnings = append(c.Warnings,
 				"未配置 LT_USER_PUBLIC_URL，找回密码的邮件不会发出（重置链接无法生成）；本地调试请设为 http://localhost:<端口>")
 		}
+		if isUnroutableGatewayHost(c.GatewayHost) {
+			c.Warnings = append(c.Warnings,
+				"LT_GATEWAY_HOST 为空或为回环/0.0.0.0：客户端会拿到这个地址，外部机器将连不上；公网部署前请改成可访问的域名或 IP")
+		}
 		return nil
 	}
 
@@ -446,6 +463,9 @@ func (c *Config) validate() error {
 
 	if len(missing) > 0 {
 		return fmt.Errorf("生产环境缺少或仍为占位符的配置项: %s", strings.Join(missing, ", "))
+	}
+	if isUnroutableGatewayHost(c.GatewayHost) {
+		return errors.New("LT_GATEWAY_HOST 必须是客户端可访问的公网域名或 IP，不能是回环地址、0.0.0.0 或空值")
 	}
 	if len(c.FrpsPluginAllowCIDRs) == 0 {
 		return errors.New("生产环境必须显式配置 LT_FRPS_PLUGIN_ALLOW_CIDR")

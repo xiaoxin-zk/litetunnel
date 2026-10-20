@@ -331,12 +331,13 @@ func (s *Services) sustained(n int, at time.Time, ok func(model.MetricSample) bo
 //   - 超过冷却：开一条新事件并推送。
 func (s *Services) raiseAlert(kind, level, message string, value, threshold float64) {
 	var last model.AlertEvent
-	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '')", kind, s.nodeID).
+	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '' OR instance IS NULL)", kind, s.nodeID).
 		Order("id DESC").First(&last).Error; err == nil {
 		switch {
 		case last.Status == model.AlertStatusFiring:
-			// 只有两个通道都没成功时才重试；邮件已入队时重复投递只会多收一封。
-			if !last.Delivered && !last.MailQueued {
+			// 只有两个通道都没成功、且邮件没有最终失败时才立刻重试。
+			// 邮件已入队时重复投递只会多收一封；已最终失败则等 30 分钟提醒再试。
+			if !last.Delivered && !last.MailQueued && !last.MailFailed {
 				s.deliverAlert(last, false)
 				return
 			}
@@ -393,8 +394,10 @@ func (s *Services) reopenAlert(ev model.AlertEvent) {
 			"resolved_at": nil,
 			// 重开意味着「这次恢复已经作废」，下一次恢复必须重新通知；
 			// 否则旧值 true 会让恢复邮件永远不再尝试。
-			"resolved_notified": false,
-			"mail_failed":       false,
+			"resolved_notified":    false,
+			"resolved_mail_queued": false,
+			"resolved_mail_failed": false,
+			"mail_failed":          false,
 		}).Error
 	if err != nil {
 		log.Printf("[alert] 重开告警失败: %v", err)
@@ -405,14 +408,15 @@ func (s *Services) reopenAlert(ev model.AlertEvent) {
 // 每轮采样对所有未命中的规则都会调用一次，因此必须幂等。
 func (s *Services) resolveAlert(kind, message string) {
 	var last model.AlertEvent
-	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '')", kind, s.nodeID).
+	if err := s.DB.Where("kind = ? AND (instance = ? OR instance = '' OR instance IS NULL)", kind, s.nodeID).
 		Order("id DESC").First(&last).Error; err != nil {
 		return
 	}
 	if last.Status != model.AlertStatusFiring {
-		// 已恢复但恢复通知没送出去：冷却窗口内顺带补一次（与触发通知的重试对称）。
-		if last.Status == model.AlertStatusResolved && !last.ResolvedNotified &&
-			last.ResolvedAt != nil && time.Since(*last.ResolvedAt) < alertCooldown {
+		// 恢复通知按通道补发：Webhook 没送达、或邮件最终失败，都在冷却窗口内再试一次。
+		if last.Status == model.AlertStatusResolved && last.ResolvedAt != nil &&
+			time.Since(*last.ResolvedAt) < alertCooldown &&
+			(!last.ResolvedNotified || last.ResolvedMailFailed) {
 			s.deliverResolved(last, message)
 		}
 		return
@@ -531,19 +535,21 @@ func (s *Services) deliverResolved(ev model.AlertEvent, message string) {
 	out.Level = "info"
 	out.Message = message
 
-	delivered := false
-	if cfg.WebhookURL != "" {
+	updates := map[string]any{}
+	if cfg.WebhookURL != "" && !ev.ResolvedNotified {
 		if err := s.postWebhook(out); err != nil {
 			log.Printf("[alert] 恢复通知推送失败（%s）: %v", ev.Kind, outbound.SanitizeError(err))
 		} else {
-			delivered = true
+			updates["resolved_notified"] = true
 		}
 	}
-	if s.sendAlertEmail(out, true) {
-		delivered = true
+	// 邮件入队只记 queued：最终失败会由发件箱回写，页面不会把入队当成已通知。
+	if !ev.ResolvedMailQueued && s.sendAlertEmail(out, true) {
+		updates["resolved_mail_queued"] = true
+		updates["resolved_mail_failed"] = false
 	}
-	if delivered {
-		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Update("resolved_notified", true)
+	if len(updates) > 0 {
+		s.DB.Model(&model.AlertEvent{}).Where("id = ?", ev.ID).Updates(updates)
 	}
 }
 

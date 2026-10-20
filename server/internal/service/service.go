@@ -172,7 +172,7 @@ func (s *Services) userLock(userID uint) *sync.Mutex {
 
 func New(db *gorm.DB, cfg *config.Config) *Services {
 	control := mustControlPlane(cfg)
-	return &Services{
+	svc := &Services{
 		DB:         db,
 		Cfg:        cfg,
 		Frps:       NewFrpsClient(cfg),
@@ -183,7 +183,6 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		LoginGuard: middleware.NewLoginGuard(loginLockThreshold, loginLockBase, loginLockMax),
 
 		instanceID: newInstanceID(),
-		nodeID:     newNodeID(cfg),
 
 		Monitor:          monitor.New(cfg.MonitorDiskPath),
 		loginLogCh:       make(chan model.LoginLog, loginLogBuffer),
@@ -196,6 +195,50 @@ func New(db *gorm.DB, cfg *config.Config) *Services {
 		drainFallback:    newProxyDrainFallbackQueue(),
 		statusGens:       map[uint]userStatusEntry{},
 		auditCounters:    &auditCounters{},
+	}
+	// 节点标识必须持久化：容器重建后主机名可能变化，否则旧告警永远无法恢复。
+	svc.nodeID = svc.loadOrCreateNodeID()
+	svc.backfillAlertInstance()
+	return svc
+}
+
+// loadOrCreateNodeID 优先使用库里的持久化标识；首次启动生成一次并写回。
+// 写入失败时退回主机名标识，至少保证同一次运行内可用。
+func (s *Services) loadOrCreateNodeID() string {
+	if v := strings.TrimSpace(s.Settings.Get(KeyNodeID)); v != "" {
+		return v
+	}
+	base := newNodeID(s.Cfg)
+	suffix, err := randomHex(4)
+	if err != nil {
+		return base
+	}
+	id := base + "-" + suffix
+	if err := s.Settings.SetInternal(map[SettingKey]string{KeyNodeID: id}); err != nil {
+		log.Printf("[alert] 持久化节点标识失败，本次运行使用临时标识（重启后旧告警可能无法恢复）: %v", err)
+		return base
+	}
+	return id
+}
+
+// backfillAlertInstance 把升级前没有归属的告警迁移到当前节点，
+// 否则它们既不会被恢复，也会一直挂在面板上。
+// 与当前节点已有的 firing 冲突时保持原样（查询里用 OR 兜底，仍可被恢复）。
+func (s *Services) backfillAlertInstance() {
+	res := s.DB.Exec(
+		`UPDATE lt_alert_events SET instance = ?
+		  WHERE (instance IS NULL OR instance = '')
+		    AND NOT EXISTS (
+		        SELECT 1 FROM lt_alert_events x
+		        WHERE x.kind = lt_alert_events.kind AND x.instance = ? AND x.status = ?
+		    )`,
+		s.nodeID, s.nodeID, model.AlertStatusFiring)
+	if res.Error != nil {
+		log.Printf("[alert] 迁移历史告警归属失败（查询仍兼容空归属）: %v", res.Error)
+		return
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("[alert] 已把 %d 条历史告警归属到当前节点", res.RowsAffected)
 	}
 }
 
@@ -221,6 +264,12 @@ func newNodeID(cfg *config.Config) string {
 	host, err := os.Hostname()
 	if err != nil || strings.TrimSpace(host) == "" {
 		host = "panel"
+	}
+	host = strings.TrimSpace(host)
+	// 列宽有限（Postgres 会真的按 varchar 长度报错），主机名截断到 32 字符；
+	// 唯一性由后面的随机后缀保证。
+	if r := []rune(host); len(r) > 32 {
+		host = string(r[:32])
 	}
 	addr := ""
 	if cfg != nil {

@@ -400,13 +400,19 @@ func (s *Services) noteAlertMailFailed(row model.MailOutbox) {
 		return
 	}
 	var payload struct {
-		AlertEventID uint `json:"alert_event_id"`
+		AlertEventID uint   `json:"alert_event_id"`
+		Phase        string `json:"phase"`
 	}
 	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil || payload.AlertEventID == 0 {
 		return
 	}
+	// 失败后必须把 queued 清掉，否则下一轮提醒会以为「已入队」而不再重试。
+	updates := map[string]any{"mail_failed": true, "mail_queued": false}
+	if payload.Phase == "resolved" {
+		updates = map[string]any{"resolved_mail_failed": true, "resolved_mail_queued": false}
+	}
 	if err := s.DB.Model(&model.AlertEvent{}).Where("id = ?", payload.AlertEventID).
-		Update("mail_failed", true).Error; err != nil {
+		Updates(updates).Error; err != nil {
 		log.Printf("[mail] 回写告警邮件失败状态出错: %v", err)
 	}
 }

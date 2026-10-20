@@ -301,7 +301,7 @@ type MetricSample struct {
 	DiskUsedPct float64   `json:"disk_used_pct"`
 	// Instance 是采样来源。多实例部署时各实例只看自己的样本，
 	// 否则会把别人的「正常窗口」当成自己恢复的依据。
-	Instance  string    `gorm:"size:64;index" json:"instance"`
+	Instance  string    `gorm:"size:96;index" json:"instance"`
 	CreatedAt time.Time `json:"-"`
 }
 
@@ -328,7 +328,7 @@ type AlertEvent struct {
 
 	// Instance 是事件的所有者。事件按实例隔离：每台实例只用自己的样本
 	// 触发和恢复自己名下的事件，避免 A 的故障被 B 的正常样本「恢复」掉。
-	Instance string `gorm:"size:64;index" json:"instance"`
+	Instance string `gorm:"size:96;index" json:"instance"`
 
 	Status     string     `gorm:"size:16;index;default:firing" json:"status"`
 	ResolvedAt *time.Time `json:"resolved_at"`
@@ -343,8 +343,11 @@ type AlertEvent struct {
 	MailQueued bool `gorm:"not null;default:0" json:"mail_queued"`
 	MailFailed bool `gorm:"not null;default:0" json:"mail_failed"`
 
-	// ResolvedNotified 只表示「恢复通知是否送达」，触发通知看 Delivered / MailQueued。
-	ResolvedNotified bool `gorm:"not null;default:0" json:"resolved_notified"`
+	// 恢复通知同样分通道记录：ResolvedNotified 是 Webhook 送达，
+	// ResolvedMailQueued / ResolvedMailFailed 是邮件的入队与最终失败。
+	ResolvedNotified   bool `gorm:"not null;default:0" json:"resolved_notified"`
+	ResolvedMailQueued bool `gorm:"not null;default:0" json:"resolved_mail_queued"`
+	ResolvedMailFailed bool `gorm:"not null;default:0" json:"resolved_mail_failed"`
 
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }

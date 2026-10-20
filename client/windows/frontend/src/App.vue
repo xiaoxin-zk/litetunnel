@@ -78,7 +78,8 @@ function applyState(next) {
   const wasIn = wasLoggedIn
   wasLoggedIn = !!next.logged_in
   state.value = next
-  markReady()
+  // frpc 还在释放时不急着收启动画面：否则会先闪一下「未找到 frpc」的警告条。
+  if (next.frpc_found) markReady()
   if (wasIn && !wasLoggedIn) {
     discardLogsForLogout(next.log_epoch)
   }
@@ -227,8 +228,8 @@ function subscribe(name, handler) {
 
 onMounted(async () => {
   disposed = false // 同一模块被重复挂载（热重载）时重新开放
-  // 兜底：状态一直没回来也要把界面露出来，不能卡在启动画面上。
-  setTimeout(markReady, 4000)
+  // 兜底：真的没有 frpc（或后端异常）时也要把界面露出来，不能卡在启动画面。
+  setTimeout(markReady, 1500)
   subscribe('state', (payload) => {
     stateSeq++ // 事件状态比任何在途快照都新，让它们失效
     applyState(payload)

@@ -51,7 +51,7 @@
                   :disabled="!!downloading && downloading !== row.name"
                   @click="downloadFile(row.name)"
                 >
-                  {{ downloading === row.name ? downloadLabel : '下载' }}
+                  {{ downloading === row.name ? '准备下载…' : '下载' }}
                 </el-button>
               </template>
             </el-table-column>
@@ -175,7 +175,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Monitor, Download } from '@element-plus/icons-vue'
 import { clientApi, downloadFrpcConfig, downloadClientFile } from '../api'
@@ -197,17 +197,9 @@ const loading = ref(false)
 const downloadUrl = ref('')
 const loadErr = ref('')
 
-// 同一时刻只允许下载一个文件：重复点击会在内存里堆出多份 10MB+ 的 blob。
+// 现在下载是浏览器原生行为：这里只覆盖「换取下载地址」这一小段等待，
+// 之后进度条由浏览器自己显示。
 const downloading = ref('')
-const downloadedBytes = ref(0)
-const totalBytes = ref(0)
-const downloadLabel = computed(() => {
-  if (!totalBytes.value) {
-    return downloadedBytes.value ? `下载中 ${fmtBytes(downloadedBytes.value)}` : '下载中'
-  }
-  const pct = Math.min(100, Math.round((downloadedBytes.value / totalBytes.value) * 100))
-  return `下载中 ${pct}%`
-})
 
 function fmtBytes(v) {
   return formatBytes(v)
@@ -244,18 +236,12 @@ async function load() {
 async function downloadFile(name) {
   if (downloading.value) return
   downloading.value = name
-  downloadedBytes.value = 0
-  totalBytes.value = 0
   try {
-    const ok = await downloadClientFile(name, (loaded, total) => {
-      downloadedBytes.value = loaded
-      totalBytes.value = total
-    })
-    if (ok) ElMessage.success(`已开始下载 ${name}`)
+    if (await downloadClientFile(name)) {
+      ElMessage.success('已开始下载，请查看浏览器下载列表')
+    }
   } finally {
     downloading.value = ''
-    downloadedBytes.value = 0
-    totalBytes.value = 0
   }
 }
 

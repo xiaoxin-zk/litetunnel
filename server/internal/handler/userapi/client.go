@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -280,19 +281,59 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 	httpx.OK(c, gin.H{"download_url": url, "files": list})
 }
 
-func (h *Handler) ClientDownloadFile(c *gin.Context) {
+// ClientDownloadLink 为安装包签发一个短时下载地址。
+//
+// 浏览器原生下载（<a href> / 地址栏）带不上 Authorization 头，而把整个文件
+// 读进 JS 内存再转 Blob 会让用户在传输完成前一直看不到下载——18MB 在慢网下
+// 就是「点了没反应」。这里改为：登录态下签发短时票据，浏览器用票据地址直接
+// 下载，立即出现在下载列表里，支持进度、暂停与断点续传。
+func (h *Handler) ClientDownloadLink(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
 		httpx.BadRequest(c, "文件名非法")
 		return
 	}
 	full := filepath.Join(h.svc.Cfg.ClientDistDir, name)
-	// 先确认是普通文件：直接交给 FileAttachment 的话，文件被删/被换成目录时
-	// 返回的是 404 或 500 的 HTML，前端只能显示「下载失败」，无从判断原因。
-	st, err := os.Stat(full)
-	if err != nil || !st.Mode().IsRegular() {
+	if st, err := os.Stat(full); err != nil || !st.Mode().IsRegular() {
 		httpx.NotFound(c, "安装包不存在或已被删除，请联系管理员重新上传")
 		return
 	}
+
+	uid := middleware.CurrentUserID(c)
+	ticket, exp := h.svc.ClientDownloadTicket(uid, name)
+	httpx.OK(c, gin.H{
+		"url":        "/api/user/client/dl/" + url.PathEscape(name) + "?ticket=" + ticket,
+		"expires_at": exp,
+	})
+}
+
+// ClientDownloadByTicket 按票据提供文件。该路由不在鉴权中间件之后：
+// 票据本身已经绑定用户、文件名与过期时间，且签名不可伪造。
+func (h *Handler) ClientDownloadByTicket(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+		httpx.BadRequest(c, "文件名非法")
+		return
+	}
+	uid, ok := h.svc.VerifyClientDownloadTicket(name, c.Query("ticket"))
+	if !ok {
+		httpx.Unauthorized(c, "下载链接无效或已过期，请回到下载页重新点击下载")
+		return
+	}
+	// 票据有效期内账号被禁用/删除的，也要立刻失效。
+	if active, _ := h.svc.ResolveUserIdentity(uid); !active {
+		httpx.Unauthorized(c, "账号已被禁用或不存在")
+		return
+	}
+
+	full := filepath.Join(h.svc.Cfg.ClientDistDir, name)
+	if st, err := os.Stat(full); err != nil || !st.Mode().IsRegular() {
+		httpx.NotFound(c, "安装包不存在或已被删除，请联系管理员重新上传")
+		return
+	}
+
+	// gin 的 ResponseWriter 没有实现 SetWriteDeadline（ResponseController 会返回
+	// ErrNotSupported），单请求延长写超时在这里行不通；写超时统一在
+	// cmd/panel/main.go 放宽到 10 分钟，覆盖慢速链路上的大文件传输。
 	c.FileAttachment(full, name)
 }

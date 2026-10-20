@@ -2,6 +2,10 @@ package service
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,7 +32,54 @@ const (
 	clientChecksumMaxRead = 4 << 10
 	// 服务端代下载安装包的超时：公网到 GitHub 可能较慢，但也不该无限等。
 	clientSyncTimeout = 10 * time.Minute
+	// 下载地址的有效期。短到即使 URL 进了访问日志也基本没有利用窗口，
+	// 又足够浏览器从点击到真正发起下载（含一次重定向/重试）。
+	clientDownloadTicketTTL = 3 * time.Minute
 )
+
+// clientDownloadKey 从 JWT 密钥派生下载专用子密钥。
+// 不复用登录密钥本身：两处用途不同，泄露一处不应连带另一处。
+func (s *Services) clientDownloadKey() []byte {
+	mac := hmac.New(sha256.New, []byte(s.Cfg.UserJWTSecret))
+	mac.Write([]byte("litetunnel/client-download/v1"))
+	return mac.Sum(nil)
+}
+
+// ClientDownloadTicket 签发短时下载票据。票据绑定用户与文件名：
+// 换名字、换用户、改过期时间都会让签名对不上。
+func (s *Services) ClientDownloadTicket(userID uint, name string) (string, time.Time) {
+	exp := time.Now().Add(clientDownloadTicketTTL)
+	payload := strconv.FormatUint(uint64(userID), 10) + "\n" + name + "\n" +
+		strconv.FormatInt(exp.Unix(), 10)
+	mac := hmac.New(sha256.New, s.clientDownloadKey())
+	mac.Write([]byte(payload))
+	return strconv.FormatUint(uint64(userID), 10) + "." +
+		strconv.FormatInt(exp.Unix(), 10) + "." + hex.EncodeToString(mac.Sum(nil)), exp
+}
+
+// VerifyClientDownloadTicket 校验票据，返回签发票据的用户。
+func (s *Services) VerifyClientDownloadTicket(name, ticket string) (uint, bool) {
+	parts := strings.Split(ticket, ".")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	uid, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || uid == 0 {
+		return 0, false
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return 0, false
+	}
+	payload := parts[0] + "\n" + name + "\n" + parts[1]
+	mac := hmac.New(sha256.New, s.clientDownloadKey())
+	mac.Write([]byte(payload))
+	want := hex.EncodeToString(mac.Sum(nil))
+	if subtle.ConstantTimeCompare([]byte(want), []byte(parts[2])) != 1 {
+		return 0, false
+	}
+	return uint(uid), true
+}
 
 var allowedClientExts = map[string]bool{
 	".zip": true,

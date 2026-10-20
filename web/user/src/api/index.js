@@ -101,7 +101,9 @@ export const redeemApi = {
 export const clientApi = {
   info: () => http.get('/client/info'),
   configText: () => http.get('/client/config'),
-  downloads: () => http.get('/client/downloads')
+  downloads: () => http.get('/client/downloads'),
+  // 换取短时下载地址，交给浏览器原生下载
+  downloadLink: (name) => http.get(`/client/download-link/${encodeURIComponent(name)}`)
 }
 
 export const statsApi = {
@@ -211,13 +213,30 @@ export async function downloadFrpcConfig() {
   if (blob) saveBlob(blob, 'frpc.toml')
 }
 
-export async function downloadClientFile(name, onProgress) {
-  const blob = await downloadToBlob(
-    `/api/user/client/downloads/${encodeURIComponent(name)}`,
-    '安装包',
-    onProgress
-  )
-  if (!blob) return false
-  saveBlob(blob, name)
+// 安装包下载：向服务端换一个短时签名地址，再用浏览器原生下载。
+//
+// 为什么不再走 fetch + Blob：那条路径必须先把整个文件读进内存才触发保存，
+// 慢网下用户在传输完成前看不到任何下载动作（浏览器下载列表里也没有条目）。
+// 原生下载是流式的：点击即出现在下载列表，有进度、可暂停、可断点续传。
+// 地址是短时（3 分钟）且绑定当前用户的，不是无鉴权公开链接。
+export async function downloadClientFile(name) {
+  let d
+  try {
+    d = await clientApi.downloadLink(name)
+  } catch {
+    // axios 拦截器已经提示了具体原因
+    return false
+  }
+  if (!d?.url) {
+    ElMessage.error('获取下载地址失败，请稍后重试')
+    return false
+  }
+  const a = document.createElement('a')
+  a.href = d.url
+  a.download = name
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
   return true
 }

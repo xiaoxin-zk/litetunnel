@@ -175,8 +175,12 @@ func newServer(addr string, handler http.Handler) *http.Server {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      4 * time.Minute,
-		IdleTimeout:       90 * time.Second,
+		// 写超时覆盖「客户端下载安装包」：10MiB 以上的文件在几 KB/s 的
+		// 链路上要几分钟，4 分钟会把还在正常传输的连接掐断（日志里的
+		// broken pipe 就是这一侧先关连接）。慢速攻击仍由 ReadHeaderTimeout
+		// 与 ReadTimeout 兜住，写超时只影响响应阶段。
+		WriteTimeout: 10 * time.Minute,
+		IdleTimeout:  90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 }

@@ -107,6 +107,14 @@ func New(
 		clientPub.POST("/auth", userH.ClientAuth)
 	}
 
+	// 安装包下载走短时票据：浏览器原生下载带不上 Authorization 头，
+	// 票据本身绑定了用户、文件名与过期时间，因此这条路由不挂鉴权中间件。
+	clientDL := r.Group("/api/user/client")
+	clientDL.Use(middleware.Limit(userAPILimiter, "user-client-dl"))
+	{
+		clientDL.GET("/dl/:name", userH.ClientDownloadByTicket)
+	}
+
 	cli := r.Group("/api/user/client")
 	cli.Use(middleware.Limit(userAPILimiter, "user-client"))
 	cli.Use(middleware.UserAuthFlexible(cfg.UserJWTSecret, svc.ResolveCredential, svc.ResolveUserIdentity))
@@ -120,6 +128,8 @@ func New(
 		{
 			dl.GET("/downloads", userH.ClientDownloads)
 			dl.GET("/downloads/:name", userH.ClientDownloadFile)
+			// 单独一段路径：Gin 的路由树不允许 :name 之后再挂子路径。
+			dl.GET("/download-link/:name", userH.ClientDownloadLink)
 		}
 	}
 

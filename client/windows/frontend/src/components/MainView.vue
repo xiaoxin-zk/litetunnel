@@ -1,30 +1,76 @@
 <template>
   <div class="layout">
     <header class="header card">
-      <div class="status">
-        <span class="dot" :class="dotClass"></span>
-        <div>
-          <div class="status-text">{{ statusText }}</div>
-          <div class="muted">
-            {{ state.gateway_host || '-' }}:{{ state.gateway_port || '-' }}
-            <template v-if="state.username"> · {{ state.username }}</template>
+      <div class="header-left">
+        <div ref="brandWrapRef" class="brand-wrap">
+          <button
+            class="brand"
+            :title="updateBadge ? `发现新版本 v${updateInfo?.latest || ''}，点击查看` : '点击查看版本与更新'"
+            @click="toggleUpdate"
+          >
+            <span class="brand-name">LiteTunnel</span>
+            <span class="brand-ver mono">
+              <span v-if="updateBadge" class="update-dot"></span>
+              v{{ currentVersion || '—' }}
+            </span>
+          </button>
+
+          <!-- 点版本号展开下拉面板，不再用弹窗挡住界面 -->
+          <transition name="drop">
+            <div v-if="updateOpen" class="update-panel" @click.stop>
+              <div class="up-head">
+                <span class="up-title">版本</span>
+                <button class="btn-ghost mini" :disabled="updateBusy" @click="checkUpdate">
+                  {{ updateBusy ? '检查中…' : '重新检查' }}
+                </button>
+              </div>
+
+              <div class="up-version mono">v{{ currentVersion || '—' }}</div>
+
+              <div class="up-state">
+                <template v-if="updateInfo?.error">
+                  <span class="up-err">{{ updateInfo.error }}</span>
+                </template>
+                <template v-else-if="updateInfo?.has_update">
+                  发现新版本 <b class="mono">v{{ updateInfo.latest }}</b>
+                </template>
+                <template v-else-if="updateInfo">已是最新版本</template>
+                <template v-else>点击「重新检查」获取最新版本</template>
+              </div>
+
+              <pre v-if="updateInfo?.notes" class="up-notes">{{ updateInfo.notes }}</pre>
+              <div v-if="updateLocalPath" class="up-ok">已下载到：{{ updateLocalPath }}</div>
+
+              <button
+                v-if="updateInfo?.has_update"
+                class="btn-primary up-btn"
+                :disabled="updateBusy"
+                @click="downloadUpdate"
+              >
+                {{ updateBusy ? '下载中…' : '下载新版本' }}
+              </button>
+              <p v-if="updateInfo?.has_update" class="up-tip">
+                下载后先退出客户端，再解压覆盖旧版本。
+              </p>
+            </div>
+          </transition>
+        </div>
+
+        <div class="status">
+          <span class="dot" :class="dotClass"></span>
+          <div>
+            <div class="status-text">{{ statusText }}</div>
+            <div class="muted">
+              {{ state.gateway_host || '-' }}:{{ state.gateway_port || '-' }}
+              <template v-if="state.username"> · {{ state.username }}</template>
+            </div>
+            <div v-if="state.frontend_url" class="muted">{{ state.frontend_url }}</div>
+            <div class="muted" :class="{ 'sync-warn': state.sync_err }">{{ syncText }}</div>
           </div>
-          <div v-if="state.frontend_url" class="muted">{{ state.frontend_url }}</div>
-          <div class="muted" :class="{ 'sync-warn': state.sync_err }">{{ syncText }}</div>
         </div>
       </div>
 
       <div class="actions">
-        <button
-          class="btn-ghost update-btn"
-          :class="{ 'has-update': updateBadge }"
-          :title="updateBadge ? `发现新版本 ${updateInfo?.latest || ''}，点击查看` : '检查是否有新版本'"
-          @click="checkUpdate"
-        >
-          <span v-if="updateBadge" class="update-dot"></span>
-          {{ updateBadge ? '有新版本' : '检查更新' }}
-          <span v-if="state.version" class="mono update-ver">v{{ state.version }}</span>
-        </button>
         <button
           class="btn-ghost"
           :disabled="busy"
@@ -353,46 +399,9 @@
       </div>
     </div>
 
-    <div v-if="updateOpen" class="modal" @click.self="updateOpen = false">
-      <div class="modal-card">
-        <div class="modal-title">版本更新</div>
-
-        <div v-if="updateInfo" class="update-box">
-          <div class="update-line">
-            <span>当前版本 <b class="mono">{{ updateInfo.current || state.version }}</b></span>
-            <span v-if="updateInfo.latest">最新版本 <b class="mono">{{ updateInfo.latest }}</b></span>
-          </div>
-
-          <div v-if="updateInfo.error" class="error">{{ updateInfo.error }}</div>
-          <template v-else-if="updateInfo.has_update">
-            <p class="muted">
-              下载后会自动保存到「下载」目录并定位文件。请先退出客户端，再解压覆盖旧版本，然后重新打开。
-            </p>
-            <pre v-if="updateInfo.notes" class="notes">{{ updateInfo.notes }}</pre>
-            <div v-if="updateLocalPath" class="ok">已下载到：{{ updateLocalPath }}</div>
-          </template>
-          <p v-else class="muted">当前已是最新版本。</p>
-        </div>
-
-        <div class="modal-actions">
-          <button class="btn-ghost" @click="updateOpen = false">关闭</button>
-          <button
-            v-if="updateInfo?.has_update"
-            class="btn-primary"
-            :disabled="updateBusy"
-            @click="downloadUpdate"
-          >
-            {{ updateBusy ? '下载中…' : '下载新版本' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
     <footer class="footer">
       <div class="footer-right">
-        <span class="muted mono" v-if="state.version">{{ state.version }}</span>
         <span class="muted mono" v-if="state.config_path">{{ state.config_path }}</span>
-        <button class="btn-ghost mini" @click="checkUpdate">检查更新</button>
         <button class="btn-ghost mini" @click="handleOpenDataDir">打开数据目录</button>
       </div>
     </footer>
@@ -400,7 +409,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from '../bridge'
 
 const props = defineProps({
@@ -422,6 +431,9 @@ const updateBusy = ref(false)
 const updateInfo = ref(null)
 const updateLocalPath = ref('')
 const updateBadge = ref(false)
+const brandWrapRef = ref(null)
+
+const currentVersion = computed(() => updateInfo.value?.current || props.state.version || '')
 
 // 打开界面时静默检查一次：有新版本才在顶栏亮红点，不主动弹窗打扰。
 async function silentCheckUpdate() {
@@ -436,7 +448,28 @@ async function silentCheckUpdate() {
   }
 }
 
-onMounted(silentCheckUpdate)
+// 点版本号展开/收起下拉面板；第一次展开时顺手检查一次。
+function toggleUpdate() {
+  updateOpen.value = !updateOpen.value
+  if (updateOpen.value && !updateInfo.value && !updateBusy.value) {
+    checkUpdate()
+  }
+}
+
+function onDocClick(e) {
+  if (!updateOpen.value) return
+  const el = brandWrapRef.value
+  if (el && !el.contains(e.target)) updateOpen.value = false
+}
+
+onMounted(() => {
+  silentCheckUpdate()
+  document.addEventListener('click', onDocClick)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', onDocClick)
+})
 
 // 新建成功后的结果面板：只展示本次新增的隧道（按 ID 差集，批量也适用）。
 const createdOpen = ref(false)
@@ -457,13 +490,17 @@ function addrLabel(t) {
 }
 
 async function checkUpdate() {
+  if (updateBusy.value) return
   updateOpen.value = true
-  updateInfo.value = null
+  updateBusy.value = true
   updateLocalPath.value = ''
   try {
     updateInfo.value = await api.checkUpdate()
+    updateBadge.value = !!updateInfo.value?.has_update
   } catch (e) {
     updateInfo.value = { current: props.state.version, error: String(e?.message || e) }
+  } finally {
+    updateBusy.value = false
   }
 }
 
@@ -1085,6 +1122,134 @@ watch(
   gap: 8px;
 }
 
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.brand-wrap {
+  position: relative;
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.brand:hover {
+  background: #f1f5f9;
+}
+
+.brand-name {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.2;
+}
+
+.brand-ver {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: #64748b;
+  line-height: 1.2;
+}
+
+.update-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  z-index: 60;
+  width: 320px;
+  padding: 12px 14px 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.16);
+}
+
+.up-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.up-title {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.up-version {
+  font-size: 22px;
+  font-weight: 700;
+  color: #0f172a;
+  line-height: 1.2;
+}
+
+.up-state {
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: #475569;
+}
+
+.up-err {
+  color: #b91c1c;
+  word-break: break-all;
+}
+
+.up-notes {
+  margin: 10px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 11.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.up-ok {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #15803d;
+  word-break: break-all;
+}
+
+.up-btn {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.up-tip {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: #94a3b8;
+  line-height: 1.6;
+}
+
+.drop-enter-active,
+.drop-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.drop-enter-from,
+.drop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
 .banner {
   padding: 10px 14px;
   border-radius: 10px;
@@ -1236,30 +1401,12 @@ watch(
   gap: 8px;
 }
 
-.update-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.update-btn.has-update {
-  color: #b45309;
-  border-color: #fcd34d;
-  background: #fffbeb;
-}
-
 .update-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: #ef4444;
   box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.16);
-}
-
-.update-ver {
-  font-size: 11.5px;
-  color: #94a3b8;
-  font-weight: 400;
 }
 
 .created-item {

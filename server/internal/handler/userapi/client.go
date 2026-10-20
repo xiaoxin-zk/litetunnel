@@ -281,6 +281,23 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 	httpx.OK(c, gin.H{"download_url": url, "files": list})
 }
 
+// ClientDownloadFile 直接凭 Authorization 提供文件。
+// 浏览器页面走 ClientDownloadLink 的票据地址；这条保留给桌面端、脚本等
+// 能自己设置请求头的调用方（流式响应，支持 Range）。
+func (h *Handler) ClientDownloadFile(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+		httpx.BadRequest(c, "文件名非法")
+		return
+	}
+	full := filepath.Join(h.svc.Cfg.ClientDistDir, name)
+	if st, err := os.Stat(full); err != nil || !st.Mode().IsRegular() {
+		httpx.NotFound(c, "安装包不存在或已被删除，请联系管理员重新上传")
+		return
+	}
+	c.FileAttachment(full, name)
+}
+
 // ClientDownloadLink 为安装包签发一个短时下载地址。
 //
 // 浏览器原生下载（<a href> / 地址栏）带不上 Authorization 头，而把整个文件

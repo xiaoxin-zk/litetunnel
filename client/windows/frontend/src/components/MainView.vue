@@ -16,6 +16,16 @@
 
       <div class="actions">
         <button
+          class="btn-ghost update-btn"
+          :class="{ 'has-update': updateBadge }"
+          :title="updateBadge ? `发现新版本 ${updateInfo?.latest || ''}，点击查看` : '检查是否有新版本'"
+          @click="checkUpdate"
+        >
+          <span v-if="updateBadge" class="update-dot"></span>
+          {{ updateBadge ? '有新版本' : '检查更新' }}
+          <span v-if="state.version" class="mono update-ver">v{{ state.version }}</span>
+        </button>
+        <button
           class="btn-ghost"
           :disabled="busy"
           :title="busy ? '正在执行，请稍候' : '停止所有隧道并清除本地凭据'"
@@ -112,19 +122,39 @@
             </div>
           </div>
 
-          <div class="tunnel-addr">
-            <span class="mono">{{ t.public_addr || '—' }}</span>
-            <button v-if="t.public_addr" class="btn-ghost mini" @click="copy(t.public_addr)">复制</button>
-            <button
-              class="tunnel-toggle"
-              :class="{ on: t.running }"
-              :disabled="busy || !state.frpc_found"
-              :title="t.running ? '断开这条隧道' : '连接这条隧道'"
-              @click="toggleTunnel(t)"
-            >
-              <span class="knob"></span>
-            </button>
-            <button class="btn-ghost mini danger" :disabled="busy" @click="removeTunnel(t)">删除</button>
+          <div class="tunnel-side">
+            <div class="addr-block">
+              <div class="addr-label">{{ addrLabel(t) }}</div>
+              <div
+                class="addr-value mono"
+                :class="{ empty: !t.public_addr, copyable: !!t.public_addr }"
+                :title="t.public_addr ? '点击复制地址' : '服务端还在分配，稍后自动刷新'"
+                @click="t.public_addr && copy(t.public_addr)"
+              >
+                {{ t.public_addr || '等待分配…' }}
+              </div>
+              <button
+                v-if="t.public_addr"
+                class="btn-ghost mini addr-copy"
+                @click="copy(t.public_addr)"
+              >
+                复制地址
+              </button>
+            </div>
+            <div class="tunnel-ctl">
+              <button
+                class="tunnel-toggle"
+                :class="{ on: t.running }"
+                :disabled="busy || !state.frpc_found"
+                :title="t.running ? '断开这条隧道' : '连接这条隧道'"
+                @click="toggleTunnel(t)"
+              >
+                <span class="knob"></span>
+              </button>
+              <button class="btn-ghost mini danger" :disabled="busy" @click="removeTunnel(t)">
+                删除
+              </button>
+            </div>
           </div>
         </div>
       </section>
@@ -297,6 +327,32 @@
       </div>
     </div>
 
+    <div v-if="createdOpen" class="modal" @click.self="createdOpen = false">
+      <div class="modal-card">
+        <div class="modal-title">隧道已创建</div>
+        <p class="muted" style="margin-top: 0">
+          把下面的地址发给需要连接的人。本机服务要保持运行，并确认这条隧道的开关是打开的。
+        </p>
+        <div v-for="t in createdList" :key="t.id" class="created-item">
+          <div class="created-name">
+            {{ t.name }}
+            <span class="tag" :class="tagClass(t)">{{ tagText(t) }}</span>
+          </div>
+          <div class="created-addr mono">{{ t.public_addr || '地址分配中，稍后刷新列表' }}</div>
+          <button
+            v-if="t.public_addr"
+            class="btn-primary mini"
+            @click="copy(t.public_addr)"
+          >
+            复制地址
+          </button>
+        </div>
+        <div class="modal-actions">
+          <button class="btn-primary" @click="createdOpen = false">知道了</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="updateOpen" class="modal" @click.self="updateOpen = false">
       <div class="modal-card">
         <div class="modal-title">版本更新</div>
@@ -344,7 +400,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { api } from '../bridge'
 
 const props = defineProps({
@@ -365,6 +421,40 @@ const updateOpen = ref(false)
 const updateBusy = ref(false)
 const updateInfo = ref(null)
 const updateLocalPath = ref('')
+const updateBadge = ref(false)
+
+// 打开界面时静默检查一次：有新版本才在顶栏亮红点，不主动弹窗打扰。
+async function silentCheckUpdate() {
+  try {
+    const info = await api.checkUpdate()
+    if (info?.has_update) {
+      updateInfo.value = info
+      updateBadge.value = true
+    }
+  } catch {
+    // 离线或服务器不可达时不提示，用户仍可手动点「检查更新」
+  }
+}
+
+onMounted(silentCheckUpdate)
+
+// 新建成功后的结果面板：只展示本次新增的隧道（按 ID 差集，批量也适用）。
+const createdOpen = ref(false)
+const createdList = ref([])
+
+function showCreated(before, next) {
+  const list = (next?.tunnels || []).filter((t) => !before.has(t.id))
+  if (!list.length) return
+  createdList.value = list
+  createdOpen.value = true
+}
+
+// 网站类隧道给的是完整 URL，TCP/UDP 给的是「主机:端口」。
+function addrLabel(t) {
+  const type = (t?.type || '').toLowerCase()
+  if (type === 'http' || type === 'https') return '网站地址'
+  return '公网地址'
+}
 
 async function checkUpdate() {
   updateOpen.value = true
@@ -628,6 +718,7 @@ async function submitCreate() {
   }
 
   busy.value = true
+  const before = new Set(props.state.tunnels.map((t) => t.id))
   try {
     const next = await api.createTunnel(
       f.name.trim(),
@@ -639,7 +730,9 @@ async function submitCreate() {
     )
     emit('update', next)
     createOpen.value = false
-    flash('隧道已创建，公网端口由服务端自动分配')
+    // 创建成功后直接把连接地址摆出来，别让人再去列表里找。
+    showCreated(before, next)
+    flash('隧道已创建，连接地址见弹窗')
   } catch (e) {
     dialogError.value = typeof e === 'string' ? e : e?.message || '创建失败'
   } finally {
@@ -669,6 +762,7 @@ async function submitBatch(prefix) {
   }
 
   busy.value = true
+  const before = new Set(props.state.tunnels.map((t) => t.id))
   try {
     const [res, next] = await api.createTunnelsBatch(
       prefix,
@@ -678,6 +772,7 @@ async function submitBatch(prefix) {
     )
     emit('update', next)
     createOpen.value = false
+    showCreated(before, next)
 
     const failed = res?.failures || []
     if (failed.length) {
@@ -1086,18 +1181,116 @@ watch(
   user-select: text;
 }
 
-.tunnel-addr {
+.tunnel-side {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 14px;
   flex-shrink: 0;
 }
 
-.tunnel-addr .mono {
-  font-size: 12.5px;
-  color: #334155;
-  -webkit-user-select: text;
-  user-select: text;
+.addr-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  max-width: 340px;
+}
+
+.addr-label {
+  font-size: 11px;
+  color: #94a3b8;
+  letter-spacing: 0.3px;
+}
+
+.addr-value {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #1e293b;
+  word-break: break-all;
+  text-align: right;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+.addr-value.copyable {
+  cursor: pointer;
+}
+
+.addr-value.copyable:hover {
+  color: #2563eb;
+  text-decoration: underline;
+}
+
+.addr-value.empty {
+  font-weight: 400;
+  color: #94a3b8;
+}
+
+.addr-copy {
+  align-self: flex-end;
+}
+
+.tunnel-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.update-btn.has-update {
+  color: #b45309;
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+
+.update-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.16);
+}
+
+.update-ver {
+  font-size: 11.5px;
+  color: #94a3b8;
+  font-weight: 400;
+}
+
+.created-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.created-name {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.created-addr {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d4ed8;
+  word-break: break-all;
+  -webkit-user-select: all;
+  user-select: all;
+}
+
+.created-item .btn-primary {
+  align-self: flex-start;
 }
 
 .mini {

@@ -231,15 +231,14 @@ type ClientDownload struct {
 }
 
 func (h *Handler) ClientDownloads(c *gin.Context) {
-	if url := strings.TrimSpace(h.svc.Settings.Get(service.KeySiteClientDownloadURL)); url != "" {
-		httpx.OK(c, gin.H{"download_url": url, "files": []ClientDownload{}})
-		return
-	}
+	// 外部下载地址与本站文件是互补关系而不是二选一：外部地址挂了、或者填的是
+	// 发布页而不是直链时，用户至少还能从这里拿到文件。两个都返回，前端并排展示。
+	url := strings.TrimSpace(h.svc.Settings.Get(service.KeySiteClientDownloadURL))
 
 	dir := h.svc.Cfg.ClientDistDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		httpx.OK(c, gin.H{"download_url": "", "files": []ClientDownload{}})
+		httpx.OK(c, gin.H{"download_url": url, "files": []ClientDownload{}})
 		return
 	}
 	list := make([]ClientDownload, 0, len(entries))
@@ -249,6 +248,11 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 		}
 		name := e.Name()
 		if name != filepath.Base(name) {
+			continue
+		}
+		// 上传中的临时文件（.upload-*）与其它隐藏文件不对外暴露：
+		// 列出来用户点了只会下到半截文件，比「没有文件」更难排查。
+		if strings.HasPrefix(name, ".") {
 			continue
 		}
 		info, err := e.Info()
@@ -262,7 +266,7 @@ func (h *Handler) ClientDownloads(c *gin.Context) {
 		})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
-	httpx.OK(c, gin.H{"download_url": "", "files": list})
+	httpx.OK(c, gin.H{"download_url": url, "files": list})
 }
 
 func (h *Handler) ClientDownloadFile(c *gin.Context) {
@@ -272,5 +276,12 @@ func (h *Handler) ClientDownloadFile(c *gin.Context) {
 		return
 	}
 	full := filepath.Join(h.svc.Cfg.ClientDistDir, name)
+	// 先确认是普通文件：直接交给 FileAttachment 的话，文件被删/被换成目录时
+	// 返回的是 404 或 500 的 HTML，前端只能显示「下载失败」，无从判断原因。
+	st, err := os.Stat(full)
+	if err != nil || !st.Mode().IsRegular() {
+		httpx.NotFound(c, "安装包不存在或已被删除，请联系管理员重新上传")
+		return
+	}
 	c.FileAttachment(full, name)
 }

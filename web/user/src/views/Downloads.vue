@@ -23,32 +23,32 @@
             <div class="lt-muted" style="margin-top: 12px; word-break: break-all; line-height: 1.7">
               {{ downloadUrl }}
             </div>
+            <el-divider v-if="files.length" />
+            <div v-if="files.length" class="lt-muted" style="margin-bottom: 8px">
+              本站也备有安装包，可直接下载：
+            </div>
           </template>
 
-          <template v-else>
-            <el-table :data="files" v-loading="loading" stripe>
-              <el-table-column label="文件" prop="name" min-width="220">
-                <template #default="{ row }">
-                  <el-icon style="vertical-align: -2px"><Monitor /></el-icon>
-                  <span style="margin-left: 6px">{{ row.name }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="大小" width="110">
-                <template #default="{ row }">{{ fmtBytes(row.size) }}</template>
-              </el-table-column>
-              <el-table-column label="更新时间" width="160">
-                <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
-              </el-table-column>
-              <el-table-column label="操作" width="100">
-                <template #default="{ row }">
-                  <el-button link type="primary" @click="downloadFile(row.name)">下载</el-button>
-                </template>
-              </el-table-column>
-              <template #empty>
-                <el-empty description="管理员尚未上传客户端安装包" />
+          <el-table v-if="files.length" :data="files" v-loading="loading" stripe>
+            <el-table-column label="文件" prop="name" min-width="220">
+              <template #default="{ row }">
+                <el-icon style="vertical-align: -2px"><Monitor /></el-icon>
+                <span style="margin-left: 6px">{{ row.name }}</span>
               </template>
-            </el-table>
-          </template>
+            </el-table-column>
+            <el-table-column label="大小" width="110">
+              <template #default="{ row }">{{ fmtBytes(row.size) }}</template>
+            </el-table-column>
+            <el-table-column label="更新时间" width="160">
+              <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="100">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="downloadFile(row.name)">下载</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else-if="!downloadUrl" description="管理员尚未上传客户端安装包" />
         </div>
       </el-col>
 

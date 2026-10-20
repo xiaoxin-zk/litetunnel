@@ -246,10 +246,23 @@ jobs:
           Expand-Archive -Path frp.zip -DestinationPath frp -Force
           $exe = Get-ChildItem -Path frp -Recurse -Filter frpc.exe | Select-Object -First 1
           if (-not $exe) { throw 'frpc.exe not found in frp release archive' }
-          New-Item -ItemType Directory -Force -Path client/windows/assets | Out-Null
-          Copy-Item $exe.FullName -Destination client/windows/assets/frpc.exe -Force
+          $dst = 'client/windows/assets'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          # go:embed 不做任何压缩：16MB 的 frpc.exe 原样打进去，客户端体积
+          # 直接翻倍。构建期先压成 gz（约 6MB），运行时释放时再解压。
+          $gzPath = Join-Path $dst 'frpc.exe.gz'
+          $src = [System.IO.File]::OpenRead($exe.FullName)
+          $outStream = [System.IO.File]::Create($gzPath)
+          $gz = New-Object System.IO.Compression.GZipStream($outStream, [System.IO.Compression.CompressionLevel]::Optimal)
+          try { $src.CopyTo($gz) } finally { $gz.Dispose(); $outStream.Dispose(); $src.Dispose() }
+          # 原始文件的 sha256：客户端释放前用它判断磁盘上的 frpc 是否需要重写，
+          # 测试也用它验证内嵌内容与官方包一致。
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path (Join-Path $dst 'frpc.sha256') -Value $hash -Encoding ASCII -NoNewline
+          $gzLen = (Get-Item $gzPath).Length
+          Write-Host ("frpc.exe {0:N0} bytes -> frpc.exe.gz {1:N0} bytes" -f $exe.Length, $gzLen)
           $lic = Get-ChildItem -Path frp -Recurse -Filter LICENSE | Select-Object -First 1
-          if ($lic) { Copy-Item $lic.FullName -Destination client/windows/assets/LICENSE-frp.txt -Force }
+          if ($lic) { Copy-Item $lic.FullName -Destination (Join-Path $dst 'LICENSE-frp.txt') -Force }
 
       - name: Build client
         working-directory: client/windows
@@ -268,7 +281,9 @@ jobs:
           # 用户最终只拿到**一个 exe**。
           # 同时注入平台地址与版本号，版本号会显示在客户端界面上，
           # 用户报障时能直接说出自己在跑哪个版本。
-          wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=$env:VERSION"
+          # -s -w：去掉符号表与 DWARF 调试信息，Wails 默认会带上，白白多出几 MB；
+          # 运行时 panic 栈仍可读，只是不能用调试器单步。
+          wails build -clean -platform windows/amd64 -tags embedfrpc -ldflags "-s -w -X main.buildServerURL=$env:LT_CLIENT_SERVER -X main.buildVersion=$env:VERSION"
 
       # main 包依赖 //go:embed all:frontend/dist，dist 由上面的 wails build
       # 生成，所以 vet 与测试都排在构建之后。构建之前的门禁只覆盖子包。

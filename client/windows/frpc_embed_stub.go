@@ -2,4 +2,7 @@
 
 package main
 
-var embeddedFrpc []byte
+var (
+	embeddedFrpcGz  []byte
+	embeddedFrpcSum string
+)

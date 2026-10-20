@@ -181,9 +181,9 @@ func NewApp() *App {
 		log.Printf("[client] %v", cfgErr)
 	}
 
-	// 这里刻意不再释放内嵌 frpc：首次要写 ~20MB，会挡在窗口创建之前。
+	// 这里刻意不再释放内嵌 frpc：首次要解压并写 ~16MB，会挡在窗口创建之前。
 	// 现在先让窗口带着启动动画出来，释放动作放到 startup 里异步做。
-	frpc.SetStrictLookup(len(embeddedFrpc) > 0)
+	frpc.SetStrictLookup(len(embeddedFrpcGz) > 0)
 
 	syncCtx, syncCancel := context.WithCancel(context.Background())
 
@@ -220,7 +220,7 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 
 	// 窗口已经创建好了，再把内嵌 frpc 释放到磁盘：
-	// 首次启动要写 ~20MB，放在这里就不会让用户对着空白窗口等。
+	// 首次启动要解压并写 ~16MB，放在这里就不会让用户对着空白窗口等。
 	go func() {
 		defer close(a.frpcReady)
 		exePath, err := ensureFrpc()

@@ -63,7 +63,7 @@
                 link
                 type="primary"
                 style="margin-left: 8px"
-                @click="copyText(info.frontend_url, '服务器地址')"
+                @click="copyField(info.frontend_url, '服务器地址')"
               >
                 复制
               </el-button>
@@ -75,7 +75,7 @@
                 link
                 type="primary"
                 style="margin-left: 8px"
-                @click="copyText(`${info.server_addr}:${info.server_port}`, '隧道网关')"
+                @click="copyField(`${info.server_addr}:${info.server_port}`, '隧道网关')"
               >
                 复制
               </el-button>
@@ -161,17 +161,17 @@ import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh, Monitor, Download } from '@element-plus/icons-vue'
 import { clientApi, downloadFrpcConfig, downloadClientFile } from '../api'
+import { copyText, formatBytes, formatTime } from '../utils/format'
 
-async function copyText(text, label) {
+// 非安全上下文（http://内网IP）里 Clipboard API 不可用，统一交给 copyText 兜底。
+async function copyField(text, label) {
   if (!text) return
-  try {
-    await navigator.clipboard.writeText(text)
+  if (await copyText(text)) {
     ElMessage.success(`${label}已复制`)
-  } catch {
-    ElMessage.warning('复制失败，请手动选中复制')
+    return
   }
+  ElMessage.warning('复制失败，请手动选中复制')
 }
-import { formatBytes, formatTime } from '../utils/format'
 
 const files = ref([])
 const info = ref({})

@@ -569,6 +569,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { adminKeyApi, mailTemplateApi, settingsApi } from '../api'
+import { copyText } from '../utils/format'
 
 const SECRET_MASK = '__UNCHANGED__'
 
@@ -827,12 +828,11 @@ async function revokeKey(row) {
 }
 
 async function copyKey() {
-  try {
-    await navigator.clipboard.writeText(newKeyPlain.value)
+  if (await copyText(newKeyPlain.value)) {
     ElMessage.success('已复制')
-  } catch {
-    ElMessage.warning('复制失败，请手动选中复制')
+    return
   }
+  ElMessage.warning('复制失败，请手动选中复制')
 }
 
 onMounted(() => {

@@ -142,6 +142,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { authApi, systemApi, TOKEN_KEY } from '../api'
+import { copyText } from '../utils/format'
 import { currentTheme, onThemeChange, toggleTheme } from '../utils/theme'
 
 const route = useRoute()
@@ -194,12 +195,11 @@ async function openUpdate() {
 }
 
 async function copyHint() {
-  try {
-    await navigator.clipboard.writeText(info.value?.deploy_hint || '')
+  if (await copyText(info.value?.deploy_hint || '')) {
     ElMessage.success('已复制升级命令')
-  } catch {
-    ElMessage.warning('复制失败，请手动选中复制')
+    return
   }
+  ElMessage.warning('复制失败，请手动选中复制')
 }
 
 function openRelease() {

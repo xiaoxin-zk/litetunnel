@@ -21,20 +21,45 @@ export function formatTime(value) {
   )}:${pad(d.getSeconds())}`
 }
 
+/**
+ * 复制到剪贴板。
+ *
+ * 面板经常用 http://内网IP:7848 访问，这属于「非安全上下文」：
+ * navigator.clipboard 在那种页面里是 undefined，只写 Clipboard API 的调用
+ * 一定会失败（表现为「复制失败，请手动选中复制」）。所以这里必须先判断
+ * 能力再兜底到 execCommand。
+ */
 export async function copyText(text) {
-  if (!text) return false
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
+  const value = String(text ?? '')
+  if (!value) return false
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return true
+    } catch {
+      // 权限被拒、页面失焦或浏览器策略限制：继续走兜底
+    }
   }
+
+  const ta = document.createElement('textarea')
+  ta.value = value
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.top = '-1000px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  const prevFocus = document.activeElement
+  ta.select()
+  ta.setSelectionRange(0, value.length)
+
+  let ok = false
+  try {
+    ok = document.execCommand('copy')
+  } catch {
+    ok = false
+  }
+  document.body.removeChild(ta)
+  if (prevFocus instanceof HTMLElement) prevFocus.focus()
+  return ok
 }

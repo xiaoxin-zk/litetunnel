@@ -183,6 +183,7 @@ func New(
 		adminRead.GET("/redeem-records", adminH.ListRedeemRecords)
 		adminRead.GET("/clients", adminH.ListClients)
 		adminRead.GET("/client-packages", adminH.ListClientPackages)
+		adminRead.GET("/client-packages/release", adminH.ClientPackageRelease)
 		adminRead.GET("/audit-logs", adminH.ListAuditLogs)
 		adminRead.GET("/login-logs", adminH.ListLoginLogs)
 		adminRead.GET("/admins", adminH.ListAdmins)
@@ -269,6 +270,7 @@ func New(
 		adminSuper.POST("/domain/dns-check", adminH.DomainDNSCheck)
 
 		adminSuper.POST("/client-packages", adminH.UploadClientPackage)
+		adminSuper.POST("/client-packages/sync", adminH.SyncClientPackage)
 		adminSuper.DELETE("/client-packages/:name", adminH.DeleteClientPackage)
 	}
 

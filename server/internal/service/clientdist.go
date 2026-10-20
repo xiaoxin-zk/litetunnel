@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +23,10 @@ const (
 	MaxClientPackageSize = 100 << 20
 
 	clientPackageMaxNameLen = 128
+	// GitHub Release 的 .sha256 产物只有一行，留足余量即可。
+	clientChecksumMaxRead = 4 << 10
+	// 服务端代下载安装包的超时：公网到 GitHub 可能较慢，但也不该无限等。
+	clientSyncTimeout = 10 * time.Minute
 )
 
 var allowedClientExts = map[string]bool{
@@ -76,6 +83,13 @@ func sortedExts() []string {
 }
 
 func (s *Services) SaveClientPackage(name string, r io.Reader) (int64, error) {
+	return s.saveClientPackage(name, r, nil)
+}
+
+// saveClientPackage 写入临时文件 → 校验 → 原子改名。
+// verify 在改名**之前**执行，拿到的是落在磁盘上的临时文件路径：
+// 校验失败时旧文件保持原样，不会出现「新包是坏的、旧的已经被覆盖」。
+func (s *Services) saveClientPackage(name string, r io.Reader, verify func(tmpPath string) error) (int64, error) {
 	dir := s.Cfg.ClientDistDir
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, fmt.Errorf("创建分发目录失败: %w", err)
@@ -111,6 +125,11 @@ func (s *Services) SaveClientPackage(name string, r io.Reader) (int64, error) {
 
 	if err := verifyPackageMagic(tmpName, name); err != nil {
 		return 0, err
+	}
+	if verify != nil {
+		if err := verify(tmpName); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := os.Chmod(tmpName, 0o644); err != nil {
@@ -211,3 +230,123 @@ func (s *Services) DeleteClientPackage(name string) error {
 	}
 	return nil
 }
+
+// SyncClientPackageFromRelease 从最新 GitHub Release 下载安装包到分发目录。
+//
+// 存在的意义是别再让管理员「先下 11MB 再传 11MB」：管理后台往往通过公网
+// 访问，浏览器上传受限于家里的上行带宽；而面板服务器到 GitHub 的链路通常
+// 更快，一次点击即可完成。Release 附带的 .sha256 会一并下载并校验，
+// 校验在临时文件上做，坏包不会覆盖目录里已有的同名文件。
+func (s *Services) SyncClientPackageFromRelease(ctx context.Context, assetName string) (string, int64, string, error) {
+	status, err := s.CheckUpdate(ctx, true)
+	if err != nil {
+		return "", 0, "", err
+	}
+	if strings.TrimSpace(assetName) == "" {
+		assetName = clientAssetName
+	}
+	name, err := SanitizeClientFileName(assetName)
+	if err != nil {
+		return "", 0, "", err
+	}
+
+	var srcURL, sumURL string
+	var assetSize int64
+	for _, a := range status.Assets {
+		switch a.Name {
+		case name:
+			srcURL, assetSize = a.URL, a.Size
+		case name + clientChecksumSuffix:
+			sumURL = a.URL
+		}
+	}
+	if srcURL == "" {
+		return "", 0, "", fmt.Errorf("%w: 最新版本 %s 里没有 %s", ErrNotFound, status.Latest, name)
+	}
+	if assetSize > MaxClientPackageSize {
+		return "", 0, "", fmt.Errorf("%w: 发布包 %s 超过 %d MB 上限",
+			ErrInvalidParam, name, MaxClientPackageSize>>20)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, clientSyncTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srcURL, nil)
+	if err != nil {
+		return "", 0, "", err
+	}
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("User-Agent", "LiteTunnel-Panel")
+	if token := strings.TrimSpace(os.Getenv("LT_UPDATE_TOKEN")); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := (&http.Client{Timeout: clientSyncTimeout}).Do(req)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("下载安装包失败: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, "", fmt.Errorf("下载安装包失败: GitHub 返回 HTTP %d", resp.StatusCode)
+	}
+
+	var wantSum string
+	if sumURL != "" {
+		// 校验和拿不到不阻断下载：老 Release 可能没传 .sha256，
+		// 但拿到了就必须对得上（见下面的 verify 回调）。
+		if sum, serr := fetchReleaseChecksum(reqCtx, sumURL); serr == nil {
+			wantSum = sum
+		}
+	}
+
+	verify := func(tmpPath string) error {
+		if wantSum == "" {
+			return nil
+		}
+		sum, herr := fileSHA256(tmpPath)
+		if herr != nil {
+			return fmt.Errorf("读取临时文件失败: %w", herr)
+		}
+		if !strings.EqualFold(sum, wantSum) {
+			return fmt.Errorf("安装包校验失败：期望 %s，实际 %s（下载内容可能被截断或篡改）", wantSum, sum)
+		}
+		return nil
+	}
+
+	n, err := s.saveClientPackage(name, resp.Body, verify)
+	if err != nil {
+		return "", 0, "", err
+	}
+	return name, n, status.Latest, nil
+}
+
+// fetchReleaseChecksum 读取 Release 上的 .sha256 文件（形如 `<hash>  <文件名>`）。
+func fetchReleaseChecksum(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "LiteTunnel-Panel")
+	if token := strings.TrimSpace(os.Getenv("LT_UPDATE_TOKEN")); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("校验和下载失败: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, clientChecksumMaxRead))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 1 && len(fields[0]) == 64 {
+			return strings.ToLower(fields[0]), nil
+		}
+	}
+	return "", errors.New("校验和文件格式无法识别")
+}
+

@@ -150,6 +150,9 @@ export const clientPkgApi = {
       }
     })
   },
+  release: () => http.get('/client-packages/release'),
+  // 服务器直接向 GitHub 拉取，耗时取决于服务器出口带宽，关闭 axios 超时
+  sync: (name) => http.post('/client-packages/sync', { name: name || '' }, { timeout: 0 }),
   remove: (name) => http.delete(`/client-packages/${encodeURIComponent(name)}`)
 }
 

@@ -2,6 +2,7 @@ package adminapi
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -153,37 +154,89 @@ func (h *Handler) ListClientPackages(c *gin.Context) {
 	})
 }
 
+// UploadClientPackage 接收安装包上传。
+//
+// 这里刻意不用 c.FormFile：它会把整个 multipart 请求体先解析到内存/临时文件，
+// 再由我们复制一遍到分发目录——11MB 的客户端包在容器里等于落两遍盘，
+// 上传进度到 100% 之后还要再等一次完整复制，看起来就像卡住了。
+// MultipartReader 是流式的：边收边写目标文件，只落一遍盘。
 func (h *Handler) UploadClientPackage(c *gin.Context) {
-	file, err := c.FormFile("file")
+	mr, err := c.Request.MultipartReader()
 	if err != nil {
-		httpx.BadRequest(c, "请选择要上传的文件")
+		httpx.BadRequest(c, "请以表单方式上传文件")
 		return
 	}
-	name, err := service.SanitizeClientFileName(file.Filename)
+	for {
+		part, perr := mr.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			httpx.BadRequest(c, "读取上传内容失败")
+			return
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		name, nerr := service.SanitizeClientFileName(part.FileName())
+		if nerr != nil {
+			_ = part.Close()
+			shared.Fail(c, nerr)
+			return
+		}
+		size, serr := h.svc.SaveClientPackage(name, part)
+		_ = part.Close()
+		if serr != nil {
+			shared.Fail(c, serr)
+			return
+		}
+		h.audit(c, "client.upload", "client_dist", name,
+			fmt.Sprintf("上传客户端安装包 %s（%d 字节）", name, size))
+		httpx.OK(c, gin.H{
+			"message": "上传成功",
+			"name":    name,
+			"size":    size,
+		})
+		return
+	}
+	httpx.BadRequest(c, "没有找到上传的文件")
+}
+
+// ClientPackageRelease 返回最新 Release 里的产物清单，供分发页展示
+// 「将同步哪个文件、多大」。放在只读分组：审计角色也能看到，不会因为
+// 没有写权限而在页面上弹一条无意义的报错。
+func (h *Handler) ClientPackageRelease(c *gin.Context) {
+	status, err := h.svc.CheckUpdate(c.Request.Context(), false)
 	if err != nil {
 		shared.Fail(c, err)
 		return
 	}
-
-	src, err := file.Open()
-	if err != nil {
-		shared.Fail(c, err)
-		return
-	}
-	defer func() { _ = src.Close() }()
-
-	n, err := h.svc.SaveClientPackage(name, src)
-	if err != nil {
-		shared.Fail(c, err)
-		return
-	}
-
-	h.audit(c, "client.upload", "client_dist", name,
-		fmt.Sprintf("上传客户端安装包 %s（%d 字节）", name, n))
 	httpx.OK(c, gin.H{
-		"message": "上传成功",
+		"version": status.Latest,
+		"assets":  status.Assets,
+	})
+}
+
+// SyncClientPackage 从最新 GitHub Release 直接下载安装包到分发目录。
+func (h *Handler) SyncClientPackage(c *gin.Context) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	name, size, version, err := h.svc.SyncClientPackageFromRelease(c.Request.Context(), req.Name)
+	if err != nil {
+		shared.Fail(c, err)
+		return
+	}
+	h.audit(c, "client.sync", "client_dist", name,
+		fmt.Sprintf("从 GitHub Release %s 同步安装包 %s（%d 字节）", version, name, size))
+	httpx.OK(c, gin.H{
+		"message": "已从 GitHub 同步",
 		"name":    name,
-		"size":    n,
+		"size":    size,
+		"version": version,
 	})
 }
 
